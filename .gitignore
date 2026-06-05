@@ -1,0 +1,30 @@
+# Visual Studio / MSBuild outputs
+.vs/
+build_vs/
+**/build/
+**/x64/
+**/Debug/
+**/Release/
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.iobj
+*.ipdb
+*.tlog
+*.lastbuildstate
+*.user
+
+# Local run logs and generated diagnostics
+*.log
+
+# Codex extraction/staging folders
+_codex_extract_*/
+_viewer_extract_*/
+_deps/
+
+# Temporary editor/system files
+*.tmp
+*.bak
+Thumbs.db
+Desktop.ini

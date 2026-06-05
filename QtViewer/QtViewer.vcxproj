@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="16.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{A7D0809D-5DA4-4A10-9C1F-8C7C603808CE}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>QtViewer</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v142</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v142</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="QtLocal.props" Condition="Exists('QtLocal.props')" />
+  <Import Project="props\zstd_embed.props" Condition="Exists('props\zstd_embed.props')" />
+
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="Exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="Exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)build\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)build\obj\$(Platform)\$(Configuration)\</IntDir>
+    <TargetName>QtViewer</TargetName>
+    <QtGeneratedDir>$(IntDir)qt\</QtGeneratedDir>
+    <QtMocDefines>-DWIN32 -D_WIN64 -D_WINDOWS -DUNICODE -D_UNICODE -DQT_WIDGETS_LIB -DQT_GUI_LIB -DQT_CORE_LIB</QtMocDefines>
+    <QtMocIncludes>-I&quot;$(MSBuildProjectDirectory)&quot; -I&quot;$(QtGeneratedDir)&quot; -I&quot;$(QtLocalInclude)&quot; -I&quot;$(QtLocalInclude)QtCore&quot; -I&quot;$(QtLocalInclude)QtGui&quot; -I&quot;$(QtLocalInclude)QtWidgets&quot;</QtMocIncludes>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory);$(QtGeneratedDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;NOMINMAX;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalOptions>/utf-8 /Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableUAC>false</EnableUAC>
+      <AdditionalDependencies>Qt6EntryPoint.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>/MANIFESTINPUT:&quot;$(MSBuildProjectDirectory)\app.manifest&quot; %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory);$(QtGeneratedDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;NOMINMAX;_CRT_SECURE_NO_WARNINGS;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalOptions>/utf-8 /Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <EnableUAC>false</EnableUAC>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <AdditionalDependencies>Qt6EntryPoint.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>/MANIFESTINPUT:&quot;$(MSBuildProjectDirectory)\app.manifest&quot; %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="ActiveSignalItemWidget.cpp" />
+    <ClCompile Include="ActiveSignalListWidget.cpp" />
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="MainWindow.cpp" />
+    <ClCompile Include="WaveCanvas.cpp" />
+    <ClCompile Include="WaveParser.cpp" />
+    <ClCompile Include="WaveParser2.cpp" />
+    <ClCompile Include="WaveParser3.cpp" />
+    <ClCompile Include="WaveParser4.cpp" />
+    <ClCompile Include="$(QtGeneratedDir)moc_ActiveSignalListWidget.cpp" />
+    <ClCompile Include="$(QtGeneratedDir)moc_MainWindow.cpp" />
+    <ClCompile Include="$(QtGeneratedDir)moc_WaveCanvas.cpp" />
+    <ClCompile Include="$(QtGeneratedDir)qrc_QtSingalViewer.cpp" />
+    <ClCompile Include="$(QtGeneratedDir)qrc_resources.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="ActiveSignalItemWidget.h" />
+    <ClInclude Include="ActiveSignalListWidget.h" />
+    <ClInclude Include="MainWindow.h" />
+    <ClInclude Include="WaveCanvas.h" />
+    <ClInclude Include="WaveParser.h" />
+    <ClInclude Include="WaveParser2.h" />
+    <ClInclude Include="WaveParser3.h" />
+    <ClInclude Include="WaveParser4.h" />
+    <ClInclude Include="WaveTypes.h" />
+    <ClInclude Include="WVZ2Format.h" />
+    <ClInclude Include="WVZ3Format.h" />
+    <ClInclude Include="wave_path_wvz4_recorder.h" />
+    <ClInclude Include="wvz4_writer_typed.h" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ResourceCompile Include="app.rc" />
+    <None Include="app.manifest" />
+    <None Include="QtSingalViewer.ui" />
+    <None Include="QtSingalViewer.qrc" />
+    <None Include="resources.qrc" />
+    <None Include="smoke_wvz4_parser.cpp" />
+  </ItemGroup>
+
+  <Target Name="GenerateQtSources" BeforeTargets="ClCompile">
+    <Error Condition="!Exists('$(QtLocalBin)moc.exe')" Text="Qt moc.exe not found. Expected $(QtLocalBin)moc.exe" />
+    <Error Condition="!Exists('$(QtLocalBin)uic.exe')" Text="Qt uic.exe not found. Expected $(QtLocalBin)uic.exe" />
+    <Error Condition="!Exists('$(QtLocalBin)rcc.exe')" Text="Qt rcc.exe not found. Expected $(QtLocalBin)rcc.exe" />
+    <MakeDir Directories="$(QtGeneratedDir)" />
+    <Exec Command="&quot;$(QtLocalBin)moc.exe&quot; $(QtMocDefines) $(QtMocIncludes) -o &quot;$(QtGeneratedDir)moc_ActiveSignalListWidget.cpp&quot; &quot;$(MSBuildProjectDirectory)\ActiveSignalListWidget.h&quot;" />
+    <Exec Command="&quot;$(QtLocalBin)moc.exe&quot; $(QtMocDefines) $(QtMocIncludes) -o &quot;$(QtGeneratedDir)moc_MainWindow.cpp&quot; &quot;$(MSBuildProjectDirectory)\MainWindow.h&quot;" />
+    <Exec Command="&quot;$(QtLocalBin)moc.exe&quot; $(QtMocDefines) $(QtMocIncludes) -o &quot;$(QtGeneratedDir)moc_WaveCanvas.cpp&quot; &quot;$(MSBuildProjectDirectory)\WaveCanvas.h&quot;" />
+    <Exec Command="&quot;$(QtLocalBin)uic.exe&quot; &quot;$(MSBuildProjectDirectory)\QtSingalViewer.ui&quot; -o &quot;$(QtGeneratedDir)ui_QtSingalViewer.h&quot;" />
+    <Exec Command="&quot;$(QtLocalBin)rcc.exe&quot; -name QtSingalViewer &quot;$(MSBuildProjectDirectory)\QtSingalViewer.qrc&quot; -o &quot;$(QtGeneratedDir)qrc_QtSingalViewer.cpp&quot;" />
+    <Exec Command="&quot;$(QtLocalBin)rcc.exe&quot; -name resources &quot;$(MSBuildProjectDirectory)\resources.qrc&quot; -o &quot;$(QtGeneratedDir)qrc_resources.cpp&quot;" />
+  </Target>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

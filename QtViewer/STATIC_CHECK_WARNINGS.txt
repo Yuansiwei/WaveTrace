@@ -1,0 +1,1 @@
+MainWindow.cpp:775: odd quote count:     )");
