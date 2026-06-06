@@ -2062,11 +2062,15 @@ MainWindow::MainWindow(QWidget* parent)
 
 MainWindow::~MainWindow() = default;
 
-void MainWindow::setupToolbarButton(QPushButton* button, const QIcon& icon, const QString& tip) {
+void MainWindow::setupToolbarButton(QPushButton* button, const QIcon& icon, const QString& objectName, const QString& tip) {
+    button->setObjectName(objectName);
     button->setIcon(icon.isNull() ? makeColorfulToolbarIcon("open") : icon);
     button->setIconSize(QSize(18, 18));
     button->setText(QString());
     button->setToolTip(tip);
+    button->setAccessibleName(tip);
+    button->setAccessibleDescription(tip);
+    button->setFocusPolicy(Qt::StrongFocus);
     button->setFixedSize(28, 28);
 }
 
@@ -2169,16 +2173,16 @@ void MainWindow::buildUi() {
     auto* btnNextChange = new QPushButton(topBarCard);
     auto* btnReset = new QPushButton(topBarCard);
 
-    setupToolbarButton(btnOpen, loadImageIconOrFallback("open", "open"), QString::fromUtf8("打开波形文件"));
-    setupToolbarButton(btnCompare, loadImageIconOrFallback("compare", "compare"), QString::fromUtf8("比较两个波形文件"));
-    setupToolbarButton(btnExportCompressed, loadImageIconOrFallback("save", "save"), QString::fromUtf8("导出波形文件"));
-    setupToolbarButton(btnZoomIn, loadImageIconOrFallback("zoom_in", "zoom_in"), QString::fromUtf8("放大"));
-    setupToolbarButton(btnZoomOut, loadImageIconOrFallback("zoom_out", "zoom_out"), QString::fromUtf8("缩小"));
-    setupToolbarButton(btnPanLeft, loadImageIconOrFallback("left", "left"), QString::fromUtf8("左移"));
-    setupToolbarButton(btnPanRight, loadImageIconOrFallback("right", "right"), QString::fromUtf8("右移"));
-    setupToolbarButton(btnPrevChange, loadImageIconOrFallback("prev_change", "prev_change"), QString::fromUtf8("跳到选中信号上一次变化"));
-    setupToolbarButton(btnNextChange, loadImageIconOrFallback("next_change", "next_change"), QString::fromUtf8("跳到选中信号下一次变化"));
-    setupToolbarButton(btnReset, loadImageIconOrFallback("reset", "reset"), QString::fromUtf8("重置视图"));
+    setupToolbarButton(btnOpen, loadImageIconOrFallback("open", "open"), QStringLiteral("toolbarOpenButton"), QString::fromUtf8("打开波形文件"));
+    setupToolbarButton(btnCompare, loadImageIconOrFallback("compare", "compare"), QStringLiteral("toolbarCompareButton"), QString::fromUtf8("比较两个波形文件"));
+    setupToolbarButton(btnExportCompressed, loadImageIconOrFallback("save", "save"), QStringLiteral("toolbarExportButton"), QString::fromUtf8("导出波形文件"));
+    setupToolbarButton(btnZoomIn, loadImageIconOrFallback("zoom_in", "zoom_in"), QStringLiteral("toolbarZoomInButton"), QString::fromUtf8("放大"));
+    setupToolbarButton(btnZoomOut, loadImageIconOrFallback("zoom_out", "zoom_out"), QStringLiteral("toolbarZoomOutButton"), QString::fromUtf8("缩小"));
+    setupToolbarButton(btnPanLeft, loadImageIconOrFallback("left", "left"), QStringLiteral("toolbarPanLeftButton"), QString::fromUtf8("左移"));
+    setupToolbarButton(btnPanRight, loadImageIconOrFallback("right", "right"), QStringLiteral("toolbarPanRightButton"), QString::fromUtf8("右移"));
+    setupToolbarButton(btnPrevChange, loadImageIconOrFallback("prev_change", "prev_change"), QStringLiteral("toolbarPrevChangeButton"), QString::fromUtf8("跳到选中信号上一次变化"));
+    setupToolbarButton(btnNextChange, loadImageIconOrFallback("next_change", "next_change"), QStringLiteral("toolbarNextChangeButton"), QString::fromUtf8("跳到选中信号下一次变化"));
+    setupToolbarButton(btnReset, loadImageIconOrFallback("reset", "reset"), QStringLiteral("toolbarResetButton"), QString::fromUtf8("重置视图"));
 
     m_jumpTimeEdit = new QLineEdit(topBarCard);
     m_jumpTimeEdit->setObjectName("jumpTimeEdit");
@@ -2602,7 +2606,7 @@ bool MainWindow::openWaveFilePath(const QString& path) {
     if (isWvz4) {
         WaveParser4::LoadOptions loadOptions;
         loadOptions.includeAllSignalDefinitions = true;
-        loadOptions.autoLoadFirstSignalCount = 6;
+        loadOptions.autoLoadFirstSignalCount = 0;
         loadOptions.loadAllIfWindowEmpty = false;
         ok = WaveParser4::loadFromFile(path, wave, error, loadOptions);
     }
@@ -2704,7 +2708,7 @@ void MainWindow::exportCompressedWaveFile() {
         for (int i = 0; i < m_wave.signalList.size(); ++i) {
             allSignalIndexes.push_back(i);
         }
-        if (!ensureSignalSamplesLoaded(allSignalIndexes)) {
+        if (!ensureSignalSamplesLoaded(allSignalIndexes, false)) {
             return;
         }
     }
@@ -3044,7 +3048,15 @@ void MainWindow::setActiveItemFormat(QTreeWidgetItem* item, const QString& text)
     }
 }
 
-bool MainWindow::ensureSignalSamplesLoaded(const QList<int>& signalIndexes) {
+bool MainWindow::canDeferSamplesWithLod(const WaveSignal& sig) const {
+    if (sig.lodLevels.isEmpty() || !m_canvas) return false;
+    const int plotWidth = qMax(1, m_canvas->width() - 20);
+    const qint64 span = qMax<qint64>(1, m_canvas->viewEnd() - m_canvas->viewStart());
+    const double cyclesPerPixel = double(span) / double(plotWidth);
+    return cyclesPerPixel >= 128.0;
+}
+
+bool MainWindow::ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool allowLodDefer) {
     if (!m_currentWaveSupportsOnDemand || m_currentWaveFilePath.isEmpty()) return true;
     if (signalIndexes.isEmpty()) return true;
 
@@ -3056,6 +3068,7 @@ bool MainWindow::ensureSignalSamplesLoaded(const QList<int>& signalIndexes) {
         if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
         const WaveSignal& sig = m_wave.signalList.at(signalIndex);
         if (sig.samplesLoaded) continue;
+        if (allowLodDefer && canDeferSamplesWithLod(sig)) continue;
         if (sig.signalId < 0) continue;
         if (seenIds.contains(sig.signalId)) continue;
         seenIds.insert(sig.signalId);
@@ -3372,4 +3385,20 @@ void MainWindow::onHoverMoved(qint64) {
 }
 
 void MainWindow::onViewportChanged(qint64, qint64) {
+    if (m_currentWaveSupportsOnDemand && m_activeList) {
+        QList<int> needRawSignals;
+        for (int i = 0; i < m_activeList->topLevelItemCount(); ++i) {
+            QTreeWidgetItem* item = m_activeList->topLevelItem(i);
+            const int signalIndex = signalIndexFromActiveItem(item);
+            if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
+            const WaveSignal& sig = m_wave.signalList.at(signalIndex);
+            if (sig.samplesLoaded) continue;
+            if (canDeferSamplesWithLod(sig)) continue;
+            needRawSignals.push_back(signalIndex);
+        }
+        if (!needRawSignals.isEmpty() && ensureSignalSamplesLoaded(needRawSignals, false)) {
+            rebuildVisibleSignals();
+        }
+    }
+    scheduleRefreshActiveValueLabels(35);
 }

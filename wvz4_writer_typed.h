@@ -49,8 +49,12 @@ using u64 = std::uint64_t;
 using u32 = std::uint32_t;
 using u8  = std::uint8_t;
 
-static const u32 kFormatVersion = 5;
+static const u32 kFormatVersion = 9;
 static const u32 kMaxScalarBytes = 8;
+static const u64 kLodBaseBucketCycles = 256;
+static const u32 kLodLevelCount = 7;
+static const u64 kLodMinRawTransitionsForTable = 4096;
+static const u64 kLodMinRawToSampleRatio = 4;
 
 // Raw WDAT payload encoding flags. The outer WDAT section and block index remain
 // unchanged; these flags describe the uncompressed raw_payload inside each block.
@@ -68,6 +72,7 @@ static const u64 kHeaderFeatureSparseRecords     = 1ull << 2;
 static const u64 kHeaderFeatureBoolToggleCodec   = 1ull << 3;
 static const u64 kHeaderFeatureByteMaskCodec     = 1ull << 4;
 static const u64 kHeaderFeatureNibbleMaskCodec   = 1ull << 5;
+static const u64 kHeaderFeatureLodTables         = 1ull << 6;
 
 enum class ValueRecordCodec : u8 {
     FullValues = 0,       // time + full fixed-width value for every transition
@@ -711,6 +716,7 @@ public:
             tr.cycle = submission.cycle;
             tr.value = upd.value;
             st.transitions.push_back(tr);
+            update_lod_tables(upd.signal_id, submission.cycle, upd.value);
             mark_current_block_shared_time(upd.signal_id, submission.cycle);
             st.current = upd.value;
             st.has_current = true;
@@ -868,6 +874,21 @@ private:
         Compression compression = Compression::None;
     };
 
+    struct LodLevelState {
+        u64 min_cycle_delta = 0;
+        bool has_last_record = false;
+        i64 last_record_cycle = 0;
+        std::vector<Transition> transitions;
+    };
+
+    struct LodStorageState {
+        bool valid = false;
+        u8 byte_width = 0;
+        ValueType value_type = ValueType::U64;
+        u64 raw_transition_count = 0;
+        std::vector<LodLevelState> levels;
+    };
+
     struct BlockJob {
         u64 block_id = 0;       // physical tile/block write order id
         i64 start_cycle = 0;
@@ -928,6 +949,63 @@ private:
         unsigned n = hw / 2;
         if (n == 0) n = 1;
         return static_cast<u32>(n);
+    }
+
+    static ScalarValue zero_scalar(u8 byte_width) {
+        ScalarValue v;
+        v.byte_count = byte_width;
+        v.bytes.fill(0);
+        return v;
+    }
+
+    void initialize_lod_storage() {
+        lod_bucket_cycles_.clear();
+        lod_bucket_cycles_.reserve(kLodLevelCount);
+        u64 bucket_cycles = kLodBaseBucketCycles;
+        for (u32 i = 0; i < kLodLevelCount; ++i) {
+            lod_bucket_cycles_.push_back(bucket_cycles);
+            if (bucket_cycles <= (std::numeric_limits<u64>::max)() / 4ull) bucket_cycles *= 4ull;
+        }
+
+        lod_states_.clear();
+        lod_states_.resize(signal_states_.size());
+        for (std::size_t i = 0; i < signal_order_.size(); ++i) {
+            const u32 storage_id = signal_order_[i];
+            if (storage_id >= lod_states_.size()) continue;
+            const SignalState& st = signal_states_[storage_id];
+            if (!st.valid || st.is_periodic_clock) continue;
+            LodStorageState& lod = lod_states_[storage_id];
+            lod.valid = true;
+            lod.byte_width = st.byte_width_bytes;
+            lod.value_type = st.def.type;
+            lod.levels.resize(lod_bucket_cycles_.size());
+            for (std::size_t level = 0; level < lod_bucket_cycles_.size(); ++level) {
+                lod.levels[level].min_cycle_delta = lod_bucket_cycles_[level];
+            }
+        }
+    }
+
+    void update_lod_tables(u32 storage_id, i64 cycle, const ScalarValue& new_value) {
+        if (cycle < 0 || storage_id >= lod_states_.size()) return;
+        LodStorageState& storage = lod_states_[storage_id];
+        if (!storage.valid || storage.byte_width == 0) return;
+        ++storage.raw_transition_count;
+        for (std::size_t level = 0; level < storage.levels.size(); ++level) {
+            LodLevelState& lod_level = storage.levels[level];
+            const u64 min_delta = lod_level.min_cycle_delta;
+            if (min_delta == 0) continue;
+            if (lod_level.has_last_record) {
+                const u64 elapsed = static_cast<u64>(cycle - lod_level.last_record_cycle);
+                if (elapsed < min_delta) continue;
+            }
+            Transition tr;
+            tr.cycle = cycle;
+            tr.value = new_value;
+            tr.value.byte_count = storage.byte_width;
+            lod_level.transitions.push_back(tr);
+            lod_level.last_record_cycle = cycle;
+            lod_level.has_last_record = true;
+        }
     }
 
     bool validate_and_prepare_layout(const Layout& layout, std::string& error) {
@@ -1119,6 +1197,7 @@ private:
             : 1u;
         current_block_shared_times_by_chunk_.clear();
         current_block_shared_times_by_chunk_.resize(chunk_count == 0 ? 1u : chunk_count);
+        initialize_lod_storage();
         return true;
     }
 
@@ -1138,6 +1217,7 @@ private:
         if (options_.enable_bool_toggle_encoding) feature_flags |= kHeaderFeatureBoolToggleCodec;
         if (options_.enable_value_byte_mask_encoding) feature_flags |= kHeaderFeatureByteMaskCodec;
         if (options_.enable_value_byte_mask_encoding) feature_flags |= kHeaderFeatureNibbleMaskCodec;
+        feature_flags |= kHeaderFeatureLodTables;
         if (!detail::write_u64(out_, feature_flags)) { error = "failed to write WVZ4 feature flags"; return false; }
         if (!detail::write_u64(out_, 0)) { error = "failed to write WVZ4 reserved"; return false; }
         if (!detail::write_u32(out_, 0)) { error = "failed to write WVZ4 reserved"; return false; }
@@ -1951,6 +2031,465 @@ private:
         std::size_t encoded_size = 0;
         u64 stride = 0;
     };
+
+    void append_value_full_record(const std::vector<Transition>& transitions,
+                                  i64 start_cycle,
+                                  u8 byte_width,
+                                  bool use_shared_time,
+                                  const std::vector<u64>* shared_times,
+                                  std::vector<u8>& out,
+                                  WdatByteBreakdown* cost) const {
+        std::size_t before = out.size();
+        detail::append_u8(out, static_cast<u8>(ValueRecordCodec::FullValues));
+        detail::append_varuint(out, static_cast<u64>(transitions.size()));
+        if (cost) cost->record_header_bytes += appended_size_since(out, before);
+        u64 prev_rel = 0;
+        std::size_t shared_pos = 0;
+        for (std::size_t t = 0; t < transitions.size(); ++t) {
+            const Transition& tr = transitions[t];
+            const u64 rel = static_cast<u64>(tr.cycle - start_cycle);
+            append_record_time(out, rel, prev_rel, use_shared_time, shared_times, shared_pos, cost);
+            before = out.size();
+            append_fixed_value_bytes(out, tr.value, byte_width);
+            if (cost) cost->value_payload_bytes += appended_size_since(out, before);
+        }
+    }
+
+    void append_value_full_stride_record(const std::vector<Transition>& transitions,
+                                         i64 start_cycle,
+                                         u8 byte_width,
+                                         u64 stride,
+                                         std::vector<u8>& out,
+                                         WdatByteBreakdown* cost) const {
+        std::size_t before = out.size();
+        detail::append_u8(out, static_cast<u8>(ValueRecordCodec::FullValuesStride));
+        detail::append_varuint(out, static_cast<u64>(transitions.size()));
+        if (cost) cost->record_header_bytes += appended_size_since(out, before);
+        if (transitions.empty()) return;
+
+        const u64 first_rel = static_cast<u64>(transitions[0].cycle - start_cycle);
+        append_record_stride_time(out, first_rel, stride, cost);
+        for (std::size_t t = 0; t < transitions.size(); ++t) {
+            before = out.size();
+            append_fixed_value_bytes(out, transitions[t].value, byte_width);
+            if (cost) cost->value_payload_bytes += appended_size_since(out, before);
+        }
+    }
+
+    void append_value_bool_toggle_record(const std::vector<Transition>& transitions,
+                                         i64 start_cycle,
+                                         bool use_shared_time,
+                                         const std::vector<u64>* shared_times,
+                                         std::vector<u8>& out,
+                                         WdatByteBreakdown* cost) const {
+        std::size_t before = out.size();
+        detail::append_u8(out, static_cast<u8>(ValueRecordCodec::BoolToggle));
+        detail::append_varuint(out, static_cast<u64>(transitions.size()));
+        if (cost) cost->record_header_bytes += appended_size_since(out, before);
+        before = out.size();
+        detail::append_u8(out, transitions.empty() ? 0u : (transitions[0].value.bytes[0] ? 1u : 0u));
+        if (cost) cost->value_payload_bytes += appended_size_since(out, before);
+        u64 prev_rel = 0;
+        std::size_t shared_pos = 0;
+        for (std::size_t t = 0; t < transitions.size(); ++t) {
+            const Transition& tr = transitions[t];
+            const u64 rel = static_cast<u64>(tr.cycle - start_cycle);
+            append_record_time(out, rel, prev_rel, use_shared_time, shared_times, shared_pos, cost);
+        }
+    }
+
+    void append_value_bool_toggle_stride_record(const std::vector<Transition>& transitions,
+                                                i64 start_cycle,
+                                                u64 stride,
+                                                std::vector<u8>& out,
+                                                WdatByteBreakdown* cost) const {
+        std::size_t before = out.size();
+        detail::append_u8(out, static_cast<u8>(ValueRecordCodec::BoolToggleStride));
+        detail::append_varuint(out, static_cast<u64>(transitions.size()));
+        if (cost) cost->record_header_bytes += appended_size_since(out, before);
+        before = out.size();
+        detail::append_u8(out, transitions.empty() ? 0u : (transitions[0].value.bytes[0] ? 1u : 0u));
+        if (cost) cost->value_payload_bytes += appended_size_since(out, before);
+        if (transitions.empty()) return;
+
+        const u64 first_rel = static_cast<u64>(transitions[0].cycle - start_cycle);
+        append_record_stride_time(out, first_rel, stride, cost);
+    }
+
+    void append_value_byte_mask_record(const std::vector<Transition>& transitions,
+                                       i64 start_cycle,
+                                       u8 byte_width,
+                                       bool use_shared_time,
+                                       const std::vector<u64>* shared_times,
+                                       std::vector<u8>& out,
+                                       WdatByteBreakdown* cost) const {
+        std::size_t before = out.size();
+        detail::append_u8(out, static_cast<u8>(ValueRecordCodec::ByteMask));
+        detail::append_varuint(out, static_cast<u64>(transitions.size()));
+        if (cost) cost->record_header_bytes += appended_size_since(out, before);
+        u64 prev_rel = 0;
+        std::size_t shared_pos = 0;
+        if (transitions.empty()) return;
+
+        const Transition& first = transitions[0];
+        append_record_time(out, static_cast<u64>(first.cycle - start_cycle), prev_rel, use_shared_time, shared_times, shared_pos, cost);
+        before = out.size();
+        append_fixed_value_bytes(out, first.value, byte_width);
+        if (cost) cost->value_payload_bytes += appended_size_since(out, before);
+
+        std::array<u8, kMaxScalarBytes> prev = first.value.bytes;
+        for (std::size_t t = 1; t < transitions.size(); ++t) {
+            const Transition& tr = transitions[t];
+            const u64 rel = static_cast<u64>(tr.cycle - start_cycle);
+            append_record_time(out, rel, prev_rel, use_shared_time, shared_times, shared_pos, cost);
+            u8 mask = 0;
+            for (u8 b = 0; b < byte_width; ++b) {
+                if (tr.value.bytes[b] != prev[b]) mask = static_cast<u8>(mask | static_cast<u8>(1u << b));
+            }
+            before = out.size();
+            detail::append_u8(out, mask);
+            if (cost) cost->value_mask_bytes += appended_size_since(out, before);
+            before = out.size();
+            for (u8 b = 0; b < byte_width; ++b) {
+                if (mask & static_cast<u8>(1u << b)) out.push_back(tr.value.bytes[b]);
+                prev[b] = tr.value.bytes[b];
+            }
+            if (cost) cost->value_payload_bytes += appended_size_since(out, before);
+        }
+    }
+
+    void append_value_byte_mask_stride_record(const std::vector<Transition>& transitions,
+                                              i64 start_cycle,
+                                              u8 byte_width,
+                                              u64 stride,
+                                              std::vector<u8>& out,
+                                              WdatByteBreakdown* cost) const {
+        std::size_t before = out.size();
+        detail::append_u8(out, static_cast<u8>(ValueRecordCodec::ByteMaskStride));
+        detail::append_varuint(out, static_cast<u64>(transitions.size()));
+        if (cost) cost->record_header_bytes += appended_size_since(out, before);
+        if (transitions.empty()) return;
+
+        const Transition& first = transitions[0];
+        const u64 first_rel = static_cast<u64>(first.cycle - start_cycle);
+        append_record_stride_time(out, first_rel, stride, cost);
+        before = out.size();
+        append_fixed_value_bytes(out, first.value, byte_width);
+        if (cost) cost->value_payload_bytes += appended_size_since(out, before);
+
+        std::array<u8, kMaxScalarBytes> prev = first.value.bytes;
+        for (std::size_t t = 1; t < transitions.size(); ++t) {
+            const Transition& tr = transitions[t];
+            u8 mask = 0;
+            for (u8 b = 0; b < byte_width; ++b) {
+                if (tr.value.bytes[b] != prev[b]) mask = static_cast<u8>(mask | static_cast<u8>(1u << b));
+            }
+            before = out.size();
+            detail::append_u8(out, mask);
+            if (cost) cost->value_mask_bytes += appended_size_since(out, before);
+            before = out.size();
+            for (u8 b = 0; b < byte_width; ++b) {
+                if (mask & static_cast<u8>(1u << b)) out.push_back(tr.value.bytes[b]);
+                prev[b] = tr.value.bytes[b];
+            }
+            if (cost) cost->value_payload_bytes += appended_size_since(out, before);
+        }
+    }
+
+    void append_value_nibble_mask_record(const std::vector<Transition>& transitions,
+                                         i64 start_cycle,
+                                         u8 byte_width,
+                                         bool use_shared_time,
+                                         const std::vector<u64>* shared_times,
+                                         std::vector<u8>& out,
+                                         WdatByteBreakdown* cost) const {
+        std::size_t before = out.size();
+        detail::append_u8(out, static_cast<u8>(ValueRecordCodec::NibbleMask));
+        detail::append_varuint(out, static_cast<u64>(transitions.size()));
+        if (cost) cost->record_header_bytes += appended_size_since(out, before);
+        if (transitions.empty()) return;
+
+        u64 prev_rel = 0;
+        std::size_t shared_pos = 0;
+        const Transition& first = transitions[0];
+        append_record_time(out, static_cast<u64>(first.cycle - start_cycle), prev_rel, use_shared_time, shared_times, shared_pos, cost);
+        before = out.size();
+        append_fixed_value_bytes(out, first.value, byte_width);
+        if (cost) cost->value_payload_bytes += appended_size_since(out, before);
+
+        std::array<u8, kMaxScalarBytes> prev = first.value.bytes;
+        for (std::size_t t = 1; t < transitions.size(); t += 2u) {
+            const Transition& tr0 = transitions[t];
+            const u64 rel0 = static_cast<u64>(tr0.cycle - start_cycle);
+            append_record_time(out, rel0, prev_rel, use_shared_time, shared_times, shared_pos, cost);
+            const u8 mask0 = changed_byte_mask_for_width(tr0.value, prev, byte_width);
+
+            u8 mask1 = 0;
+            if (t + 1u < transitions.size()) {
+                std::array<u8, kMaxScalarBytes> after0 = prev;
+                for (u8 b = 0; b < byte_width; ++b) after0[b] = tr0.value.bytes[b];
+                const Transition& tr1 = transitions[t + 1u];
+                const u64 rel1 = static_cast<u64>(tr1.cycle - start_cycle);
+                append_record_time(out, rel1, prev_rel, use_shared_time, shared_times, shared_pos, cost);
+                mask1 = changed_byte_mask_for_width(tr1.value, after0, byte_width);
+            }
+
+            before = out.size();
+            detail::append_u8(out, static_cast<u8>((mask0 & 0x0fu) | static_cast<u8>((mask1 & 0x0fu) << 4)));
+            if (cost) cost->value_mask_bytes += appended_size_since(out, before);
+
+            before = out.size();
+            append_changed_value_bytes_by_mask(tr0.value, byte_width, mask0, prev, out);
+            if (t + 1u < transitions.size()) {
+                const Transition& tr1 = transitions[t + 1u];
+                append_changed_value_bytes_by_mask(tr1.value, byte_width, mask1, prev, out);
+            }
+            if (cost) cost->value_payload_bytes += appended_size_since(out, before);
+        }
+    }
+
+    void append_value_nibble_mask_stride_record(const std::vector<Transition>& transitions,
+                                                i64 start_cycle,
+                                                u8 byte_width,
+                                                u64 stride,
+                                                std::vector<u8>& out,
+                                                WdatByteBreakdown* cost) const {
+        std::size_t before = out.size();
+        detail::append_u8(out, static_cast<u8>(ValueRecordCodec::NibbleMaskStride));
+        detail::append_varuint(out, static_cast<u64>(transitions.size()));
+        if (cost) cost->record_header_bytes += appended_size_since(out, before);
+        if (transitions.empty()) return;
+
+        const Transition& first = transitions[0];
+        const u64 first_rel = static_cast<u64>(first.cycle - start_cycle);
+        append_record_stride_time(out, first_rel, stride, cost);
+        before = out.size();
+        append_fixed_value_bytes(out, first.value, byte_width);
+        if (cost) cost->value_payload_bytes += appended_size_since(out, before);
+
+        std::array<u8, kMaxScalarBytes> prev = first.value.bytes;
+        for (std::size_t t = 1; t < transitions.size(); t += 2u) {
+            const Transition& tr0 = transitions[t];
+            const u8 mask0 = changed_byte_mask_for_width(tr0.value, prev, byte_width);
+
+            u8 mask1 = 0;
+            if (t + 1u < transitions.size()) {
+                std::array<u8, kMaxScalarBytes> after0 = prev;
+                for (u8 b = 0; b < byte_width; ++b) after0[b] = tr0.value.bytes[b];
+                const Transition& tr1 = transitions[t + 1u];
+                mask1 = changed_byte_mask_for_width(tr1.value, after0, byte_width);
+            }
+
+            before = out.size();
+            detail::append_u8(out, static_cast<u8>((mask0 & 0x0fu) | static_cast<u8>((mask1 & 0x0fu) << 4)));
+            if (cost) cost->value_mask_bytes += appended_size_since(out, before);
+
+            before = out.size();
+            append_changed_value_bytes_by_mask(tr0.value, byte_width, mask0, prev, out);
+            if (t + 1u < transitions.size()) {
+                const Transition& tr1 = transitions[t + 1u];
+                append_changed_value_bytes_by_mask(tr1.value, byte_width, mask1, prev, out);
+            }
+            if (cost) cost->value_payload_bytes += appended_size_since(out, before);
+        }
+    }
+
+    SignalRecordChoice choose_value_record_codec_and_size(const std::vector<Transition>& transitions,
+                                                          i64 start_cycle,
+                                                          u8 byte_width,
+                                                          ValueType value_type,
+                                                          bool use_shared_time,
+                                                          const std::vector<u64>* shared_times) const {
+        const std::size_t count = transitions.size();
+        const std::size_t header_size = 1u + detail::varuint_size(static_cast<u64>(count));
+        SignalRecordChoice choice;
+        if (count == 0) {
+            choice.codec = ValueRecordCodec::FullValues;
+            choice.encoded_size = header_size;
+            return choice;
+        }
+
+        std::size_t time_size = 0;
+        u64 prev_rel = 0;
+        std::size_t shared_pos = 0;
+
+        bool can_bool = options_.enable_bool_toggle_encoding &&
+                        value_type == ValueType::Bool &&
+                        byte_width == 1;
+
+        bool can_nibble_mask = options_.enable_value_byte_mask_encoding &&
+                               byte_width > 2 &&
+                               byte_width <= 4 &&
+                               count > 1;
+
+        bool can_byte_mask = options_.enable_value_byte_mask_encoding &&
+                             byte_width > 4 &&
+                             count > 1;
+
+        bool can_stride = options_.enable_stride_time_record_encoding &&
+                          !use_shared_time &&
+                          count >= 3u;
+        u64 stride = 0;
+        u64 prev_abs_rel = 0;
+
+        const std::size_t full_value_bytes = count * static_cast<std::size_t>(byte_width);
+        std::size_t byte_mask_value_bytes = can_byte_mask ? static_cast<std::size_t>(byte_width) : 0u;
+        std::size_t nibble_mask_value_bytes = can_nibble_mask
+            ? (static_cast<std::size_t>(byte_width) + (count - 1u + 1u) / 2u)
+            : 0u;
+        std::array<u8, kMaxScalarBytes> prev_value = transitions[0].value.bytes;
+        std::array<u8, kMaxScalarBytes> prev_nibble_value = transitions[0].value.bytes;
+
+        for (std::size_t t = 0; t < count; ++t) {
+            const Transition& tr = transitions[t];
+            const u64 rel = static_cast<u64>(tr.cycle - start_cycle);
+            time_size += record_time_encoded_size(rel, prev_rel, use_shared_time, shared_times, shared_pos);
+
+            if (can_stride) {
+                if (t == 0) {
+                    prev_abs_rel = rel;
+                } else {
+                    const u64 delta = rel - prev_abs_rel;
+                    if (t == 1) {
+                        stride = delta;
+                    } else if (delta != stride) {
+                        can_stride = false;
+                    }
+                    prev_abs_rel = rel;
+                }
+            }
+
+            if (can_bool) {
+                if (tr.value.bytes[0] > 1u || (t > 0 && tr.value.bytes[0] == transitions[t - 1].value.bytes[0])) {
+                    can_bool = false;
+                }
+            }
+
+            if (can_nibble_mask && t > 0) {
+                for (u8 b = 0; b < byte_width; ++b) {
+                    if (tr.value.bytes[b] != prev_nibble_value[b]) ++nibble_mask_value_bytes;
+                    prev_nibble_value[b] = tr.value.bytes[b];
+                }
+                if (nibble_mask_value_bytes >= full_value_bytes) {
+                    can_nibble_mask = false;
+                }
+            }
+
+            if (can_byte_mask && t > 0) {
+                byte_mask_value_bytes += 1u;
+                for (u8 b = 0; b < byte_width; ++b) {
+                    if (tr.value.bytes[b] != prev_value[b]) ++byte_mask_value_bytes;
+                    prev_value[b] = tr.value.bytes[b];
+                }
+                if (byte_mask_value_bytes >= full_value_bytes) {
+                    can_byte_mask = false;
+                }
+            }
+        }
+
+        const std::size_t full_size = header_size + time_size + full_value_bytes;
+        choice.codec = ValueRecordCodec::FullValues;
+        choice.encoded_size = full_size;
+
+        if (can_bool) {
+            const std::size_t bool_size = header_size + 1u + time_size;
+            if (bool_size < choice.encoded_size) {
+                choice.codec = ValueRecordCodec::BoolToggle;
+                choice.encoded_size = bool_size;
+            }
+        }
+
+        if (can_nibble_mask) {
+            const std::size_t nibble_mask_size = header_size + time_size + nibble_mask_value_bytes;
+            if (nibble_mask_size < choice.encoded_size) {
+                choice.codec = ValueRecordCodec::NibbleMask;
+                choice.encoded_size = nibble_mask_size;
+            }
+        }
+
+        if (can_byte_mask) {
+            const std::size_t byte_mask_size = header_size + time_size + byte_mask_value_bytes;
+            if (byte_mask_size < choice.encoded_size) {
+                choice.codec = ValueRecordCodec::ByteMask;
+                choice.encoded_size = byte_mask_size;
+            }
+        }
+
+        if (can_stride) {
+            const u64 first_rel = static_cast<u64>(transitions[0].cycle - start_cycle);
+            const std::size_t stride_time_size = record_stride_time_size(first_rel, stride);
+            const std::size_t full_stride_size = header_size + stride_time_size + full_value_bytes;
+            if (full_stride_size < choice.encoded_size) {
+                choice.codec = ValueRecordCodec::FullValuesStride;
+                choice.encoded_size = full_stride_size;
+                choice.stride = stride;
+            }
+            if (can_bool) {
+                const std::size_t bool_stride_size = header_size + 1u + stride_time_size;
+                if (bool_stride_size < choice.encoded_size) {
+                    choice.codec = ValueRecordCodec::BoolToggleStride;
+                    choice.encoded_size = bool_stride_size;
+                    choice.stride = stride;
+                }
+            }
+            if (can_nibble_mask) {
+                const std::size_t nibble_mask_stride_size = header_size + stride_time_size + nibble_mask_value_bytes;
+                if (nibble_mask_stride_size < choice.encoded_size) {
+                    choice.codec = ValueRecordCodec::NibbleMaskStride;
+                    choice.encoded_size = nibble_mask_stride_size;
+                    choice.stride = stride;
+                }
+            }
+            if (can_byte_mask) {
+                const std::size_t byte_mask_stride_size = header_size + stride_time_size + byte_mask_value_bytes;
+                if (byte_mask_stride_size < choice.encoded_size) {
+                    choice.codec = ValueRecordCodec::ByteMaskStride;
+                    choice.encoded_size = byte_mask_stride_size;
+                    choice.stride = stride;
+                }
+            }
+        }
+        return choice;
+    }
+
+    void append_value_best_record(const std::vector<Transition>& transitions,
+                                  i64 start_cycle,
+                                  u8 byte_width,
+                                  ValueType value_type,
+                                  bool use_shared_time,
+                                  const std::vector<u64>* shared_times,
+                                  std::vector<u8>& out) const {
+        const SignalRecordChoice choice = choose_value_record_codec_and_size(transitions, start_cycle, byte_width,
+                                                                             value_type, use_shared_time, shared_times);
+        detail::reserve_extra(out, choice.encoded_size);
+        switch (choice.codec) {
+        case ValueRecordCodec::BoolToggle:
+            append_value_bool_toggle_record(transitions, start_cycle, use_shared_time, shared_times, out, NULL);
+            break;
+        case ValueRecordCodec::BoolToggleStride:
+            append_value_bool_toggle_stride_record(transitions, start_cycle, choice.stride, out, NULL);
+            break;
+        case ValueRecordCodec::ByteMask:
+            append_value_byte_mask_record(transitions, start_cycle, byte_width, use_shared_time, shared_times, out, NULL);
+            break;
+        case ValueRecordCodec::ByteMaskStride:
+            append_value_byte_mask_stride_record(transitions, start_cycle, byte_width, choice.stride, out, NULL);
+            break;
+        case ValueRecordCodec::NibbleMask:
+            append_value_nibble_mask_record(transitions, start_cycle, byte_width, use_shared_time, shared_times, out, NULL);
+            break;
+        case ValueRecordCodec::NibbleMaskStride:
+            append_value_nibble_mask_stride_record(transitions, start_cycle, byte_width, choice.stride, out, NULL);
+            break;
+        case ValueRecordCodec::FullValuesStride:
+            append_value_full_stride_record(transitions, start_cycle, byte_width, choice.stride, out, NULL);
+            break;
+        case ValueRecordCodec::FullValues:
+        default:
+            append_value_full_record(transitions, start_cycle, byte_width, use_shared_time, shared_times, out, NULL);
+            break;
+        }
+    }
 
     SignalRecordChoice choose_signal_record_codec_and_size(u32 signal_id,
                                                            const BlockJob& job,
@@ -2923,6 +3462,71 @@ private:
         return static_cast<bool>(log);
     }
 
+    std::vector<u8> build_lod_level_payload_v9(const LodLevelState& lod_level,
+                                               const LodStorageState& storage,
+                                               u64& record_count) const {
+        std::vector<u8> out;
+        record_count = static_cast<u64>(lod_level.transitions.size());
+        if (lod_level.transitions.empty()) return out;
+        append_value_best_record(lod_level.transitions, 0, storage.byte_width,
+                                 storage.value_type, false, NULL, out);
+        return out;
+    }
+
+    static std::vector<std::size_t> select_lod_levels_to_store(const LodStorageState& storage) {
+        std::vector<std::size_t> selected;
+        if (storage.raw_transition_count < kLodMinRawTransitionsForTable) return selected;
+
+        u64 previous_count = storage.raw_transition_count;
+        for (std::size_t level = 0; level < storage.levels.size(); ++level) {
+            const u64 sampled_count = static_cast<u64>(storage.levels[level].transitions.size());
+            if (sampled_count == 0) continue;
+            if (sampled_count <= previous_count / kLodMinRawToSampleRatio) {
+                selected.push_back(level);
+                previous_count = sampled_count;
+            }
+        }
+        return selected;
+    }
+
+    void append_lod_tables_to_footer(std::vector<u8>& payload) const {
+        detail::append_varuint(payload, static_cast<u64>(lod_bucket_cycles_.size()));
+        for (std::size_t i = 0; i < lod_bucket_cycles_.size(); ++i) {
+            detail::append_varuint(payload, lod_bucket_cycles_[i]);
+        }
+
+        u64 storage_count = 0;
+        for (std::size_t sid = 0; sid < lod_states_.size(); ++sid) {
+            const LodStorageState& storage = lod_states_[sid];
+            if (!storage.valid) continue;
+            if (!select_lod_levels_to_store(storage).empty()) ++storage_count;
+        }
+        detail::append_varuint(payload, storage_count);
+
+        for (std::size_t sid = 0; sid < lod_states_.size(); ++sid) {
+            const LodStorageState& storage = lod_states_[sid];
+            if (!storage.valid) continue;
+            const std::vector<std::size_t> selected_levels = select_lod_levels_to_store(storage);
+            const u64 non_empty_levels = static_cast<u64>(selected_levels.size());
+            if (non_empty_levels == 0) continue;
+
+            detail::append_varuint(payload, static_cast<u64>(sid));
+            detail::append_varuint(payload, storage.byte_width);
+            detail::append_varuint(payload, 0u);
+            detail::append_varuint(payload, non_empty_levels);
+            for (std::size_t selected = 0; selected < selected_levels.size(); ++selected) {
+                const std::size_t level = selected_levels[selected];
+                const LodLevelState& lod_level = storage.levels[level];
+                u64 record_count = 0;
+                const std::vector<u8> level_payload = build_lod_level_payload_v9(lod_level, storage, record_count);
+                detail::append_varuint(payload, static_cast<u64>(level));
+                detail::append_varuint(payload, record_count);
+                detail::append_varuint(payload, static_cast<u64>(level_payload.size()));
+                detail::append_vector_bytes(payload, level_payload);
+            }
+        }
+    }
+
     bool write_footer_and_patch_header(std::string& error) {
         footer_offset_ = static_cast<u64>(out_.tellp());
         std::vector<u8> payload;
@@ -2940,6 +3544,23 @@ private:
             detail::append_varuint(payload, r.raw_size);
             detail::append_u8(payload, static_cast<u8>(r.compression));
         }
+
+        std::map<u32, std::vector<u64> > block_indexes_by_chunk;
+        for (std::size_t i = 0; i < block_index_.size(); ++i) {
+            block_indexes_by_chunk[block_index_[i].signal_chunk_id].push_back(static_cast<u64>(i));
+        }
+        detail::append_varuint(payload, static_cast<u64>(block_indexes_by_chunk.size()));
+        for (std::map<u32, std::vector<u64> >::const_iterator it = block_indexes_by_chunk.begin();
+             it != block_indexes_by_chunk.end(); ++it) {
+            detail::append_varuint(payload, it->first);
+            detail::append_varuint(payload, static_cast<u64>(it->second.size()));
+            u64 prev = 0;
+            for (std::size_t i = 0; i < it->second.size(); ++i) {
+                detail::append_varuint(payload, it->second[i] - prev);
+                prev = it->second[i];
+            }
+        }
+        append_lod_tables_to_footer(payload);
         if (!write_section("FOOT", payload, error)) return false;
 
         out_.seekp(8 + 4 + 4 + 8, std::ios::beg); // magic + version + header_size + block_span
@@ -2954,6 +3575,8 @@ private:
         output_path_.clear();
         signal_states_.clear();
         signal_order_.clear();
+        lod_states_.clear();
+        lod_bucket_cycles_.clear();
         block_index_.clear();
         current_block_shared_times_by_chunk_.clear();
         max_signal_id_ = 0;
@@ -2999,6 +3622,8 @@ private:
     std::ofstream out_;
     std::vector<SignalState> signal_states_; // indexed by signal_id
     std::vector<u32> signal_order_;          // ascending signal_id order
+    std::vector<LodStorageState> lod_states_; // indexed by physical storage_id
+    std::vector<u64> lod_bucket_cycles_;
     std::vector<BlockIndexRecord> block_index_;
     std::vector<std::vector<u64> > current_block_shared_times_by_chunk_;
     u32 max_signal_id_ = 0;

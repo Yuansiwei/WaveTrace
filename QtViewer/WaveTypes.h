@@ -32,6 +32,28 @@ struct WaveSample {
     bool rawFieldsReady = false;
 };
 
+static const quint8 kWaveLodSeenZero = 0x1u;
+static const quint8 kWaveLodSeenNonZero = 0x2u;
+static const quint8 kWaveLodSeenZ = 0x4u;
+static const quint8 kWaveLodSeenAbsent = 0x8u;
+
+struct WaveLodBucket {
+    qint64 start = 0;
+    qint64 end = 0;
+    quint64 firstRawBits = 0;
+    quint64 lastRawBits = 0;
+    quint64 minRawBits = 0;
+    quint64 maxRawBits = 0;
+    quint32 transitionCount = 0;
+    quint8 stateMask = 0;
+};
+
+struct WaveLodLevel {
+    qint64 bucketCycles = 0;
+    QVector<WaveLodBucket> buckets;
+    QVector<WaveSample> samples;
+};
+
 struct WaveDiffRegion {
     qint64 start = 0;
     qint64 end = 0;
@@ -41,6 +63,9 @@ struct WaveSignal {
     // Stable WVZ3 signal id. For legacy formats this is usually the signalList index.
     // MainWindow uses this to load samples on demand without assuming signalList index == file id.
     int signalId = -1;
+    // Physical WVZ4 storage stream id. Several logical signal ids may share one
+    // storage stream through WVZ4 aliases.
+    int storageId = -1;
     QString name;
     SignalKind kind = SignalKind::Bit;
     int width = 1;
@@ -57,6 +82,9 @@ struct WaveSignal {
     // Derived cache for fast navigation. Contains times where samples[i] differs from samples[i-1].
     QVector<qint64> changeTimes;
     bool changeTimesReady = false;
+    // WVZ4 file-level overview data. v7/v8 use bucket summaries; v9 stores a
+    // decimated transition stream encoded with the same value-record codecs as WDAT.
+    QVector<WaveLodLevel> lodLevels;
 };
 
 

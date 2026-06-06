@@ -4,9 +4,11 @@
 #include <QEvent>
 #include <QEasingCurve>
 #include <QMouseEvent>
+#include <QBrush>
 #include <QColor>
 #include <QLinearGradient>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPen>
 #include <QVariantAnimation>
 #include <QWheelEvent>
@@ -42,6 +44,115 @@ namespace {
         return event->pos().x();
 #endif
     }
+
+    QRectF busRoundedFrameRect(const QRect& rect) {
+        QRectF r(rect);
+        r.adjust(0.5, 0.5, -0.5, -0.5);
+        if (r.width() < 1.0) r.setWidth(1.0);
+        if (r.height() < 1.0) r.setHeight(1.0);
+        return r;
+    }
+
+    qreal busRoundedFrameRadius(const QRectF& frame) {
+        const qreal w = frame.width();
+        const qreal h = frame.height();
+        if (w <= 3.0 || h <= 3.0) return 0.0;
+
+        return qMin<qreal>(3.0, qMin<qreal>(h * 0.18, w * 0.18));
+    }
+
+    struct BusFrame {
+        QRect rect;
+        bool drawLeftEdge = true;
+        bool drawRightEdge = true;
+    };
+
+    void drawBusFrame(QPainter& p, const BusFrame& busFrame, const QColor& color,
+                      qreal penWidth, const QBrush& brush = Qt::NoBrush) {
+        if (busFrame.rect.isEmpty()) return;
+
+        const QRectF frame = busRoundedFrameRect(busFrame.rect);
+        const qreal radius = busRoundedFrameRadius(frame);
+        const bool drawLeft = busFrame.drawLeftEdge;
+        const bool drawRight = busFrame.drawRightEdge;
+
+        p.setPen(QPen(color, penWidth, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        if (drawLeft && drawRight) {
+            p.setBrush(brush);
+            p.drawRoundedRect(frame, radius, radius);
+            return;
+        }
+
+        if (brush.style() != Qt::NoBrush) {
+            p.fillRect(frame, brush);
+        }
+
+        p.setBrush(Qt::NoBrush);
+        if (radius <= 0.0) {
+            p.drawLine(QPointF(frame.left(), frame.top()), QPointF(frame.right(), frame.top()));
+            p.drawLine(QPointF(frame.left(), frame.bottom()), QPointF(frame.right(), frame.bottom()));
+            if (drawLeft) p.drawLine(QPointF(frame.left(), frame.top()), QPointF(frame.left(), frame.bottom()));
+            if (drawRight) p.drawLine(QPointF(frame.right(), frame.top()), QPointF(frame.right(), frame.bottom()));
+            return;
+        }
+
+        QPainterPath path;
+        const qreal left = frame.left();
+        const qreal right = frame.right();
+        const qreal top = frame.top();
+        const qreal bottom = frame.bottom();
+
+        path.moveTo(left + (drawLeft ? radius : 0.0), top);
+        path.lineTo(right - (drawRight ? radius : 0.0), top);
+        path.moveTo(right - (drawRight ? radius : 0.0), bottom);
+        path.lineTo(left + (drawLeft ? radius : 0.0), bottom);
+
+        if (drawRight) {
+            path.moveTo(right - radius, top);
+            path.quadTo(right, top, right, top + radius);
+            path.lineTo(right, bottom - radius);
+            path.quadTo(right, bottom, right - radius, bottom);
+        }
+        if (drawLeft) {
+            path.moveTo(left + radius, bottom);
+            path.quadTo(left, bottom, left, bottom - radius);
+            path.lineTo(left, top + radius);
+            path.quadTo(left, top, left + radius, top);
+        }
+        p.drawPath(path);
+    }
+
+    void drawBusRoundedFrames(QPainter& p, const QVector<BusFrame>& frames, const QColor& color,
+                              qreal penWidth, const QBrush& brush = Qt::NoBrush) {
+        if (frames.isEmpty()) return;
+
+        const bool oldAntialiasing = p.testRenderHint(QPainter::Antialiasing);
+        const QPen oldPen = p.pen();
+        const QBrush oldBrush = p.brush();
+        p.setRenderHint(QPainter::Antialiasing, true);
+        for (const BusFrame& frame : frames) {
+            drawBusFrame(p, frame, color, penWidth, brush);
+        }
+        p.setPen(oldPen);
+        p.setBrush(oldBrush);
+        p.setRenderHint(QPainter::Antialiasing, oldAntialiasing);
+    }
+
+    void drawBusRoundedFrame(QPainter& p, const QRect& rect, const QColor& color,
+                             qreal penWidth, const QBrush& brush = Qt::NoBrush,
+                             bool drawLeftEdge = true, bool drawRightEdge = true) {
+        if (rect.isEmpty()) return;
+
+        const bool oldAntialiasing = p.testRenderHint(QPainter::Antialiasing);
+        const QPen oldPen = p.pen();
+        const QBrush oldBrush = p.brush();
+        p.setRenderHint(QPainter::Antialiasing, true);
+        drawBusFrame(p, BusFrame{ rect, drawLeftEdge, drawRightEdge }, color, penWidth, brush);
+        p.setPen(oldPen);
+        p.setBrush(oldBrush);
+        p.setRenderHint(QPainter::Antialiasing, oldAntialiasing);
+    }
+
     QString normalizedTextValue(const QString& raw) {
         QString s = raw.trimmed();
         if (s.startsWith(QStringLiteral("0x"), Qt::CaseInsensitive)) return s.mid(2).toUpper();
@@ -205,6 +316,99 @@ namespace {
             text += QStringLiteral(".0");
         }
         return text;
+    }
+
+    int targetLodSamplesForPlotWidth(int plotWidth) {
+        return qMax(64, plotWidth / 2);
+    }
+
+    const WaveLodLevel* chooseLodLevelForViewport(const WaveSignal& sig, qint64 spanValue, int plotWidth) {
+        const double cyclesPerPixel = double(spanValue) / double(qMax(1, plotWidth));
+        if (cyclesPerPixel < 128.0 || sig.lodLevels.isEmpty()) return nullptr;
+        const WaveLodLevel* first = nullptr;
+        const WaveLodLevel* best = nullptr;
+
+        const int targetSamples = targetLodSamplesForPlotWidth(plotWidth);
+        const qint64 maxBucketCycles = qMax<qint64>(1, qint64(std::ceil(double(spanValue) / double(targetSamples))));
+        for (int i = 0; i < sig.lodLevels.size(); ++i) {
+            const WaveLodLevel& level = sig.lodLevels.at(i);
+            if (level.bucketCycles <= 0 || (level.buckets.isEmpty() && level.samples.isEmpty())) continue;
+            if (!first) first = &level;
+            if (level.bucketCycles <= maxBucketCycles) best = &level;
+            else break;
+        }
+        return best ? best : first;
+    }
+
+    int lowerSampleIndexForTime(const QVector<WaveSample>& samples, qint64 t) {
+        int lo = 0;
+        int hi = samples.size();
+        while (lo < hi) {
+            const int mid = (lo + hi) / 2;
+            if (samples.at(mid).time < t) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
+    QVector<int> collectTimedSampleIndicesForWindow(const QVector<WaveSample>& samples,
+                                                    qint64 start,
+                                                    qint64 end,
+                                                    int targetSamples) {
+        QVector<int> out;
+        if (samples.isEmpty()) return out;
+
+        const int firstIdx = qMax(0, lowerSampleIndexForTime(samples, start) - 1);
+        const int lastSearchExclusive = (end == std::numeric_limits<qint64>::max())
+            ? samples.size()
+            : lowerSampleIndexForTime(samples, end + 1);
+        int lastExclusive = lastSearchExclusive;
+        if (lastExclusive <= firstIdx) lastExclusive = qMin(samples.size(), firstIdx + 1);
+
+        const int visibleCount = lastExclusive - firstIdx;
+        const int cappedTarget = qMax(1, targetSamples);
+        if (visibleCount <= cappedTarget) {
+            out.reserve(visibleCount);
+            for (int i = firstIdx; i < lastExclusive; ++i) out.push_back(i);
+            return out;
+        }
+
+        const qint64 desiredStride = qMax<qint64>(1, (end - start) / cappedTarget);
+        out.reserve(cappedTarget + 4);
+        int idx = firstIdx;
+        while (idx < lastExclusive) {
+            out.push_back(idx);
+            if (idx >= lastExclusive - 1) break;
+            const qint64 nextTime = samples.at(idx).time + desiredStride;
+            int next = lowerSampleIndexForTime(samples, nextTime);
+            if (next <= idx) next = idx + 1;
+            if (next >= lastExclusive) break;
+            idx = next;
+        }
+        if (out.isEmpty() || out.constLast() != lastExclusive - 1) out.push_back(lastExclusive - 1);
+        return out;
+    }
+
+    int lowerLodBucketByEnd(const QVector<WaveLodBucket>& buckets, qint64 t) {
+        int lo = 0;
+        int hi = buckets.size();
+        while (lo < hi) {
+            const int mid = (lo + hi) / 2;
+            if (buckets.at(mid).end <= t) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
+    WaveSample makeRawLodSample(quint64 rawBits) {
+        WaveSample s;
+        s.rawBits = rawBits;
+        s.rawFieldsReady = true;
+        return s;
+    }
+
+    quint8 lodStableMaskForRaw(quint64 rawBits) {
+        return (rawBits & 1ull) ? kWaveLodSeenNonZero : kWaveLodSeenZero;
     }
 }
 
@@ -1099,6 +1303,229 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
         p.setPen(QColor("#1A1A1A"));
         p.drawLine(0, yTop + m_rowHeight, width(), yTop + m_rowHeight);
 
+        const int plotLeft = qMax(0, m_padX);
+        const int plotRight = qMin(width() - 1, width() - m_padX);
+        const int plotWidth = qMax(1, plotRight - plotLeft + 1);
+        if (const WaveLodLevel* lodLevel = chooseLodLevelForViewport(sig, spanValue, plotWidth)) {
+            if (!lodLevel->samples.isEmpty()) {
+                const QVector<WaveSample>& lodSamples = lodLevel->samples;
+                const QVector<int> drawSampleIndices = collectTimedSampleIndicesForWindow(
+                    lodSamples, m_viewStart, m_viewEnd, targetLodSamplesForPlotWidth(plotWidth));
+
+                if (sig.kind == SignalKind::Bit) {
+                    QVector<QLine> knownSolid;
+                    QVector<QLine> selectedSolid;
+                    QVector<QLine> zDashed;
+                    QVector<QLine> absentSolid;
+                    knownSolid.reserve(drawSampleIndices.size() * 2);
+                    selectedSolid.reserve(drawSampleIndices.size() * 2);
+                    zDashed.reserve(drawSampleIndices.size() / 2 + 4);
+                    absentSolid.reserve(drawSampleIndices.size() / 2 + 4);
+
+                    for (int s = 0; s < drawSampleIndices.size(); ++s) {
+                        const int i = drawSampleIndices.at(s);
+                        const qint64 t0 = lodSamples.at(i).time;
+                        const int nextIndex = (s + 1 < drawSampleIndices.size()) ? drawSampleIndices.at(s + 1) : (i + 1);
+                        const qint64 t1 = (nextIndex < lodSamples.size()) ? lodSamples.at(nextIndex).time : fullEnd();
+                        const qint64 segStart = qMax(t0, m_viewStart);
+                        const qint64 segEnd = qMin(t1, m_viewEnd);
+                        if (segEnd <= segStart) continue;
+
+                        const WaveSample& curSample = lodSamples.at(i);
+                        const QChar state = classifyBitStateChar(curSample);
+                        const int y = (state == QLatin1Char('1')) ? yHigh : ((state == QLatin1Char('0')) ? yLow : yMid);
+                        const bool isZ = (state == QLatin1Char('z'));
+                        const bool isAbsent = (state == QLatin1Char('a'));
+                        QVector<QLine>& target = isAbsent ? absentSolid : (isZ ? zDashed : (isSelectedRow ? selectedSolid : knownSolid));
+                        const int x1 = fastX(segStart);
+                        const int x2 = qMax(x1 + 1, fastX(segEnd));
+                        target.push_back(QLine(x1, y, x2, y));
+
+                        if (s > 0 && t0 >= m_viewStart && t0 <= m_viewEnd &&
+                            !waveSamplesEquivalent(lodSamples.at(drawSampleIndices.at(s - 1)), curSample)) {
+                            const QChar prevState = classifyBitStateChar(lodSamples.at(drawSampleIndices.at(s - 1)));
+                            const int py = (prevState == QLatin1Char('1')) ? yHigh : ((prevState == QLatin1Char('0')) ? yLow : yMid);
+                            const int xs = fastX(t0);
+                            if (isAbsent || prevState == QLatin1Char('a')) absentSolid.push_back(QLine(xs, py, xs, y));
+                            else if (isZ || prevState == QLatin1Char('z')) zDashed.push_back(QLine(xs, py, xs, y));
+                            else if (isSelectedRow) selectedSolid.push_back(QLine(xs, py, xs, y));
+                            else knownSolid.push_back(QLine(xs, py, xs, y));
+                        }
+                    }
+
+                    if (!knownSolid.isEmpty()) {
+                        p.setPen(QPen(waveGreen, isSelectedRow ? 2.8 : 2.2, Qt::SolidLine, Qt::SquareCap));
+                        p.drawLines(knownSolid);
+                    }
+                    if (!selectedSolid.isEmpty()) {
+                        p.setPen(QPen(selectedKnownColor, 2.8, Qt::SolidLine, Qt::SquareCap));
+                        p.drawLines(selectedSolid);
+                    }
+                    if (!zDashed.isEmpty()) {
+                        p.setPen(QPen(zColor, isSelectedRow ? 2.8 : 2.2, Qt::DashLine, Qt::SquareCap));
+                        p.drawLines(zDashed);
+                    }
+                    if (!absentSolid.isEmpty()) {
+                        p.setPen(QPen(absentColor, isSelectedRow ? 2.8 : 2.2, Qt::SolidLine, Qt::SquareCap));
+                        p.drawLines(absentSolid);
+                    }
+                } else {
+                    const int yBusTop = yTop + 8;
+                    const int yBusBottom = yTop + m_rowHeight - 8;
+                    const qreal penWidth = isSelectedRow ? 1.9 : 1.5;
+                    QVector<BusFrame> knownFrames;
+                    QVector<BusFrame> zFrames;
+                    QVector<BusFrame> absentRects;
+                    knownFrames.reserve(drawSampleIndices.size());
+                    zFrames.reserve(drawSampleIndices.size() / 2 + 4);
+                    absentRects.reserve(drawSampleIndices.size() / 4 + 4);
+
+                    for (int s = 0; s < drawSampleIndices.size(); ++s) {
+                        const int i = drawSampleIndices.at(s);
+                        const qint64 t0 = lodSamples.at(i).time;
+                        const int nextIndex = (s + 1 < drawSampleIndices.size()) ? drawSampleIndices.at(s + 1) : (i + 1);
+                        const qint64 t1 = (nextIndex < lodSamples.size()) ? lodSamples.at(nextIndex).time : fullEnd();
+                        const qint64 segStart = qMax(t0, m_viewStart);
+                        const qint64 segEnd = qMin(qMax(t1, t0 + 1), m_viewEnd);
+                        if (segEnd <= segStart) continue;
+
+                        const WaveSample& curSample = lodSamples.at(i);
+                        const bool isZ = sampleContainsUnknownState(curSample);
+                        const bool isAbsent = sampleIsAbsentState(curSample);
+                        const int x1 = fastX(segStart);
+                        const int x2 = qMax(x1 + 1, fastX(segEnd));
+                        const QRect frameRect(x1, yBusTop, qMax(1, x2 - x1), qMax(1, yBusBottom - yBusTop));
+                        const BusFrame frame{ frameRect, t0 > m_viewStart, t1 < m_viewEnd };
+                        if (isAbsent) {
+                            absentRects.push_back(frame);
+                        } else {
+                            QVector<BusFrame>& target = isZ ? zFrames : knownFrames;
+                            target.push_back(frame);
+                            const QRect textRect(x1 + 6, yTop + 3, qMax(1, x2 - x1 - 12), m_rowHeight - 6);
+                            if (textRect.width() > 48) {
+                                p.setPen(isZ ? zColor.lighter(140) : waveGreenText);
+                                p.drawText(textRect, Qt::AlignVCenter | Qt::AlignHCenter,
+                                           formatValue(sig, curSample, entry.format));
+                            }
+                        }
+                    }
+
+                    drawBusRoundedFrames(p, knownFrames, isSelectedRow ? waveGreen.lighter(130) : waveGreen, penWidth);
+                    drawBusRoundedFrames(p, zFrames, zColor, penWidth);
+                    drawBusRoundedFrames(p, absentRects, absentColor, penWidth);
+                }
+                continue;
+            }
+
+            const QVector<WaveLodBucket>& buckets = lodLevel->buckets;
+            int lodIndex = lowerLodBucketByEnd(buckets, m_viewStart);
+            quint64 currentRaw = (lodIndex > 0) ? buckets.at(lodIndex - 1).lastRawBits : 0ull;
+            qint64 cursor = m_viewStart;
+
+            auto drawBitMaskRange = [&](quint8 mask, qint64 start, qint64 end) {
+                if (end <= start || mask == 0u) return;
+                const int x1 = fastX(start);
+                const int x2 = qMax(x1 + 1, fastX(end));
+                const int drawW = qMax(1, x2 - x1);
+                const quint8 normalMask = quint8(mask & (kWaveLodSeenZero | kWaveLodSeenNonZero | kWaveLodSeenZ));
+                if (mask & kWaveLodSeenAbsent) {
+                    p.fillRect(QRect(x1, yMid, drawW, 1), absentColor);
+                }
+                if (normalMask == 0u) return;
+                const QColor fill = (normalMask & kWaveLodSeenZ)
+                    ? QColor(40, 90, 120, 220)
+                    : (isSelectedRow ? waveGreen.lighter(130) : waveGreen);
+                if (normalMask == kWaveLodSeenZero) {
+                    p.fillRect(QRect(x1, yLow - 1, drawW, 3), fill);
+                } else if (normalMask == kWaveLodSeenNonZero) {
+                    p.fillRect(QRect(x1, yHigh - 1, drawW, 3), fill);
+                } else if (normalMask == kWaveLodSeenZ) {
+                    p.fillRect(QRect(x1, yMid - 1, drawW, 3), fill);
+                } else {
+                    int top = yMid - 1;
+                    int bottom = yMid + 1;
+                    if (normalMask & kWaveLodSeenNonZero) { top = qMin(top, yHigh - 1); bottom = qMax(bottom, yHigh + 1); }
+                    if (normalMask & kWaveLodSeenZero) { top = qMin(top, yLow - 1); bottom = qMax(bottom, yLow + 1); }
+                    if (normalMask & kWaveLodSeenZ) { top = qMin(top, yMid - 1); bottom = qMax(bottom, yMid + 1); }
+                    p.fillRect(QRect(x1, top, drawW, qMax(3, bottom - top + 1)), fill);
+                }
+            };
+
+            const int yBusTop = yTop + 8;
+            const int yBusBottom = yTop + m_rowHeight - 8;
+            auto drawBusStableRange = [&](quint64 rawBits, qint64 start, qint64 end) {
+                if (end <= start) return;
+                const int x1 = fastX(start);
+                const int x2 = qMax(x1 + 1, fastX(end));
+                const QColor color = isSelectedRow ? waveGreen.lighter(130) : waveGreen;
+                drawBusRoundedFrame(p, QRect(x1, yBusTop, qMax(1, x2 - x1), qMax(1, yBusBottom - yBusTop)),
+                                    color, isSelectedRow ? 1.9 : 1.5, Qt::NoBrush,
+                                    start > m_viewStart, end < m_viewEnd);
+                const QRect textRect(x1 + 6, yTop + 3, qMax(1, x2 - x1 - 12), m_rowHeight - 6);
+                if (textRect.width() > 48) {
+                    p.setPen(waveGreenText);
+                    p.drawText(textRect, Qt::AlignVCenter | Qt::AlignHCenter,
+                               formatValue(sig, makeRawLodSample(rawBits), entry.format));
+                }
+            };
+            auto drawBusActivityRange = [&](const WaveLodBucket& bucket, qint64 start, qint64 end) {
+                if (end <= start) return;
+                const int x1 = fastX(start);
+                const int x2 = qMax(x1 + 1, fastX(end));
+                const QColor fill = isSelectedRow ? QColor(68, 190, 118, 140) : QColor(34, 197, 94, 120);
+                drawBusRoundedFrame(p, QRect(x1, yBusTop, qMax(1, x2 - x1), qMax(1, yBusBottom - yBusTop)),
+                                    isSelectedRow ? waveGreen.lighter(130) : waveGreen,
+                                    isSelectedRow ? 1.9 : 1.5, QBrush(fill),
+                                    start > m_viewStart, end < m_viewEnd);
+                const QRect textRect(x1 + 4, yTop + 3, qMax(1, x2 - x1 - 8), m_rowHeight - 6);
+                if (textRect.width() > 76) {
+                    const QString text = QStringLiteral("%1..%2")
+                        .arg(formatValue(sig, makeRawLodSample(bucket.minRawBits), entry.format),
+                             formatValue(sig, makeRawLodSample(bucket.maxRawBits), entry.format));
+                    p.setPen(waveGreenText);
+                    p.drawText(textRect, Qt::AlignVCenter | Qt::AlignHCenter, text);
+                }
+            };
+
+            auto drawStableRange = [&](quint64 rawBits, qint64 start, qint64 end) {
+                if (sig.kind == SignalKind::Bit) drawBitMaskRange(lodStableMaskForRaw(rawBits), start, end);
+                else drawBusStableRange(rawBits, start, end);
+            };
+
+            while (lodIndex < buckets.size() && cursor < m_viewEnd) {
+                const WaveLodBucket& bucket = buckets.at(lodIndex);
+                if (bucket.start >= m_viewEnd) break;
+                if (bucket.start > cursor) {
+                    drawStableRange(currentRaw, cursor, qMin(bucket.start, m_viewEnd));
+                    cursor = qMin(bucket.start, m_viewEnd);
+                }
+                if (bucket.end > cursor) {
+                    const qint64 segStart = qMax(cursor, qMax(bucket.start, m_viewStart));
+                    const qint64 segEnd = qMin(bucket.end, m_viewEnd);
+                    if (segEnd > segStart) {
+                        if (sig.kind == SignalKind::Bit) {
+                            quint8 mask = bucket.stateMask;
+                            if (bucket.transitionCount == 0) mask = lodStableMaskForRaw(bucket.lastRawBits);
+                            drawBitMaskRange(mask, segStart, segEnd);
+                        } else {
+                            const bool active = bucket.transitionCount > 0 ||
+                                bucket.firstRawBits != bucket.lastRawBits ||
+                                bucket.minRawBits != bucket.maxRawBits;
+                            if (active) drawBusActivityRange(bucket, segStart, segEnd);
+                            else drawBusStableRange(bucket.lastRawBits, segStart, segEnd);
+                        }
+                    }
+                    cursor = qMax(cursor, qMin(bucket.end, m_viewEnd));
+                }
+                currentRaw = bucket.lastRawBits;
+                ++lodIndex;
+            }
+            if (cursor < m_viewEnd) {
+                drawStableRange(currentRaw, cursor, m_viewEnd);
+            }
+            continue;
+        }
+
         if (sig.samples.isEmpty()) continue;
 
         const int firstIdx = qMax(0, lowerIndexForTime(sig.samples, m_viewStart) - 1);
@@ -1107,9 +1534,6 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
 
         if (sig.kind == SignalKind::Bit) {
             const int visibleCount = lastExclusive - firstIdx;
-            const int plotLeft = qMax(0, m_padX);
-            const int plotRight = qMin(width() - 1, width() - m_padX);
-            const int plotWidth = qMax(1, plotRight - plotLeft + 1);
             const bool highDensityBit = visibleCount > qMax(160, plotWidth * 2);
 
             if (highDensityBit) {
@@ -1336,31 +1760,14 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
             const qreal penWidth = isSelectedRow ? 1.9 : 1.5;
             const int yBusTop = yTop + 8;
             const int yBusBottom = yTop + m_rowHeight - 8;
-            // Keep bus transition diagonals close to vertical: smaller horizontal span => larger slope.
-            const int slantHalf = lowDensity ? 3 : 2;
 
             if (!highDensity) {
-                QVector<QLine> knownLines;
-                QVector<QLine> zLines;
-                QVector<QLine> transitionCoverLines;
-                QVector<QLine> transitionKnownSlantLines;
-                QVector<QLine> transitionZSlantLines;
-                QVector<QRect> absentRects;
-                knownLines.reserve(visibleCount * 4);
-                zLines.reserve(visibleCount * 3 / 2 + 4);
-                transitionCoverLines.reserve(visibleCount * 2);
-                transitionKnownSlantLines.reserve(visibleCount * 2);
-                transitionZSlantLines.reserve(visibleCount);
+                QVector<BusFrame> knownFrames;
+                QVector<BusFrame> zFrames;
+                QVector<BusFrame> absentRects;
+                knownFrames.reserve(visibleCount);
+                zFrames.reserve(visibleCount / 2 + 4);
                 absentRects.reserve(visibleCount / 2 + 4);
-
-                auto addSegLine = [&](bool isZ, const QLine& line) {
-                    if (isZ) zLines.push_back(line);
-                    else knownLines.push_back(line);
-                };
-                auto addTransitionSlantLine = [&](bool isZ, const QLine& line) {
-                    if (isZ) transitionZSlantLines.push_back(line);
-                    else transitionKnownSlantLines.push_back(line);
-                };
 
                 for (int i = firstIdx; i < lastExclusive; ++i) {
                     const qint64 t0 = sig.samples.at(i).time;
@@ -1374,31 +1781,15 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     const bool isAbsent = sampleIsAbsentState(curSample);
                     const int x1 = fastX(segStart);
                     const int x2 = qMax(x1 + 1, fastX(segEnd));
+                    const QRect frameRect(x1, yBusTop, qMax(1, x2 - x1), qMax(1, yBusBottom - yBusTop));
+                    const BusFrame frame{ frameRect, t0 > m_viewStart, t1 < m_viewEnd };
 
                     if (isAbsent) {
-                        absentRects.push_back(QRect(x1, yBusTop, qMax(1, x2 - x1), qMax(1, yBusBottom - yBusTop)));
+                        absentRects.push_back(frame);
                     }
                     else {
-                        addSegLine(isZ, QLine(x1, yBusTop, x2, yBusTop));
-                        addSegLine(isZ, QLine(x1, yBusBottom, x2, yBusBottom));
-                    }
-
-                    if (!isAbsent && i > 0 && t0 >= m_viewStart && t0 <= m_viewEnd && !waveSamplesEquivalent(sig.samples.at(i - 1), curSample)) {
-                        const WaveSample& prevSample = sig.samples.at(i - 1);
-                        const bool prevZ = sampleContainsUnknownState(prevSample);
-                        const bool prevAbsent = sampleIsAbsentState(prevSample);
-                        if (!prevAbsent) {
-                            const bool transIsZ = isZ || prevZ;
-                            const int xs = fastX(t0);
-                            const int xl = qMax(m_padX, xs - slantHalf);
-                            const int xr = qMin(width() - m_padX, xs + slantHalf);
-                            // Draw order is important: first cover the existing horizontal bus rails,
-                            // then draw the two transition diagonals on top.
-                            transitionCoverLines.push_back(QLine(xl, yBusTop, xr, yBusTop));
-                            transitionCoverLines.push_back(QLine(xl, yBusBottom, xr, yBusBottom));
-                            addTransitionSlantLine(transIsZ, QLine(xl, yBusTop, xr, yBusBottom));
-                            addTransitionSlantLine(transIsZ, QLine(xl, yBusBottom, xr, yBusTop));
-                        }
+                        QVector<BusFrame>& target = isZ ? zFrames : knownFrames;
+                        target.push_back(frame);
                     }
 
                     if (lowDensity && !isAbsent) {
@@ -1411,54 +1802,20 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     }
                 }
 
-                if (!knownLines.isEmpty()) {
-                    p.setPen(QPen(isSelectedRow ? waveGreen.lighter(130) : waveGreen, penWidth, Qt::SolidLine, Qt::SquareCap));
-                    p.setBrush(Qt::NoBrush);
-                    p.drawLines(knownLines);
-                }
-                if (!zLines.isEmpty()) {
-                    p.setPen(QPen(zColor, penWidth, Qt::SolidLine, Qt::SquareCap));
-                    p.setBrush(Qt::NoBrush);
-                    p.drawLines(zLines);
-                }
-                if (!transitionCoverLines.isEmpty()) {
-                    const QColor capColor = isSelectedRow ? QColor(80, 120, 185, 120) : QColor(Qt::black);
-                    p.setPen(QPen(capColor, penWidth + 0.6, Qt::SolidLine, Qt::SquareCap));
-                    p.setBrush(Qt::NoBrush);
-                    p.drawLines(transitionCoverLines);
-                }
-                if (!transitionKnownSlantLines.isEmpty()) {
-                    p.setPen(QPen(isSelectedRow ? waveGreen.lighter(130) : waveGreen, penWidth, Qt::SolidLine, Qt::SquareCap));
-                    p.setBrush(Qt::NoBrush);
-                    p.drawLines(transitionKnownSlantLines);
-                }
-                if (!transitionZSlantLines.isEmpty()) {
-                    p.setPen(QPen(zColor, penWidth, Qt::SolidLine, Qt::SquareCap));
-                    p.setBrush(Qt::NoBrush);
-                    p.drawLines(transitionZSlantLines);
-                }
-                if (!absentRects.isEmpty()) {
-                    p.setPen(QPen(absentColor, penWidth, Qt::SolidLine, Qt::SquareCap));
-                    p.setBrush(Qt::NoBrush);
-                    for (int ri = 0; ri < absentRects.size(); ++ri) p.drawRect(absentRects.at(ri));
-                }
+                drawBusRoundedFrames(p, knownFrames, isSelectedRow ? waveGreen.lighter(130) : waveGreen, penWidth);
+                drawBusRoundedFrames(p, zFrames, zColor, penWidth);
+                drawBusRoundedFrames(p, absentRects, absentColor, penWidth);
             }
             else {
-                struct BlockRun { int x1; int x2; int state; };
-                QVector<BlockRun> runs;
-                runs.reserve(qMin(visibleCount, 4096));
+                const QVector<int> sampled = collectTimedSampleIndicesForWindow(
+                    sig.samples, m_viewStart, m_viewEnd, targetLodSamplesForPlotWidth(plotWidth));
+                QVector<BusFrame> knownFrames;
+                QVector<BusFrame> zFrames;
+                QVector<BusFrame> absentRects;
+                knownFrames.reserve(sampled.size());
+                zFrames.reserve(sampled.size() / 2 + 4);
+                absentRects.reserve(sampled.size() / 4 + 4);
 
-                auto flushRun = [&](int x1, int x2, int state) {
-                    if (x2 <= x1) return;
-                    if (!runs.isEmpty() && runs.last().state == state && x1 <= runs.last().x2 + 1) {
-                        runs.last().x2 = qMax(runs.last().x2, x2);
-                    }
-                    else {
-                        runs.push_back({ x1, x2, state });
-                    }
-                };
-
-                const QVector<int> sampled = collectSampleIndicesForWindow(sig, entry.signalIndex, m_viewStart, m_viewEnd, 2000);
                 for (int s = 0; s < sampled.size(); ++s) {
                     const int i = sampled.at(s);
                     const qint64 t0 = sig.samples.at(i).time;
@@ -1472,28 +1829,22 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     const int x1 = fastX(segStart);
                     const int x2 = qMax(x1 + 1, fastX(segEnd));
                     const WaveSample& curSample = sig.samples.at(i);
-                    const int state = sampleIsAbsentState(curSample) ? 2 : (sampleContainsUnknownState(curSample) ? 1 : 0);
-                    flushRun(x1, x2, state);
-                }
-
-                for (const BlockRun& run : runs) {
-                    if (run.state == 2) {
-                        p.setPen(QPen(absentColor, penWidth, Qt::SolidLine, Qt::SquareCap));
-                        p.setBrush(Qt::NoBrush);
-                        p.drawRect(QRect(run.x1, yTop + 7, qMax(1, run.x2 - run.x1), m_rowHeight - 14));
+                    const QRect frameRect(x1, yBusTop, qMax(1, x2 - x1), qMax(1, yBusBottom - yBusTop));
+                    const BusFrame frame{ frameRect, t0 > m_viewStart, t1 < m_viewEnd };
+                    if (sampleIsAbsentState(curSample)) {
+                        absentRects.push_back(frame);
                     }
-                    else if (run.state == 1) {
-                        const QRect zr(run.x1, yTop + 7, qMax(1, run.x2 - run.x1), m_rowHeight - 14);
-                        p.setPen(QPen(QColor(255, 72, 72), penWidth, Qt::SolidLine, Qt::SquareCap));
-                        p.setBrush(Qt::NoBrush);
-                        p.drawRect(zr);
-                        p.drawLine(zr.left() + 1, zr.center().y(), zr.right() - 1, zr.center().y());
+                    else if (sampleContainsUnknownState(curSample)) {
+                        zFrames.push_back(frame);
                     }
                     else {
-                        const QColor fill = isSelectedRow ? waveGreen.lighter(130) : waveGreen;
-                        p.fillRect(QRect(run.x1, yTop + 7, qMax(1, run.x2 - run.x1), m_rowHeight - 14), fill);
+                        knownFrames.push_back(frame);
                     }
                 }
+
+                drawBusRoundedFrames(p, knownFrames, isSelectedRow ? waveGreen.lighter(130) : waveGreen, penWidth);
+                drawBusRoundedFrames(p, zFrames, QColor(255, 72, 72), penWidth);
+                drawBusRoundedFrames(p, absentRects, absentColor, penWidth);
             }
         }
     }
@@ -1587,24 +1938,27 @@ void WaveCanvas::mousePressEvent(QMouseEvent* event) {
             return;
         }
 
-        if (event->modifiers() & Qt::ShiftModifier) {
+        m_rulerSelecting = true;
+        m_rulerDragStartPos = mouseEventPosCompat(event);
+        m_rulerSelectAnchorTime = xToTime(mouseEventXCompat(event));
+        m_rulerSelectCurrentTime = m_rulerSelectAnchorTime;
+        m_rulerSelectionMoved = false;
+        m_pendingClickRow = rowAtY(mouseEventYCompat(event));
+        m_pendingClickCtrlHeld = (event->modifiers() & Qt::ControlModifier) != 0;
+        update();
+        event->accept();
+        return;
+    }
+
+    if (event->button() == Qt::MiddleButton) {
+        if (mouseEventYCompat(event) >= m_timeHeaderHeight && !overviewRect().contains(mouseEventPosCompat(event))) {
             m_dragging = true;
+            m_panDragMoved = false;
             m_dragStartPos = mouseEventPosCompat(event);
             m_dragStartViewStart = m_viewStart;
             m_dragStartViewEnd = m_viewEnd;
-        }
-        else {
-            // Allow the same time-range selection gesture on waveform rows as on
-            // the time ruler.  If the mouse is not dragged, releaseEvent treats it
-            // as the normal cursor/row selection click.
-            m_rulerSelecting = true;
-            m_rulerDragStartPos = mouseEventPosCompat(event);
-            m_rulerSelectAnchorTime = xToTime(mouseEventXCompat(event));
-            m_rulerSelectCurrentTime = m_rulerSelectAnchorTime;
-            m_rulerSelectionMoved = false;
-            m_pendingClickRow = rowAtY(mouseEventYCompat(event));
-            m_pendingClickCtrlHeld = (event->modifiers() & Qt::ControlModifier) != 0;
-            update();
+            m_pendingClickRow = -1;
+            m_pendingClickCtrlHeld = false;
             event->accept();
             return;
         }
@@ -1649,6 +2003,11 @@ void WaveCanvas::mouseMoveEvent(QMouseEvent* event) {
     if (m_dragging) {
         const double usable = width() - 2.0 * m_padX;
         const double dx = mouseEventXCompat(event) - m_dragStartPos.x();
+        if (!m_panDragMoved && std::abs(dx) < 4) {
+            event->accept();
+            return;
+        }
+        m_panDragMoved = true;
         const qint64 dt = static_cast<qint64>(std::llround(-(dx / qMax(usable, 1.0)) * double(m_dragStartViewEnd - m_dragStartViewStart)));
         qint64 ns = m_dragStartViewStart + dt;
         qint64 ne = m_dragStartViewEnd + dt;
@@ -1659,6 +2018,9 @@ void WaveCanvas::mouseMoveEvent(QMouseEvent* event) {
         m_viewStart = ns;
         m_viewEnd = ne;
         Q_EMIT viewportChanged(m_viewStart, m_viewEnd);
+        update();
+        event->accept();
+        return;
     }
     update();
     QWidget::mouseMoveEvent(event);
@@ -1695,7 +2057,18 @@ void WaveCanvas::mouseReleaseEvent(QMouseEvent* event) {
         return;
     }
 
+    if (event->button() == Qt::MiddleButton && m_dragging) {
+        m_dragging = false;
+        m_panDragMoved = false;
+        m_pendingClickRow = -1;
+        m_pendingClickCtrlHeld = false;
+        update();
+        event->accept();
+        return;
+    }
+
     m_dragging = false;
+    m_panDragMoved = false;
     m_overviewDragging = false;
     QWidget::mouseReleaseEvent(event);
 }

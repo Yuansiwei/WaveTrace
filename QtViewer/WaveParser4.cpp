@@ -52,6 +52,10 @@ static const u32 kSupportedVersionV2 = 2;
 static const u32 kSupportedVersionV3 = 3;
 static const u32 kSupportedVersionV4 = 4;
 static const u32 kSupportedVersionV5 = 5;
+static const u32 kSupportedVersionV6 = 6;
+static const u32 kSupportedVersionV7 = 7;
+static const u32 kSupportedVersionV8 = 8;
+static const u32 kSupportedVersionV9 = 9;
 
 // WVZ4 v2 raw WDAT payload flags. These match wvz4_writer_typed.h.
 static const u64 kWdatDeltaTimes      = 1ull << 0;
@@ -591,9 +595,75 @@ bool parseClockSection(const QByteArray& payload,
     return true;
 }
 
+bool readFooterScalarBits(SpanReader& r, int byteWidth, quint64& out) {
+    const char* valueBytes = nullptr;
+    if (byteWidth <= 0 || byteWidth > 8 || !r.readBytes(valueBytes, byteWidth)) return false;
+    out = 0;
+    for (int i = 0; i < byteWidth; ++i) {
+        out |= (quint64(static_cast<uchar>(valueBytes[i])) << (8 * i));
+    }
+    return true;
+}
+
+bool decodeSignalRecord(SpanReader& rr,
+                        bool hasValueCodec,
+                        bool useDeltaTimes,
+                        bool useSharedTimeTable,
+                        const QVector<u64>& sharedTimes,
+                        i64 blockStart,
+                        i64 blockEnd,
+                        int byteWidth,
+                        const QVector<int>& outputIndexes,
+                        const QVector<WaveSignal>& outputSignals,
+                        QVector<QVector<WaveSample>>& samplesByOutputIndex,
+                        qint64 windowStart,
+                        qint64 windowEnd,
+                        QString& error);
+
+bool decodeLodTransitionStreamPayload(const char* payload,
+                                      int payloadSize,
+                                      int byteWidth,
+                                      QVector<WaveSample>& samples,
+                                      QString& error) {
+    if (byteWidth <= 0 || byteWidth > 8 || payloadSize < 0) {
+        error = QStringLiteral("WVZ4 FOOT v9: invalid LOD transition stream header");
+        return false;
+    }
+
+    SpanReader rr(payload, payloadSize);
+    QVector<WaveSignal> fakeSignals;
+    fakeSignals.resize(1);
+    fakeSignals[0].width = qMin(64, byteWidth * 8);
+
+    QVector<QVector<WaveSample>> decoded;
+    decoded.resize(1);
+    QVector<int> outputIndexes;
+    outputIndexes.push_back(0);
+    QVector<u64> sharedTimes;
+
+    if (!decodeSignalRecord(rr, true, true, false, sharedTimes,
+                            0, std::numeric_limits<qint64>::max(),
+                            byteWidth, outputIndexes, fakeSignals, decoded,
+                            0, std::numeric_limits<qint64>::max(), error)) {
+        if (error.isEmpty()) error = QStringLiteral("WVZ4 FOOT v9: failed to decode LOD transition stream");
+        return false;
+    }
+    if (!rr.eof()) {
+        error = QStringLiteral("WVZ4 FOOT v9: LOD transition stream has trailing bytes");
+        return false;
+    }
+
+    samples = decoded[0];
+    return true;
+}
+
 bool parseFooterSection(const QByteArray& payload,
                         u32 formatVersion,
+                        const QVector<int>& byteWidthByStorageId,
+                        const QVector<int>& boolStorageByStorageId,
                         QVector<BlockIndexRec>& blocks,
+                        QVector<QVector<int>>& blockIndexesByChunk,
+                        QVector<QVector<WaveLodLevel>>& lodLevelsByStorageId,
                         QString& error) {
     SpanReader r(payload);
     u64 count = 0;
@@ -661,6 +731,268 @@ bool parseFooterSection(const QByteArray& payload,
             return false;
         }
         blocks.push_back(b);
+    }
+    blockIndexesByChunk.clear();
+    lodLevelsByStorageId.clear();
+    if (formatVersion >= kSupportedVersionV6) {
+        u64 chunkCount = 0;
+        if (!r.readVarUInt(chunkCount)) {
+            error = QStringLiteral("WVZ4 FOOT v6: missing chunk index count");
+            return false;
+        }
+        if (chunkCount > 10000000ull) {
+            error = QStringLiteral("WVZ4 FOOT v6: unreasonable chunk index count");
+            return false;
+        }
+        for (u64 ci = 0; ci < chunkCount; ++ci) {
+            u64 chunkId = 0;
+            u64 entryCount = 0;
+            if (!r.readVarUInt(chunkId) || !r.readVarUInt(entryCount)) {
+                error = QStringLiteral("WVZ4 FOOT v6: malformed chunk index header");
+                return false;
+            }
+            if (chunkId > u64(std::numeric_limits<int>::max()) ||
+                entryCount > u64(std::numeric_limits<int>::max())) {
+                error = QStringLiteral("WVZ4 FOOT v6: chunk index too large");
+                return false;
+            }
+            if (blockIndexesByChunk.size() <= int(chunkId)) {
+                blockIndexesByChunk.resize(int(chunkId) + 1);
+            }
+            QVector<int>& indexes = blockIndexesByChunk[int(chunkId)];
+            if (!indexes.isEmpty()) {
+                error = QStringLiteral("WVZ4 FOOT v6: duplicate chunk index %1").arg(chunkId);
+                return false;
+            }
+            indexes.reserve(int(entryCount));
+            u64 prev = 0;
+            for (u64 ei = 0; ei < entryCount; ++ei) {
+                u64 delta = 0;
+                if (!r.readVarUInt(delta)) {
+                    error = QStringLiteral("WVZ4 FOOT v6: malformed chunk index body");
+                    return false;
+                }
+                if (delta > u64(std::numeric_limits<int>::max()) ||
+                    prev > u64(std::numeric_limits<int>::max()) - delta) {
+                    error = QStringLiteral("WVZ4 FOOT v6: chunk index overflow");
+                    return false;
+                }
+                const u64 index = prev + delta;
+                if (index >= u64(blocks.size())) {
+                    error = QStringLiteral("WVZ4 FOOT v6: chunk index references missing block");
+                    return false;
+                }
+                if (!indexes.isEmpty() && int(index) <= indexes.last()) {
+                    error = QStringLiteral("WVZ4 FOOT v6: chunk index is not strictly increasing");
+                    return false;
+                }
+                const BlockIndexRec& b = blocks.at(int(index));
+                if (b.signalChunkId != chunkId) {
+                    error = QStringLiteral("WVZ4 FOOT v6: chunk index references wrong chunk");
+                    return false;
+                }
+                indexes.push_back(int(index));
+                prev = index;
+            }
+        }
+    }
+    if (formatVersion >= kSupportedVersionV7) {
+        u64 lodLevelCount = 0;
+        if (!r.readVarUInt(lodLevelCount)) {
+            error = QStringLiteral("WVZ4 FOOT v7: missing LOD level count");
+            return false;
+        }
+        if (lodLevelCount == 0 || lodLevelCount > 64ull) {
+            error = QStringLiteral("WVZ4 FOOT v7: unreasonable LOD level count");
+            return false;
+        }
+        QVector<qint64> bucketCyclesByLevel;
+        bucketCyclesByLevel.reserve(int(lodLevelCount));
+        qint64 prevBucketCycles = 0;
+        for (u64 i = 0; i < lodLevelCount; ++i) {
+            u64 bucketCycles = 0;
+            if (!r.readVarUInt(bucketCycles) || bucketCycles == 0 ||
+                bucketCycles > u64(std::numeric_limits<qint64>::max())) {
+                error = QStringLiteral("WVZ4 FOOT v7: invalid LOD bucket width");
+                return false;
+            }
+            if (prevBucketCycles != 0 && qint64(bucketCycles) <= prevBucketCycles) {
+                error = QStringLiteral("WVZ4 FOOT v7: LOD bucket widths are not increasing");
+                return false;
+            }
+            bucketCyclesByLevel.push_back(qint64(bucketCycles));
+            prevBucketCycles = qint64(bucketCycles);
+        }
+
+        u64 storageCount = 0;
+        if (!r.readVarUInt(storageCount)) {
+            error = QStringLiteral("WVZ4 FOOT v7: missing LOD storage count");
+            return false;
+        }
+        if (storageCount > 100000000ull) {
+            error = QStringLiteral("WVZ4 FOOT v7: unreasonable LOD storage count");
+            return false;
+        }
+        for (u64 si = 0; si < storageCount; ++si) {
+            u64 storageId = 0;
+            u64 storedByteWidth = 0;
+            u64 storageFlags = 0;
+            u64 storageLevelCount = 0;
+            bool okStorageHeader = r.readVarUInt(storageId) && storageId != 0 &&
+                storageId <= u64(std::numeric_limits<int>::max()) &&
+                r.readVarUInt(storedByteWidth) && storedByteWidth != 0 && storedByteWidth <= 8;
+            if (okStorageHeader && formatVersion >= kSupportedVersionV8) {
+                okStorageHeader = r.readVarUInt(storageFlags) &&
+                    storageFlags <= ((formatVersion >= kSupportedVersionV9) ? 0ull : 1ull);
+            }
+            okStorageHeader = okStorageHeader &&
+                r.readVarUInt(storageLevelCount) && storageLevelCount <= lodLevelCount;
+            if (!okStorageHeader) {
+                error = QStringLiteral("WVZ4 FOOT v7: malformed LOD storage header");
+                return false;
+            }
+            const int storageIndex = int(storageId);
+            const int byteWidth = int(storedByteWidth);
+            const int expectedByteWidth = directIntMapValue(byteWidthByStorageId, storageIndex, byteWidth);
+            if (expectedByteWidth != byteWidth) {
+                error = QStringLiteral("WVZ4 FOOT v7: LOD byte width mismatch for storage_id %1").arg(storageIndex);
+                return false;
+            }
+            const bool storageIsBool = storageIndex >= 0 && storageIndex < boolStorageByStorageId.size() &&
+                boolStorageByStorageId.at(storageIndex) != 0;
+            const bool compactBool = formatVersion >= kSupportedVersionV8 &&
+                formatVersion < kSupportedVersionV9 && ((storageFlags & 1ull) != 0);
+            if (compactBool && (!storageIsBool || byteWidth != 1)) {
+                error = QStringLiteral("WVZ4 FOOT v8: compact bool LOD flag on non-bool storage_id %1").arg(storageIndex);
+                return false;
+            }
+            if (lodLevelsByStorageId.size() <= storageIndex) {
+                lodLevelsByStorageId.resize(storageIndex + 1);
+            }
+            QVector<WaveLodLevel>& storageLevels = lodLevelsByStorageId[storageIndex];
+            if (!storageLevels.isEmpty()) {
+                error = QStringLiteral("WVZ4 FOOT v7: duplicate LOD storage_id %1").arg(storageIndex);
+                return false;
+            }
+            storageLevels.resize(int(lodLevelCount));
+            QVector<quint8> seenLevel(int(lodLevelCount), 0);
+            for (u64 li = 0; li < storageLevelCount; ++li) {
+                u64 levelIndex64 = 0;
+                u64 recordCount = 0;
+                if (!r.readVarUInt(levelIndex64) || levelIndex64 >= lodLevelCount ||
+                    !r.readVarUInt(recordCount) ||
+                    recordCount > u64(std::numeric_limits<int>::max())) {
+                    error = QStringLiteral("WVZ4 FOOT v7: malformed LOD level header");
+                    return false;
+                }
+                const int levelIndex = int(levelIndex64);
+                if (seenLevel.at(levelIndex)) {
+                    error = QStringLiteral("WVZ4 FOOT v7: duplicate LOD level for storage_id %1").arg(storageIndex);
+                    return false;
+                }
+                seenLevel[levelIndex] = 1;
+
+                WaveLodLevel& level = storageLevels[levelIndex];
+                level.bucketCycles = bucketCyclesByLevel.at(levelIndex);
+                if (formatVersion >= kSupportedVersionV9) {
+                    u64 payloadSize64 = 0;
+                    const char* levelPayload = nullptr;
+                    if (!r.readVarUInt(payloadSize64) ||
+                        payloadSize64 > u64(std::numeric_limits<int>::max()) ||
+                        payloadSize64 > u64(r.remaining()) ||
+                        !r.readBytes(levelPayload, int(payloadSize64))) {
+                        error = QStringLiteral("WVZ4 FOOT v9: malformed LOD transition stream payload");
+                        return false;
+                    }
+                    level.samples.reserve(int(recordCount));
+                    if (!decodeLodTransitionStreamPayload(levelPayload, int(payloadSize64), byteWidth,
+                                                          level.samples, error)) {
+                        return false;
+                    }
+                    if (level.samples.size() > int(recordCount)) {
+                        error = QStringLiteral("WVZ4 FOOT v9: LOD transition stream record count mismatch");
+                        return false;
+                    }
+                    continue;
+                }
+                level.buckets.reserve(int(recordCount));
+                u64 prevBucketStart = 0;
+                for (u64 ri = 0; ri < recordCount; ++ri) {
+                    u64 delta = 0;
+                    u64 runBucketCount = 1;
+                    u64 transitionCount = 0;
+                    u8 stateMask = 0;
+                    bool okBucketHeader = r.readVarUInt(delta);
+                    if (okBucketHeader && formatVersion >= kSupportedVersionV8) {
+                        okBucketHeader = r.readVarUInt(runBucketCount) && runBucketCount != 0;
+                    }
+                    okBucketHeader = okBucketHeader &&
+                        r.readVarUInt(transitionCount) &&
+                        transitionCount <= u64(std::numeric_limits<quint32>::max());
+                    if (!okBucketHeader || !r.readU8(stateMask)) {
+                        error = QStringLiteral("WVZ4 FOOT v7: malformed LOD bucket header");
+                        return false;
+                    }
+                    if (transitionCount > u64(std::numeric_limits<quint32>::max())) {
+                        error = QStringLiteral("WVZ4 FOOT v7: LOD transition count too large");
+                        return false;
+                    }
+                    if (delta > u64(std::numeric_limits<qint64>::max()) ||
+                        prevBucketStart > u64(std::numeric_limits<qint64>::max()) - delta) {
+                        error = QStringLiteral("WVZ4 FOOT v7: LOD bucket start overflow");
+                        return false;
+                    }
+                    const u64 bucketStart = prevBucketStart + delta;
+                    if (!level.buckets.isEmpty() && qint64(bucketStart) <= level.buckets.last().start) {
+                        error = QStringLiteral("WVZ4 FOOT v7: LOD bucket starts are not increasing");
+                        return false;
+                    }
+
+                    WaveLodBucket bucket;
+                    bucket.start = qint64(bucketStart);
+                    if (runBucketCount > u64(std::numeric_limits<qint64>::max()) ||
+                        u64(level.bucketCycles) > u64(std::numeric_limits<qint64>::max()) / runBucketCount) {
+                        error = QStringLiteral("WVZ4 FOOT v8: LOD run span overflow");
+                        return false;
+                    }
+                    const qint64 runCycles = qint64(runBucketCount * u64(level.bucketCycles));
+                    if (runCycles > std::numeric_limits<qint64>::max() - bucket.start) {
+                        error = QStringLiteral("WVZ4 FOOT v7: LOD bucket end overflow");
+                        return false;
+                    }
+                    bucket.end = bucket.start + runCycles;
+                    bucket.transitionCount = quint32(transitionCount);
+                    if (!level.buckets.isEmpty() && bucket.start < level.buckets.last().end) {
+                        error = QStringLiteral("WVZ4 FOOT v8: LOD records overlap");
+                        return false;
+                    }
+                    if (compactBool) {
+                        bucket.stateMask = stateMask & 0x0fu;
+                        bucket.lastRawBits = (stateMask & 0x10u) ? 1ull : 0ull;
+                        bucket.firstRawBits = bucket.lastRawBits;
+                        bucket.minRawBits = (bucket.stateMask & kWaveLodSeenZero) ? 0ull : bucket.lastRawBits;
+                        bucket.maxRawBits = (bucket.stateMask & kWaveLodSeenNonZero) ? 1ull : bucket.lastRawBits;
+                    } else {
+                        bucket.stateMask = stateMask;
+                        if (!readFooterScalarBits(r, byteWidth, bucket.firstRawBits) ||
+                            !readFooterScalarBits(r, byteWidth, bucket.lastRawBits) ||
+                            !readFooterScalarBits(r, byteWidth, bucket.minRawBits) ||
+                            !readFooterScalarBits(r, byteWidth, bucket.maxRawBits)) {
+                            error = QStringLiteral("WVZ4 FOOT v7: truncated LOD bucket values");
+                            return false;
+                        }
+                    }
+                    level.buckets.push_back(bucket);
+                    prevBucketStart = bucketStart;
+                }
+            }
+            for (int i = storageLevels.size() - 1; i >= 0; --i) {
+                if (storageLevels.at(i).bucketCycles != 0 ||
+                    !storageLevels.at(i).buckets.isEmpty() ||
+                    !storageLevels.at(i).samples.isEmpty()) break;
+                storageLevels.removeLast();
+            }
+        }
     }
     if (!r.eof()) {
         error = QStringLiteral("WVZ4 FOOT: trailing bytes after block index");
@@ -2318,7 +2650,7 @@ bool decodeWdatSectionStreaming(QFile& file,
                                     byteWidthBySignalId, outputSignals, samplesByOutputIndex,
                                     windowStart, windowEnd, minTime, maxTime, error);
     }
-    if (formatVersion >= kSupportedVersionV3 && formatVersion <= kSupportedVersionV5) {
+    if (formatVersion >= kSupportedVersionV3 && formatVersion <= kSupportedVersionV9) {
         return decodeRawWaveTileV3(raw, formatVersion, blockId, start, end,
                                    signalChunkId, firstSignalId, signalCount,
                                    selectedIds, allSelected, outputIndexesByStorageId,
@@ -2333,7 +2665,9 @@ bool decodeWdatSectionStreaming(QFile& file,
 
 bool decodeWdatSectionsFromFooterIndex(QFile& file,
                                         const QVector<BlockIndexRec>& footerBlocks,
+                                        const QVector<QVector<int>>& blockIndexesByChunk,
                                         u32 formatVersion,
+                                        u64 signalsPerChunk,
                                         const QSet<int>& selectedIds,
                                         bool allSelected,
                                         const QVector<QVector<int>>& outputIndexesByStorageId,
@@ -2347,7 +2681,37 @@ bool decodeWdatSectionsFromFooterIndex(QFile& file,
                                         QString& error) {
     if (selectedIds.isEmpty() && !allSelected) return true;
 
-    for (int i = 0; i < footerBlocks.size(); ++i) {
+    QVector<int> selectedBlockIndexes;
+    const bool canUseChunkMap = !allSelected && !selectedIds.isEmpty() &&
+                                signalsPerChunk > 0 &&
+                                !blockIndexesByChunk.isEmpty();
+    if (canUseChunkMap) {
+        QSet<int> seenChunks;
+        for (int sid : selectedIds) {
+            if (sid <= 0) continue;
+            const u64 chunk64 = (u64(sid) - 1ull) / signalsPerChunk;
+            if (chunk64 > u64(std::numeric_limits<int>::max())) continue;
+            const int chunk = int(chunk64);
+            if (seenChunks.contains(chunk)) continue;
+            seenChunks.insert(chunk);
+            if (chunk >= 0 && chunk < blockIndexesByChunk.size()) {
+                const QVector<int>& indexes = blockIndexesByChunk.at(chunk);
+                selectedBlockIndexes.reserve(selectedBlockIndexes.size() + indexes.size());
+                for (int idx : indexes) selectedBlockIndexes.push_back(idx);
+            }
+        }
+        std::sort(selectedBlockIndexes.begin(), selectedBlockIndexes.end());
+        selectedBlockIndexes.erase(std::unique(selectedBlockIndexes.begin(), selectedBlockIndexes.end()),
+                                   selectedBlockIndexes.end());
+    }
+
+    const int loopCount = canUseChunkMap ? selectedBlockIndexes.size() : footerBlocks.size();
+    for (int loopIndex = 0; loopIndex < loopCount; ++loopIndex) {
+        const int i = canUseChunkMap ? selectedBlockIndexes.at(loopIndex) : loopIndex;
+        if (i < 0 || i >= footerBlocks.size()) {
+            error = QStringLiteral("WVZ4 FOOT v6 chunk index points outside block table");
+            return false;
+        }
         const BlockIndexRec& b = footerBlocks.at(i);
         if (!blockOverlapsWindow(b.start, b.end, windowStart, windowEnd)) continue;
         if (formatVersion >= kSupportedVersionV3) {
@@ -2494,7 +2858,7 @@ bool decodeWdatSection(const QByteArray& payload,
                                     byteWidthBySignalId, outputSignals, samplesByOutputIndex,
                                     windowStart, windowEnd, minTime, maxTime, error);
     }
-    if (formatVersion >= kSupportedVersionV3 && formatVersion <= kSupportedVersionV5) {
+    if (formatVersion >= kSupportedVersionV3 && formatVersion <= kSupportedVersionV9) {
         return decodeRawWaveTileV3(raw, formatVersion, blockId, start, end,
                                    signalChunkId, firstSignalId, signalCount,
                                    selectedIds, allSelected, outputIndexesByStorageId,
@@ -2539,7 +2903,6 @@ bool WaveParser4::loadFromFile(const QString& filePath,
     const u64 headerSignalsPerChunk = readU64LE(header.constData() + 32);
     const u64 headerFeatureFlags = readU64LE(header.constData() + 40);
     Q_UNUSED(blockSpan);
-    Q_UNUSED(headerSignalsPerChunk);
     Q_UNUSED(headerFeatureFlags);
 
     // On-demand WVZ4 sample load only needs SIGT plus WDAT.  NAME/NODE/NAMZ/NODZ
@@ -2549,7 +2912,9 @@ bool WaveParser4::loadFromFile(const QString& filePath,
 
     if (version != kSupportedVersionV1 && version != kSupportedVersionV2 &&
         version != kSupportedVersionV3 && version != kSupportedVersionV4 &&
-        version != kSupportedVersionV5) {
+        version != kSupportedVersionV5 && version != kSupportedVersionV6 &&
+        version != kSupportedVersionV7 && version != kSupportedVersionV8 &&
+        version != kSupportedVersionV9) {
         error = QStringLiteral("不支持的 WVZ4 版本：%1").arg(version);
         return false;
     }
@@ -2571,6 +2936,8 @@ bool WaveParser4::loadFromFile(const QString& filePath,
     QVector<SigRec> sigs;
     QVector<ClockRec> clocks;
     QVector<BlockIndexRec> footerBlocks;
+    QVector<QVector<int>> footerBlockIndexesByChunk;
+    QVector<QVector<WaveLodLevel>> footerLodLevelsByStorageId;
 
     QSet<int> selectedIds;
     QSet<int> selectedStorageIds;
@@ -2578,6 +2945,8 @@ bool WaveParser4::loadFromFile(const QString& filePath,
     QVector<int> outputIndexBySignalId;
     QVector<QVector<int>> outputIndexesByStorageId;
     QVector<int> byteWidthByStorageId;
+    QVector<int> boolStorageByStorageId;
+    QVector<int> storageIdBySignalId;
     QVector<QVector<WaveSample>> samplesByOutputIndex;
     bool outputInitialized = false;
     bool useFooterIndexedWdat = false;
@@ -2629,7 +2998,9 @@ bool WaveParser4::loadFromFile(const QString& filePath,
 
         byteWidthByStorageId.clear();
         byteWidthByStorageId.reserve(sigs.size());
-        QVector<int> storageIdBySignalId;
+        boolStorageByStorageId.clear();
+        boolStorageByStorageId.reserve(sigs.size());
+        storageIdBySignalId.clear();
         for (int i = 0; i < sigs.size(); ++i) {
             const SigRec& s = sigs.at(i);
             int bytes = 0;
@@ -2645,6 +3016,8 @@ bool WaveParser4::loadFromFile(const QString& filePath,
                 return false;
             }
             directIntMapSet(byteWidthByStorageId, storageId, bytes);
+            directIntMapSet(boolStorageByStorageId, storageId,
+                            (s.type == ValueType::Bool && s.bitWidth == 1) ? 1 : 0);
         }
         if (!allSelectedStorageIds) {
             for (QSet<int>::const_iterator it = selectedIds.constBegin(); it != selectedIds.constEnd(); ++it) {
@@ -2656,6 +3029,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
         auto makeWaveSignal = [&](const SigRec& s, bool selected) -> WaveSignal {
             WaveSignal sig;
             sig.signalId = int(s.signalId);
+            sig.storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
             // Keep only the leaf segment here. The complete path is reconstructed
             // from WaveTreeInfo only when the signal is added to the active list or exported.
             // On sample-only reloads MainWindow only consumes signal_id + samples,
@@ -2704,7 +3078,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
 
         samplesByOutputIndex.resize(outputSignals.size());
 
-        if (version >= kSupportedVersionV2 && version <= kSupportedVersionV5) {
+        if (version >= kSupportedVersionV2 && version <= kSupportedVersionV9) {
             if (!appendImplicitZeroSamplesForSelectedSignals(selectedIds, allSelectedSignalIds,
                                                              outputSignals, samplesByOutputIndex,
                                                              minTime, maxTime, error)) {
@@ -2757,7 +3131,9 @@ bool WaveParser4::loadFromFile(const QString& filePath,
 
                 QByteArray footerPayload;
                 if (!readSectionPayload(file, footerHeader, footerPayload, error)) return false;
-                if (!parseFooterSection(footerPayload, version, footerBlocks, error)) return false;
+                if (!parseFooterSection(footerPayload, version, byteWidthByStorageId, boolStorageByStorageId,
+                                        footerBlocks, footerBlockIndexesByChunk,
+                                        footerLodLevelsByStorageId, error)) return false;
                 const u64 fileSize64 = u64(file.size());
                 for (int i = 0; i < footerBlocks.size(); ++i) {
                     const BlockIndexRec& b = footerBlocks.at(i);
@@ -2823,7 +3199,9 @@ bool WaveParser4::loadFromFile(const QString& filePath,
                 error = QStringLiteral("WVZ4 footer_offset does not point to the FOOT section");
                 return false;
             }
-            if (!parseFooterSection(payload, version, footerBlocks, error)) return false;
+            if (!parseFooterSection(payload, version, byteWidthByStorageId, boolStorageByStorageId,
+                                    footerBlocks, footerBlockIndexesByChunk,
+                                    footerLodLevelsByStorageId, error)) return false;
             const u64 fileSize64 = u64(file.size());
             for (int i = 0; i < footerBlocks.size(); ++i) {
                 const BlockIndexRec& b = footerBlocks.at(i);
@@ -2841,7 +3219,9 @@ bool WaveParser4::loadFromFile(const QString& filePath,
     if (!initializeOutput()) return false;
 
     if (useFooterIndexedWdat && (allSelectedStorageIds || !selectedStorageIds.isEmpty())) {
-        if (!decodeWdatSectionsFromFooterIndex(file, footerBlocks, version, selectedStorageIds, allSelectedStorageIds,
+        if (!decodeWdatSectionsFromFooterIndex(file, footerBlocks, footerBlockIndexesByChunk,
+                                               version, headerSignalsPerChunk,
+                                               selectedStorageIds, allSelectedStorageIds,
                                                outputIndexesByStorageId, byteWidthByStorageId,
                                                outputSignals, samplesByOutputIndex,
                                                options.timeStart, options.timeEnd,
@@ -2862,6 +3242,12 @@ bool WaveParser4::loadFromFile(const QString& filePath,
                                        minTime, maxTime);
 
     for (int i = 0; i < outputSignals.size(); ++i) {
+        const int storageId = outputSignals.at(i).storageId > 0
+            ? outputSignals.at(i).storageId
+            : directIntMapValue(storageIdBySignalId, outputSignals.at(i).signalId, outputSignals.at(i).signalId);
+        if (storageId > 0 && storageId < footerLodLevelsByStorageId.size()) {
+            outputSignals[i].lodLevels = footerLodLevelsByStorageId.at(storageId);
+        }
         outputSignals[i].samples = std::move(samplesByOutputIndex[i]);
         if (allSelectedSignalIds || selectedIds.contains(outputSignals.at(i).signalId)) {
             outputSignals[i].samplesLoaded = true;

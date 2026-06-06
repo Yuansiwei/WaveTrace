@@ -88,7 +88,7 @@ private:
 
     void buildUi();
     void applyTheme();
-    void setupToolbarButton(QPushButton* button, const QIcon& icon, const QString& tip);
+    void setupToolbarButton(QPushButton* button, const QIcon& icon, const QString& objectName, const QString& tip);
     void loadDemoWave();
     void applyWave(const WaveFile& wave);
     void updateMetaLabel();
@@ -106,7 +106,8 @@ private:
     void scheduleRefreshActiveValueLabels(int delayMs = 35);
 
     void insertSignalIntoTree(const QString& fullName, int signalIndex);
-    bool ensureSignalSamplesLoaded(const QList<int>& signalIndexes);
+    bool canDeferSamplesWithLod(const WaveSignal& sig) const;
+    bool ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool allowLodDefer = true);
 
     void addSignalToActive(int signalIndex);
     void addSignalIndexesToActive(const QList<int>& signalIndexes);

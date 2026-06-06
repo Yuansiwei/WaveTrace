@@ -69,6 +69,7 @@ private:
     QPoint m_dragStartPos;
     qint64 m_dragStartViewStart = 0;
     qint64 m_dragStartViewEnd = 100;
+    bool m_panDragMoved = false;
 
     bool m_overviewDragging = false;
     double m_overviewDragOffset = 0.0;
