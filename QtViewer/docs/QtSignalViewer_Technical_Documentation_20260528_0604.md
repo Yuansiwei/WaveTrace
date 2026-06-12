@@ -15,7 +15,7 @@ The viewer supports normal single-file waveform inspection and two-file comparis
 | Area | Deliverable | Purpose |
 |---|---|---|
 | File format | WVZ4 v3 | Stable-topology waveform storage with signal chunk tiles. |
-| Writer | `wvz4_writer_typed.h` | Typed writer, v3 chunked WDAT, optional WAL monitor support. |
+| Writer | `wvz4_writer_typed.h` | Typed writer, v3 chunked WDAT, and writer-helper process support. |
 | Recorder | `wave_path_wvz4_recorder.h` | Stable-path recorder for reflected simulation objects. |
 | Parser | `WaveParser4.cpp/.h` | Reads WVZ4 metadata, WDAT tiles, compressed layouts, and footers. |
 | Viewer | QtSignalViewer | Tree browsing, active signal list, waveform canvas, comparison workflow. |
@@ -45,7 +45,7 @@ The current design intentionally separates topology metadata from waveform sampl
 | `WaveParser3.h/.cpp` | WVZ3 support. |
 | `WaveParser2.h/.cpp` | WVZ2 support. |
 | `WaveParser.h/.cpp` | Older JSON / WVZ compatibility. |
-| `wvz4_writer_typed.h` | WVZ4 v3 typed writer and WAL monitor/finalizer support. |
+| `wvz4_writer_typed.h` | WVZ4 v3 typed writer and writer-helper process support. |
 | `wave_path_wvz4_recorder.h` | Stable-path WVZ4 recorder for reflected waveform capture. |
 | `icons/compare.png` | Toolbar icon for two-file comparison. |
 
@@ -194,7 +194,7 @@ The writer is header-only and validates layout before writing. It supports:
 - Signal chunking by `(signal_id - 1) / signals_per_chunk`.
 - Optional zstd compression.
 - Optional block pipeline compression/writing.
-- WAL monitor/finalizer path.
+- Writer-helper process path.
 
 ### 8.2 Signal Chunking
 
@@ -204,9 +204,9 @@ Signal chunking avoids decompressing unrelated signals. Each chunk usually conta
 
 WVZ4 v2 and v3 define an implicit all-zero value for every signal at cycle 0. The writer omits explicit first-zero transitions. The parser supplies an implicit zero sample for loaded signals, while explicit non-zero cycle-0 samples override it.
 
-### 8.4 WAL / Monitor Finalization
+### 8.4 Writer Helper Finalization
 
-The WAL path allows a separate monitor to replay committed spool records into a finalized WVZ4 file. Recovery is guaranteed only up to the last committed WAL record. Unfinished or checksum-invalid WAL records are ignored.
+The writer-helper path sends committed layout/cycle frames to a separate helper process over a named pipe. The helper owns the WVZ4 writer, writes the final file directly, and finalizes it after the parent exits, crashes, or is killed. Recovery is guaranteed only up to the last complete frame received by the helper.
 
 ## 9. Parser and Loading Workflow
 
@@ -356,7 +356,7 @@ Before delivery or regression testing, verify:
 
 - WVZ4 is designed for stable topology and scalar values up to 64 bits.
 - WVZ4 does not support Z/high-impedance states in the current writer path.
-- The monitor can recover only committed WAL records.
+- The helper can recover only complete layout/cycle frames it has received.
 - A main-thread crash that leaves the process alive is intentionally not handled.
 - Some legacy formats still rely on textual value storage and fallback hydration.
 

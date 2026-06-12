@@ -2,7 +2,7 @@
 
 This package keeps the existing WVZ4 stable-topology writer features and adds two optional features:
 
-1. **Process-level WAL/monitor finalization**. The simulation process may write committed layout/cycle records to a spool file. A separate monitor/finalizer process can replay committed records and produce a finalized WVZ4 after the simulation process exits or is killed. Recovery is guaranteed only up to the last committed WAL record.
+1. **Process-level writer helper finalization**. The simulation process sends committed layout/cycle frames to a helper process over a named pipe. The helper owns the real WVZ4 writer and finalizes the file after the simulation process exits, crashes, or is killed. Recovery is guaranteed only up to the last complete cycle frame received by the helper.
 2. **Two-dimensional WDAT tiling**. Wave data is split by time block and by signal chunk. The signal chunk is computed by `signal_chunk_id = (signal_id - 1) / signals_per_chunk`. Each decompressed WDAT tile stores an offset table for all signals in that chunk, so a reader can jump to a signal's local record after decompressing only that tile.
 
 ## Writer options
@@ -35,64 +35,48 @@ writer.close(error);
 `wvz4::AsyncWriter` also still works.
 
 
-## PathStableWvz4Recorder WAL mode
+## PathStableWvz4Recorder helper mode
 
-If you want the waveform to survive `kill`/process termination, do not let the
-main simulation process write the final `.wvz4` directly.  Enable recorder WAL
-mode and open the replayed output.
+`PathStableWvz4Recorder` uses writer-helper mode by default so the waveform can
+survive simulation process crash/kill. The main process sends layout/cycle
+frames to `wvz4_writer_monitor.exe`; the helper process owns the real
+`wvz4::Writer` and writes the final `.wvz4` directly.
 
 ```cpp
 PathStableWvz4Recorder::OpenConfig cfg;
 cfg.file_path = "out.wvz4";
-cfg.use_wal_spool = true;
-cfg.wal_spool_path = "out.wvz4.spool"; // optional; default is file_path + ".spool"
-cfg.wal_replay_to_output_on_close = true; // normal exit produces out.wvz4
+cfg.use_writer_process = true; // default
+cfg.writer_process_exe_path = "wvz4_writer_monitor.exe"; // optional; auto-located when empty
 recorder.open(cfg, error);
 ```
 
-After killing the main process, run the monitor/finalizer:
+On normal close, the parent sends a `Finalize` frame and waits for the helper
+ack. If the parent process is killed, the helper observes the parent process
+handle becoming signaled and/or the named pipe breaking, then closes the writer
+and emits `FOOT/footer_offset`.
+
+The helper command line is internal to `PathStableWvz4Recorder`, but can be
+started manually for protocol debugging:
 
 ```bash
-wvz4_writer_monitor.exe out.wvz4.spool out.wvz4
+wvz4_writer_monitor.exe --writer-helper --pipe <name> --parent-pid <pid> --out out.wvz4
 ```
 
 Do not open an in-progress direct-writer `.wvz4` after killing the process.  A
 torn direct write may contain a `WDAT` section header whose recorded length is
-larger than the remaining file bytes.
-
-## WAL / monitor path
-
-Main simulation process:
-
-```cpp
-wvz4::WalWriter wal;
-wal.open("out.wvz4.spool", layout, opt, error);
-
-// per cycle
-wal.submit_cycle(submission, error);  // writes commit marker after payload
-
-// normal finish
-wal.request_finalize(error);
-wal.close();
-```
-
-Monitor/finalizer process:
-
-```cpp
-std::string error;
-wvz4::WalMonitor::replay_committed_spool_to_file(
-    "out.wvz4.spool", "out.wvz4", error);
-```
-
-A minimal command-line finalizer is included:
-
-```bash
-wvz4_writer_monitor.exe out.wvz4.spool out.wvz4
-```
+larger than the remaining file bytes. New reader paths reject v3+ files whose
+header has no finalized `FOOT/footer_offset`.
 
 ## Crash semantics
 
-The monitor can only recover data committed to the spool file. It cannot recover data still stored in the main process memory, thread-local buffers, or an unfinished cycle. A partially written WAL record is ignored because its commit marker is not set or its checksum fails.
+The helper can only recover data it fully received and acknowledged. It cannot
+recover data still stored in the main process memory, thread-local buffers, the
+current unfinished cycle, or a half-written pipe frame. If the helper process
+itself is killed while writing the final `.wvz4`, the file may still be
+unfinished; the viewer will reject it until a valid `FOOT/footer_offset` exists.
+
+WVZ4 v3+ reader paths treat a missing `FOOT/footer_offset` as an unfinished
+direct/helper-writer file and reject it by default.
 
 This version intentionally does **not** handle the case where the main thread crashes but the process stays alive.
 
@@ -329,7 +313,7 @@ or at `WriterOptions::stats_log_path` if explicitly set.  The report includes:
 - per-record value codec usage;
 - clock descriptor count.
 
-For WAL replay, the replayed output log is written next to the final output file rather than the temporary replay file.
+For helper-process writing, the stats log is written next to the final output file.
 
 ### Recorder lifecycle cleanup
 

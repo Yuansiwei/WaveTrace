@@ -17,9 +17,46 @@
 #include <limits>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
 #include <vector>
 
 namespace {
+
+    constexpr qreal kWaveStrokeWidth = 1.0;
+
+    QPen waveStrokePen(const QColor& color,
+                       Qt::PenStyle style = Qt::SolidLine,
+                       Qt::PenCapStyle cap = Qt::SquareCap,
+                       Qt::PenJoinStyle join = Qt::MiterJoin) {
+        QPen pen(color, kWaveStrokeWidth, style, cap, join);
+        pen.setCosmetic(true);
+        return pen;
+    }
+
+    void drawBitTransitionSpan(QPainter& p, int x1, int x2, int yHigh, int yLow, const QColor& color) {
+        if (x2 <= x1) x2 = x1 + 1;
+        const int right = qMax(x1, x2 - 1);
+        p.setPen(waveStrokePen(color));
+        p.drawLine(x1, yHigh, right, yHigh);
+        p.drawLine(x1, yLow, right, yLow);
+        for (int x = x1; x <= right; ++x) {
+            p.drawLine(x, yHigh, x, yLow);
+        }
+    }
+
+    bool viewerDisableLodEnabled() {
+        static const bool enabled = []() {
+            const char* value = std::getenv("WV_VIEWER_DISABLE_LOD");
+            return value && value[0] && std::strcmp(value, "0") != 0;
+        }();
+        return enabled;
+    }
+
+    int plotSpanPxForWidth(int widgetWidth, int padX) {
+        return qMax(1, widgetWidth - 2 * padX);
+    }
 
     static inline QPoint mouseEventPosCompat(const QMouseEvent* event) {
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
@@ -76,7 +113,7 @@ namespace {
         const bool drawLeft = busFrame.drawLeftEdge;
         const bool drawRight = busFrame.drawRightEdge;
 
-        p.setPen(QPen(color, penWidth, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        p.setPen(waveStrokePen(color, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
         if (drawLeft && drawRight) {
             p.setBrush(brush);
             p.drawRoundedRect(frame, radius, radius);
@@ -148,6 +185,32 @@ namespace {
         const QBrush oldBrush = p.brush();
         p.setRenderHint(QPainter::Antialiasing, true);
         drawBusFrame(p, BusFrame{ rect, drawLeftEdge, drawRightEdge }, color, penWidth, brush);
+        p.setPen(oldPen);
+        p.setBrush(oldBrush);
+        p.setRenderHint(QPainter::Antialiasing, oldAntialiasing);
+    }
+
+    void drawDenseBusMiniFrame(QPainter& p, int x1, int x2, int yTop, int yBottom,
+                               const QColor& lineColor, const QColor& fillColor, qreal penWidth) {
+        if (x2 <= x1 || yBottom <= yTop) return;
+
+        const bool oldAntialiasing = p.testRenderHint(QPainter::Antialiasing);
+        const QPen oldPen = p.pen();
+        const QBrush oldBrush = p.brush();
+
+        p.setRenderHint(QPainter::Antialiasing, false);
+        p.setPen(Qt::NoPen);
+        p.setBrush(Qt::NoBrush);
+        p.fillRect(QRect(x1, yTop, qMax(1, x2 - x1), qMax(1, yBottom - yTop)), fillColor);
+
+        p.setPen(waveStrokePen(lineColor));
+        const int right = qMax(x1, x2 - 1);
+        const int bottom = qMax(yTop, yBottom - 1);
+        p.drawLine(x1, yTop, right, yTop);
+        p.drawLine(x1, bottom, right, bottom);
+        p.drawLine(x1, yTop, x1, bottom);
+        p.drawLine(right, yTop, right, bottom);
+
         p.setPen(oldPen);
         p.setBrush(oldBrush);
         p.setRenderHint(QPainter::Antialiasing, oldAntialiasing);
@@ -322,7 +385,81 @@ namespace {
         return qMax(64, plotWidth / 2);
     }
 
-    const WaveLodLevel* chooseLodLevelForViewport(const WaveSignal& sig, qint64 spanValue, int plotWidth) {
+    qint64 lodSampleWindowStart(qint64 time, qint64 bucketCycles) {
+        if (bucketCycles <= 0) return time;
+        if (time >= 0) return (time / bucketCycles) * bucketCycles;
+        const qint64 d = ((time + 1) / bucketCycles) - 1;
+        return d * bucketCycles;
+    }
+
+    qint64 lodSampleWindowEnd(qint64 windowStart, qint64 bucketCycles) {
+        if (bucketCycles <= 0) return windowStart + 1;
+        if (windowStart > std::numeric_limits<qint64>::max() - bucketCycles) {
+            return std::numeric_limits<qint64>::max();
+        }
+        return windowStart + bucketCycles;
+    }
+
+    QVector<WaveLodValidRange> effectiveLodValidRanges(const WaveLodLevel& level) {
+        if (!level.validRanges.isEmpty()) return level.validRanges;
+        QVector<WaveLodValidRange> ranges;
+        const qint64 bucketCycles = qMax<qint64>(1, level.bucketCycles);
+
+        if (!level.buckets.isEmpty()) {
+            WaveLodValidRange range;
+            range.start = level.buckets.constFirst().start;
+            range.end = level.buckets.constLast().end;
+            if (range.end > range.start) ranges.push_back(range);
+            return ranges;
+        }
+
+        if (level.samples.size() < 2) return ranges;
+        const qint64 maxContinuousGap = qMax<qint64>(bucketCycles * 8, bucketCycles + 1);
+        qint64 prevWindowStart = lodSampleWindowStart(level.samples.constFirst().time, bucketCycles);
+        bool open = false;
+        qint64 openStart = 0;
+        qint64 openEnd = 0;
+
+        for (int i = 1; i < level.samples.size(); ++i) {
+            const qint64 windowStart = lodSampleWindowStart(level.samples.at(i).time, bucketCycles);
+            const qint64 gap = windowStart - prevWindowStart;
+            if (gap >= 0 && gap <= maxContinuousGap) {
+                if (!open) {
+                    open = true;
+                    openStart = prevWindowStart;
+                }
+                openEnd = lodSampleWindowEnd(windowStart, bucketCycles);
+            } else if (open) {
+                WaveLodValidRange range;
+                range.start = openStart;
+                range.end = openEnd;
+                if (range.end > range.start) ranges.push_back(range);
+                open = false;
+            }
+            prevWindowStart = windowStart;
+        }
+
+        if (open) {
+            WaveLodValidRange range;
+            range.start = openStart;
+            range.end = std::numeric_limits<qint64>::max();
+            ranges.push_back(range);
+        }
+        return ranges;
+    }
+
+    bool lodLevelIntersectsRange(const WaveLodLevel& level, qint64 start, qint64 end) {
+        if (end <= start) return false;
+        const QVector<WaveLodValidRange> ranges = effectiveLodValidRanges(level);
+        if (ranges.isEmpty()) return false;
+        for (const WaveLodValidRange& range : ranges) {
+            if (range.end > start && range.start < end) return true;
+        }
+        return false;
+    }
+
+    const WaveLodLevel* chooseLodLevelForViewport(const WaveSignal& sig, qint64 start, qint64 end,
+                                                  qint64 spanValue, int plotWidth) {
         const double cyclesPerPixel = double(spanValue) / double(qMax(1, plotWidth));
         if (cyclesPerPixel < 128.0 || sig.lodLevels.isEmpty()) return nullptr;
         const WaveLodLevel* first = nullptr;
@@ -333,6 +470,7 @@ namespace {
         for (int i = 0; i < sig.lodLevels.size(); ++i) {
             const WaveLodLevel& level = sig.lodLevels.at(i);
             if (level.bucketCycles <= 0 || (level.buckets.isEmpty() && level.samples.isEmpty())) continue;
+            if (!lodLevelIntersectsRange(level, start, end)) continue;
             if (!first) first = &level;
             if (level.bucketCycles <= maxBucketCycles) best = &level;
             else break;
@@ -445,7 +583,7 @@ qint64 WaveCanvas::fullStartTime() const { return fullStart(); }
 qint64 WaveCanvas::fullEndTime() const { return fullEnd(); }
 
 QRect WaveCanvas::overviewRect() const {
-    return QRect(m_padX, height() - m_overviewHeight - 8, qMax(10, width() - 2 * m_padX), m_overviewHeight);
+    return QRect(m_padX, height() - m_overviewHeight - 8, plotSpanPxForWidth(width(), m_padX), m_overviewHeight);
 }
 
 QRectF WaveCanvas::overviewThumbRect() const {
@@ -956,15 +1094,15 @@ bool WaveCanvas::jumpToTime(qint64 internalTime) {
 }
 
 qint64 WaveCanvas::xToTime(double x) const {
-    const double usable = width() - 2.0 * m_padX;
+    const double usable = double(plotSpanPxForWidth(width(), m_padX));
     if (usable <= 1.0) return m_viewStart;
-    const double clamped = qBound<double>(m_padX, x, width() - m_padX);
+    const double clamped = qBound<double>(m_padX, x, m_padX + usable);
     const double ratio = (clamped - m_padX) / usable;
     return m_viewStart + static_cast<qint64>(std::llround(ratio * double(span())));
 }
 
 double WaveCanvas::timeToX(qint64 t) const {
-    const double usable = width() - 2.0 * m_padX;
+    const double usable = double(plotSpanPxForWidth(width(), m_padX));
     return m_padX + (double(t - m_viewStart) / double(span())) * usable;
 }
 
@@ -1223,12 +1361,18 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
     }
 
     const qint64 spanValue = qMax<qint64>(1, span());
-    const qint64 usablePx = qMax<qint64>(1, width() - 2 * m_padX);
+    const int plotLeft = qMax(0, m_padX);
+    const int plotSpanPx = plotSpanPxForWidth(width(), m_padX);
+    const int plotRightBoundary = plotLeft + plotSpanPx;
+    const int plotRightPixel = qMax(plotLeft, plotRightBoundary - 1);
+    const qint64 usablePx = qMax<qint64>(1, plotSpanPx);
+    auto fastXF = [&](qint64 t) -> double {
+        if (t <= m_viewStart) return double(plotLeft);
+        if (t >= m_viewEnd) return double(plotRightBoundary);
+        return double(plotLeft) + (double(t - m_viewStart) * double(usablePx)) / double(spanValue);
+    };
     auto fastX = [&](qint64 t) -> int {
-        if (t <= m_viewStart) return m_padX;
-        if (t >= m_viewEnd) return width() - m_padX;
-        const qint64 dt = t - m_viewStart;
-        return m_padX + int((dt * usablePx + spanValue / 2) / spanValue);
+        return int(std::lround(fastXF(t)));
     };
     auto lowerIndexForTime = [](const QVector<WaveSample>& samples, qint64 t) -> int {
         int lo = 0, hi = samples.size();
@@ -1303,116 +1447,293 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
         p.setPen(QColor("#1A1A1A"));
         p.drawLine(0, yTop + m_rowHeight, width(), yTop + m_rowHeight);
 
-        const int plotLeft = qMax(0, m_padX);
-        const int plotRight = qMin(width() - 1, width() - m_padX);
-        const int plotWidth = qMax(1, plotRight - plotLeft + 1);
-        if (const WaveLodLevel* lodLevel = chooseLodLevelForViewport(sig, spanValue, plotWidth)) {
+        const int plotRight = plotRightPixel;
+        const int plotWidth = plotSpanPx;
+        const bool preferRawSamples = viewerDisableLodEnabled() ||
+            (sig.kind == SignalKind::Bit && sig.samplesLoaded && !sig.samples.isEmpty()) ||
+            (sig.samplesLoaded && !sig.samples.isEmpty() &&
+             sig.samples.size() <= qMax(2000, plotWidth * 8));
+        if (!preferRawSamples) if (const WaveLodLevel* lodLevel = chooseLodLevelForViewport(sig, m_viewStart, m_viewEnd, spanValue, plotWidth)) {
             if (!lodLevel->samples.isEmpty()) {
-                const QVector<WaveSample>& lodSamples = lodLevel->samples;
-                const QVector<int> drawSampleIndices = collectTimedSampleIndicesForWindow(
-                    lodSamples, m_viewStart, m_viewEnd, targetLodSamplesForPlotWidth(plotWidth));
+                int selectedLodIndex = -1;
+                for (int levelIndex = 0; levelIndex < sig.lodLevels.size(); ++levelIndex) {
+                    if (&sig.lodLevels.at(levelIndex) == lodLevel) {
+                        selectedLodIndex = levelIndex;
+                        break;
+                    }
+                }
+                if (selectedLodIndex < 0) selectedLodIndex = 0;
 
-                if (sig.kind == SignalKind::Bit) {
-                    QVector<QLine> knownSolid;
-                    QVector<QLine> selectedSolid;
-                    QVector<QLine> zDashed;
-                    QVector<QLine> absentSolid;
-                    knownSolid.reserve(drawSampleIndices.size() * 2);
-                    selectedSolid.reserve(drawSampleIndices.size() * 2);
-                    zDashed.reserve(drawSampleIndices.size() / 2 + 4);
-                    absentSolid.reserve(drawSampleIndices.size() / 2 + 4);
-
-                    for (int s = 0; s < drawSampleIndices.size(); ++s) {
-                        const int i = drawSampleIndices.at(s);
-                        const qint64 t0 = lodSamples.at(i).time;
-                        const int nextIndex = (s + 1 < drawSampleIndices.size()) ? drawSampleIndices.at(s + 1) : (i + 1);
-                        const qint64 t1 = (nextIndex < lodSamples.size()) ? lodSamples.at(nextIndex).time : fullEnd();
-                        const qint64 segStart = qMax(t0, m_viewStart);
-                        const qint64 segEnd = qMin(t1, m_viewEnd);
-                        if (segEnd <= segStart) continue;
-
-                        const WaveSample& curSample = lodSamples.at(i);
-                        const QChar state = classifyBitStateChar(curSample);
+                auto drawRawLastResortRange = [&](qint64 start, qint64 end) {
+                    if (!sig.samplesLoaded || sig.samples.isEmpty() || end <= start) return;
+                    const int x1 = fastX(start);
+                    const int x2 = qMax(x1 + 1, fastX(end));
+                    const int changeIdx = lowerIndexForTime(sig.samples, start);
+                    const bool hasChange = changeIdx < sig.samples.size() && sig.samples.at(changeIdx).time < end;
+                    if (sig.kind == SignalKind::Bit) {
+                        if (hasChange) {
+                            const QColor color = isSelectedRow ? selectedKnownColor : waveGreen;
+                            drawBitTransitionSpan(p, x1, x2, yHigh, yLow, color);
+                            return;
+                        }
+                        const WaveSample sample = rawValueAtTime(entry.signalIndex, start);
+                        const QChar state = classifyBitStateChar(sample);
                         const int y = (state == QLatin1Char('1')) ? yHigh : ((state == QLatin1Char('0')) ? yLow : yMid);
-                        const bool isZ = (state == QLatin1Char('z'));
-                        const bool isAbsent = (state == QLatin1Char('a'));
-                        QVector<QLine>& target = isAbsent ? absentSolid : (isZ ? zDashed : (isSelectedRow ? selectedSolid : knownSolid));
-                        const int x1 = fastX(segStart);
-                        const int x2 = qMax(x1 + 1, fastX(segEnd));
-                        target.push_back(QLine(x1, y, x2, y));
-
-                        if (s > 0 && t0 >= m_viewStart && t0 <= m_viewEnd &&
-                            !waveSamplesEquivalent(lodSamples.at(drawSampleIndices.at(s - 1)), curSample)) {
-                            const QChar prevState = classifyBitStateChar(lodSamples.at(drawSampleIndices.at(s - 1)));
-                            const int py = (prevState == QLatin1Char('1')) ? yHigh : ((prevState == QLatin1Char('0')) ? yLow : yMid);
-                            const int xs = fastX(t0);
-                            if (isAbsent || prevState == QLatin1Char('a')) absentSolid.push_back(QLine(xs, py, xs, y));
-                            else if (isZ || prevState == QLatin1Char('z')) zDashed.push_back(QLine(xs, py, xs, y));
-                            else if (isSelectedRow) selectedSolid.push_back(QLine(xs, py, xs, y));
-                            else knownSolid.push_back(QLine(xs, py, xs, y));
+                        const QColor color = (state == QLatin1Char('z')) ? zColor :
+                            ((state == QLatin1Char('a')) ? absentColor : (isSelectedRow ? selectedKnownColor : waveGreen));
+                        p.setPen(waveStrokePen(color, state == QLatin1Char('z') ? Qt::DashLine : Qt::SolidLine));
+                        p.drawLine(x1, y, x2, y);
+                    } else {
+                        const int yBusTop = yTop + 8;
+                        const int yBusBottom = yTop + m_rowHeight - 8;
+                        const QColor color = isSelectedRow ? waveGreen.lighter(130) : waveGreen;
+                        if (hasChange) {
+                            p.fillRect(QRect(x1, yBusTop, qMax(1, x2 - x1), qMax(1, yBusBottom - yBusTop)), color);
+                            return;
+                        }
+                        const WaveSample sample = rawValueAtTime(entry.signalIndex, start);
+                        drawBusRoundedFrame(p, QRect(x1, yBusTop, qMax(1, x2 - x1), qMax(1, yBusBottom - yBusTop)),
+                                            color, kWaveStrokeWidth, Qt::NoBrush,
+                                            start > m_viewStart, end < m_viewEnd);
+                        const QRect textRect(x1 + 6, yTop + 3, qMax(1, x2 - x1 - 12), m_rowHeight - 6);
+                        if (textRect.width() > 48) {
+                            p.setPen(waveGreenText);
+                            p.drawText(textRect, Qt::AlignVCenter | Qt::AlignHCenter,
+                                       formatValue(sig, sample, entry.format));
                         }
                     }
+                };
 
-                    if (!knownSolid.isEmpty()) {
-                        p.setPen(QPen(waveGreen, isSelectedRow ? 2.8 : 2.2, Qt::SolidLine, Qt::SquareCap));
-                        p.drawLines(knownSolid);
-                    }
-                    if (!selectedSolid.isEmpty()) {
-                        p.setPen(QPen(selectedKnownColor, 2.8, Qt::SolidLine, Qt::SquareCap));
-                        p.drawLines(selectedSolid);
-                    }
-                    if (!zDashed.isEmpty()) {
-                        p.setPen(QPen(zColor, isSelectedRow ? 2.8 : 2.2, Qt::DashLine, Qt::SquareCap));
-                        p.drawLines(zDashed);
-                    }
-                    if (!absentSolid.isEmpty()) {
-                        p.setPen(QPen(absentColor, isSelectedRow ? 2.8 : 2.2, Qt::SolidLine, Qt::SquareCap));
-                        p.drawLines(absentSolid);
-                    }
-                } else {
-                    const int yBusTop = yTop + 8;
-                    const int yBusBottom = yTop + m_rowHeight - 8;
-                    const qreal penWidth = isSelectedRow ? 1.9 : 1.5;
-                    QVector<BusFrame> knownFrames;
-                    QVector<BusFrame> zFrames;
-                    QVector<BusFrame> absentRects;
-                    knownFrames.reserve(drawSampleIndices.size());
-                    zFrames.reserve(drawSampleIndices.size() / 2 + 4);
-                    absentRects.reserve(drawSampleIndices.size() / 4 + 4);
+                auto drawLodSampleRange = [&](const WaveLodLevel& level, qint64 visibleStart, qint64 visibleEnd) {
+                    if (level.samples.isEmpty() || visibleEnd <= visibleStart) return;
 
-                    for (int s = 0; s < drawSampleIndices.size(); ++s) {
-                        const int i = drawSampleIndices.at(s);
-                        const qint64 t0 = lodSamples.at(i).time;
-                        const int nextIndex = (s + 1 < drawSampleIndices.size()) ? drawSampleIndices.at(s + 1) : (i + 1);
-                        const qint64 t1 = (nextIndex < lodSamples.size()) ? lodSamples.at(nextIndex).time : fullEnd();
-                        const qint64 segStart = qMax(t0, m_viewStart);
-                        const qint64 segEnd = qMin(qMax(t1, t0 + 1), m_viewEnd);
-                        if (segEnd <= segStart) continue;
+                    const QVector<WaveSample>& lodSamples = level.samples;
+                    const qint64 lodBucketCycles = qMax<qint64>(1, level.bucketCycles);
+                    const qint64 searchStart = (visibleStart > std::numeric_limits<qint64>::min() + lodBucketCycles)
+                        ? (visibleStart - lodBucketCycles)
+                        : std::numeric_limits<qint64>::min();
+                    const qint64 searchEnd = (visibleEnd < std::numeric_limits<qint64>::max() - lodBucketCycles)
+                        ? (visibleEnd + lodBucketCycles)
+                        : std::numeric_limits<qint64>::max();
+                    const int firstIdx = qMax(0, lowerSampleIndexForTime(lodSamples, searchStart) - 1);
+                    int lastExclusive = (searchEnd == std::numeric_limits<qint64>::max())
+                        ? lodSamples.size()
+                        : lowerSampleIndexForTime(lodSamples, searchEnd + 1);
+                    if (lastExclusive <= firstIdx) lastExclusive = qMin(lodSamples.size(), firstIdx + 1);
 
-                        const WaveSample& curSample = lodSamples.at(i);
-                        const bool isZ = sampleContainsUnknownState(curSample);
-                        const bool isAbsent = sampleIsAbsentState(curSample);
-                        const int x1 = fastX(segStart);
-                        const int x2 = qMax(x1 + 1, fastX(segEnd));
-                        const QRect frameRect(x1, yBusTop, qMax(1, x2 - x1), qMax(1, yBusBottom - yBusTop));
-                        const BusFrame frame{ frameRect, t0 > m_viewStart, t1 < m_viewEnd };
-                        if (isAbsent) {
-                            absentRects.push_back(frame);
-                        } else {
-                            QVector<BusFrame>& target = isZ ? zFrames : knownFrames;
-                            target.push_back(frame);
-                            const QRect textRect(x1 + 6, yTop + 3, qMax(1, x2 - x1 - 12), m_rowHeight - 6);
-                            if (textRect.width() > 48) {
-                                p.setPen(isZ ? zColor.lighter(140) : waveGreenText);
-                                p.drawText(textRect, Qt::AlignVCenter | Qt::AlignHCenter,
-                                           formatValue(sig, curSample, entry.format));
+                    if (sig.kind == SignalKind::Bit) {
+                        QVector<QLine> knownSolid;
+                        QVector<QLine> selectedSolid;
+                        QVector<QLine> zDashed;
+                        QVector<QLine> absentSolid;
+                        knownSolid.reserve((lastExclusive - firstIdx) * 2);
+                        selectedSolid.reserve((lastExclusive - firstIdx) * 2);
+                        zDashed.reserve((lastExclusive - firstIdx) / 2 + 4);
+                        absentSolid.reserve((lastExclusive - firstIdx) / 2 + 4);
+
+                        auto bitY = [&](const WaveSample& sample) {
+                            const QChar state = classifyBitStateChar(sample);
+                            return (state == QLatin1Char('1')) ? yHigh : ((state == QLatin1Char('0')) ? yLow : yMid);
+                        };
+
+                        for (int i = firstIdx; i < lastExclusive; ++i) {
+                            const WaveSample& sample = lodSamples.at(i);
+                            const qint64 t0 = sample.time;
+                            const qint64 t1 = (i + 1 < lodSamples.size()) ? lodSamples.at(i + 1).time : fullEnd();
+                            const qint64 segStart = qMax(t0, visibleStart);
+                            const qint64 segEnd = qMin(t1, visibleEnd);
+                            if (segEnd <= segStart) continue;
+
+                            const QChar state = classifyBitStateChar(sample);
+                            const int y = bitY(sample);
+                            const bool isZ = (state == QLatin1Char('z'));
+                            const bool isAbsent = (state == QLatin1Char('a'));
+                            QVector<QLine>& target = isAbsent ? absentSolid : (isZ ? zDashed : (isSelectedRow ? selectedSolid : knownSolid));
+
+                            const int x1 = fastX(segStart);
+                            const int x2 = qMax(x1 + 1, fastX(segEnd));
+
+                            if (i > 0 && t0 >= visibleStart && t0 <= visibleEnd) {
+                                const WaveSample& prev = lodSamples.at(i - 1);
+                                const QChar prevState = classifyBitStateChar(prev);
+                                const int py = bitY(prev);
+                                if (py != y || prevState != state) {
+                                    const int xs = fastX(t0);
+                                    if (isAbsent || prevState == QLatin1Char('a')) {
+                                        absentSolid.push_back(QLine(xs, py, xs, y));
+                                    }
+                                    else if (isZ || prevState == QLatin1Char('z')) {
+                                        zDashed.push_back(QLine(xs, py, xs, y));
+                                    }
+                                    else if (isSelectedRow) {
+                                        selectedSolid.push_back(QLine(xs, py, xs, y));
+                                    }
+                                    else {
+                                        knownSolid.push_back(QLine(xs, py, xs, y));
+                                    }
+                                }
+                            }
+
+                            if (x2 > x1) {
+                                target.push_back(QLine(x1, y, x2, y));
+                            }
+                            else if (target.isEmpty() || target.constLast().x1() != x1 || target.constLast().y1() != y || target.constLast().y2() != y) {
+                                target.push_back(QLine(x1, y, x1 + 1, y));
+                            }
+
+                            if (isZ && (x2 - x1) >= 18) {
+                                p.setPen(zColor.lighter(140));
+                                p.drawText(QRect(x1 + 2, yTop + 2, qMax(1, x2 - x1 - 4), m_rowHeight - 4), Qt::AlignCenter,
+                                    QStringLiteral("Z"));
                             }
                         }
-                    }
 
-                    drawBusRoundedFrames(p, knownFrames, isSelectedRow ? waveGreen.lighter(130) : waveGreen, penWidth);
-                    drawBusRoundedFrames(p, zFrames, zColor, penWidth);
-                    drawBusRoundedFrames(p, absentRects, absentColor, penWidth);
+                        if (!knownSolid.isEmpty()) {
+                            p.setPen(waveStrokePen(waveGreen));
+                            p.drawLines(knownSolid);
+                        }
+                        if (!selectedSolid.isEmpty()) {
+                            p.setPen(waveStrokePen(selectedKnownColor));
+                            p.drawLines(selectedSolid);
+                        }
+                        if (!zDashed.isEmpty()) {
+                            p.setPen(waveStrokePen(zColor, Qt::DashLine));
+                            p.drawLines(zDashed);
+                        }
+                        if (!absentSolid.isEmpty()) {
+                            p.setPen(waveStrokePen(absentColor));
+                            p.drawLines(absentSolid);
+                        }
+                    } else {
+                        const int yBusTop = yTop + 8;
+                        const int yBusBottom = yTop + m_rowHeight - 8;
+                        const qreal penWidth = kWaveStrokeWidth;
+                        enum class DenseMiniFrameKind { Known, Z, Absent };
+                        auto denseMiniFrameLineColor = [&](DenseMiniFrameKind kind) {
+                            if (kind == DenseMiniFrameKind::Z) return zColor;
+                            if (kind == DenseMiniFrameKind::Absent) return absentColor;
+                            return isSelectedRow ? waveGreen.lighter(130) : waveGreen;
+                        };
+                        auto denseMiniFrameFillColor = [&](DenseMiniFrameKind kind) {
+                            QColor fill = denseMiniFrameLineColor(kind);
+                            fill.setAlpha(kind == DenseMiniFrameKind::Absent ? 80 : (kind == DenseMiniFrameKind::Z ? 95 : (isSelectedRow ? 105 : 88)));
+                            return fill;
+                        };
+                        auto sampleKind = [&](const WaveSample& sample) {
+                            if (sampleIsAbsentState(sample)) return DenseMiniFrameKind::Absent;
+                            if (sampleContainsUnknownState(sample)) return DenseMiniFrameKind::Z;
+                            return DenseMiniFrameKind::Known;
+                        };
+                        auto drawBusStableSampleRange = [&](const WaveSample* sample, qint64 start, qint64 end) {
+                            if (!sample || end <= start) return;
+                            const int x1 = fastX(start);
+                            const int x2 = qMax(x1 + 1, fastX(end));
+                            const DenseMiniFrameKind kind = sampleKind(*sample);
+                            const QColor color = denseMiniFrameLineColor(kind);
+                            drawBusRoundedFrame(p, QRect(x1, yBusTop, qMax(1, x2 - x1), qMax(1, yBusBottom - yBusTop)),
+                                                color, penWidth, Qt::NoBrush,
+                                                start > m_viewStart, end < m_viewEnd);
+                            if (kind != DenseMiniFrameKind::Absent) {
+                                const QRect textRect(x1 + 6, yTop + 3, qMax(1, x2 - x1 - 12), m_rowHeight - 6);
+                                if (textRect.width() > 48) {
+                                    p.setPen(kind == DenseMiniFrameKind::Z ? zColor.lighter(140) : waveGreenText);
+                                    p.drawText(textRect, Qt::AlignVCenter | Qt::AlignHCenter,
+                                               formatValue(sig, *sample, entry.format));
+                                }
+                            }
+                        };
+                        auto drawBusActivityWindow = [&](const WaveSample& sample, qint64 start, qint64 end) {
+                            if (end <= start) return;
+                            const int x1 = fastX(start);
+                            const int x2 = qMax(x1 + 1, fastX(end));
+                            const DenseMiniFrameKind kind = sampleKind(sample);
+                            drawDenseBusMiniFrame(p, x1, x2, yBusTop, yBusBottom,
+                                                  denseMiniFrameLineColor(kind), denseMiniFrameFillColor(kind),
+                                                  kWaveStrokeWidth);
+                        };
+
+                        WaveSample rawAnchorSample;
+                        const WaveSample* currentSample = nullptr;
+                        if (sig.samplesLoaded && !sig.samples.isEmpty()) {
+                            rawAnchorSample = rawValueAtTime(entry.signalIndex, visibleStart);
+                            if (!sampleIsAbsentState(rawAnchorSample)) currentSample = &rawAnchorSample;
+                        }
+                        qint64 cursor = visibleStart;
+                        for (int i = firstIdx; i < lastExclusive && cursor < visibleEnd; ++i) {
+                            const WaveSample& sample = lodSamples.at(i);
+                            const qint64 winStart = lodSampleWindowStart(sample.time, lodBucketCycles);
+                            const qint64 winEnd = lodSampleWindowEnd(winStart, lodBucketCycles);
+                            if (winEnd <= visibleStart) {
+                                currentSample = &sample;
+                                continue;
+                            }
+                            if (winStart >= visibleEnd) break;
+                            const qint64 activeStart = qMax(winStart, visibleStart);
+                            const qint64 activeEnd = qMin(winEnd, visibleEnd);
+                            if (cursor < activeStart) drawBusStableSampleRange(currentSample, cursor, activeStart);
+                            const qint64 drawStart = qMax(activeStart, cursor);
+                            if (activeEnd > drawStart) drawBusActivityWindow(sample, drawStart, activeEnd);
+                            currentSample = &sample;
+                            cursor = qMax(cursor, activeEnd);
+                        }
+                        if (cursor < visibleEnd) drawBusStableSampleRange(currentSample, cursor, visibleEnd);
+                    }
+                };
+
+                std::function<void(qint64, qint64, int)> drawFallbackLodRange;
+                drawFallbackLodRange = [&](qint64 start, qint64 end, int firstLevelIndex) {
+                    if (end <= start) return;
+                    for (int levelIndex = qMax(0, firstLevelIndex); levelIndex < sig.lodLevels.size(); ++levelIndex) {
+                        const WaveLodLevel& fallbackLevel = sig.lodLevels.at(levelIndex);
+                        if (fallbackLevel.bucketCycles <= 0 || fallbackLevel.samples.isEmpty()) continue;
+
+                        const QVector<WaveLodValidRange> fallbackRanges = effectiveLodValidRanges(fallbackLevel);
+                        if (fallbackRanges.isEmpty()) {
+                            drawLodSampleRange(fallbackLevel, start, end);
+                            return;
+                        }
+
+                        for (const WaveLodValidRange& range : fallbackRanges) {
+                            const qint64 clippedStart = qMax(range.start, start);
+                            const qint64 clippedEnd = qMin(range.end, end);
+                            if (clippedEnd <= clippedStart) continue;
+                            if (start < clippedStart) {
+                                drawFallbackLodRange(start, clippedStart, levelIndex + 1);
+                            }
+                            drawLodSampleRange(fallbackLevel, clippedStart, clippedEnd);
+                            if (clippedEnd < end) {
+                                drawFallbackLodRange(clippedEnd, end, levelIndex + 1);
+                            }
+                            return;
+                        }
+                    }
+                    drawRawLastResortRange(start, end);
+                };
+
+                const QVector<WaveLodValidRange> validRanges = effectiveLodValidRanges(*lodLevel);
+                if (validRanges.isEmpty()) {
+                    drawLodSampleRange(*lodLevel, m_viewStart, m_viewEnd);
+                    continue;
+                }
+
+                bool drewLodRange = false;
+                qint64 cursor = m_viewStart;
+                for (const WaveLodValidRange& range : validRanges) {
+                    const qint64 clippedStart = qMax(range.start, m_viewStart);
+                    const qint64 clippedEnd = qMin(range.end, m_viewEnd);
+                    if (clippedEnd <= clippedStart) continue;
+                    if (cursor < clippedStart) {
+                        drawFallbackLodRange(cursor, clippedStart, selectedLodIndex + 1);
+                    }
+                    drawLodSampleRange(*lodLevel, clippedStart, clippedEnd);
+                    cursor = qMax(cursor, clippedEnd);
+                    drewLodRange = true;
+                }
+                if (cursor < m_viewEnd) {
+                    drawFallbackLodRange(cursor, m_viewEnd, selectedLodIndex + 1);
+                }
+                if (!drewLodRange) {
+                    drawFallbackLodRange(m_viewStart, m_viewEnd, selectedLodIndex + 1);
                 }
                 continue;
             }
@@ -1427,39 +1748,39 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                 const int x1 = fastX(start);
                 const int x2 = qMax(x1 + 1, fastX(end));
                 const int drawW = qMax(1, x2 - x1);
+                const int right = x1 + drawW - 1;
+                auto drawMaskLine = [&](int y, const QColor& color) {
+                    p.setPen(waveStrokePen(color));
+                    p.drawLine(x1, y, right, y);
+                };
                 const quint8 normalMask = quint8(mask & (kWaveLodSeenZero | kWaveLodSeenNonZero | kWaveLodSeenZ));
                 if (mask & kWaveLodSeenAbsent) {
-                    p.fillRect(QRect(x1, yMid, drawW, 1), absentColor);
+                    drawMaskLine(yMid, absentColor);
                 }
                 if (normalMask == 0u) return;
                 const QColor fill = (normalMask & kWaveLodSeenZ)
                     ? QColor(40, 90, 120, 220)
                     : (isSelectedRow ? waveGreen.lighter(130) : waveGreen);
-                if (normalMask == kWaveLodSeenZero) {
-                    p.fillRect(QRect(x1, yLow - 1, drawW, 3), fill);
-                } else if (normalMask == kWaveLodSeenNonZero) {
-                    p.fillRect(QRect(x1, yHigh - 1, drawW, 3), fill);
-                } else if (normalMask == kWaveLodSeenZ) {
-                    p.fillRect(QRect(x1, yMid - 1, drawW, 3), fill);
-                } else {
-                    int top = yMid - 1;
-                    int bottom = yMid + 1;
-                    if (normalMask & kWaveLodSeenNonZero) { top = qMin(top, yHigh - 1); bottom = qMax(bottom, yHigh + 1); }
-                    if (normalMask & kWaveLodSeenZero) { top = qMin(top, yLow - 1); bottom = qMax(bottom, yLow + 1); }
-                    if (normalMask & kWaveLodSeenZ) { top = qMin(top, yMid - 1); bottom = qMax(bottom, yMid + 1); }
-                    p.fillRect(QRect(x1, top, drawW, qMax(3, bottom - top + 1)), fill);
+                if ((normalMask & kWaveLodSeenZero) && (normalMask & kWaveLodSeenNonZero)) {
+                    drawBitTransitionSpan(p, x1, x2, yHigh, yLow, fill);
+                    if (normalMask & kWaveLodSeenZ) drawMaskLine(yMid, fill);
+                    return;
                 }
+                if (normalMask & kWaveLodSeenZero) drawMaskLine(yLow, fill);
+                if (normalMask & kWaveLodSeenNonZero) drawMaskLine(yHigh, fill);
+                if (normalMask & kWaveLodSeenZ) drawMaskLine(yMid, fill);
             };
 
             const int yBusTop = yTop + 8;
             const int yBusBottom = yTop + m_rowHeight - 8;
+            const int denseActivityMiniFrameMaxWidth = 6;
             auto drawBusStableRange = [&](quint64 rawBits, qint64 start, qint64 end) {
                 if (end <= start) return;
                 const int x1 = fastX(start);
                 const int x2 = qMax(x1 + 1, fastX(end));
                 const QColor color = isSelectedRow ? waveGreen.lighter(130) : waveGreen;
                 drawBusRoundedFrame(p, QRect(x1, yBusTop, qMax(1, x2 - x1), qMax(1, yBusBottom - yBusTop)),
-                                    color, isSelectedRow ? 1.9 : 1.5, Qt::NoBrush,
+                                    color, kWaveStrokeWidth, Qt::NoBrush,
                                     start > m_viewStart, end < m_viewEnd);
                 const QRect textRect(x1 + 6, yTop + 3, qMax(1, x2 - x1 - 12), m_rowHeight - 6);
                 if (textRect.width() > 48) {
@@ -1472,10 +1793,17 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                 if (end <= start) return;
                 const int x1 = fastX(start);
                 const int x2 = qMax(x1 + 1, fastX(end));
-                const QColor fill = isSelectedRow ? QColor(68, 190, 118, 140) : QColor(34, 197, 94, 120);
+                QColor fill = isSelectedRow ? QColor(68, 190, 118, 140) : QColor(34, 197, 94, 120);
+                const QColor color = isSelectedRow ? waveGreen.lighter(130) : waveGreen;
+                if (x2 - x1 <= denseActivityMiniFrameMaxWidth) {
+                    QColor denseFill = fill;
+                    drawDenseBusMiniFrame(p, x1, x2, yBusTop, yBusBottom,
+                                          color, denseFill, kWaveStrokeWidth);
+                    return;
+                }
                 drawBusRoundedFrame(p, QRect(x1, yBusTop, qMax(1, x2 - x1), qMax(1, yBusBottom - yBusTop)),
-                                    isSelectedRow ? waveGreen.lighter(130) : waveGreen,
-                                    isSelectedRow ? 1.9 : 1.5, QBrush(fill),
+                                    color,
+                                    kWaveStrokeWidth, QBrush(fill),
                                     start > m_viewStart, end < m_viewEnd);
                 const QRect textRect(x1 + 4, yTop + 3, qMax(1, x2 - x1 - 8), m_rowHeight - 6);
                 if (textRect.width() > 76) {
@@ -1534,153 +1862,37 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
 
         if (sig.kind == SignalKind::Bit) {
             const int visibleCount = lastExclusive - firstIdx;
-            const bool highDensityBit = visibleCount > qMax(160, plotWidth * 2);
-
-            if (highDensityBit) {
-                const WaveSample* sampleData = sig.samples.constData();
+            {
                 std::vector<int> lowDiff(plotWidth + 1, 0);
                 std::vector<int> highDiff(plotWidth + 1, 0);
                 std::vector<int> zDiff(plotWidth + 1, 0);
                 std::vector<int> absentDiff(plotWidth + 1, 0);
 
-                auto addBitRange = [&](quint8 mask, int x1, int x2) {
-                    if (mask == 0u) return;
-                    int clampedX1 = x1;
-                    int clampedX2 = x2;
-                    if (clampedX1 < plotLeft) clampedX1 = plotLeft;
-                    if (clampedX1 > plotRight) clampedX1 = plotRight;
-                    if (clampedX2 < plotLeft + 1) clampedX2 = plotLeft + 1;
-                    if (clampedX2 > plotRight + 1) clampedX2 = plotRight + 1;
-                    if (clampedX2 <= clampedX1) return;
-                    const int a = clampedX1 - plotLeft;
-                    const int b = clampedX2 - plotLeft;
-                    if (mask & 0x1u) { ++lowDiff[a];  --lowDiff[b]; }
-                    if (mask & 0x2u) { ++highDiff[a]; --highDiff[b]; }
-                    if (mask & 0x4u) { ++zDiff[a];    --zDiff[b]; }
-                    if (mask & 0x8u) { ++absentDiff[a]; --absentDiff[b]; }
+                struct VerticalSpan {
+                    int minY = std::numeric_limits<int>::max();
+                    int maxY = std::numeric_limits<int>::min();
                 };
+                std::vector<VerticalSpan> knownVertical(plotWidth);
+                std::vector<VerticalSpan> selectedVertical(plotWidth);
+                std::vector<VerticalSpan> zVertical(plotWidth);
+                std::vector<VerticalSpan> absentVertical(plotWidth);
 
-                const QVector<int> sampled = collectSampleIndicesForWindow(sig, entry.signalIndex, m_viewStart, m_viewEnd, 2000);
-                quint8 prevMask = (firstIdx > 0) ? classifyBitStateCode(sampleData[firstIdx - 1]) : 0u;
-                for (int s = 0; s < sampled.size(); ++s) {
-                    const int i = sampled.at(s);
-                    const WaveSample& ws = sampleData[i];
-                    const qint64 t0 = ws.time;
-                    qint64 t1 = m_viewEnd;
-                    if (s + 1 < sampled.size()) t1 = sampleData[sampled.at(s + 1)].time;
-                    else if (i + 1 < sig.samples.size()) t1 = sampleData[i + 1].time;
-                    else t1 = fullEnd();
-                    const qint64 segStart = qMax(t0, m_viewStart);
-                    const qint64 segEnd = qMin(t1, m_viewEnd);
-                    const quint8 curMask = classifyBitStateCode(ws);
-                    if (segEnd > segStart) {
-                        const int x1 = fastX(segStart);
-                        const int x2 = qMax(x1 + 1, fastX(segEnd));
-                        addBitRange(curMask, x1, x2);
-                    }
-
-                    if (s > 0 && t0 >= m_viewStart && t0 <= m_viewEnd) {
-                        const int xs = fastX(t0);
-                        addBitRange(quint8(prevMask | curMask), xs, xs + 1);
-                    }
-                    prevMask = curMask;
-                }
-
-                const QColor knownFill = isSelectedRow ? waveGreen.lighter(130) : waveGreen;
-                const QColor zFill(40, 90, 120, 220);
-
-                int lowAcc = 0;
-                int highAcc = 0;
-                int zAcc = 0;
-                int absentAcc = 0;
-                int runStart = -1;
-                quint8 runMask = 0u;
-
-                auto flushMaskRun = [&](int xStart, int xEnd, quint8 mask) {
-                    if (mask == 0u || xEnd <= xStart) return;
-                    const int drawX = plotLeft + xStart;
-                    const int drawW = qMax(1, xEnd - xStart);
-                    if (mask & 0x8u) {
-                        p.fillRect(QRect(drawX, yMid, drawW, 1), absentColor);
-                    }
-                    const quint8 normalMask = quint8(mask & 0x7u);
-                    if (normalMask == 0u) return;
-                    const QColor fill = (normalMask & 0x4u) ? zFill : knownFill;
-                    if (normalMask == 0x1u) {
-                        p.fillRect(QRect(drawX, yLow - 1, drawW, 3), fill);
-                    }
-                    else if (normalMask == 0x2u) {
-                        p.fillRect(QRect(drawX, yHigh - 1, drawW, 3), fill);
-                    }
-                    else if (normalMask == 0x4u) {
-                        p.fillRect(QRect(drawX, yMid - 1, drawW, 3), fill);
-                    }
-                    else {
-                        int top = yMid - 1;
-                        int bottom = yMid + 1;
-                        if (normalMask & 0x2u) { top = qMin(top, yHigh - 1); bottom = qMax(bottom, yHigh + 1); }
-                        if (normalMask & 0x1u) { top = qMin(top, yLow - 1); bottom = qMax(bottom, yLow + 1); }
-                        if (normalMask & 0x4u) { top = qMin(top, yMid - 1); bottom = qMax(bottom, yMid + 1); }
-                        p.fillRect(QRect(drawX, top, drawW, qMax(3, bottom - top + 1)), fill);
-                    }
+                auto bitYForState = [&](QChar state) {
+                    return (state == QLatin1Char('1')) ? yHigh : ((state == QLatin1Char('0')) ? yLow : yMid);
                 };
-
-                for (int x = 0; x < plotWidth; ++x) {
-                    lowAcc += lowDiff[x];
-                    highAcc += highDiff[x];
-                    zAcc += zDiff[x];
-                    absentAcc += absentDiff[x];
-                    quint8 mask = 0u;
-                    if (lowAcc > 0) mask |= 0x1u;
-                    if (highAcc > 0) mask |= 0x2u;
-                    if (zAcc > 0) mask |= 0x4u;
-                    if (absentAcc > 0) mask |= 0x8u;
-
-                    if (x == 0) {
-                        runMask = mask;
-                        runStart = 0;
-                        continue;
-                    }
-                    if (mask != runMask) {
-                        flushMaskRun(runStart, x, runMask);
-                        runStart = x;
-                        runMask = mask;
-                    }
-                }
-                flushMaskRun(runStart, plotWidth, runMask);
-            }
-            else {
-                QVector<QLine> knownSolid;
-                QVector<QLine> selectedSolid;
-                QVector<QLine> zDashed;
-                QVector<QLine> absentSolid;
-                knownSolid.reserve((lastExclusive - firstIdx) * 2);
-                selectedSolid.reserve((lastExclusive - firstIdx) * 2);
-                zDashed.reserve((lastExclusive - firstIdx) / 2 + 4);
-                absentSolid.reserve((lastExclusive - firstIdx) / 2 + 4);
-
-                int lastKnownVerticalX = std::numeric_limits<int>::min();
-                int lastSelectedVerticalX = std::numeric_limits<int>::min();
-                int lastZVerticalX = std::numeric_limits<int>::min();
-                int lastAbsentVerticalX = std::numeric_limits<int>::min();
-                int knownVerticalIndex = -1;
-                int selectedVerticalIndex = -1;
-                int zVerticalIndex = -1;
-                int absentVerticalIndex = -1;
-
-                auto appendMergedVertical = [](QVector<QLine>& lines, int& lastX, int& lineIndex, int x, int y1, int y2) {
-                    if (lines.isEmpty() || lineIndex < 0 || lastX != x) {
-                        lines.push_back(QLine(x, qMin(y1, y2), x, qMax(y1, y2)));
-                        lineIndex = lines.size() - 1;
-                        lastX = x;
-                    }
-                    else {
-                        QLine& ln = lines[lineIndex];
-                        const int ny1 = qMin(qMin(ln.y1(), ln.y2()), qMin(y1, y2));
-                        const int ny2 = qMax(qMax(ln.y1(), ln.y2()), qMax(y1, y2));
-                        ln.setP1(QPoint(x, ny1));
-                        ln.setP2(QPoint(x, ny2));
-                    }
+                auto markHorizontal = [&](std::vector<int>& diff, int x1, int x2) {
+                    int a = qBound(plotLeft, x1, plotRight) - plotLeft;
+                    int b = qBound(plotLeft + 1, qMax(x1 + 1, x2), plotRight + 1) - plotLeft;
+                    if (b <= a) b = qMin(plotWidth, a + 1);
+                    ++diff[a];
+                    --diff[b];
+                };
+                auto markVertical = [&](std::vector<VerticalSpan>& spans, int x, int y1, int y2) {
+                    if (x < plotLeft || x > plotRight) return;
+                    const int idx = x - plotLeft;
+                    VerticalSpan& span = spans[idx];
+                    span.minY = qMin(span.minY, qMin(y1, y2));
+                    span.maxY = qMax(span.maxY, qMax(y1, y2));
                 };
 
                 for (int i = firstIdx; i < lastExclusive; ++i) {
@@ -1691,39 +1903,35 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     if (segEnd <= segStart) continue;
 
                     const QChar state = classifyBitStateChar(sig.samples.at(i));
-                    const int y = (state == QLatin1Char('1')) ? yHigh : ((state == QLatin1Char('0')) ? yLow : yMid);
+                    const int y = bitYForState(state);
                     const bool isZ = (state == QLatin1Char('z'));
                     const bool isAbsent = (state == QLatin1Char('a'));
-                    QVector<QLine>& target = isAbsent ? absentSolid : (isZ ? zDashed : (isSelectedRow ? selectedSolid : knownSolid));
 
                     const int x1 = fastX(segStart);
                     const int x2 = fastX(segEnd);
+                    if (isAbsent) markHorizontal(absentDiff, x1, x2);
+                    else if (isZ) markHorizontal(zDiff, x1, x2);
+                    else if (state == QLatin1Char('1')) markHorizontal(highDiff, x1, x2);
+                    else markHorizontal(lowDiff, x1, x2);
 
                     if (i > 0 && t0 >= m_viewStart && t0 <= m_viewEnd) {
                         const QChar prevState = classifyBitStateChar(sig.samples.at(i - 1));
-                        const int py = (prevState == QLatin1Char('1')) ? yHigh : ((prevState == QLatin1Char('0')) ? yLow : yMid);
+                        const int py = bitYForState(prevState);
                         if (py != y || prevState != state) {
                             const int xs = fastX(t0);
                             if (isAbsent || prevState == QLatin1Char('a')) {
-                                appendMergedVertical(absentSolid, lastAbsentVerticalX, absentVerticalIndex, xs, py, y);
+                                markVertical(absentVertical, xs, py, y);
                             }
                             else if (isZ || prevState == QLatin1Char('z')) {
-                                appendMergedVertical(zDashed, lastZVerticalX, zVerticalIndex, xs, py, y);
+                                markVertical(zVertical, xs, py, y);
                             }
                             else if (isSelectedRow) {
-                                appendMergedVertical(selectedSolid, lastSelectedVerticalX, selectedVerticalIndex, xs, py, y);
+                                markVertical(selectedVertical, xs, py, y);
                             }
                             else {
-                                appendMergedVertical(knownSolid, lastKnownVerticalX, knownVerticalIndex, xs, py, y);
+                                markVertical(knownVertical, xs, py, y);
                             }
                         }
-                    }
-
-                    if (x2 > x1) {
-                        target.push_back(QLine(x1, y, x2, y));
-                    }
-                    else if (target.isEmpty() || target.constLast().x1() != x1 || target.constLast().y1() != y || target.constLast().y2() != y) {
-                        target.push_back(QLine(x1, y, x1 + 1, y));
                     }
 
                     if (isZ && (x2 - x1) >= 18) {
@@ -1733,31 +1941,49 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     }
                 }
 
-                if (!knownSolid.isEmpty()) {
-                    p.setPen(QPen(waveGreen, isSelectedRow ? 2.8 : 2.2, Qt::SolidLine, Qt::SquareCap));
-                    p.drawLines(knownSolid);
-                }
-                if (!selectedSolid.isEmpty()) {
-                    p.setPen(QPen(selectedKnownColor, 2.8, Qt::SolidLine, Qt::SquareCap));
-                    p.drawLines(selectedSolid);
-                }
-                if (!zDashed.isEmpty()) {
-                    p.setPen(QPen(zColor, isSelectedRow ? 2.8 : 2.2, Qt::DashLine, Qt::SquareCap));
-                    p.drawLines(zDashed);
-                }
-                if (!absentSolid.isEmpty()) {
-                    p.setPen(QPen(absentColor, isSelectedRow ? 2.8 : 2.2, Qt::SolidLine, Qt::SquareCap));
-                    p.drawLines(absentSolid);
-                }
+                auto drawHorizontalRuns = [&](const std::vector<int>& diff, int y, const QColor& color, Qt::PenStyle style = Qt::SolidLine) {
+                    p.setPen(waveStrokePen(color, style));
+                    int acc = 0;
+                    int runStart = -1;
+                    for (int x = 0; x < plotWidth; ++x) {
+                        acc += diff[x];
+                        const bool active = acc > 0;
+                        if (active && runStart < 0) runStart = x;
+                        if ((!active || x + 1 == plotWidth) && runStart >= 0) {
+                            const int endX = active && x + 1 == plotWidth ? x : x - 1;
+                            p.drawLine(plotLeft + runStart, y, plotLeft + qMax(runStart, endX), y);
+                            runStart = -1;
+                        }
+                    }
+                };
+                auto drawVerticalSpans = [&](const std::vector<VerticalSpan>& spans, const QColor& color, Qt::PenStyle style = Qt::SolidLine) {
+                    p.setPen(waveStrokePen(color, style));
+                    for (int x = 0; x < plotWidth; ++x) {
+                        const VerticalSpan& span = spans[x];
+                        if (span.minY <= span.maxY) {
+                            p.drawLine(plotLeft + x, span.minY, plotLeft + x, span.maxY);
+                        }
+                    }
+                };
+
+                const QColor knownColor = isSelectedRow ? selectedKnownColor : waveGreen;
+                drawHorizontalRuns(lowDiff, yLow, knownColor);
+                drawHorizontalRuns(highDiff, yHigh, knownColor);
+                drawHorizontalRuns(zDiff, yMid, zColor, Qt::DashLine);
+                drawHorizontalRuns(absentDiff, yMid, absentColor);
+                drawVerticalSpans(knownVertical, waveGreen);
+                drawVerticalSpans(selectedVertical, selectedKnownColor);
+                drawVerticalSpans(zVertical, zColor, Qt::DashLine);
+                drawVerticalSpans(absentVertical, absentColor);
             }
         }
         else {
             const int visibleCount = lastExclusive - firstIdx;
-            const int plotWidth = qMax(1, width() - 2 * m_padX);
+            const int plotWidth = plotSpanPx;
             const bool lowDensity = visibleCount <= qMax(40, plotWidth / 3);
-            const bool highDensity = visibleCount > qMax(80, plotWidth * 2 / 5);
+            const bool highDensity = visibleCount > qMax(4000, plotWidth * 8);
             const bool mediumDensity = !lowDensity && !highDensity;
-            const qreal penWidth = isSelectedRow ? 1.9 : 1.5;
+            const qreal penWidth = kWaveStrokeWidth;
             const int yBusTop = yTop + 8;
             const int yBusBottom = yTop + m_rowHeight - 8;
 
@@ -1815,6 +2041,19 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                 knownFrames.reserve(sampled.size());
                 zFrames.reserve(sampled.size() / 2 + 4);
                 absentRects.reserve(sampled.size() / 4 + 4);
+                enum class DenseMiniFrameKind { Known, Z, Absent };
+                const int denseMiniFrameMaxWidth = 6;
+                const QColor highDensityZColor(255, 72, 72);
+                auto denseMiniFrameLineColor = [&](DenseMiniFrameKind kind) {
+                    if (kind == DenseMiniFrameKind::Z) return highDensityZColor;
+                    if (kind == DenseMiniFrameKind::Absent) return absentColor;
+                    return isSelectedRow ? waveGreen.lighter(130) : waveGreen;
+                };
+                auto denseMiniFrameFillColor = [&](DenseMiniFrameKind kind) {
+                    QColor fill = denseMiniFrameLineColor(kind);
+                    fill.setAlpha(kind == DenseMiniFrameKind::Absent ? 80 : (kind == DenseMiniFrameKind::Z ? 95 : (isSelectedRow ? 105 : 88)));
+                    return fill;
+                };
 
                 for (int s = 0; s < sampled.size(); ++s) {
                     const int i = sampled.at(s);
@@ -1831,6 +2070,14 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     const WaveSample& curSample = sig.samples.at(i);
                     const QRect frameRect(x1, yBusTop, qMax(1, x2 - x1), qMax(1, yBusBottom - yBusTop));
                     const BusFrame frame{ frameRect, t0 > m_viewStart, t1 < m_viewEnd };
+                    if (x2 - x1 <= denseMiniFrameMaxWidth) {
+                        const DenseMiniFrameKind kind = sampleIsAbsentState(curSample) ? DenseMiniFrameKind::Absent :
+                            (sampleContainsUnknownState(curSample) ? DenseMiniFrameKind::Z : DenseMiniFrameKind::Known);
+                        drawDenseBusMiniFrame(p, x1, x2, yBusTop, yBusBottom,
+                                              denseMiniFrameLineColor(kind), denseMiniFrameFillColor(kind),
+                                              kWaveStrokeWidth);
+                        continue;
+                    }
                     if (sampleIsAbsentState(curSample)) {
                         absentRects.push_back(frame);
                     }
@@ -1843,7 +2090,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                 }
 
                 drawBusRoundedFrames(p, knownFrames, isSelectedRow ? waveGreen.lighter(130) : waveGreen, penWidth);
-                drawBusRoundedFrames(p, zFrames, QColor(255, 72, 72), penWidth);
+                drawBusRoundedFrames(p, zFrames, highDensityZColor, penWidth);
                 drawBusRoundedFrames(p, absentRects, absentColor, penWidth);
             }
         }
@@ -2001,7 +2248,7 @@ void WaveCanvas::mouseMoveEvent(QMouseEvent* event) {
     }
 
     if (m_dragging) {
-        const double usable = width() - 2.0 * m_padX;
+        const double usable = double(plotSpanPxForWidth(width(), m_padX));
         const double dx = mouseEventXCompat(event) - m_dragStartPos.x();
         if (!m_panDragMoved && std::abs(dx) < 4) {
             event->accept();

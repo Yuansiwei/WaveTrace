@@ -75,6 +75,33 @@ inline BoolStoragePtr<T> as_bool_storage_ptr(const T* p) noexcept {
 
 namespace detail {
 
+struct UnionFieldTag {};
+
+struct UnionFieldBase {
+    explicit UnionFieldBase(const void* p) : ptr(p) {}
+    const void* ptr;
+};
+
+template <typename Visitor, typename Ptr, typename... Meta>
+auto invoke_ptr_visitor_impl(int, Visitor&& visitor, const char* name, Ptr ptr, Meta&&... meta)
+    -> decltype(visitor(name, ptr, std::forward<Meta>(meta)...), void()) {
+    visitor(name, ptr, std::forward<Meta>(meta)...);
+}
+
+template <typename Visitor, typename Ptr, typename... Meta>
+void invoke_ptr_visitor_impl(long, Visitor&& visitor, const char* name, Ptr ptr, Meta&&...) {
+    visitor(name, ptr);
+}
+
+template <typename Visitor, typename Ptr, typename... Meta>
+void invoke_ptr_visitor(Visitor&& visitor, const char* name, Ptr ptr, Meta&&... meta) {
+    invoke_ptr_visitor_impl(0,
+                            std::forward<Visitor>(visitor),
+                            name,
+                            ptr,
+                            std::forward<Meta>(meta)...);
+}
+
 template <typename T>
 struct is_bool_storage_ptr : std::false_type {};
 

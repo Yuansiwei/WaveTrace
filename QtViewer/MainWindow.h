@@ -10,6 +10,7 @@
 #include <memory>
 
 class QLabel;
+class QDialog;
 class QLineEdit;
 class QPushButton;
 class QIcon;
@@ -18,6 +19,7 @@ class QTimer;
 class QAbstractItemModel;
 class QModelIndex;
 class QTreeView;
+class QTreeWidget;
 class QTreeWidgetItem;
 class WaveCanvas;
 class ActiveSignalListWidget;
@@ -28,7 +30,7 @@ class MainWindow : public QMainWindow {
 public:
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override;
-    bool openWaveFilePath(const QString& path);
+    bool openWaveFilePath(const QString& path, bool showError = true);
 
 private:
     void openWaveFile();
@@ -41,6 +43,11 @@ private:
     void jumpToPrevChange();
     void jumpToNextChange();
     void jumpToTime();
+    void openDerivedSignalDialog();
+    void openValueFindDialog();
+    void runValueFind();
+    void jumpToPreviousValueFindHit();
+    void jumpToNextValueFindHit();
     void resetView();
 
     void onAddSelectedFromTree();
@@ -61,6 +68,12 @@ private:
         RoleSignalIndex = Qt::UserRole,
         RoleSignalWidth,
         RoleCurrentFormat
+    };
+
+    struct ValueFindHit {
+        int signalIndex = -1;
+        int sampleIndex = -1;
+        qint64 time = -1;
     };
 
     WaveFile m_wave;
@@ -84,19 +97,34 @@ private:
     QPushButton* m_clearActiveButton = nullptr;
     QSplitter* m_splitter = nullptr;
     QTimer* m_activeValueRefreshTimer = nullptr;
+    QDialog* m_valueFindDialog = nullptr;
+    QLineEdit* m_valueFindEdit = nullptr;
+    QLabel* m_valueFindSummaryLabel = nullptr;
+    QTreeWidget* m_valueFindResults = nullptr;
+    QPushButton* m_valueFindPrevButton = nullptr;
+    QPushButton* m_valueFindNextButton = nullptr;
+    QVector<ValueFindHit> m_valueFindHits;
+    QList<int> m_valueFindSignalIndexes;
+    QString m_valueFindSummaryBase;
+    int m_valueFindCurrentHit = -1;
     std::unique_ptr<SignalLogicTree> m_signalTreeModel;
 
     void buildUi();
     void applyTheme();
     void setupToolbarButton(QPushButton* button, const QIcon& icon, const QString& objectName, const QString& tip);
     void loadDemoWave();
-    void applyWave(const WaveFile& wave);
+    void applyWave(WaveFile&& wave);
     void updateMetaLabel();
 
     void rebuildTree();
     void resetTreeViewModel();
     void collectSignalIndexesFromLogicNode(int nodeId, QSet<int>& seen, QList<int>& output) const;
     QList<int> selectedActiveSignalIndexesForJump() const;
+    QList<int> selectedActiveSignalIndexesForFind() const;
+    void rebuildValueFindResults();
+    void updateValueFindNavigationState();
+    void jumpToValueFindHit(int hitIndex);
+    void jumpToAdjacentValueFindHit(bool forward);
     void showTreeSearchResults(const QString& query);
     void rebuildActiveListRows();
     void rebuildVisibleSignals();
@@ -108,6 +136,7 @@ private:
     void insertSignalIntoTree(const QString& fullName, int signalIndex);
     bool canDeferSamplesWithLod(const WaveSignal& sig) const;
     bool ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool allowLodDefer = true);
+    bool createDerivedSignal(const QString& name, const QString& expression, int widthOverride);
 
     void addSignalToActive(int signalIndex);
     void addSignalIndexesToActive(const QList<int>& signalIndexes);

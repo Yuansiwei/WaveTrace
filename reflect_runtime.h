@@ -328,7 +328,7 @@ void serialize_object(std::ostream& out, const T* obj, VisitSet& visited) {
             emit_key(name);
             serialize_value(out, value, visited);
         },
-        [&](const char* name, auto getter) {
+        [&](const char* name, auto getter, auto...) {
             emit_key(name);
             serialize_value(out, getter(obj), visited);
         });
@@ -367,4 +367,3 @@ std::string to_json(const T& obj) {
 #pragma pop_macro("min")
 #undef REFLECT_RUNTIME_RESTORE_MIN_MACRO_
 #endif
-

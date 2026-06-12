@@ -75,7 +75,10 @@ namespace
         std::string declQualifiedName;
         CX_CXXAccessSpecifier access = CX_CXXInvalidAccessSpecifier;
         bool isBitField = false;
+        bool isUnionField = false;
         int bitWidth = -1;
+        long long bitOffset = -1;
+        long long unionStorageBytes = -1;
     };
 
     struct TemplateParamInfo
@@ -108,6 +111,7 @@ namespace
         bool useReflectAccessAlias = false;
         std::string reflectAccessAliasName;
         bool isStruct = false;
+        bool isUnion = false;
         // True only for C-style anonymous typedef records such as:
         //   typedef struct { ... } Foo;
         // Such aliases do not have a real tag name, so generated type references
@@ -288,7 +292,10 @@ namespace
         std::string displayName;
         std::string typeName;
         bool isBitField = false;
+        bool isUnionField = false;
         int bitWidth = -1;
+        long long bitOffset = -1;
+        long long unionStorageBytes = -1;
         bool exprIsPointerAlready = false;
         bool asBoolStorage = false;
         std::string constExpr;
@@ -408,6 +415,10 @@ namespace
     bool IsInsideUnionByParentChain(CXCursor cursor, bool semantic);
 
     bool IsInsideUnion(CXCursor cursor);
+
+    CXCursor FindEnclosingUnionCursor(CXCursor cursor);
+
+    long long AnonymousUnionStorageBytesForField(CXCursor fieldCursor, CXCursor ownerRecordCursor, bool ownerIsUnion);
 
     bool IsUnionTypeCursor(CXCursor cursor);
 
@@ -2104,7 +2115,7 @@ namespace
 
     bool IsRecordKind(CXCursorKind kind)
     {
-        return kind == CXCursor_StructDecl || kind == CXCursor_ClassDecl;
+        return kind == CXCursor_StructDecl || kind == CXCursor_ClassDecl || kind == CXCursor_UnionDecl;
     }
 
     std::string GetQualifiedName(CXCursor cursor)
@@ -2114,7 +2125,7 @@ namespace
         {
             const CXCursorKind k = clang_getCursorKind(cur);
             if (k == CXCursor_TranslationUnit) break;
-            if (k == CXCursor_Namespace || k == CXCursor_StructDecl || k == CXCursor_ClassDecl || k == CXCursor_ClassTemplate || k == CXCursor_TypedefDecl)
+            if (k == CXCursor_Namespace || k == CXCursor_StructDecl || k == CXCursor_ClassDecl || k == CXCursor_UnionDecl || k == CXCursor_ClassTemplate || k == CXCursor_TypedefDecl)
             {
                 std::string name = ToStdString(clang_getCursorSpelling(cur));
                 if (!name.empty()) parts.push_back(name);
@@ -2179,6 +2190,7 @@ namespace
     bool IsRecordLikeCursorKind(CXCursorKind kind)
     {
         return kind == CXCursor_StructDecl ||
+            kind == CXCursor_UnionDecl ||
             kind == CXCursor_ClassDecl ||
             kind == CXCursor_ClassTemplate;
     }
@@ -2218,6 +2230,53 @@ namespace
         // emitted as if they were normal obj->field members.
         return IsInsideUnionByParentChain(cursor, true) ||
             IsInsideUnionByParentChain(cursor, false);
+    }
+
+    CXCursor FindEnclosingUnionCursor(CXCursor cursor)
+    {
+        for (CXCursor cur = clang_getCursorLexicalParent(cursor);
+             !clang_Cursor_isNull(cur);
+             cur = clang_getCursorLexicalParent(cur))
+        {
+            const CXCursorKind k = clang_getCursorKind(cur);
+            if (k == CXCursor_TranslationUnit) break;
+            if (k == CXCursor_UnionDecl) return cur;
+        }
+
+        for (CXCursor cur = clang_getCursorSemanticParent(cursor);
+             !clang_Cursor_isNull(cur);
+             cur = clang_getCursorSemanticParent(cur))
+        {
+            const CXCursorKind k = clang_getCursorKind(cur);
+            if (k == CXCursor_TranslationUnit) break;
+            if (k == CXCursor_UnionDecl) return cur;
+        }
+
+        return clang_getNullCursor();
+    }
+
+    long long AnonymousUnionStorageBytesForField(CXCursor fieldCursor, CXCursor ownerRecordCursor, bool ownerIsUnion)
+    {
+        if (ownerIsUnion) return -1;
+        if (clang_getCursorKind(fieldCursor) != CXCursor_FieldDecl) return -1;
+        if (!IsInsideUnion(fieldCursor)) return -1;
+
+        CXCursor semParent = clang_getCursorSemanticParent(fieldCursor);
+        if (clang_Cursor_isNull(semParent) ||
+            !clang_equalCursors(semParent, ownerRecordCursor))
+        {
+            return -1;
+        }
+
+        const CXCursor unionCursor = FindEnclosingUnionCursor(fieldCursor);
+        if (clang_Cursor_isNull(unionCursor) ||
+            clang_getCursorKind(unionCursor) != CXCursor_UnionDecl)
+        {
+            return -1;
+        }
+
+        const long long size = clang_Type_getSizeOf(clang_getCursorType(unionCursor));
+        return size > 0 ? size : -1;
     }
 
     bool IsUnionTypeCursor(CXCursor cursor)
@@ -2542,7 +2601,7 @@ namespace
     std::string GetRecordSkipReason(CXCursor cursor, const CollectContext& ctx)
     {
         const CXCursorKind kind = clang_getCursorKind(cursor);
-        if (!IsRecordKind(kind)) return "not class/struct cursor";
+        if (!IsRecordKind(kind)) return "not class/struct/union cursor";
         if (clang_getCursorKind(clang_getCursorSemanticParent(cursor)) == CXCursor_ClassTemplate)
         {
             return "template backing record; handled by ClassTemplate cursor";
@@ -2783,6 +2842,119 @@ namespace
         return !GetRecordSkipReason(cursor, ctx).empty();
     }
 
+    bool RecordHasCollectedFieldName(const RecordInfo& rec, const std::string& name)
+    {
+        for (std::size_t i = 0; i < rec.fields.size(); ++i)
+        {
+            if (rec.fields[i].name == name) return true;
+        }
+        return false;
+    }
+
+    void CollectAnonymousUnionFields(CXTranslationUnit tu,
+                                     CXCursor ownerRecordCursor,
+                                     CXCursor unionCursor,
+                                     RecordInfo& rec,
+                                     CollectContext* ctx,
+                                     bool* foundBody)
+    {
+        if (rec.isUnion) return;
+        if (clang_getCursorKind(unionCursor) != CXCursor_UnionDecl) return;
+
+        const std::string unionName = ToStdString(clang_getCursorSpelling(unionCursor));
+        if (!unionName.empty() && !LooksLikeLibclangAnonymousName(unionName)) return;
+
+        CXCursor semParent = clang_getCursorSemanticParent(unionCursor);
+        if (!clang_Cursor_isNull(semParent) &&
+            !clang_equalCursors(semParent, ownerRecordCursor))
+        {
+            return;
+        }
+
+        const long long unionStorageBytes = clang_Type_getSizeOf(clang_getCursorType(unionCursor));
+        if (unionStorageBytes <= 0)
+        {
+            if (ctx) ++ctx->fieldsSkippedSystemC;
+            PrintCursorDebugLine("[anonymous union skipped]", unionCursor,
+                "reason=storage-size-unavailable owner=[" + rec.qualifiedName + "]");
+            return;
+        }
+
+        struct Payload
+        {
+            CXTranslationUnit tu;
+            CXCursor ownerRecordCursor;
+            RecordInfo* out;
+            CollectContext* ctx;
+            bool* foundBody;
+            long long unionStorageBytes;
+        } payload{ tu, ownerRecordCursor, &rec, ctx, foundBody, unionStorageBytes };
+
+        clang_visitChildren(
+            unionCursor,
+            [](CXCursor child, CXCursor, CXClientData clientData) {
+                Payload* payload = static_cast<Payload*>(clientData);
+                RecordInfo* out = payload->out;
+                CollectContext* ctx = payload->ctx;
+                const CXCursorKind kind = clang_getCursorKind(child);
+                if (kind != CXCursor_FieldDecl) return CXChildVisit_Continue;
+
+                FieldInfo f;
+                f.name = ToStdString(clang_getCursorSpelling(child));
+                if (f.name.empty())
+                {
+                    if (ctx) ++ctx->fieldsSkippedEmptyName;
+                    PrintCursorDebugLine("[field skipped]", child, "reason=anonymous-union-empty-name owner=[" + out->qualifiedName + "]");
+                    return CXChildVisit_Continue;
+                }
+                if (RecordHasCollectedFieldName(*out, f.name))
+                {
+                    PrintCursorDebugLine("[field skipped]", child, "reason=anonymous-union-duplicate-injected-field owner=[" + out->qualifiedName + "] field=[" + f.name + "]");
+                    return CXChildVisit_Continue;
+                }
+
+                CXType fieldType = clang_getCursorType(child);
+                f.typeName = ToStdString(clang_getTypeSpelling(fieldType));
+                f.canonicalTypeName = ToStdString(clang_getTypeSpelling(clang_getCanonicalType(fieldType)));
+                f.declQualifiedName = GetTypeDeclarationQualifiedName(fieldType);
+                if (ShouldSkipFieldType(f.typeName))
+                {
+                    if (ctx) ++ctx->fieldsSkippedSystemC;
+                    PrintCursorDebugLine("[field skipped]", child, "reason=anonymous-union-systemc-non-whitelist owner=[" + out->qualifiedName + "] field=[" + f.name + "] type=[" + f.typeName + "]");
+                    return CXChildVisit_Continue;
+                }
+                if (!FieldTypeAccessPathIsReflectAccessible(payload->tu, child))
+                {
+                    if (IsDependentOrTemplateParamFieldType(child))
+                    {
+                        PrintCursorDebugLine("[field kept]", child, "reason=anonymous-union-dependent-field-type-access-check-deferred owner=[" + out->qualifiedName + "] field=[" + f.name + "] type=[" + f.typeName + "] canonical=[" + f.canonicalTypeName + "]");
+                    }
+                    else
+                    {
+                        if (ctx) ++ctx->fieldsSkippedEmptyName;
+                        PrintCursorDebugLine("[field skipped]", child, "reason=anonymous-union-field-type-has-non-public-access-path owner=[" + out->qualifiedName + "] field=[" + f.name + "] type=[" + f.typeName + "] canonical=[" + f.canonicalTypeName + "]");
+                        return CXChildVisit_Continue;
+                    }
+                }
+
+                f.access = NormalizeAccess(clang_getCXXAccessSpecifier(child), out->isStruct);
+                f.isBitField = clang_Cursor_isBitField(child) != 0;
+                f.isUnionField = true;
+                f.unionStorageBytes = payload->unionStorageBytes;
+                if (f.isBitField)
+                {
+                    f.bitWidth = clang_getFieldDeclBitWidth(child);
+                    f.bitOffset = clang_Cursor_getOffsetOfField(child);
+                }
+                out->fields.push_back(f);
+                if (ctx) ++ctx->fieldsKept;
+                if (payload->foundBody) *payload->foundBody = true;
+                PrintCursorDebugLine("[field kept]", child, "owner=[" + out->qualifiedName + "] field=[" + f.name + "] type=[" + f.typeName + "] access=" + std::to_string(static_cast<int>(f.access)) + " unionStorageBytes=" + std::to_string(payload->unionStorageBytes) + " allowPrivateReflect=" + (out->allowPrivateReflect ? "yes" : "no"));
+                return CXChildVisit_Continue;
+            },
+            &payload);
+    }
+
     void CollectRecordBody(CXTranslationUnit tu, CXCursor recordCursor, RecordInfo& rec, CollectContext* ctx)
     {
         const bool friendAllowedBeforeFields = CursorHasReflectAccessFriend(tu, recordCursor);
@@ -2841,10 +3013,15 @@ namespace
 
                 if (kind == CXCursor_FieldDecl)
                 {
-                    if (IsInsideUnion(child) || IsUnionFieldCursor(child))
+                    const bool anonymousUnionInjectedField = !out->isUnion && IsInsideUnion(child);
+                    const long long anonymousUnionStorageBytes =
+                        anonymousUnionInjectedField
+                            ? AnonymousUnionStorageBytesForField(child, payload->recordCursor, out->isUnion)
+                            : -1;
+                    if (anonymousUnionInjectedField && anonymousUnionStorageBytes <= 0)
                     {
                         if (ctx) ++ctx->fieldsSkippedSystemC;
-                        PrintCursorDebugLine("[field skipped]", child, "reason=union-field-or-inside-union owner=[" + out->qualifiedName + "]");
+                        PrintCursorDebugLine("[field skipped]", child, "reason=anonymous-union-storage-size-unavailable owner=[" + out->qualifiedName + "]");
                         return CXChildVisit_Continue;
                     }
 
@@ -2866,6 +3043,11 @@ namespace
                     {
                         if (ctx) ++ctx->fieldsSkippedEmptyName;
                         PrintCursorDebugLine("[field skipped]", child, "reason=empty-name owner=[" + out->qualifiedName + "]");
+                        return CXChildVisit_Continue;
+                    }
+                    if (anonymousUnionInjectedField && RecordHasCollectedFieldName(*out, f.name))
+                    {
+                        PrintCursorDebugLine("[field skipped]", child, "reason=anonymous-union-duplicate-injected-field owner=[" + out->qualifiedName + "] field=[" + f.name + "]");
                         return CXChildVisit_Continue;
                     }
                     CXType fieldType = clang_getCursorType(child);
@@ -2893,10 +3075,22 @@ namespace
                     }
                     f.access = NormalizeAccess(clang_getCXXAccessSpecifier(child), out->isStruct);
                     f.isBitField = clang_Cursor_isBitField(child) != 0;
-                    if (f.isBitField) f.bitWidth = clang_getFieldDeclBitWidth(child);
+                    f.isUnionField = out->isUnion || anonymousUnionStorageBytes > 0;
+                    f.unionStorageBytes = anonymousUnionStorageBytes;
+                    if (f.isBitField)
+                    {
+                        f.bitWidth = clang_getFieldDeclBitWidth(child);
+                        f.bitOffset = clang_Cursor_getOffsetOfField(child);
+                    }
                     out->fields.push_back(f);
                     if (ctx) ++ctx->fieldsKept;
                     PrintCursorDebugLine("[field kept]", child, "owner=[" + out->qualifiedName + "] field=[" + f.name + "] type=[" + f.typeName + "] access=" + std::to_string(static_cast<int>(f.access)) + " allowPrivateReflect=" + (out->allowPrivateReflect ? "yes" : "no"));
+                    return CXChildVisit_Continue;
+                }
+
+                if (kind == CXCursor_UnionDecl)
+                {
+                    CollectAnonymousUnionFields(payload->tu, payload->recordCursor, child, *out, ctx, NULL);
                     return CXChildVisit_Continue;
                 }
 
@@ -2933,6 +3127,7 @@ namespace
         struct Payload
         {
             CXTranslationUnit tu;
+            CXCursor recordCursor;
             RecordInfo* out;
             bool* foundBody;
             int* unnamedCounter;
@@ -2944,6 +3139,7 @@ namespace
         bool usedNestedRecord = false;
         int unnamedTemplateParamIndex = 0;
         payload.tu = tu;
+        payload.recordCursor = cursor;
         payload.out = &rec;
         payload.foundBody = &foundBody;
         payload.unnamedCounter = &unnamedTemplateParamIndex;
@@ -3084,7 +3280,8 @@ namespace
 
                     out->bases.clear();
                     out->fields.clear();
-                    out->isStruct = (kind == CXCursor_StructDecl);
+                    out->isStruct = (kind == CXCursor_StructDecl || kind == CXCursor_UnionDecl);
+                    out->isUnion = (kind == CXCursor_UnionDecl);
                     CollectRecordBody(payload->tu, child, *out, payload->ctx);
                     *foundBody = true;
                     *usedNestedRecord = true;
@@ -3117,16 +3314,34 @@ namespace
 
                 if (!*usedNestedRecord && kind == CXCursor_FieldDecl)
                 {
-                    if (IsInsideUnion(child) || IsUnionFieldCursor(child))
+                    const bool anonymousUnionInjectedField = !out->isUnion && IsInsideUnion(child);
+                    const long long anonymousUnionStorageBytes =
+                        anonymousUnionInjectedField
+                            ? AnonymousUnionStorageBytesForField(child, payload->recordCursor, out->isUnion)
+                            : -1;
+                    if (anonymousUnionInjectedField && anonymousUnionStorageBytes <= 0)
                     {
                         if (payload->ctx) ++payload->ctx->fieldsSkippedSystemC;
-                        PrintCursorDebugLine("[field skipped]", child, "reason=union-field-or-inside-union owner=[" + out->qualifiedName + "]");
+                        PrintCursorDebugLine("[field skipped]", child, "reason=anonymous-union-storage-size-unavailable owner=[" + out->qualifiedName + "]");
+                        return CXChildVisit_Continue;
+                    }
+                    CXCursor semParent = clang_getCursorSemanticParent(child);
+                    if (!clang_Cursor_isNull(semParent) &&
+                        !clang_equalCursors(semParent, payload->recordCursor))
+                    {
+                        if (payload->ctx) ++payload->ctx->fieldsSkippedEmptyName;
+                        PrintCursorDebugLine("[field skipped]", child, "reason=semantic-parent-not-current-record owner=[" + out->qualifiedName + "]");
                         return CXChildVisit_Continue;
                     }
                     FieldInfo f;
                     f.name = ToStdString(clang_getCursorSpelling(child));
                     if (!f.name.empty())
                     {
+                        if (anonymousUnionInjectedField && RecordHasCollectedFieldName(*out, f.name))
+                        {
+                            PrintCursorDebugLine("[field skipped]", child, "reason=anonymous-union-duplicate-injected-field owner=[" + out->qualifiedName + "] field=[" + f.name + "]");
+                            return CXChildVisit_Continue;
+                        }
                         CXType fieldType = clang_getCursorType(child);
                         f.typeName = ToStdString(clang_getTypeSpelling(fieldType));
                         f.canonicalTypeName = ToStdString(clang_getTypeSpelling(clang_getCanonicalType(fieldType)));
@@ -3152,7 +3367,13 @@ namespace
                         }
                         f.access = NormalizeAccess(clang_getCXXAccessSpecifier(child), out->isStruct);
                         f.isBitField = clang_Cursor_isBitField(child) != 0;
-                        if (f.isBitField) f.bitWidth = clang_getFieldDeclBitWidth(child);
+                        f.isUnionField = out->isUnion || anonymousUnionStorageBytes > 0;
+                        f.unionStorageBytes = anonymousUnionStorageBytes;
+                        if (f.isBitField)
+                        {
+                            f.bitWidth = clang_getFieldDeclBitWidth(child);
+                            f.bitOffset = clang_Cursor_getOffsetOfField(child);
+                        }
                         out->fields.push_back(f);
                         if (payload->ctx) ++payload->ctx->fieldsKept;
                         PrintCursorDebugLine("[field kept]", child, "owner=[" + out->qualifiedName + "] field=[" + f.name + "] type=[" + f.typeName + "] access=" + std::to_string(static_cast<int>(f.access)) + " allowPrivateReflect=" + (out->allowPrivateReflect ? "yes" : "no"));
@@ -3163,6 +3384,12 @@ namespace
                         if (payload->ctx) ++payload->ctx->fieldsSkippedEmptyName;
                         PrintCursorDebugLine("[field skipped]", child, "reason=empty-name owner=[" + out->qualifiedName + "]");
                     }
+                    return CXChildVisit_Continue;
+                }
+
+                if (!*usedNestedRecord && kind == CXCursor_UnionDecl)
+                {
+                    CollectAnonymousUnionFields(payload->tu, payload->recordCursor, child, *out, payload->ctx, foundBody);
                     return CXChildVisit_Continue;
                 }
 
@@ -3201,7 +3428,6 @@ namespace
         if (!clang_Cursor_isNull(defCursor)) recordCursor = defCursor;
 
         const CXCursorKind recordKind = clang_getCursorKind(recordCursor);
-        if (recordKind == CXCursor_UnionDecl) return false;
         if (!IsRecordKind(recordKind)) return false;
         if (!clang_isCursorDefinition(recordCursor)) return false;
         if (IsInsideUnion(recordCursor)) return false;
@@ -3218,7 +3444,8 @@ namespace
         rec.simpleName = typedefName;
         rec.sourcePath = GetCursorSourceFilePath(typedefCursor);
         if (rec.sourcePath.empty()) rec.sourcePath = GetCursorSourceFilePath(recordCursor);
-        rec.isStruct = (recordKind == CXCursor_StructDecl);
+        rec.isStruct = (recordKind == CXCursor_StructDecl || recordKind == CXCursor_UnionDecl);
+        rec.isUnion = (recordKind == CXCursor_UnionDecl);
         rec.isAnonymousTypedefAlias = true;
         CollectRecordBody(tu, recordCursor, rec, &ctx);
         return !rec.qualifiedName.empty();
@@ -3292,7 +3519,8 @@ namespace
             rec.sourcePath = GetCursorSourceFilePath(cursor);
             rec.semanticParentQualifiedName = GetQualifiedName(clang_getCursorSemanticParent(cursor));
             rec.accessPathPublic = CursorAccessPathIsPublicOrTopLevel(cursor);
-            rec.isStruct = (kind == CXCursor_StructDecl);
+            rec.isStruct = (kind == CXCursor_StructDecl || kind == CXCursor_UnionDecl);
+            rec.isUnion = (kind == CXCursor_UnionDecl);
             if (IsExplicitTemplateSpecialization(cursor))
             {
                 rec.templateKind = RecordTemplateKind::ExplicitSpecialization;
@@ -4106,7 +4334,7 @@ namespace
         // Disambiguate only non-template, real tag types from same-named data members.
         // MSVC/IntelliSense may reject spellings such as "struct ::ns::Type", so the
         // emitted elaborated type uses "struct ns::Type" / "class ns::Type".
-        return std::string(rec.isStruct ? "struct " : "class ") + emittedName;
+        return std::string(rec.isUnion ? "union " : (rec.isStruct ? "struct " : "class ")) + emittedName;
     }
 
     const RecordInfo* FindRecord(const std::map<std::string, const RecordInfo*>& byName, const std::string& typeName)
@@ -4232,7 +4460,10 @@ namespace
             m.displayName = f.name;
             m.typeName = f.typeName;
             m.isBitField = f.isBitField;
+            m.isUnionField = f.isUnionField;
             m.bitWidth = f.bitWidth;
+            m.bitOffset = f.bitOffset;
+            m.unionStorageBytes = f.unionStorageBytes;
             m.exprIsPointerAlready = false;
             m.asBoolStorage = !f.isBitField && IsBoolStorageTypedefSpelling(opt, f.typeName);
             m.constExpr = constObjExpr + "->" + f.name;
@@ -5923,13 +6154,24 @@ namespace
                 {
                     usedGetterConst = true;
                     const std::string getterName = BuildBitGetterName(m.displayName);
-                    os << "        on_getter(\"" << EscapeString(m.displayName) << "\", &::wave::ReflectAccess<" << recType << ">::" << getterName << ", " << m.bitWidth << ");\n";
+                    os << "        on_getter(\"" << EscapeString(m.displayName) << "\", &::wave::ReflectAccess<" << recType << ">::" << getterName << ", " << m.bitWidth << ", " << m.bitOffset << ");\n";
                 }
                 else
                 {
                     if (m.asBoolStorage)
                     {
                         os << "        on_ptr(\"" << EscapeString(m.displayName) << "\", ::wave::as_bool_storage_ptr(std::addressof(" << m.constExpr << ")));\n";
+                    }
+                    else if (m.isUnionField)
+                    {
+                        if (m.unionStorageBytes > 0)
+                        {
+                            os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.constExpr << "), ::wave::detail::UnionFieldTag(), " << m.unionStorageBytes << ", ::wave::detail::UnionFieldBase(std::addressof(" << m.constExpr << ")));\n";
+                        }
+                        else
+                        {
+                            os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.constExpr << "), ::wave::detail::UnionFieldTag(), sizeof(Self));\n";
+                        }
                     }
                     else if (m.exprIsPointerAlready)
                     {
@@ -5962,13 +6204,24 @@ namespace
                 {
                     usedGetterMut = true;
                     const std::string getterName = BuildBitGetterName(m.displayName);
-                    os << "        on_getter(\"" << EscapeString(m.displayName) << "\", &::wave::ReflectAccess<" << recType << ">::" << getterName << ", " << m.bitWidth << ");\n";
+                    os << "        on_getter(\"" << EscapeString(m.displayName) << "\", &::wave::ReflectAccess<" << recType << ">::" << getterName << ", " << m.bitWidth << ", " << m.bitOffset << ");\n";
                 }
                 else
                 {
                     if (m.asBoolStorage)
                     {
                         os << "        on_ptr(\"" << EscapeString(m.displayName) << "\", ::wave::as_bool_storage_ptr(std::addressof(" << m.mutExpr << ")));\n";
+                    }
+                    else if (m.isUnionField)
+                    {
+                        if (m.unionStorageBytes > 0)
+                        {
+                            os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.mutExpr << "), ::wave::detail::UnionFieldTag(), " << m.unionStorageBytes << ", ::wave::detail::UnionFieldBase(std::addressof(" << m.mutExpr << ")));\n";
+                        }
+                        else
+                        {
+                            os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.mutExpr << "), ::wave::detail::UnionFieldTag(), sizeof(Self));\n";
+                        }
                     }
                     else if (m.exprIsPointerAlready)
                     {
@@ -8533,4 +8786,3 @@ int main(int argc, char** argv)
 #pragma pop_macro("min")
 #undef REFLECTGEN_RESTORE_MIN_MACRO_
 #endif
-

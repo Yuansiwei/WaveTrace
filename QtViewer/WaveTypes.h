@@ -4,6 +4,7 @@
 #include <QVector>
 #include <QtGlobal>
 
+#include <cstring>
 #include <limits>
 
 enum class SignalKind {
@@ -48,10 +49,16 @@ struct WaveLodBucket {
     quint8 stateMask = 0;
 };
 
+struct WaveLodValidRange {
+    qint64 start = 0;
+    qint64 end = 0;
+};
+
 struct WaveLodLevel {
     qint64 bucketCycles = 0;
     QVector<WaveLodBucket> buckets;
     QVector<WaveSample> samples;
+    QVector<WaveLodValidRange> validRanges;
 };
 
 struct WaveDiffRegion {
@@ -66,6 +73,7 @@ struct WaveSignal {
     // Physical WVZ4 storage stream id. Several logical signal ids may share one
     // storage stream through WVZ4 aliases.
     int storageId = -1;
+    int bitOffset = 0;
     QString name;
     SignalKind kind = SignalKind::Bit;
     int width = 1;
@@ -83,7 +91,7 @@ struct WaveSignal {
     QVector<qint64> changeTimes;
     bool changeTimesReady = false;
     // WVZ4 file-level overview data. v7/v8 use bucket summaries; v9 stores a
-    // decimated transition stream encoded with the same value-record codecs as WDAT.
+    // decimated transition stream in FOOT; v10 stores chunked transition streams in LODZ.
     QVector<WaveLodLevel> lodLevels;
 };
 
@@ -254,6 +262,18 @@ inline QString waveSampleRawText(const SignalKind kind, const int width, const V
         return QStringLiteral("0b") + QString::number(masked, 2).rightJustified(safeWidth, QLatin1Char('0'));
     case ValueRadix::Hex:
         return QStringLiteral("0x") + QString::number(masked, 16).toUpper().rightJustified(qMax(1, (safeWidth + 3) / 4), QLatin1Char('0'));
+    case ValueRadix::Float: {
+        quint32 bits = quint32(masked & 0xffffffffull);
+        float v = 0.0f;
+        std::memcpy(&v, &bits, sizeof(v));
+        return QString::number(double(v), 'g', 9);
+    }
+    case ValueRadix::Double: {
+        quint64 bits = sample.rawBits;
+        double v = 0.0;
+        std::memcpy(&v, &bits, sizeof(v));
+        return QString::number(v, 'g', 17);
+    }
     default:
         return QString::number(masked);
     }

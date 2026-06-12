@@ -39,6 +39,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <condition_variable>
 #include <chrono>
@@ -234,6 +235,8 @@ struct TrackDecl {
     std::string path;       // debug/backward-compatible full path; WVZ4 recorder does not store it in file layout.
     ValueKind kind = ValueKind::Unknown;
     std::uint32_t bit_width = 64;
+    std::uint32_t bit_offset = 0;
+    bool storage_only = false;
 };
 
 class IWaveSink {
@@ -439,6 +442,56 @@ struct BuildOptions {
 };
 
 namespace detail {
+
+struct WaveTraceLevelLimit {
+    bool enabled;
+    std::size_t max_dot_count;
+
+    WaveTraceLevelLimit() : enabled(false), max_dot_count(0) {}
+    explicit WaveTraceLevelLimit(std::size_t n) : enabled(true), max_dot_count(n) {}
+};
+
+inline WaveTraceLevelLimit parse_wave_trace_level_env_() {
+    const char* env = std::getenv("WaveTraceLevel");
+    if (!env || !env[0]) return WaveTraceLevelLimit();
+
+    std::size_t value = 0;
+    for (const char* p = env; *p; ++p) {
+        if (*p < '0' || *p > '9') return WaveTraceLevelLimit();
+        const std::size_t digit = static_cast<std::size_t>(*p - '0');
+        const std::size_t max_value = (std::numeric_limits<std::size_t>::max)();
+        if (value > (max_value - digit) / 10u) {
+            value = max_value;
+        } else {
+            value = value * 10u + digit;
+        }
+    }
+    if (value == 0) return WaveTraceLevelLimit();
+    return WaveTraceLevelLimit(value);
+}
+
+inline const WaveTraceLevelLimit& wave_trace_level_limit() {
+    static const WaveTraceLevelLimit limit = parse_wave_trace_level_env_();
+    return limit;
+}
+
+inline std::size_t wave_trace_dot_count(const std::string& path) {
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < path.size(); ++i) {
+        if (path[i] == '.') ++count;
+    }
+    return count;
+}
+
+inline bool wave_trace_leaf_path_allowed(const std::string& path) {
+    const WaveTraceLevelLimit& limit = wave_trace_level_limit();
+    return !limit.enabled || wave_trace_dot_count(path) <= limit.max_dot_count;
+}
+
+inline bool wave_trace_descend_path_allowed(const std::string& path) {
+    const WaveTraceLevelLimit& limit = wave_trace_level_limit();
+    return !limit.enabled || wave_trace_dot_count(path) < limit.max_dot_count;
+}
 
 struct WaveCpuFeatures {
     bool sse2 = false;
@@ -1446,6 +1499,9 @@ struct TrackDesc {
     std::uint32_t bit_width;
     TrackThreadClass thread_class;
     TrackId storage_id;
+    std::uint32_t bit_offset;
+    bool storage_only;
+    bool declaration_only;
     const void* memory_ctx;
     std::uint32_t memory_byte_width;
     std::uint32_t dirty_peek_group_id;
@@ -1456,6 +1512,7 @@ struct TrackDesc {
                   kind(ValueKind::Unknown), sample_ctx(NULL), scalar_reader(NULL),
                   scalar_kind(ScalarSampleKind::None), bit_width(0),
                   thread_class(TrackThreadClass::MainThreadOnly), storage_id(0),
+                  bit_offset(0), storage_only(false), declaration_only(false),
                   memory_ctx(NULL), memory_byte_width(0),
                   dirty_peek_group_id(kInvalidIndex),
                   dirty_wave_value_group_id(kInvalidIndex),
@@ -2008,6 +2065,74 @@ private:
         ScalarGetterStorage(const Obj* o, T (*g)(const Obj*)) : obj(o), getter(g) {}
     };
 
+    struct BitfieldStorageReadStorage : ScalarGetterStorageBase {
+        const unsigned char* address;
+        std::uint32_t byte_count;
+
+        BitfieldStorageReadStorage(const unsigned char* a, std::uint32_t n)
+            : address(a), byte_count(n) {}
+    };
+
+    struct BitfieldStorageKey {
+        const void* object_address;
+        const void* type_tag;
+        std::uint32_t byte_offset;
+        std::uint32_t byte_count;
+
+        BitfieldStorageKey() : object_address(NULL), type_tag(NULL), byte_offset(0), byte_count(0) {}
+        BitfieldStorageKey(const void* obj, const void* tag, std::uint32_t off, std::uint32_t count)
+            : object_address(obj), type_tag(tag), byte_offset(off), byte_count(count) {}
+
+        bool operator==(const BitfieldStorageKey& other) const {
+            return object_address == other.object_address &&
+                   type_tag == other.type_tag &&
+                   byte_offset == other.byte_offset &&
+                   byte_count == other.byte_count;
+        }
+    };
+
+    struct BitfieldStorageKeyHash {
+        std::size_t operator()(const BitfieldStorageKey& key) const {
+            std::size_t h = std::hash<const void*>()(key.object_address);
+            h ^= std::hash<const void*>()(key.type_tag) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            h ^= std::hash<std::uint32_t>()(key.byte_offset) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            h ^= std::hash<std::uint32_t>()(key.byte_count) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+
+    struct UnionAliasContext {
+        const unsigned char* base;
+        const void* object_address;
+        const void* type_tag;
+        std::uint32_t byte_count;
+
+        UnionAliasContext() : base(NULL), object_address(NULL), type_tag(NULL), byte_count(0) {}
+        UnionAliasContext(const unsigned char* b, const void* obj, const void* tag, std::uint32_t n)
+            : base(b), object_address(obj), type_tag(tag), byte_count(n) {}
+    };
+
+    struct ScopedUnionAliasContext {
+        Tracer* owner;
+        std::size_t old_size;
+
+        ScopedUnionAliasContext(Tracer* t,
+                                const unsigned char* base,
+                                const void* object_address,
+                                const void* type_tag,
+                                std::uint32_t byte_count)
+            : owner(t), old_size(t ? t->union_alias_context_stack_.size() : 0) {
+            if (owner && base && object_address && type_tag && byte_count != 0) {
+                owner->union_alias_context_stack_.push_back(
+                    UnionAliasContext(base, object_address, type_tag, byte_count));
+            }
+        }
+
+        ~ScopedUnionAliasContext() {
+            if (owner) owner->union_alias_context_stack_.resize(old_size);
+        }
+    };
+
     IWaveSink& sink_;
     BuildOptions options_;
     std::ofstream debug_log_stream_;
@@ -2030,6 +2155,9 @@ private:
     std::vector<TrackRuntimeState> track_runtime_;
     std::deque<std::string> track_runtime_last_values_;
     std::vector<std::unique_ptr<ScalarGetterStorageBase> > scalar_getter_storage_;
+    std::unordered_map<BitfieldStorageKey, TrackId, BitfieldStorageKeyHash> bitfield_storage_by_key_;
+    std::vector<BitfieldStorageKey> bitfield_storage_created_keys_;
+    std::vector<UnionAliasContext> union_alias_context_stack_;
     std::vector<ObjectEntry> objects_;
     std::deque<std::string> object_debug_names_;
     std::vector<LazyValueWatch> lazy_value_watches_;
@@ -2791,6 +2919,21 @@ private:
         if (!storage || !storage->obj || !storage->getter) return false;
         const T value = storage->getter(storage->obj);
         return fill_scalar_snapshot_from_value<T>(value, sample);
+    }
+
+    static bool read_bitfield_storage(const void* storage_ptr, ScalarSnapshot& sample) {
+        const BitfieldStorageReadStorage* storage = static_cast<const BitfieldStorageReadStorage*>(storage_ptr);
+        if (!storage || !storage->address || storage->byte_count == 0 || storage->byte_count > 8) return false;
+        std::uint64_t bits = 0;
+        for (std::uint32_t i = 0; i < storage->byte_count; ++i) {
+            bits |= (static_cast<std::uint64_t>(storage->address[i]) << (8u * i));
+        }
+        sample.sample_kind = unsigned_scalar_kind_for_size(storage->byte_count);
+        if (sample.sample_kind == ScalarSampleKind::None) return false;
+        sample.u64_value = bits;
+        sample.i64_value = static_cast<std::int64_t>(bits);
+        sample.bits = bits;
+        return true;
     }
 
     static bool read_scalar_snapshot(const TrackDesc& track, ScalarSnapshot& sample) {
@@ -6365,6 +6508,7 @@ private:
         std::size_t track_runtime_size;
         std::size_t track_runtime_last_values_size;
         std::size_t scalar_getter_storage_size;
+        std::size_t bitfield_storage_created_keys_size;
         std::size_t objects_size;
         std::size_t object_debug_names_size;
         std::size_t object_created_keys_size;
@@ -6403,6 +6547,7 @@ private:
         cp.track_runtime_size = track_runtime_.size();
         cp.track_runtime_last_values_size = track_runtime_last_values_.size();
         cp.scalar_getter_storage_size = scalar_getter_storage_.size();
+        cp.bitfield_storage_created_keys_size = bitfield_storage_created_keys_.size();
         cp.objects_size = objects_.size();
         cp.object_debug_names_size = object_debug_names_.size();
         cp.object_created_keys_size = object_created_keys_.size();
@@ -6436,6 +6581,10 @@ private:
         while (object_created_keys_.size() > cp.object_created_keys_size) {
             object_id_by_key_.erase(object_created_keys_.back());
             object_created_keys_.pop_back();
+        }
+        while (bitfield_storage_created_keys_.size() > cp.bitfield_storage_created_keys_size) {
+            bitfield_storage_by_key_.erase(bitfield_storage_created_keys_.back());
+            bitfield_storage_created_keys_.pop_back();
         }
         nodes_.resize(cp.nodes_size);
         node_names_.resize(cp.node_names_size);
@@ -7254,6 +7403,23 @@ private:
     }
 
     NodeId create_node(NodeId parent_id, const std::string& path, NodeKind kind, ObjectId object_id) {
+        const bool trace_level_allowed =
+            kind == NodeKind::Leaf
+                ? detail::wave_trace_leaf_path_allowed(path)
+                : detail::wave_trace_descend_path_allowed(path);
+        if (!trace_level_allowed) {
+            if (options_.debug_log) {
+                debug_log_msg(std::string("trace level skip node kind=") +
+                              node_kind_name(kind) +
+                              " path=" + path +
+                              " dots=" + detail::to_string_unsigned(
+                                  static_cast<std::uint64_t>(detail::wave_trace_dot_count(path))) +
+                              " limit=" + detail::to_string_unsigned(
+                                  static_cast<std::uint64_t>(detail::wave_trace_level_limit().max_dot_count)));
+            }
+            return 0;
+        }
+
         const NodeId id = next_node_id_++;
         NodeDesc& node = ensure_id_slot_reserved(nodes_, id, options_.id_slot_node_growth_chunk);
         node = NodeDesc();
@@ -7378,6 +7544,10 @@ private:
                                 const std::string& path,
                                 ValueKind kind,
                                 TrackDesc& track) {
+        if (node_id == 0 && !track.storage_only) {
+            return 0;
+        }
+
         NodeDesc* node = find_node(node_id);
         if (node) {
             track.next_in_node = node->first_track;
@@ -7395,6 +7565,8 @@ private:
         }
         decl.kind = kind;
         decl.bit_width = track.bit_width != 0 ? track.bit_width : scalar_bit_width(track.scalar_kind);
+        decl.bit_offset = track.bit_offset;
+        decl.storage_only = track.storage_only;
         sink_.on_track_declared(decl);
 
         all_track_ids_.push_back(track.id);
@@ -7402,7 +7574,9 @@ private:
         // track-id list. Scalar tracks take the scalar fast path; custom/string/
         // SystemC/VSIP/value-source tracks are sampled by worker threads as custom
         // samplers. main_thread_track_ids_ is kept only for source compatibility.
-        parallel_track_ids_.push_back(track.id);
+        if (!track.declaration_only) {
+            parallel_track_ids_.push_back(track.id);
+        }
         invalidate_flat_leaf_fast_table();
 
         if (options_.debug_log || options_.emit_track_decl_path) {
@@ -8127,6 +8301,7 @@ private:
             return 0;
         }
 
+        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const std::uint32_t group_id = get_or_create_dirty_peek_group(
             detail::pointer_address(p),
             reflect::type_tag_of<typename detail::remove_cvref<V>::type>(),
@@ -8143,6 +8318,11 @@ private:
         const std::uint32_t end_new_range = static_cast<std::uint32_t>(dirty_peek_ranges_.size());
         active_dirty_peek_group_id_ = previous_group;
         active_dirty_peek_range_id_ = previous_range;
+
+        if (result == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
 
         // Bind the hook only after the peek value actually produced a signal
         // subtree.  Dirty-only polling suppression is enabled only when every
@@ -8199,6 +8379,10 @@ private:
         if (!ptr) return 0;
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const NodeId node_id = create_node(parent_id, path, NodeKind::Leaf, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
         if (options_.debug_log) debug_log_msg(std::string("wave_value leaf add path=") + path +
                       " wrapper=" + detail::pointer_to_string(detail::pointer_address(ptr)) +
                       " value_addr=" + detail::pointer_to_string(detail::pointer_address(std::addressof(ptr->read()))));
@@ -8215,6 +8399,10 @@ private:
         if (!ptr.ptr) return 0;
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const NodeId node_id = create_node(parent_id, path, NodeKind::Leaf, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
         if (options_.debug_log) debug_log_msg(std::string("bool_storage leaf add path=") + path +
                       " ptr=" + detail::pointer_to_string(detail::pointer_address(ptr.ptr)));
         const TrackId tid = create_bool_storage_ptr_track<T>(node_id, path, ptr);
@@ -8229,8 +8417,15 @@ private:
     typename std::enable_if<!detail::is_std_string<T>::value, NodeId>::type
     add_leaf_signal(const std::string& path, NodeId parent_id, const T* ptr) {
         if (!ptr) return 0;
+        if (NodeId union_alias = add_union_alias_leaf_signal_<T>(path, parent_id, ptr)) {
+            return union_alias;
+        }
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const NodeId node_id = create_node(parent_id, path, NodeKind::Leaf, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
         if (options_.debug_log) debug_log_msg(std::string("leaf add path=") + path +
                       " ptr=" + detail::pointer_to_string(detail::pointer_address(ptr)));
         const TrackId tid = create_scalar_ptr_track(
@@ -8258,6 +8453,10 @@ private:
         typedef typename detail::remove_cvref<RawT>::type CleanT;
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const NodeId node_id = create_node(parent_id, path, NodeKind::Leaf, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
         if (options_.debug_log) debug_log_msg(std::string("volatile_leaf add path=") + path +
                       " ptr=" + detail::pointer_to_string(detail::pointer_address(ptr)));
         const TrackId tid = create_scalar_volatile_ptr_track<CleanT>(
@@ -8324,12 +8523,360 @@ private:
         return static_cast<std::uint32_t>(v);
     }
 
+    static long long getter_bit_offset_or_negative() { return -1; }
+
+    template <typename First>
+    static long long getter_bit_offset_or_negative(First) { return -1; }
+
+    template <typename First, typename Second, typename... Rest>
+    static long long getter_bit_offset_or_negative(First, Second second, Rest...) {
+        (void)sizeof...(Rest);
+        return static_cast<long long>(second);
+    }
+
+    static std::size_t union_field_storage_bytes_or_zero() { return 0; }
+
+    template <typename SizeT, typename... Rest>
+    static std::size_t union_field_storage_bytes_or_zero(detail::UnionFieldTag, SizeT size, Rest...) {
+        const unsigned long long v = static_cast<unsigned long long>(size);
+        if (v == 0 || v > static_cast<unsigned long long>((std::numeric_limits<std::uint32_t>::max)())) return 0;
+        return static_cast<std::size_t>(v);
+    }
+
+    template <typename First, typename... Rest>
+    static std::size_t union_field_storage_bytes_or_zero(First, Rest... rest) {
+        return union_field_storage_bytes_or_zero(rest...);
+    }
+
+    static const void* union_field_base_or_null() { return NULL; }
+
+    template <typename... Rest>
+    static const void* union_field_base_or_null(detail::UnionFieldBase base, Rest...) {
+        return base.ptr;
+    }
+
+    template <typename First, typename... Rest>
+    static const void* union_field_base_or_null(First, Rest... rest) {
+        return union_field_base_or_null(rest...);
+    }
+
+    struct BitfieldStorageRange {
+        std::uint32_t byte_offset;
+        std::uint32_t byte_count;
+        std::uint32_t bit_offset;
+
+        BitfieldStorageRange() : byte_offset(0), byte_count(0), bit_offset(0) {}
+    };
+
+    static std::uint32_t supported_storage_byte_count_for_bits(std::uint32_t bit_count) {
+        const std::uint32_t bytes = (bit_count + 7u) / 8u;
+        if (bytes <= 1u) return 1u;
+        if (bytes <= 2u) return 2u;
+        if (bytes <= 4u) return 4u;
+        if (bytes <= 8u) return 8u;
+        return 0u;
+    }
+
+    static bool choose_raw_storage_range(std::size_t object_byte_count,
+                                         long long field_bit_offset,
+                                         std::uint32_t field_bit_width,
+                                         BitfieldStorageRange& out) {
+        if (field_bit_offset < 0 || field_bit_width == 0 || field_bit_width > 64u) return false;
+        const unsigned long long object_bits = static_cast<unsigned long long>(object_byte_count) * 8ull;
+        const unsigned long long start = static_cast<unsigned long long>(field_bit_offset);
+        const unsigned long long end = start + static_cast<unsigned long long>(field_bit_width);
+        if (end < start || end > object_bits) return false;
+
+        const unsigned long long chunk_base_bit = (start / 64ull) * 64ull;
+        const std::uint32_t chunk_offset = static_cast<std::uint32_t>(start - chunk_base_bit);
+        const std::uint32_t chunk_need_bits = chunk_offset + field_bit_width;
+        if (chunk_need_bits <= 64u) {
+            const std::uint32_t chunk_base_byte = static_cast<std::uint32_t>(chunk_base_bit / 8ull);
+            const std::uint32_t desired_count = (object_byte_count >= static_cast<std::size_t>(chunk_base_byte) + 8u)
+                ? 8u
+                : supported_storage_byte_count_for_bits(chunk_need_bits);
+            if (desired_count != 0u && object_byte_count >= static_cast<std::size_t>(chunk_base_byte) + desired_count) {
+                out.byte_offset = chunk_base_byte;
+                out.byte_count = desired_count;
+                out.bit_offset = chunk_offset;
+                return true;
+            }
+        }
+
+        const std::uint32_t byte_base = static_cast<std::uint32_t>(start / 8ull);
+        const std::uint32_t bit_offset = static_cast<std::uint32_t>(start - static_cast<unsigned long long>(byte_base) * 8ull);
+        const std::uint32_t byte_need_bits = bit_offset + field_bit_width;
+        const std::uint32_t byte_count = supported_storage_byte_count_for_bits(byte_need_bits);
+        if (byte_count == 0u || object_byte_count < static_cast<std::size_t>(byte_base) + byte_count) return false;
+        out.byte_offset = byte_base;
+        out.byte_count = byte_count;
+        out.bit_offset = bit_offset;
+        return true;
+    }
+
+    template <typename Obj>
+    static bool choose_bitfield_storage_range(long long field_bit_offset,
+                                              std::uint32_t field_bit_width,
+                                              BitfieldStorageRange& out) {
+        return choose_raw_storage_range(sizeof(Obj), field_bit_offset, field_bit_width, out);
+    }
+
+    static bool choose_union_alias_storage_range(std::size_t union_byte_count,
+                                                 long long field_bit_offset,
+                                                 std::uint32_t field_bit_width,
+                                                 BitfieldStorageRange& out) {
+        if (field_bit_offset < 0 || field_bit_width == 0 || field_bit_width > 64u) return false;
+        const unsigned long long start = static_cast<unsigned long long>(field_bit_offset);
+        const unsigned long long end = start + static_cast<unsigned long long>(field_bit_width);
+        const unsigned long long total_bits = static_cast<unsigned long long>(union_byte_count) * 8ull;
+        if (end < start || end > total_bits) return false;
+
+        const std::uint32_t byte_offset = static_cast<std::uint32_t>((start / 64ull) * 8ull);
+        if (byte_offset >= union_byte_count) return false;
+        const std::size_t remaining = union_byte_count - static_cast<std::size_t>(byte_offset);
+        const std::uint32_t byte_count =
+            remaining >= 8u ? 8u :
+            remaining >= 4u ? 4u :
+            remaining >= 2u ? 2u :
+            remaining >= 1u ? 1u : 0u;
+        if (byte_count == 0u) return false;
+        const std::uint32_t bit_offset = static_cast<std::uint32_t>(start - static_cast<unsigned long long>(byte_offset) * 8ull);
+        if (bit_offset + field_bit_width > byte_count * 8u) {
+            return choose_raw_storage_range(union_byte_count, field_bit_offset, field_bit_width, out);
+        }
+        out.byte_offset = byte_offset;
+        out.byte_count = byte_count;
+        out.bit_offset = bit_offset;
+        return true;
+    }
+
+    TrackId create_bitfield_storage_track_(const std::string& path,
+                                           const unsigned char* address,
+                                           std::uint32_t byte_count) {
+        const ScalarSampleKind scalar_kind = unsigned_scalar_kind_for_size(byte_count);
+        if (!address || scalar_kind == ScalarSampleKind::None || byte_count == 0u || byte_count > 8u) return 0;
+
+        const TrackId id = next_track_id_++;
+        TrackDesc& track = ensure_id_slot_reserved(tracks_, id, options_.id_slot_track_growth_chunk);
+        track = TrackDesc();
+        track.id = id;
+        track.node_id = 0;
+        track.kind = ValueKind::UnsignedInt;
+        TrackRuntimeState& runtime = ensure_id_slot_reserved(track_runtime_, id, options_.id_slot_track_growth_chunk);
+        runtime = TrackRuntimeState();
+
+        std::unique_ptr<ScalarGetterStorageBase> storage(
+            new BitfieldStorageReadStorage(address, byte_count));
+        track.sample_ctx = static_cast<const void*>(storage.get());
+        track.scalar_reader = &read_bitfield_storage;
+        track.scalar_kind = scalar_kind;
+        track.bit_width = byte_count * 8u;
+        track.thread_class = TrackThreadClass::ParallelSafe;
+        track.storage_id = id;
+        track.storage_only = true;
+        track.memory_ctx = static_cast<const void*>(address);
+        track.memory_byte_width = byte_count;
+        if (active_dirty_peek_group_id_ != kInvalidIndex) {
+            track.dirty_peek_group_id = active_dirty_peek_group_id_;
+        }
+        if (active_dirty_wave_array_group_id_ != kInvalidIndex) {
+            track.dirty_wave_array_group_id = active_dirty_wave_array_group_id_;
+        }
+        scalar_getter_storage_.push_back(std::move(storage));
+
+        const TrackId created = finish_track_create(0, path, ValueKind::UnsignedInt, track);
+        record_dirty_peek_leaf_for_track(created);
+        record_dirty_wave_array_leaf_for_track(created);
+        return created;
+    }
+
+    TrackId get_or_create_raw_storage_track_(const std::string& path,
+                                             const void* object_address,
+                                             const void* type_tag,
+                                             const unsigned char* base,
+                                             const BitfieldStorageRange& range) {
+        if (!object_address || !type_tag || !base || range.byte_count == 0u) return 0;
+        const BitfieldStorageKey key(object_address,
+                                     type_tag,
+                                     range.byte_offset,
+                                     range.byte_count);
+        typename std::unordered_map<BitfieldStorageKey, TrackId, BitfieldStorageKeyHash>::const_iterator it =
+            bitfield_storage_by_key_.find(key);
+        if (it != bitfield_storage_by_key_.end()) return it->second;
+
+        const unsigned char* address = base + range.byte_offset;
+        const std::string storage_path = path + "::$raw_storage@" +
+            detail::to_string_unsigned(range.byte_offset) + "+" +
+            detail::to_string_unsigned(range.byte_count);
+        const TrackId created = create_bitfield_storage_track_(storage_path, address, range.byte_count);
+        if (created != 0) {
+            bitfield_storage_by_key_.insert(std::make_pair(key, created));
+            bitfield_storage_created_keys_.push_back(key);
+        }
+        return created;
+    }
+
+    template <typename Obj>
+    TrackId get_or_create_bitfield_storage_track_(const std::string& path,
+                                                  const Obj* obj,
+                                                  const BitfieldStorageRange& range) {
+        if (!obj || range.byte_count == 0u) return 0;
+        return get_or_create_raw_storage_track_(
+            path,
+            detail::pointer_address(obj),
+            reflect::type_tag_of<Obj>(),
+            reinterpret_cast<const unsigned char*>(obj),
+            range);
+    }
+
+    TrackId create_bitfield_alias_track_(NodeId node_id,
+                                         const std::string& path,
+                                         ValueKind kind,
+                                         TrackId storage_id,
+                                         std::uint32_t bit_offset,
+                                         std::uint32_t bit_width) {
+        if (node_id == 0 || storage_id == 0 || bit_width == 0u || bit_width > 64u) return 0;
+        const TrackId id = next_track_id_++;
+        TrackDesc& track = ensure_id_slot_reserved(tracks_, id, options_.id_slot_track_growth_chunk);
+        track = TrackDesc();
+        track.id = id;
+        track.node_id = node_id;
+        track.kind = kind;
+        track.scalar_kind = ScalarSampleKind::None;
+        track.bit_width = bit_width;
+        track.storage_id = storage_id;
+        track.bit_offset = bit_offset;
+        track.declaration_only = true;
+        TrackRuntimeState& runtime = ensure_id_slot_reserved(track_runtime_, id, options_.id_slot_track_growth_chunk);
+        runtime = TrackRuntimeState();
+        return finish_track_create(node_id, path, kind, track);
+    }
+
+    const UnionAliasContext* find_union_alias_context_for_(const void* ptr, std::size_t byte_count) const {
+        if (!ptr || byte_count == 0) return NULL;
+        const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(ptr);
+        for (std::size_t i = union_alias_context_stack_.size(); i > 0; --i) {
+            const UnionAliasContext& ctx = union_alias_context_stack_[i - 1u];
+            if (!ctx.base || ctx.byte_count == 0) continue;
+            const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(ctx.base);
+            if (addr < base) continue;
+            const std::uintptr_t offset = addr - base;
+            if (offset > static_cast<std::uintptr_t>(ctx.byte_count)) continue;
+            if (byte_count > static_cast<std::size_t>(ctx.byte_count - static_cast<std::uint32_t>(offset))) continue;
+            return &ctx;
+        }
+        return NULL;
+    }
+
+    template <typename T>
+    typename std::enable_if<detail::is_leaf_scalar<T>::value && !detail::is_std_string<T>::value, NodeId>::type
+    add_union_alias_leaf_signal_(const std::string& path, NodeId parent_id, const T* ptr) {
+        typedef typename detail::remove_cvref<T>::type CleanT;
+        const ScalarSampleKind sk = scalar_kind_for_type<CleanT>();
+        const std::size_t memory_bytes = scalar_sample_kind_byte_width(sk);
+        if (sk == ScalarSampleKind::None || ptr == NULL || memory_bytes == 0) return 0;
+        if (!detail::wave_trace_leaf_path_allowed(path)) return 0;
+        const UnionAliasContext* ctx = find_union_alias_context_for_(detail::pointer_address(ptr), memory_bytes);
+        if (!ctx) return 0;
+
+        const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(detail::pointer_address(ptr));
+        const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(ctx->base);
+        const std::uint32_t field_bit_width = scalar_bit_width(sk);
+        const long long field_bit_offset = static_cast<long long>((addr - base) * 8ull);
+        BitfieldStorageRange range;
+        if (!choose_union_alias_storage_range(ctx->byte_count, field_bit_offset, field_bit_width, range)) return 0;
+
+        const TrackId storage_id = get_or_create_raw_storage_track_(
+            path,
+            ctx->object_address,
+            ctx->type_tag,
+            ctx->base,
+            range);
+        if (storage_id == 0) return 0;
+
+        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
+        const NodeId node_id = create_node(parent_id, path, NodeKind::Leaf, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        const TrackId tid = create_bitfield_alias_track_(
+            node_id,
+            path,
+            detail::classify_value_kind<CleanT>(),
+            storage_id,
+            range.bit_offset,
+            field_bit_width);
+        if (tid == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        return node_id;
+    }
+
+    template <typename T>
+    typename std::enable_if<!detail::is_leaf_scalar<T>::value || detail::is_std_string<T>::value, NodeId>::type
+    add_union_alias_leaf_signal_(const std::string&, NodeId, const T*) {
+        return 0;
+    }
+
+    template <typename UnionT, typename FieldT>
+    NodeId expand_union_member_ptr(const std::string& path,
+                                   NodeId parent_id,
+                                   const FieldT* field_ptr,
+                                   const UnionT* union_obj,
+                                   std::size_t union_storage_bytes,
+                                   const void* explicit_union_base = NULL) {
+        if (!field_ptr || !union_obj || union_storage_bytes == 0 ||
+            union_storage_bytes > static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())) {
+            return expand_member_ptr(path, parent_id, field_ptr);
+        }
+
+        typedef typename detail::remove_cvref<UnionT>::type CleanUnionT;
+        const void* union_base = explicit_union_base ? explicit_union_base : detail::pointer_address(union_obj);
+        ScopedUnionAliasContext guard(
+            this,
+            reinterpret_cast<const unsigned char*>(union_base),
+            union_base,
+            reflect::type_tag_of<CleanUnionT>(),
+            static_cast<std::uint32_t>(union_storage_bytes));
+        return expand_member_ptr(path, parent_id, field_ptr);
+    }
+
+    template <typename UnionT, typename FieldT>
+    NodeId expand_reflected_child_ptr_with_union_meta_(const std::string& path,
+                                                      NodeId parent_id,
+                                                      const FieldT* field_ptr,
+                                                      const UnionT* union_obj,
+                                                      std::size_t union_storage_bytes,
+                                                      const void* union_base = NULL) {
+        if (union_storage_bytes != 0) {
+            return expand_union_member_ptr(path, parent_id, field_ptr, union_obj, union_storage_bytes, union_base);
+        }
+        return expand_member_ptr(path, parent_id, field_ptr);
+    }
+
+    template <typename UnionT, typename FieldValue>
+    typename std::enable_if<!std::is_pointer<typename detail::remove_cvref<FieldValue>::type>::value, NodeId>::type
+    expand_reflected_child_ptr_with_union_meta_(const std::string& path,
+                                               NodeId parent_id,
+                                               FieldValue field_value,
+                                               const UnionT*,
+                                               std::size_t,
+                                               const void* = NULL) {
+        return expand_member_ptr(path, parent_id, field_value);
+    }
+
     template <typename Obj, typename T>
     typename std::enable_if<detail::is_leaf_scalar<T>::value && !detail::is_std_string<T>::value, NodeId>::type
     add_getter_signal(const std::string& path, NodeId parent_id, const Obj* obj, T (*getter)(const Obj*), std::uint32_t explicit_bit_width = 0) {
         if (!obj || !getter) return 0;
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const NodeId node_id = create_node(parent_id, path, NodeKind::Leaf, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
         const TrackId tid = create_scalar_getter_track<Obj, T>(
             node_id,
             path,
@@ -8345,10 +8892,55 @@ private:
     }
 
     template <typename Obj, typename T>
+    typename std::enable_if<detail::is_leaf_scalar<T>::value && !detail::is_std_string<T>::value, NodeId>::type
+    add_bitfield_range_signal(const std::string& path,
+                              NodeId parent_id,
+                              const Obj* obj,
+                              T (*getter)(const Obj*),
+                              std::uint32_t explicit_bit_width,
+                              long long field_bit_offset) {
+        if (!obj || !getter) return 0;
+        if (!detail::wave_trace_leaf_path_allowed(path)) return 0;
+        BitfieldStorageRange range;
+        if (!choose_bitfield_storage_range<Obj>(field_bit_offset, explicit_bit_width, range)) {
+            return add_getter_signal<Obj, T>(path, parent_id, obj, getter, explicit_bit_width);
+        }
+        const TrackId storage_id = get_or_create_bitfield_storage_track_<Obj>(path, obj, range);
+        if (storage_id == 0) {
+            return add_getter_signal<Obj, T>(path, parent_id, obj, getter, explicit_bit_width);
+        }
+
+        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
+        const NodeId node_id = create_node(parent_id, path, NodeKind::Leaf, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        const TrackId tid = create_bitfield_alias_track_(
+            node_id,
+            path,
+            detail::classify_value_kind<T>(),
+            storage_id,
+            range.bit_offset,
+            explicit_bit_width);
+        if (tid == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        return node_id;
+    }
+
+    template <typename Obj, typename T>
     typename std::enable_if<!detail::is_leaf_scalar<T>::value || detail::is_std_string<T>::value, NodeId>::type
     add_getter_signal(const std::string& path, NodeId parent_id, const Obj*, T (*)(const Obj*), std::uint32_t = 0) {
         if (options_.debug_log) debug_log_msg(std::string("non-scalar/string getter skipped path=") + path);
         return 0;
+    }
+
+    template <typename Obj, typename T>
+    typename std::enable_if<!detail::is_leaf_scalar<T>::value || detail::is_std_string<T>::value, NodeId>::type
+    add_bitfield_range_signal(const std::string& path, NodeId parent_id, const Obj* obj, T (*getter)(const Obj*), std::uint32_t explicit_bit_width, long long) {
+        return add_getter_signal<Obj, T>(path, parent_id, obj, getter, explicit_bit_width);
     }
 
     NodeId add_marker(const std::string& path, NodeId parent_id, InvalidKind invalid, const std::string& suffix) {
@@ -8382,11 +8974,17 @@ private:
         if (!ptr) return 0;
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
         typedef typename wave_array_traits<ArrT>::element_type ElemT;
         const std::uint32_t prev_group = active_dirty_wave_array_group_id_;
         const std::uint32_t prev_range = active_dirty_wave_array_range_id_;
 
         for (std::size_t i = 0; i < wave_array_traits<ArrT>::size; ++i) {
+            const std::string child_path = detail::compose_index_child_path(path, i);
+            TopologyCheckpoint elem_cp = make_topology_checkpoint(node_id);
             const ElemT* elem = std::addressof((*ptr)[i]);
             if (options_.enable_wave_array_dirty) {
                 const std::uint32_t group_id = get_or_create_dirty_wave_array_group(
@@ -8400,10 +8998,13 @@ private:
                 active_dirty_wave_array_group_id_ = kInvalidIndex;
                 active_dirty_wave_array_range_id_ = kInvalidIndex;
             }
-            expand_member_clean_dispatch<ElemT>(
-                detail::compose_index_child_path(path, i),
+            const NodeId child_node = expand_member_clean_dispatch<ElemT>(
+                child_path,
                 node_id,
                 elem);
+            if (child_node == 0) {
+                rollback_topology_to(elem_cp);
+            }
         }
 
         active_dirty_wave_array_group_id_ = prev_group;
@@ -8422,6 +9023,10 @@ private:
         if (!ptr) return 0;
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
         for (std::size_t i = 0; i < N; ++i) {
             expand_field(detail::compose_index_child_path(path, i), node_id, &((*ptr)[i]));
         }
@@ -8434,6 +9039,10 @@ private:
         if (!ptr) return 0;
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
         for (std::size_t i = 0; i < ptr->size(); ++i) {
             typedef typename detail::remove_cvref<decltype((*ptr)[i])>::type ElementT;
             expand_field(detail::compose_index_child_path(path, i), node_id, &((*ptr)[i]));
@@ -8447,6 +9056,10 @@ private:
         if (!ptr) return 0;
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
         expand_field(detail::compose_child_path(path, "first"), node_id, &ptr->first);
         expand_field(detail::compose_child_path(path, "second"), node_id, &ptr->second);
         return keep_node_or_rollback(cp, node_id);
@@ -8644,6 +9257,10 @@ private:
         if (!ptr) return 0;
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
         typedef typename detail::remove_cvref<decltype((*ptr)[0])>::type ElementT;
         for (std::size_t i = 0; i < ptr->size(); ++i) {
             expand_field(detail::compose_index_child_path(path, i), node_id, &((*ptr)[i]));
@@ -8771,11 +9388,18 @@ private:
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const ObjectId object_id = ensure_object(key, typeid(FieldT).name());
         const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, object_id);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
         ExpandingGuard expanding_guard(expanding_, key);
         detail::call_reflected_visit<FieldT>(
             ptr,
-            [this, &path, node_id](const char* name, auto child_field_ptr) {
-                expand_member_ptr(detail::compose_child_path(path, name), node_id, child_field_ptr);
+            [this, &path, node_id, ptr](const char* name, auto child_field_ptr, auto... meta) {
+                const std::string child_path = detail::compose_child_path(path, name);
+                const std::size_t union_bytes = union_field_storage_bytes_or_zero(meta...);
+                const void* union_base = union_field_base_or_null(meta...);
+                expand_reflected_child_ptr_with_union_meta_(child_path, node_id, child_field_ptr, ptr, union_bytes, union_base);
             },
             [this, &path, node_id](const char* name, const auto&) {
                 const std::string bit_path = detail::compose_child_path(path, name);
@@ -8784,7 +9408,13 @@ private:
             [this, &path, node_id, ptr](const char* name, auto getter, auto... meta) {
                 typedef typename detail::remove_cvref<decltype(getter(ptr))>::type GetterValueT;
                 const std::string bit_path = detail::compose_child_path(path, name);
-                add_getter_signal<FieldT, GetterValueT>(bit_path, node_id, ptr, getter, getter_bit_width_or_zero(meta...));
+                add_bitfield_range_signal<FieldT, GetterValueT>(
+                    bit_path,
+                    node_id,
+                    ptr,
+                    getter,
+                    getter_bit_width_or_zero(meta...),
+                    getter_bit_offset_or_negative(meta...));
             });
         return keep_node_or_rollback(cp, node_id);
     }
@@ -8861,6 +9491,10 @@ private:
         if (options_.debug_log) debug_log_msg(std::string("member dispatch branch=std_array path=") + path);
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
         for (std::size_t i = 0; i < clean_ptr->size(); ++i) {
             typedef typename detail::remove_cvref<decltype((*clean_ptr)[i])>::type ElemT;
             expand_member_clean_dispatch<ElemT>(
@@ -8880,6 +9514,10 @@ private:
         if (options_.debug_log) debug_log_msg(std::string("member dispatch branch=std_pair path=") + path);
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
         typedef typename detail::remove_cvref<decltype(clean_ptr->first)>::type FirstT;
         typedef typename detail::remove_cvref<decltype(clean_ptr->second)>::type SecondT;
         expand_member_clean_dispatch<FirstT>(
@@ -9169,11 +9807,18 @@ private:
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const ObjectId object_id = ensure_object(key, typeid(T).name());
         const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, object_id);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
         ExpandingGuard expanding_guard(expanding_, key);
         detail::call_reflected_visit<T>(
             ptr,
-            [this, &path, node_id](const char* name, auto field_ptr) {
-                expand_member_ptr(detail::compose_child_path(path, name), node_id, field_ptr);
+            [this, &path, node_id, ptr](const char* name, auto field_ptr, auto... meta) {
+                const std::string child_path = detail::compose_child_path(path, name);
+                const std::size_t union_bytes = union_field_storage_bytes_or_zero(meta...);
+                const void* union_base = union_field_base_or_null(meta...);
+                expand_reflected_child_ptr_with_union_meta_(child_path, node_id, field_ptr, ptr, union_bytes, union_base);
             },
             [this, &path, node_id](const char* name, const auto&) {
                 const std::string bit_path = detail::compose_child_path(path, name);
@@ -9182,7 +9827,13 @@ private:
             [this, &path, node_id, ptr](const char* name, auto getter, auto... meta) {
                 typedef typename detail::remove_cvref<decltype(getter(ptr))>::type GetterValueT;
                 const std::string bit_path = detail::compose_child_path(path, name);
-                add_getter_signal<T, GetterValueT>(bit_path, node_id, ptr, getter, getter_bit_width_or_zero(meta...));
+                add_bitfield_range_signal<T, GetterValueT>(
+                    bit_path,
+                    node_id,
+                    ptr,
+                    getter,
+                    getter_bit_width_or_zero(meta...),
+                    getter_bit_offset_or_negative(meta...));
             });
         return keep_node_or_rollback(cp, node_id);
     }

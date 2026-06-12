@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cerrno>
 #include <condition_variable>
 #include <chrono>
 #include <cstdarg>
@@ -38,6 +39,16 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #ifndef WVZ4_NO_ZSTD
 #include <zstd.h>
 #endif
@@ -49,12 +60,14 @@ using u64 = std::uint64_t;
 using u32 = std::uint32_t;
 using u8  = std::uint8_t;
 
-static const u32 kFormatVersion = 9;
+static const u32 kFormatVersion = 12;
+static const u8 kSignalFlagStorageOnly = 1u << 0;
 static const u32 kMaxScalarBytes = 8;
 static const u64 kLodBaseBucketCycles = 256;
 static const u32 kLodLevelCount = 7;
 static const u64 kLodMinRawTransitionsForTable = 4096;
-static const u64 kLodMinRawToSampleRatio = 4;
+static const u64 kLodMaxRecordsToSourceRatio = 5; // one LOD level may keep at most 20% of its source records.
+static const u64 kLodTimeChunkBuckets = 4096;
 
 // Raw WDAT payload encoding flags. The outer WDAT section and block index remain
 // unchanged; these flags describe the uncompressed raw_payload inside each block.
@@ -155,7 +168,9 @@ struct SignalDefinition {
     u32 node_id = 0;       // leaf node id in NodeTable
     ValueType type = ValueType::U64;
     u32 bit_width = 64;    // <= 64 in WVZ4 typed writer
+    u32 bit_offset = 0;    // bit range within storage_id, least-significant bit is offset 0
     Radix radix = Radix::Auto;
+    bool storage_only = false; // hidden physical stream; viewer exposes aliases that reference it
 };
 
 // WVZ4 v4 periodic clock descriptor.  A clock signal listed here is not stored
@@ -220,6 +235,11 @@ struct WriterOptions {
     // instead of one time varint per transition.  This changes the WDAT record
     // codec id, so the viewer/reader must support the Stride codec variants.
     bool enable_stride_time_record_encoding = true;
+
+    // LOD tables speed up wide-range rendering but keep sampled transition
+    // summaries in memory until FOOT is written. Disable for very large writer
+    // stress runs when first-open/on-demand parser behavior is the target.
+    bool enable_lod_tables = true;
 
     // Emit a sidecar text report at close. Empty path means <wvz4-file>.log.
     bool enable_stats_log = true;
@@ -874,11 +894,36 @@ private:
         Compression compression = Compression::None;
     };
 
+    struct LodChunkIndexRecord {
+        u64 chunk_id = 0;
+        u32 level_index = 0;
+        u32 signal_chunk_id = 0;
+        i64 start_cycle = 0;
+        i64 end_cycle = 0;
+        u64 file_offset = 0;
+        u64 file_size = 0;
+        u64 raw_size = 0;
+        Compression compression = Compression::None;
+        u64 storage_count = 0;
+        u64 record_count = 0;
+    };
+
+    struct LodValidRange {
+        i64 start_cycle = 0;
+        i64 end_cycle = 0;
+    };
+
     struct LodLevelState {
         u64 min_cycle_delta = 0;
-        bool has_last_record = false;
-        i64 last_record_cycle = 0;
+        bool disabled = false;
+        bool has_pending_window = false;
+        i64 pending_window_start = 0;
+        Transition pending_transition;
         std::vector<Transition> transitions;
+        bool has_open_valid_range = false;
+        i64 open_valid_start = 0;
+        i64 open_valid_end = 0;
+        std::vector<LodValidRange> valid_ranges;
     };
 
     struct LodStorageState {
@@ -887,6 +932,25 @@ private:
         ValueType value_type = ValueType::U64;
         u64 raw_transition_count = 0;
         std::vector<LodLevelState> levels;
+    };
+
+    struct LodSelectedLevel {
+        std::size_t level = 0;
+        u64 source_record_count = 0;
+    };
+
+    struct LodSelectedStorageLevel {
+        u32 storage_id = 0;
+        u64 source_record_count = 0;
+    };
+
+    struct LodStorageLevelRef {
+        u32 storage_id = 0;
+        const LodStorageState* storage = NULL;
+        const LodLevelState* lod_level = NULL;
+        std::vector<Transition> transitions;
+        std::vector<LodValidRange> valid_ranges;
+        std::size_t cursor = 0;
     };
 
     struct BlockJob {
@@ -958,15 +1022,20 @@ private:
         return v;
     }
 
-    void initialize_lod_storage() {
+    void initialize_lod_bucket_cycles() {
         lod_bucket_cycles_.clear();
         lod_bucket_cycles_.reserve(kLodLevelCount);
         u64 bucket_cycles = kLodBaseBucketCycles;
         for (u32 i = 0; i < kLodLevelCount; ++i) {
             lod_bucket_cycles_.push_back(bucket_cycles);
-            if (bucket_cycles <= (std::numeric_limits<u64>::max)() / 4ull) bucket_cycles *= 4ull;
+            if (bucket_cycles <= (std::numeric_limits<u64>::max)() / kLodMaxRecordsToSourceRatio) {
+                bucket_cycles *= kLodMaxRecordsToSourceRatio;
+            }
         }
+    }
 
+    void initialize_lod_storage() {
+        initialize_lod_bucket_cycles();
         lod_states_.clear();
         lod_states_.resize(signal_states_.size());
         for (std::size_t i = 0; i < signal_order_.size(); ++i) {
@@ -978,33 +1047,163 @@ private:
             lod.valid = true;
             lod.byte_width = st.byte_width_bytes;
             lod.value_type = st.def.type;
-            lod.levels.resize(lod_bucket_cycles_.size());
-            for (std::size_t level = 0; level < lod_bucket_cycles_.size(); ++level) {
-                lod.levels[level].min_cycle_delta = lod_bucket_cycles_[level];
-            }
         }
     }
 
+    void initialize_lod_levels(LodStorageState& storage) {
+        if (!storage.levels.empty()) return;
+        storage.levels.resize(lod_bucket_cycles_.size());
+        for (std::size_t level = 0; level < lod_bucket_cycles_.size(); ++level) {
+            storage.levels[level].min_cycle_delta = lod_bucket_cycles_[level];
+        }
+    }
+
+    static bool append_lod_transition_if_useful(LodLevelState& lod_level,
+                                                const Transition& transition,
+                                                u64 source_record_count) {
+        const u64 max_useful_samples = source_record_count / kLodMaxRecordsToSourceRatio;
+        if (max_useful_samples == 0) return false;
+        if (!lod_level.transitions.empty() &&
+            lod_level.transitions.back().cycle == transition.cycle) {
+            lod_level.transitions.back() = transition;
+            return true;
+        }
+        if (static_cast<u64>(lod_level.transitions.size() + 1) > max_useful_samples) return false;
+        lod_level.transitions.push_back(transition);
+        return true;
+    }
+
+    static i64 lod_sampling_window_start(i64 cycle, u64 span) {
+        if (cycle <= 0 || span == 0) return 0;
+        const u64 ucycle = static_cast<u64>(cycle);
+        const u64 start = (ucycle / span) * span;
+        const u64 imax = static_cast<u64>((std::numeric_limits<i64>::max)());
+        return static_cast<i64>((std::min)(start, imax));
+    }
+
+    static i64 lod_sampling_window_end(i64 window_start, u64 span) {
+        const u64 imax = static_cast<u64>((std::numeric_limits<i64>::max)());
+        const u64 ustart = window_start <= 0 ? 0u : static_cast<u64>(window_start);
+        if (span == 0 || span > imax - ustart) return (std::numeric_limits<i64>::max)();
+        return static_cast<i64>(ustart + span);
+    }
+
+    static void close_lod_valid_range(LodLevelState& lod_level) {
+        if (!lod_level.has_open_valid_range) return;
+        if (lod_level.open_valid_end > lod_level.open_valid_start) {
+            LodValidRange range;
+            range.start_cycle = lod_level.open_valid_start;
+            range.end_cycle = lod_level.open_valid_end;
+            lod_level.valid_ranges.push_back(range);
+        }
+        lod_level.has_open_valid_range = false;
+        lod_level.open_valid_start = 0;
+        lod_level.open_valid_end = 0;
+    }
+
+    static void extend_lod_valid_range(LodLevelState& lod_level, i64 window_start) {
+        const i64 window_end = lod_sampling_window_end(window_start, lod_level.min_cycle_delta);
+        if (!lod_level.has_open_valid_range) {
+            lod_level.has_open_valid_range = true;
+            lod_level.open_valid_start = window_start;
+            lod_level.open_valid_end = window_end;
+            return;
+        }
+        if (window_start < lod_level.open_valid_start) lod_level.open_valid_start = window_start;
+        if (window_end > lod_level.open_valid_end) lod_level.open_valid_end = window_end;
+    }
+
+    static u64 lod_level_materialized_count(const LodLevelState& lod_level) {
+        u64 count = static_cast<u64>(lod_level.transitions.size());
+        if (lod_level.has_pending_window) {
+            if (lod_level.transitions.empty() ||
+                lod_level.transitions.back().cycle != lod_level.pending_transition.cycle) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    static std::vector<Transition> materialize_lod_level_transitions(const LodLevelState& lod_level) {
+        std::vector<Transition> out = lod_level.transitions;
+        if (lod_level.has_pending_window) {
+            if (!out.empty() && out.back().cycle == lod_level.pending_transition.cycle) {
+                out.back() = lod_level.pending_transition;
+            } else {
+                out.push_back(lod_level.pending_transition);
+            }
+        }
+        return out;
+    }
+
+    static std::vector<LodValidRange> materialize_lod_level_valid_ranges(const LodLevelState& lod_level) {
+        std::vector<LodValidRange> out = lod_level.valid_ranges;
+        if (lod_level.has_open_valid_range && lod_level.open_valid_end > lod_level.open_valid_start) {
+            LodValidRange range;
+            range.start_cycle = lod_level.open_valid_start;
+            range.end_cycle = lod_level.open_valid_end;
+            out.push_back(range);
+        }
+        if (lod_level.has_pending_window) {
+            const i64 start = lod_level.pending_window_start;
+            const i64 end = (std::numeric_limits<i64>::max)();
+            if (!out.empty() && out.back().end_cycle >= start) {
+                out.back().end_cycle = end;
+            } else {
+                LodValidRange range;
+                range.start_cycle = start;
+                range.end_cycle = end;
+                out.push_back(range);
+            }
+        }
+        return out;
+    }
+
+    static void update_lod_level_window(LodLevelState& lod_level,
+                                        const Transition& transition,
+                                        u64 source_record_count) {
+        const i64 window_start = lod_sampling_window_start(transition.cycle, lod_level.min_cycle_delta);
+        if (!lod_level.has_pending_window) {
+            lod_level.pending_window_start = window_start;
+            lod_level.pending_transition = transition;
+            lod_level.has_pending_window = true;
+            return;
+        }
+        if (window_start == lod_level.pending_window_start) {
+            lod_level.pending_transition = transition;
+            return;
+        }
+        const bool appended = append_lod_transition_if_useful(lod_level, lod_level.pending_transition, source_record_count);
+        if (appended) {
+            extend_lod_valid_range(lod_level, lod_level.pending_window_start);
+        } else {
+            close_lod_valid_range(lod_level);
+        }
+        lod_level.pending_window_start = window_start;
+        lod_level.pending_transition = transition;
+    }
+
     void update_lod_tables(u32 storage_id, i64 cycle, const ScalarValue& new_value) {
+        if (!options_.enable_lod_tables) return;
         if (cycle < 0 || storage_id >= lod_states_.size()) return;
         LodStorageState& storage = lod_states_[storage_id];
         if (!storage.valid || storage.byte_width == 0) return;
         ++storage.raw_transition_count;
+        initialize_lod_levels(storage);
+        Transition tr;
+        tr.cycle = cycle;
+        tr.value = new_value;
+        tr.value.byte_count = storage.byte_width;
+        u64 source_record_count = storage.raw_transition_count;
         for (std::size_t level = 0; level < storage.levels.size(); ++level) {
             LodLevelState& lod_level = storage.levels[level];
             const u64 min_delta = lod_level.min_cycle_delta;
-            if (min_delta == 0) continue;
-            if (lod_level.has_last_record) {
-                const u64 elapsed = static_cast<u64>(cycle - lod_level.last_record_cycle);
-                if (elapsed < min_delta) continue;
+            if (lod_level.disabled || min_delta == 0) continue;
+            update_lod_level_window(lod_level, tr, source_record_count);
+            const u64 materialized_count = lod_level_materialized_count(lod_level);
+            if (!lod_level.disabled && materialized_count != 0) {
+                source_record_count = materialized_count;
             }
-            Transition tr;
-            tr.cycle = cycle;
-            tr.value = new_value;
-            tr.value.byte_count = storage.byte_width;
-            lod_level.transitions.push_back(tr);
-            lod_level.last_record_cycle = cycle;
-            lod_level.has_last_record = true;
         }
     }
 
@@ -1114,14 +1313,26 @@ private:
             if (s.signal_id == 0) { error = "SignalDefinition.signal_id must be positive"; return false; }
             if (s.storage_id == 0 || s.storage_id > max_signal_id) { error = detail::make_error("SignalDefinition.storage_id invalid for signal_id: ", s.signal_id); return false; }
             if (seen_signals[s.signal_id]) { error = detail::make_error("duplicate signal_id: ", s.signal_id); return false; }
-            if (s.node_id == 0 || s.node_id >= seen_nodes.size() || !seen_nodes[s.node_id]) {
-                error = detail::make_error("SignalDefinition references missing node_id: ", s.node_id); return false;
-            }
-            if (node_first_child[s.node_id] != 0) {
-                error = detail::make_error("SignalDefinition node_id must be a leaf node: ", s.node_id); return false;
-            }
-            if (node_kind[s.node_id] != NodeKind::SignalLeaf) {
-                error = detail::make_error("SignalDefinition node_id must reference a SignalLeaf node: ", s.node_id); return false;
+            if (s.storage_only) {
+                if (s.node_id != 0) {
+                    error = detail::make_error("storage-only SignalDefinition must not reference a node_id: ", s.signal_id); return false;
+                }
+                if (s.storage_id != s.signal_id) {
+                    error = detail::make_error("storage-only SignalDefinition must use itself as storage_id: ", s.signal_id); return false;
+                }
+                if (s.bit_offset != 0) {
+                    error = detail::make_error("storage-only SignalDefinition bit_offset must be zero for signal_id: ", s.signal_id); return false;
+                }
+            } else {
+                if (s.node_id == 0 || s.node_id >= seen_nodes.size() || !seen_nodes[s.node_id]) {
+                    error = detail::make_error("SignalDefinition references missing node_id: ", s.node_id); return false;
+                }
+                if (node_first_child[s.node_id] != 0) {
+                    error = detail::make_error("SignalDefinition node_id must be a leaf node: ", s.node_id); return false;
+                }
+                if (node_kind[s.node_id] != NodeKind::SignalLeaf) {
+                    error = detail::make_error("SignalDefinition node_id must reference a SignalLeaf node: ", s.node_id); return false;
+                }
             }
             if (!detail::is_valid_radix(s.radix)) {
                 error = detail::make_error("invalid Radix for signal_id: ", s.signal_id); return false;
@@ -1136,7 +1347,13 @@ private:
             if (s.bit_width > static_cast<u32>(bytes) * 8u) {
                 error = detail::make_error("signal bit_width exceeds ValueType capacity for signal_id: ", s.signal_id); return false;
             }
+            if (s.bit_offset >= 64u || s.bit_offset + s.bit_width > 64u || s.bit_offset + s.bit_width < s.bit_width) {
+                error = detail::make_error("SignalDefinition bit range is invalid for signal_id: ", s.signal_id); return false;
+            }
             if (!seen_storages[s.storage_id]) {
+                if (s.bit_offset != 0) {
+                    error = detail::make_error("SignalDefinition bit_offset requires an existing physical storage signal for signal_id: ", s.signal_id); return false;
+                }
                 SignalState st;
                 st.valid = true;
                 st.def = s;
@@ -1152,8 +1369,13 @@ private:
                 seen_storages[s.storage_id] = 1;
             } else {
                 const SignalState& existing = signal_states_[s.storage_id];
-                if (!existing.valid || existing.def.type != s.type || existing.def.bit_width != s.bit_width) {
+                if (!existing.valid) {
                     error = detail::make_error("SignalDefinition.storage_id has incompatible logical aliases for signal_id: ", s.signal_id);
+                    return false;
+                }
+                const u32 storage_bits = static_cast<u32>(existing.byte_width_bytes) * 8u;
+                if (s.bit_offset + s.bit_width > storage_bits) {
+                    error = detail::make_error("SignalDefinition bit range exceeds storage capacity for signal_id: ", s.signal_id);
                     return false;
                 }
             }
@@ -1197,7 +1419,12 @@ private:
             : 1u;
         current_block_shared_times_by_chunk_.clear();
         current_block_shared_times_by_chunk_.resize(chunk_count == 0 ? 1u : chunk_count);
-        initialize_lod_storage();
+        if (options_.enable_lod_tables) {
+            initialize_lod_storage();
+        } else {
+            initialize_lod_bucket_cycles();
+            lod_states_.clear();
+        }
         return true;
     }
 
@@ -1217,7 +1444,7 @@ private:
         if (options_.enable_bool_toggle_encoding) feature_flags |= kHeaderFeatureBoolToggleCodec;
         if (options_.enable_value_byte_mask_encoding) feature_flags |= kHeaderFeatureByteMaskCodec;
         if (options_.enable_value_byte_mask_encoding) feature_flags |= kHeaderFeatureNibbleMaskCodec;
-        feature_flags |= kHeaderFeatureLodTables;
+        if (options_.enable_lod_tables) feature_flags |= kHeaderFeatureLodTables;
         if (!detail::write_u64(out_, feature_flags)) { error = "failed to write WVZ4 feature flags"; return false; }
         if (!detail::write_u64(out_, 0)) { error = "failed to write WVZ4 reserved"; return false; }
         if (!detail::write_u32(out_, 0)) { error = "failed to write WVZ4 reserved"; return false; }
@@ -1330,6 +1557,8 @@ private:
             detail::append_u8(payload, static_cast<u8>(s.type));
             detail::append_varuint(payload, s.bit_width);
             detail::append_u8(payload, static_cast<u8>(s.radix));
+            detail::append_varuint(payload, s.bit_offset);
+            detail::append_u8(payload, s.storage_only ? kSignalFlagStorageOnly : 0u);
         }
         if (!write_layout_section("SIGT", "SIGZ", payload, error)) return false;
 
@@ -3462,72 +3691,278 @@ private:
         return static_cast<bool>(log);
     }
 
-    std::vector<u8> build_lod_level_payload_v9(const LodLevelState& lod_level,
-                                               const LodStorageState& storage,
-                                               u64& record_count) const {
+    std::vector<u8> build_lod_transition_payload(const std::vector<Transition>& transitions,
+                                                 std::size_t begin,
+                                                 std::size_t end,
+                                                 const LodStorageState& storage,
+                                                 u64& record_count) const {
         std::vector<u8> out;
-        record_count = static_cast<u64>(lod_level.transitions.size());
-        if (lod_level.transitions.empty()) return out;
-        append_value_best_record(lod_level.transitions, 0, storage.byte_width,
+        record_count = 0;
+        if (begin >= end || begin >= transitions.size()) return out;
+        end = (std::min)(end, transitions.size());
+        std::vector<Transition> slice;
+        slice.reserve(end - begin);
+        for (std::size_t i = begin; i < end; ++i) slice.push_back(transitions[i]);
+        record_count = static_cast<u64>(slice.size());
+        append_value_best_record(slice, 0, storage.byte_width,
                                  storage.value_type, false, NULL, out);
         return out;
     }
 
-    static std::vector<std::size_t> select_lod_levels_to_store(const LodStorageState& storage) {
-        std::vector<std::size_t> selected;
+    static std::vector<LodSelectedLevel> select_lod_levels_to_store(const LodStorageState& storage) {
+        std::vector<LodSelectedLevel> selected;
         if (storage.raw_transition_count < kLodMinRawTransitionsForTable) return selected;
 
         u64 previous_count = storage.raw_transition_count;
         for (std::size_t level = 0; level < storage.levels.size(); ++level) {
-            const u64 sampled_count = static_cast<u64>(storage.levels[level].transitions.size());
+            const LodLevelState& lod_level = storage.levels[level];
+            if (lod_level.disabled) continue;
+            const u64 sampled_count = lod_level_materialized_count(lod_level);
             if (sampled_count == 0) continue;
-            if (sampled_count <= previous_count / kLodMinRawToSampleRatio) {
-                selected.push_back(level);
+            if (sampled_count <= previous_count / kLodMaxRecordsToSourceRatio) {
+                LodSelectedLevel s;
+                s.level = level;
+                s.source_record_count = previous_count;
+                selected.push_back(s);
                 previous_count = sampled_count;
             }
         }
         return selected;
     }
 
-    void append_lod_tables_to_footer(std::vector<u8>& payload) const {
+    static u64 lod_time_chunk_span(u64 bucket_cycles) {
+        if (bucket_cycles == 0) return kLodTimeChunkBuckets;
+        if (bucket_cycles > (std::numeric_limits<u64>::max)() / kLodTimeChunkBuckets) {
+            return (std::numeric_limits<u64>::max)();
+        }
+        return bucket_cycles * kLodTimeChunkBuckets;
+    }
+
+    static i64 lod_time_window_start(i64 cycle, u64 span) {
+        if (cycle <= 0 || span == 0) return 0;
+        const u64 ucycle = static_cast<u64>(cycle);
+        const u64 start = (ucycle / span) * span;
+        const u64 imax = static_cast<u64>((std::numeric_limits<i64>::max)());
+        return static_cast<i64>((std::min)(start, imax));
+    }
+
+    static i64 lod_time_window_end(i64 start, u64 span) {
+        const u64 imax = static_cast<u64>((std::numeric_limits<i64>::max)());
+        const u64 ustart = start <= 0 ? 0u : static_cast<u64>(start);
+        if (span == 0 || span > imax - ustart) return (std::numeric_limits<i64>::max)();
+        return static_cast<i64>(ustart + span);
+    }
+
+    bool write_lodz_section(u32 level_index,
+                            u32 signal_chunk_id,
+                            i64 start_cycle,
+                            i64 end_cycle,
+                            const std::vector<u8>& raw_payload,
+                            u64 storage_count,
+                            u64 record_count,
+                            std::string& error) {
+        if (raw_payload.empty() || storage_count == 0 || record_count == 0) return true;
+
+        Compression compression = Compression::None;
+        std::vector<u8> encoded = raw_payload;
+        if (options_.compression == Compression::Zstd) {
+            std::vector<u8> compressed;
+            if (!compress_payload_zstd(raw_payload, compressed, error)) return false;
+            if (!compressed.empty() && compressed.size() < raw_payload.size()) {
+                encoded.swap(compressed);
+                compression = Compression::Zstd;
+            }
+        }
+
+        const u64 chunk_id = static_cast<u64>(lod_chunk_index_.size());
+        std::vector<u8> section_payload;
+        section_payload.reserve(48 + encoded.size());
+        detail::append_varuint(section_payload, chunk_id);
+        detail::append_varuint(section_payload, level_index);
+        detail::append_varuint(section_payload, signal_chunk_id);
+        detail::append_i64(section_payload, start_cycle);
+        detail::append_i64(section_payload, end_cycle);
+        detail::append_u8(section_payload, static_cast<u8>(compression));
+        detail::append_varuint(section_payload, static_cast<u64>(raw_payload.size()));
+        detail::append_varuint(section_payload, static_cast<u64>(encoded.size()));
+        detail::append_vector_bytes(section_payload, encoded);
+
+        const u64 offset = static_cast<u64>(out_.tellp());
+        if (!write_section("LODZ", section_payload, error)) return false;
+        const u64 end = static_cast<u64>(out_.tellp());
+
+        LodChunkIndexRecord idx;
+        idx.chunk_id = chunk_id;
+        idx.level_index = level_index;
+        idx.signal_chunk_id = signal_chunk_id;
+        idx.start_cycle = start_cycle;
+        idx.end_cycle = end_cycle;
+        idx.file_offset = offset;
+        idx.file_size = end - offset;
+        idx.raw_size = static_cast<u64>(raw_payload.size());
+        idx.compression = compression;
+        idx.storage_count = storage_count;
+        idx.record_count = record_count;
+        lod_chunk_index_.push_back(idx);
+        return true;
+    }
+
+    bool write_lodz_chunks(std::string& error) {
+        lod_chunk_index_.clear();
+        if (!options_.enable_lod_tables || lod_bucket_cycles_.empty() || lod_states_.empty()) return true;
+
+        std::vector<std::map<u32, std::vector<LodSelectedStorageLevel> > > selected_by_level_and_chunk(lod_bucket_cycles_.size());
+        const u32 spc = (options_.enable_signal_chunking && options_.signals_per_chunk != 0)
+            ? options_.signals_per_chunk
+            : ((max_signal_id_ == 0) ? 1u : max_signal_id_);
+
+        for (std::size_t sid = 0; sid < lod_states_.size(); ++sid) {
+            const LodStorageState& storage = lod_states_[sid];
+            if (!storage.valid || storage.levels.empty()) continue;
+            const std::vector<LodSelectedLevel> selected_levels = select_lod_levels_to_store(storage);
+            if (selected_levels.empty()) continue;
+            const u32 storage_id = static_cast<u32>(sid);
+            if (storage_id == 0) continue;
+            const u32 signal_chunk_id = options_.enable_signal_chunking
+                ? ((storage_id - 1u) / spc)
+                : 0u;
+            for (std::size_t i = 0; i < selected_levels.size(); ++i) {
+                const std::size_t level = selected_levels[i].level;
+                if (level < selected_by_level_and_chunk.size()) {
+                    LodSelectedStorageLevel selected;
+                    selected.storage_id = storage_id;
+                    selected.source_record_count = selected_levels[i].source_record_count;
+                    selected_by_level_and_chunk[level][signal_chunk_id].push_back(selected);
+                }
+            }
+        }
+
+        for (std::size_t level = 0; level < selected_by_level_and_chunk.size(); ++level) {
+            const u64 span = lod_time_chunk_span(lod_bucket_cycles_[level]);
+            std::map<u32, std::vector<LodSelectedStorageLevel> >& by_chunk = selected_by_level_and_chunk[level];
+            for (std::map<u32, std::vector<LodSelectedStorageLevel> >::iterator it = by_chunk.begin(); it != by_chunk.end(); ++it) {
+                std::vector<LodStorageLevelRef> refs;
+                refs.reserve(it->second.size());
+                for (std::size_t i = 0; i < it->second.size(); ++i) {
+                    const LodSelectedStorageLevel& selected = it->second[i];
+                    const u32 storage_id = selected.storage_id;
+                    if (storage_id >= lod_states_.size()) continue;
+                    const LodStorageState& storage = lod_states_[storage_id];
+                    if (level >= storage.levels.size()) continue;
+                    const LodLevelState& lod_level = storage.levels[level];
+                    if (lod_level.disabled || lod_level.transitions.empty()) continue;
+                    std::vector<Transition> materialized = materialize_lod_level_transitions(lod_level);
+                    if (static_cast<u64>(materialized.size()) >
+                        selected.source_record_count / kLodMaxRecordsToSourceRatio) {
+                        materialized.clear();
+                    }
+                    if (materialized.empty()) continue;
+                    LodStorageLevelRef ref;
+                    ref.storage_id = storage_id;
+                    ref.storage = &storage;
+                    ref.lod_level = &lod_level;
+                    ref.transitions.swap(materialized);
+                    ref.valid_ranges = materialize_lod_level_valid_ranges(lod_level);
+                    refs.push_back(ref);
+                }
+
+                while (true) {
+                    bool have_next = false;
+                    i64 window_start = (std::numeric_limits<i64>::max)();
+                    for (std::size_t r = 0; r < refs.size(); ++r) {
+                        const std::vector<Transition>& transitions = refs[r].transitions;
+                        if (refs[r].cursor >= transitions.size()) continue;
+                        const i64 candidate = lod_time_window_start(transitions[refs[r].cursor].cycle, span);
+                        if (!have_next || candidate < window_start) {
+                            have_next = true;
+                            window_start = candidate;
+                        }
+                    }
+                    if (!have_next) break;
+                    const i64 window_end = lod_time_window_end(window_start, span);
+
+                    std::vector<u8> records_payload;
+                    u64 storage_count = 0;
+                    u64 record_count = 0;
+                    for (std::size_t r = 0; r < refs.size(); ++r) {
+                        const std::vector<Transition>& transitions = refs[r].transitions;
+                        if (refs[r].cursor >= transitions.size()) continue;
+                        if (lod_time_window_start(transitions[refs[r].cursor].cycle, span) != window_start) continue;
+
+                        const std::size_t begin = refs[r].cursor;
+                        while (refs[r].cursor < transitions.size() &&
+                               transitions[refs[r].cursor].cycle < window_end) {
+                            ++refs[r].cursor;
+                        }
+                        u64 slice_count = 0;
+                        const std::vector<u8> stream_payload =
+                            build_lod_transition_payload(transitions, begin, refs[r].cursor, *refs[r].storage, slice_count);
+                        if (slice_count == 0 || stream_payload.empty()) continue;
+
+                        std::vector<LodValidRange> valid_ranges;
+                        for (std::size_t vr = 0; vr < refs[r].valid_ranges.size(); ++vr) {
+                            const LodValidRange& src = refs[r].valid_ranges[vr];
+                            if (src.end_cycle <= window_start || src.start_cycle >= window_end) continue;
+                            LodValidRange clipped;
+                            clipped.start_cycle = src.start_cycle;
+                            clipped.end_cycle = src.end_cycle;
+                            if (clipped.end_cycle > clipped.start_cycle) valid_ranges.push_back(clipped);
+                        }
+                        if (valid_ranges.empty()) continue;
+
+                        detail::append_varuint(records_payload, refs[r].storage_id);
+                        detail::append_varuint(records_payload, refs[r].storage->byte_width);
+                        detail::append_varuint(records_payload, static_cast<u64>(valid_ranges.size()));
+                        for (std::size_t vr = 0; vr < valid_ranges.size(); ++vr) {
+                            detail::append_i64(records_payload, valid_ranges[vr].start_cycle);
+                            detail::append_i64(records_payload, valid_ranges[vr].end_cycle);
+                        }
+                        detail::append_varuint(records_payload, slice_count);
+                        detail::append_varuint(records_payload, static_cast<u64>(stream_payload.size()));
+                        detail::append_vector_bytes(records_payload, stream_payload);
+                        ++storage_count;
+                        record_count += slice_count;
+                    }
+
+                    if (storage_count == 0 || record_count == 0) continue;
+                    std::vector<u8> raw_payload;
+                    detail::append_varuint(raw_payload, storage_count);
+                    detail::append_vector_bytes(raw_payload, records_payload);
+                    if (!write_lodz_section(static_cast<u32>(level), it->first, window_start, window_end,
+                                            raw_payload, storage_count, record_count, error)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    void append_lodz_index_to_footer(std::vector<u8>& payload) const {
         detail::append_varuint(payload, static_cast<u64>(lod_bucket_cycles_.size()));
         for (std::size_t i = 0; i < lod_bucket_cycles_.size(); ++i) {
             detail::append_varuint(payload, lod_bucket_cycles_[i]);
         }
 
-        u64 storage_count = 0;
-        for (std::size_t sid = 0; sid < lod_states_.size(); ++sid) {
-            const LodStorageState& storage = lod_states_[sid];
-            if (!storage.valid) continue;
-            if (!select_lod_levels_to_store(storage).empty()) ++storage_count;
-        }
-        detail::append_varuint(payload, storage_count);
-
-        for (std::size_t sid = 0; sid < lod_states_.size(); ++sid) {
-            const LodStorageState& storage = lod_states_[sid];
-            if (!storage.valid) continue;
-            const std::vector<std::size_t> selected_levels = select_lod_levels_to_store(storage);
-            const u64 non_empty_levels = static_cast<u64>(selected_levels.size());
-            if (non_empty_levels == 0) continue;
-
-            detail::append_varuint(payload, static_cast<u64>(sid));
-            detail::append_varuint(payload, storage.byte_width);
-            detail::append_varuint(payload, 0u);
-            detail::append_varuint(payload, non_empty_levels);
-            for (std::size_t selected = 0; selected < selected_levels.size(); ++selected) {
-                const std::size_t level = selected_levels[selected];
-                const LodLevelState& lod_level = storage.levels[level];
-                u64 record_count = 0;
-                const std::vector<u8> level_payload = build_lod_level_payload_v9(lod_level, storage, record_count);
-                detail::append_varuint(payload, static_cast<u64>(level));
-                detail::append_varuint(payload, record_count);
-                detail::append_varuint(payload, static_cast<u64>(level_payload.size()));
-                detail::append_vector_bytes(payload, level_payload);
-            }
+        detail::append_varuint(payload, static_cast<u64>(lod_chunk_index_.size()));
+        for (std::size_t i = 0; i < lod_chunk_index_.size(); ++i) {
+            const LodChunkIndexRecord& r = lod_chunk_index_[i];
+            detail::append_varuint(payload, r.chunk_id);
+            detail::append_varuint(payload, r.level_index);
+            detail::append_varuint(payload, r.signal_chunk_id);
+            detail::append_i64(payload, r.start_cycle);
+            detail::append_i64(payload, r.end_cycle);
+            detail::append_varuint(payload, r.file_offset);
+            detail::append_varuint(payload, r.file_size);
+            detail::append_varuint(payload, r.raw_size);
+            detail::append_u8(payload, static_cast<u8>(r.compression));
+            detail::append_varuint(payload, r.storage_count);
+            detail::append_varuint(payload, r.record_count);
         }
     }
 
     bool write_footer_and_patch_header(std::string& error) {
+        if (!write_lodz_chunks(error)) return false;
         footer_offset_ = static_cast<u64>(out_.tellp());
         std::vector<u8> payload;
         detail::append_varuint(payload, static_cast<u64>(block_index_.size()));
@@ -3560,7 +3995,7 @@ private:
                 prev = it->second[i];
             }
         }
-        append_lod_tables_to_footer(payload);
+        append_lodz_index_to_footer(payload);
         if (!write_section("FOOT", payload, error)) return false;
 
         out_.seekp(8 + 4 + 4 + 8, std::ios::beg); // magic + version + header_size + block_span
@@ -3578,6 +4013,7 @@ private:
         lod_states_.clear();
         lod_bucket_cycles_.clear();
         block_index_.clear();
+        lod_chunk_index_.clear();
         current_block_shared_times_by_chunk_.clear();
         max_signal_id_ = 0;
         have_pending_content_ = false;
@@ -3625,6 +4061,7 @@ private:
     std::vector<LodStorageState> lod_states_; // indexed by physical storage_id
     std::vector<u64> lod_bucket_cycles_;
     std::vector<BlockIndexRecord> block_index_;
+    std::vector<LodChunkIndexRecord> lod_chunk_index_;
     std::vector<std::vector<u64> > current_block_shared_times_by_chunk_;
     u32 max_signal_id_ = 0;
     bool have_pending_content_ = false;
@@ -3928,26 +4365,14 @@ private:
 
 
 // -----------------------------------------------------------------------------
-// Process monitor / WAL support.
+// Writer helper process support.
 //
-// These classes are deliberately additive: the existing Writer and AsyncWriter
-// paths are unchanged.  A simulation process can write committed records to a
-// spool file, while an external monitor process later calls
-// WalMonitor::replay_committed_spool_to_file().  If the simulation process is
-// killed, records whose commit marker was not written are ignored; the resulting
-// WVZ4 file is crash-consistent up to the last committed cycle.
+// The parent process submits layout/cycle frames over a named pipe.  The helper
+// process owns the real Writer and finalizes the WVZ4 directly when the parent
+// closes normally, exits, crashes, or is killed.
 // -----------------------------------------------------------------------------
-enum class WalRecordType : u32 {
-    Layout   = 1,
-    Cycle    = 2,
-    Flush    = 3,
-    Finalize = 4
-};
 
 namespace detail {
-static const u32 kWalMagic = 0x4c345657u; // "WV4L" little-endian spelling.
-static const std::size_t kWalHeaderSize = 32;
-
 inline u32 fnv1a32(const std::vector<u8>& data) {
     u32 h = 2166136261u;
     for (std::size_t i = 0; i < data.size(); ++i) {
@@ -3961,22 +4386,99 @@ inline void append_i32(std::vector<u8>& out, std::int32_t v) {
     append_u32(out, static_cast<u32>(v));
 }
 
-inline bool write_all_stream(std::fstream& f, const void* data, std::size_t size) {
-    if (size == 0) return true;
-    f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
-    return static_cast<bool>(f);
+inline bool file_exists(const std::string& path) {
+    std::ifstream in(path.c_str(), std::ios::binary);
+    return static_cast<bool>(in);
 }
 
-inline bool write_u32_stream(std::fstream& f, u32 v) {
-    u8 b[4] = { static_cast<u8>(v), static_cast<u8>(v >> 8), static_cast<u8>(v >> 16), static_cast<u8>(v >> 24) };
-    return write_all_stream(f, b, 4);
+#if defined(_WIN32)
+inline std::string win32_error_message(const std::string& prefix, DWORD code = GetLastError()) {
+    std::ostringstream os;
+    os << prefix << " (GetLastError=" << static_cast<unsigned long>(code) << ")";
+    return os.str();
 }
 
-inline bool write_u64_stream(std::fstream& f, u64 v) {
-    u8 b[8];
-    for (int i = 0; i < 8; ++i) b[i] = static_cast<u8>(v >> (8 * i));
-    return write_all_stream(f, b, 8);
+inline std::string parent_dir(const std::string& path) {
+    const std::size_t pos = path.find_last_of("\\/");
+    if (pos == std::string::npos) return std::string();
+    return path.substr(0, pos);
 }
+
+inline std::string join_path(const std::string& dir, const std::string& leaf) {
+    if (dir.empty()) return leaf;
+    const char last = dir[dir.size() - 1];
+    if (last == '\\' || last == '/') return dir + leaf;
+    return dir + "\\" + leaf;
+}
+
+inline std::string current_exe_dir() {
+    char buffer[MAX_PATH];
+    const DWORD n = GetModuleFileNameA(NULL, buffer, static_cast<DWORD>(sizeof(buffer)));
+    if (n == 0 || n >= sizeof(buffer)) return std::string();
+    return parent_dir(std::string(buffer, buffer + n));
+}
+
+inline std::string quote_process_arg(const std::string& arg) {
+    std::string out;
+    out.reserve(arg.size() + 2);
+    out.push_back('"');
+    for (std::size_t i = 0; i < arg.size(); ++i) {
+        if (arg[i] == '"') out.push_back('\\');
+        out.push_back(arg[i]);
+    }
+    out.push_back('"');
+    return out;
+}
+
+inline bool write_all_handle(HANDLE h, const void* data, std::size_t size, std::string& error) {
+    const u8* p = static_cast<const u8*>(data);
+    while (size > 0) {
+        const DWORD chunk = static_cast<DWORD>((std::min<std::size_t>)(size, 1u << 20));
+        DWORD written = 0;
+        if (!WriteFile(h, p, chunk, &written, NULL)) {
+            error = win32_error_message("failed to write WVZ4 IPC pipe");
+            return false;
+        }
+        if (written == 0) {
+            error = "failed to write WVZ4 IPC pipe: zero-byte write";
+            return false;
+        }
+        p += written;
+        size -= written;
+    }
+    return true;
+}
+
+inline bool read_all_handle(HANDLE h, void* data, std::size_t size, bool& disconnected, std::string& error) {
+    disconnected = false;
+    u8* p = static_cast<u8*>(data);
+    while (size > 0) {
+        const DWORD chunk = static_cast<DWORD>((std::min<std::size_t>)(size, 1u << 20));
+        DWORD read = 0;
+        if (!ReadFile(h, p, chunk, &read, NULL)) {
+            const DWORD code = GetLastError();
+            if (code == ERROR_BROKEN_PIPE || code == ERROR_HANDLE_EOF || code == ERROR_PIPE_NOT_CONNECTED) {
+                disconnected = true;
+                return false;
+            }
+            error = win32_error_message("failed to read WVZ4 IPC pipe", code);
+            return false;
+        }
+        if (read == 0) {
+            disconnected = true;
+            return false;
+        }
+        p += read;
+        size -= read;
+    }
+    return true;
+}
+
+inline bool wait_process_exited(HANDLE process, DWORD milliseconds) {
+    return process && process != INVALID_HANDLE_VALUE &&
+           WaitForSingleObject(process, milliseconds) == WAIT_OBJECT_0;
+}
+#endif
 
 inline u32 load_u32_le(const u8* p) {
     return static_cast<u32>(p[0]) | (static_cast<u32>(p[1]) << 8) |
@@ -4049,6 +4551,7 @@ inline void serialize_options(std::vector<u8>& out, const WriterOptions& o) {
     append_u8(out, o.enable_bool_toggle_encoding ? 1 : 0);
     append_u8(out, o.enable_value_byte_mask_encoding ? 1 : 0);
     append_u8(out, o.enable_stride_time_record_encoding ? 1 : 0);
+    append_u8(out, o.enable_lod_tables ? 1 : 0);
     append_u8(out, o.enable_stats_log ? 1 : 0);
     append_string(out, o.stats_log_path);
     append_varuint(out, static_cast<u64>(o.transition_reserve_per_signal));
@@ -4071,6 +4574,7 @@ inline bool deserialize_options(PayloadReader& r, WriterOptions& o) {
     if (!r.read_u8(b)) return false; o.enable_bool_toggle_encoding = (b != 0);
     if (!r.read_u8(b)) return false; o.enable_value_byte_mask_encoding = (b != 0);
     if (!r.read_u8(b)) return false; o.enable_stride_time_record_encoding = (b != 0);
+    if (!r.read_u8(b)) return false; o.enable_lod_tables = (b != 0);
     if (!r.read_u8(b)) return false; o.enable_stats_log = (b != 0);
     if (!r.read_string(o.stats_log_path)) return false;
     if (!r.read_varuint(v)) return false; o.transition_reserve_per_signal = static_cast<std::size_t>(v);
@@ -4102,6 +4606,8 @@ inline void serialize_layout(std::vector<u8>& out, const Layout& l) {
         append_u8(out, static_cast<u8>(s.type));
         append_varuint(out, s.bit_width);
         append_u8(out, static_cast<u8>(s.radix));
+        append_varuint(out, s.bit_offset);
+        append_u8(out, s.storage_only ? kSignalFlagStorageOnly : 0u);
     }
     append_varuint(out, static_cast<u64>(l.clocks.size()));
     for (std::size_t i = 0; i < l.clocks.size(); ++i) {
@@ -4145,6 +4651,8 @@ inline bool deserialize_layout(PayloadReader& r, Layout& l) {
         if (!r.read_u8(b)) return false; rec.type = static_cast<ValueType>(b);
         if (!r.read_varuint(tmp)) return false; rec.bit_width = static_cast<u32>(tmp);
         if (!r.read_u8(b)) return false; rec.radix = static_cast<Radix>(b);
+        if (!r.read_varuint(tmp)) return false; rec.bit_offset = static_cast<u32>(tmp);
+        if (!r.read_u8(b)) return false; rec.storage_only = (b & kSignalFlagStorageOnly) != 0;
         l.signals.push_back(rec);
     }
     if (!r.read_varuint(n)) return false;
@@ -4187,152 +4695,467 @@ inline bool deserialize_cycle(PayloadReader& r, CycleSubmission& s) {
     }
     return true;
 }
+
+static const u32 kIpcMagic = 0x34504957u;    // "WIP4" little-endian spelling.
+static const u32 kIpcAckMagic = 0x34415057u; // "WPA4" little-endian spelling.
+static const std::size_t kIpcHeaderSize = 28;
+static const std::size_t kIpcAckHeaderSize = 24;
+static const u64 kMaxIpcPayloadBytes = 512ull * 1024ull * 1024ull;
 } // namespace detail
 
-class WalWriter {
-public:
-    WalWriter() {}
-    ~WalWriter() { close(); }
+enum class WriterProcessFrameType : u32 {
+    Layout   = 1,
+    Cycle    = 2,
+    Finalize = 3
+};
 
-    bool open(const std::string& spool_path, const Layout& layout,
-              const WriterOptions& options, std::string& error) {
-        close();
+class WriterProcessClient {
+public:
+    WriterProcessClient() {}
+    ~WriterProcessClient() { std::string ignored; close(ignored); }
+
+    WriterProcessClient(const WriterProcessClient&) = delete;
+    WriterProcessClient& operator=(const WriterProcessClient&) = delete;
+
+    bool open(const std::string& output_path,
+              const Layout& layout,
+              const WriterOptions& options,
+              std::string& error,
+              const std::string& helper_exe_path = std::string(),
+              DWORD connect_timeout_ms = 10000) {
+#if !defined(_WIN32)
+        (void)output_path; (void)layout; (void)options; (void)helper_exe_path; (void)connect_timeout_ms;
+        error = "WVZ4 writer helper process is only implemented on Windows";
+        return false;
+#else
+        std::string close_error;
+        close(close_error);
         error.clear();
-        spool_.open(spool_path.c_str(), std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
-        if (!spool_) { error = "failed to open WVZ4 spool file: " + spool_path; return false; }
-        seq_ = 0;
-        opened_ = true;
+
+        const std::string helper = resolve_helper_path(helper_exe_path);
+        if (helper.empty()) {
+            error = "failed to find wvz4_writer_monitor.exe for WVZ4 writer helper";
+            return false;
+        }
+
+        pipe_name_ = make_pipe_name();
+        if (!start_helper_process(helper, output_path, error)) {
+            cleanup_handles(false);
+            return false;
+        }
+        if (!connect_pipe(connect_timeout_ms, error)) {
+            cleanup_handles(true);
+            return false;
+        }
+
         std::vector<u8> payload;
         detail::serialize_options(payload, options);
         detail::serialize_layout(payload, layout);
-        return write_record(WalRecordType::Layout, payload, error);
-    }
-
-    bool submit_cycle(const CycleSubmission& s, std::string& error) {
-        std::vector<u8> payload;
-        detail::serialize_cycle(payload, s);
-        return write_record(WalRecordType::Cycle, payload, error);
-    }
-
-    bool request_flush(std::string& error) {
-        std::vector<u8> payload;
-        return write_record(WalRecordType::Flush, payload, error);
-    }
-
-    bool request_finalize(std::string& error) {
-        std::vector<u8> payload;
-        return write_record(WalRecordType::Finalize, payload, error);
-    }
-
-    void close() {
-        if (spool_.is_open()) spool_.close();
-        opened_ = false;
-    }
-
-private:
-    bool write_record(WalRecordType type, const std::vector<u8>& payload, std::string& error) {
-        error.clear();
-        if (!opened_) { error = "WVZ4 WalWriter is not open"; return false; }
-        const u32 checksum = detail::fnv1a32(payload);
-        const std::streampos record_start = spool_.tellp();
-        if (!detail::write_u32_stream(spool_, detail::kWalMagic)) { error = "failed to write WAL magic"; return false; }
-        if (!detail::write_u32_stream(spool_, static_cast<u32>(type))) { error = "failed to write WAL type"; return false; }
-        if (!detail::write_u64_stream(spool_, ++seq_)) { error = "failed to write WAL seq"; return false; }
-        if (!detail::write_u64_stream(spool_, static_cast<u64>(payload.size()))) { error = "failed to write WAL payload size"; return false; }
-        if (!detail::write_u32_stream(spool_, checksum)) { error = "failed to write WAL checksum"; return false; }
-        if (!detail::write_u32_stream(spool_, 0)) { error = "failed to write WAL commit placeholder"; return false; }
-        if (!detail::write_all_stream(spool_, payload.data(), payload.size())) { error = "failed to write WAL payload"; return false; }
-        spool_.flush();
-        spool_.seekp(record_start + static_cast<std::streamoff>(28), std::ios::beg);
-        if (!detail::write_u32_stream(spool_, 1)) { error = "failed to write WAL commit marker"; return false; }
-        spool_.seekp(0, std::ios::end);
-        spool_.flush();
-        return true;
-    }
-
-private:
-    std::fstream spool_;
-    bool opened_ = false;
-    u64 seq_ = 0;
-};
-
-class WalMonitor {
-public:
-    static bool replay_committed_spool_to_file(const std::string& spool_path,
-                                               const std::string& output_path,
-                                               std::string& error) {
-        error.clear();
-        std::ifstream in(spool_path.c_str(), std::ios::binary);
-        if (!in) { error = "failed to open WVZ4 spool for replay: " + spool_path; return false; }
-        const std::string tmp_path = output_path + ".tmp";
-        Writer writer;
-        bool have_layout = false;
-        bool finalized = false;
-        u64 expected_seq = 1;
-        while (true) {
-            u8 hdr[detail::kWalHeaderSize];
-            in.read(reinterpret_cast<char*>(hdr), static_cast<std::streamsize>(sizeof(hdr)));
-            if (in.gcount() == 0) break; // clean EOF
-            if (in.gcount() != static_cast<std::streamsize>(sizeof(hdr))) break; // torn tail
-            const u32 magic = detail::load_u32_le(hdr + 0);
-            const u32 type_u = detail::load_u32_le(hdr + 4);
-            const u64 seq = detail::load_u64_le(hdr + 8);
-            const u64 size = detail::load_u64_le(hdr + 16);
-            const u32 checksum = detail::load_u32_le(hdr + 24);
-            const u32 committed = detail::load_u32_le(hdr + 28);
-            if (magic != detail::kWalMagic || committed != 1 || seq != expected_seq) break;
-            static const u64 kMaxWalPayloadBytes = 256ull * 1024ull * 1024ull;
-            if (size > kMaxWalPayloadBytes || size > static_cast<u64>((std::numeric_limits<std::size_t>::max)())) {
-                error = "WVZ4 WAL payload size is too large or corrupt";
-                return false;
-            }
-            std::vector<u8> payload(static_cast<std::size_t>(size));
-            if (size > 0) {
-                in.read(reinterpret_cast<char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
-                if (in.gcount() != static_cast<std::streamsize>(payload.size())) break;
-            }
-            if (detail::fnv1a32(payload) != checksum) break;
-            ++expected_seq;
-            detail::PayloadReader r(payload);
-            const WalRecordType type = static_cast<WalRecordType>(type_u);
-            if (type == WalRecordType::Layout) {
-                WriterOptions opt;
-                Layout layout;
-                if (!detail::deserialize_options(r, opt) || !detail::deserialize_layout(r, layout) || !r.at_end()) {
-                    error = "corrupt WVZ4 WAL layout record"; return false;
-                }
-                if (have_layout) { error = "WVZ4 WAL has duplicate layout record"; return false; }
-                if (opt.enable_stats_log && opt.stats_log_path.empty()) opt.stats_log_path = output_path + ".log";
-                if (!writer.open(tmp_path, layout, opt, error)) return false;
-                have_layout = true;
-            } else if (type == WalRecordType::Cycle) {
-                if (!have_layout) { error = "WVZ4 WAL cycle appears before layout"; return false; }
-                CycleSubmission s;
-                if (!detail::deserialize_cycle(r, s) || !r.at_end()) { error = "corrupt WVZ4 WAL cycle record"; return false; }
-                if (!writer.submit_cycle(s, error)) return false;
-            } else if (type == WalRecordType::Flush) {
-                // Current Writer finalizes on close only.  Flush records are kept
-                // for process protocol compatibility and are harmless during replay.
-                continue;
-            } else if (type == WalRecordType::Finalize) {
-                finalized = true;
-                break;
-            } else {
-                break;
-            }
+        if (!send_frame(WriterProcessFrameType::Layout, payload, error) ||
+            !read_ack(seq_, error)) {
+            cleanup_handles(true);
+            return false;
         }
-        (void)finalized;
-        if (!have_layout) { error = "WVZ4 WAL has no committed layout record"; return false; }
-        if (!writer.close(error)) return false;
-        std::remove(output_path.c_str());
-        if (std::rename(tmp_path.c_str(), output_path.c_str()) != 0) {
-            error = "failed to rename WVZ4 tmp file to output file";
+        opened_ = true;
+        return true;
+#endif
+    }
+
+    bool submit_cycle(const CycleSubmission& submission, std::string& error) {
+#if !defined(_WIN32)
+        (void)submission;
+        error = "WVZ4 writer helper process is only implemented on Windows";
+        return false;
+#else
+        error.clear();
+        if (!opened_) { error = "WVZ4 WriterProcessClient is not open"; return false; }
+        std::vector<u8> payload;
+        detail::serialize_cycle(payload, submission);
+        return send_frame(WriterProcessFrameType::Cycle, payload, error) &&
+               read_ack(seq_, error);
+#endif
+    }
+
+    bool close(std::string& error) {
+        error.clear();
+#if defined(_WIN32)
+        if (!opened_) {
+            cleanup_handles(false);
+            return true;
+        }
+
+        bool ok = true;
+        std::string local_error;
+        std::vector<u8> payload;
+        if (!send_frame(WriterProcessFrameType::Finalize, payload, local_error) ||
+            !read_ack(seq_, local_error)) {
+            ok = false;
+        }
+        cleanup_handles(true);
+        opened_ = false;
+        if (!ok) error = local_error.empty() ? "WVZ4 writer helper close failed" : local_error;
+        return ok;
+#else
+        return true;
+#endif
+    }
+
+private:
+#if defined(_WIN32)
+    static std::string make_pipe_name() {
+        std::ostringstream os;
+        os << "\\\\.\\pipe\\WaveTraceWVZ4Writer_"
+           << static_cast<unsigned long>(GetCurrentProcessId()) << "_"
+           << static_cast<unsigned long long>(GetTickCount64()) << "_"
+           << reinterpret_cast<std::uintptr_t>(&os);
+        return os.str();
+    }
+
+    static std::string resolve_helper_path(const std::string& explicit_path) {
+        if (!explicit_path.empty() && detail::file_exists(explicit_path)) return explicit_path;
+
+        std::vector<std::string> candidates;
+        candidates.push_back("wvz4_writer_monitor.exe");
+        candidates.push_back(detail::join_path("build_vs\\wvz4_writer_monitor\\Release", "wvz4_writer_monitor.exe"));
+        const std::string exe_dir = detail::current_exe_dir();
+        if (!exe_dir.empty()) {
+            candidates.push_back(detail::join_path(exe_dir, "wvz4_writer_monitor.exe"));
+            candidates.push_back(detail::join_path(detail::join_path(detail::parent_dir(detail::parent_dir(exe_dir)),
+                                                                      "wvz4_writer_monitor\\Release"),
+                                                  "wvz4_writer_monitor.exe"));
+        }
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (detail::file_exists(candidates[i])) return candidates[i];
+        }
+        return std::string();
+    }
+
+    bool start_helper_process(const std::string& helper,
+                              const std::string& output_path,
+                              std::string& error) {
+        std::string cmd;
+        cmd.reserve(helper.size() + output_path.size() + pipe_name_.size() + 128);
+        cmd += detail::quote_process_arg(helper);
+        cmd += " --writer-helper --pipe ";
+        cmd += detail::quote_process_arg(pipe_name_);
+        cmd += " --parent-pid ";
+        cmd += std::to_string(static_cast<unsigned long>(GetCurrentProcessId()));
+        cmd += " --out ";
+        cmd += detail::quote_process_arg(output_path);
+
+        std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
+        mutable_cmd.push_back('\0');
+
+        STARTUPINFOA si;
+        std::memset(&si, 0, sizeof(si));
+        si.cb = sizeof(si);
+        std::memset(&pi_, 0, sizeof(pi_));
+        if (!CreateProcessA(helper.c_str(), mutable_cmd.data(), NULL, NULL, FALSE,
+                            CREATE_NO_WINDOW, NULL, NULL, &si, &pi_)) {
+            error = detail::win32_error_message("failed to start WVZ4 writer helper");
             return false;
         }
         return true;
     }
+
+    bool connect_pipe(DWORD timeout_ms, std::string& error) {
+        const ULONGLONG start = GetTickCount64();
+        while (true) {
+            pipe_ = CreateFileA(pipe_name_.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+                                NULL, OPEN_EXISTING, 0, NULL);
+            if (pipe_ != INVALID_HANDLE_VALUE) return true;
+
+            const DWORD code = GetLastError();
+            if (pi_.hProcess && WaitForSingleObject(pi_.hProcess, 0) == WAIT_OBJECT_0) {
+                error = "WVZ4 writer helper exited before pipe connection";
+                return false;
+            }
+            const ULONGLONG elapsed = GetTickCount64() - start;
+            if (elapsed >= timeout_ms) {
+                error = "timed out connecting to WVZ4 writer helper pipe";
+                return false;
+            }
+            if (code != ERROR_FILE_NOT_FOUND && code != ERROR_PIPE_BUSY) {
+                error = detail::win32_error_message("failed to connect WVZ4 writer helper pipe", code);
+                return false;
+            }
+            Sleep(20);
+        }
+    }
+
+    bool send_frame(WriterProcessFrameType type, const std::vector<u8>& payload, std::string& error) {
+        if (pipe_ == INVALID_HANDLE_VALUE) { error = "WVZ4 writer helper pipe is not connected"; return false; }
+        const u32 checksum = detail::fnv1a32(payload);
+        std::vector<u8> header;
+        header.reserve(detail::kIpcHeaderSize);
+        detail::append_u32(header, detail::kIpcMagic);
+        detail::append_u32(header, static_cast<u32>(type));
+        detail::append_u64(header, ++seq_);
+        detail::append_u64(header, static_cast<u64>(payload.size()));
+        detail::append_u32(header, checksum);
+        if (!detail::write_all_handle(pipe_, header.data(), header.size(), error)) return false;
+        if (!payload.empty() && !detail::write_all_handle(pipe_, payload.data(), payload.size(), error)) return false;
+        return true;
+    }
+
+    bool read_ack(u64 expected_seq, std::string& error) {
+        u8 hdr[detail::kIpcAckHeaderSize];
+        bool disconnected = false;
+        if (!detail::read_all_handle(pipe_, hdr, sizeof(hdr), disconnected, error)) {
+            if (disconnected) error = "WVZ4 writer helper pipe disconnected before ack";
+            return false;
+        }
+        const u32 magic = detail::load_u32_le(hdr + 0);
+        const u64 seq = detail::load_u64_le(hdr + 4);
+        const u32 ok = detail::load_u32_le(hdr + 12);
+        const u32 message_size = detail::load_u32_le(hdr + 16);
+        const u32 checksum = detail::load_u32_le(hdr + 20);
+        if (magic != detail::kIpcAckMagic || seq != expected_seq) {
+            error = "WVZ4 writer helper returned an invalid ack";
+            return false;
+        }
+        std::vector<u8> message(message_size);
+        if (message_size > 0 &&
+            !detail::read_all_handle(pipe_, message.data(), message.size(), disconnected, error)) {
+            if (disconnected) error = "WVZ4 writer helper pipe disconnected during ack";
+            return false;
+        }
+        if (detail::fnv1a32(message) != checksum) {
+            error = "WVZ4 writer helper ack checksum mismatch";
+            return false;
+        }
+        if (ok == 0) {
+            error.assign(reinterpret_cast<const char*>(message.data()), message.size());
+            if (error.empty()) error = "WVZ4 writer helper reported failure";
+            return false;
+        }
+        return true;
+    }
+
+    void cleanup_handles(bool wait_for_process) {
+        if (pipe_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(pipe_);
+            pipe_ = INVALID_HANDLE_VALUE;
+        }
+        if (wait_for_process && pi_.hProcess) {
+            WaitForSingleObject(pi_.hProcess, 5000);
+        }
+        if (pi_.hThread) {
+            CloseHandle(pi_.hThread);
+            pi_.hThread = NULL;
+        }
+        if (pi_.hProcess) {
+            CloseHandle(pi_.hProcess);
+            pi_.hProcess = NULL;
+        }
+    }
+
+    HANDLE pipe_ = INVALID_HANDLE_VALUE;
+    PROCESS_INFORMATION pi_ {};
+#endif
+
+    bool opened_ = false;
+    u64 seq_ = 0;
+    std::string pipe_name_;
 };
 
+class WriterProcessServer {
+public:
+    static bool run(const std::string& pipe_name,
+                    const std::string& output_path,
+                    unsigned long parent_pid,
+                    std::string& error) {
+#if !defined(_WIN32)
+        (void)pipe_name; (void)output_path; (void)parent_pid;
+        error = "WVZ4 writer helper process is only implemented on Windows";
+        return false;
+#else
+        error.clear();
+        HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(parent_pid));
+        HANDLE pipe = CreateNamedPipeA(pipe_name.c_str(),
+                                       PIPE_ACCESS_DUPLEX,
+                                       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
+                                       1,
+                                       1u << 20,
+                                       1u << 20,
+                                       0,
+                                       NULL);
+        if (pipe == INVALID_HANDLE_VALUE) {
+            if (parent) CloseHandle(parent);
+            error = detail::win32_error_message("failed to create WVZ4 writer helper pipe");
+            return false;
+        }
+
+        bool connected = false;
+        while (!connected) {
+            if (ConnectNamedPipe(pipe, NULL)) {
+                connected = true;
+                break;
+            }
+            const DWORD code = GetLastError();
+            if (code == ERROR_PIPE_CONNECTED) {
+                connected = true;
+                break;
+            }
+            if (parent && WaitForSingleObject(parent, 0) == WAIT_OBJECT_0) {
+                CloseHandle(pipe);
+                CloseHandle(parent);
+                return true;
+            }
+            if (code != ERROR_PIPE_LISTENING && code != ERROR_NO_DATA) {
+                CloseHandle(pipe);
+                if (parent) CloseHandle(parent);
+                error = detail::win32_error_message("failed while waiting for WVZ4 writer helper pipe client", code);
+                return false;
+            }
+            Sleep(20);
+        }
+
+        DWORD mode = PIPE_READMODE_BYTE | PIPE_WAIT;
+        SetNamedPipeHandleState(pipe, &mode, NULL, NULL);
+
+        Writer writer;
+        bool have_writer = false;
+        bool result = true;
+        while (true) {
+            WriterProcessFrameType type = WriterProcessFrameType::Finalize;
+            u64 seq = 0;
+            std::vector<u8> payload;
+            bool disconnected = false;
+            if (!read_frame(pipe, type, seq, payload, disconnected, error)) {
+                if (disconnected) {
+                    if (have_writer) {
+                        std::string close_error;
+                        if (!writer.close(close_error)) {
+                            error = close_error;
+                            result = false;
+                        }
+                    }
+                    break;
+                }
+                result = false;
+                break;
+            }
+
+            std::string op_error;
+            bool ok = handle_frame(type, payload, output_path, writer, have_writer, op_error);
+            if (!send_ack(pipe, seq, ok, op_error, error)) {
+                result = false;
+                break;
+            }
+            if (!ok) {
+                result = false;
+                break;
+            }
+            if (type == WriterProcessFrameType::Finalize) {
+                break;
+            }
+        }
+
+        FlushFileBuffers(pipe);
+        DisconnectNamedPipe(pipe);
+        CloseHandle(pipe);
+        if (parent) CloseHandle(parent);
+        return result;
+#endif
+    }
+
+private:
+#if defined(_WIN32)
+    static bool read_frame(HANDLE pipe,
+                           WriterProcessFrameType& type,
+                           u64& seq,
+                           std::vector<u8>& payload,
+                           bool& disconnected,
+                           std::string& error) {
+        u8 hdr[detail::kIpcHeaderSize];
+        if (!detail::read_all_handle(pipe, hdr, sizeof(hdr), disconnected, error)) return false;
+        const u32 magic = detail::load_u32_le(hdr + 0);
+        const u32 type_u = detail::load_u32_le(hdr + 4);
+        seq = detail::load_u64_le(hdr + 8);
+        const u64 size = detail::load_u64_le(hdr + 16);
+        const u32 checksum = detail::load_u32_le(hdr + 24);
+        if (magic != detail::kIpcMagic) {
+            error = "WVZ4 writer helper received invalid IPC magic";
+            return false;
+        }
+        if (size > detail::kMaxIpcPayloadBytes ||
+            size > static_cast<u64>((std::numeric_limits<std::size_t>::max)())) {
+            error = "WVZ4 writer helper IPC payload is too large";
+            return false;
+        }
+        payload.assign(static_cast<std::size_t>(size), 0);
+        if (size > 0 && !detail::read_all_handle(pipe, payload.data(), payload.size(), disconnected, error)) {
+            return false;
+        }
+        if (detail::fnv1a32(payload) != checksum) {
+            error = "WVZ4 writer helper IPC payload checksum mismatch";
+            return false;
+        }
+        type = static_cast<WriterProcessFrameType>(type_u);
+        return true;
+    }
+
+    static bool handle_frame(WriterProcessFrameType type,
+                             const std::vector<u8>& payload,
+                             const std::string& output_path,
+                             Writer& writer,
+                             bool& have_writer,
+                             std::string& error) {
+        error.clear();
+        detail::PayloadReader r(payload);
+        if (type == WriterProcessFrameType::Layout) {
+            if (have_writer) { error = "WVZ4 writer helper received duplicate layout"; return false; }
+            WriterOptions opt;
+            Layout layout;
+            if (!detail::deserialize_options(r, opt) ||
+                !detail::deserialize_layout(r, layout) ||
+                !r.at_end()) {
+                error = "WVZ4 writer helper received corrupt layout payload";
+                return false;
+            }
+            if (opt.enable_stats_log && opt.stats_log_path.empty()) opt.stats_log_path = output_path + ".log";
+            if (!writer.open(output_path, layout, opt, error)) return false;
+            have_writer = true;
+            return true;
+        }
+        if (type == WriterProcessFrameType::Cycle) {
+            if (!have_writer) { error = "WVZ4 writer helper received cycle before layout"; return false; }
+            CycleSubmission s;
+            if (!detail::deserialize_cycle(r, s) || !r.at_end()) {
+                error = "WVZ4 writer helper received corrupt cycle payload";
+                return false;
+            }
+            return writer.submit_cycle(s, error);
+        }
+        if (type == WriterProcessFrameType::Finalize) {
+            if (!have_writer) return true;
+            if (!writer.close(error)) return false;
+            have_writer = false;
+            return true;
+        }
+        error = "WVZ4 writer helper received unknown IPC frame type";
+        return false;
+    }
+
+    static bool send_ack(HANDLE pipe, u64 seq, bool ok, const std::string& message, std::string& error) {
+        std::vector<u8> msg;
+        if (!message.empty()) {
+            msg.assign(message.begin(), message.end());
+        }
+        std::vector<u8> header;
+        header.reserve(detail::kIpcAckHeaderSize);
+        detail::append_u32(header, detail::kIpcAckMagic);
+        detail::append_u64(header, seq);
+        detail::append_u32(header, ok ? 1u : 0u);
+        detail::append_u32(header, static_cast<u32>(msg.size()));
+        detail::append_u32(header, detail::fnv1a32(msg));
+        if (!detail::write_all_handle(pipe, header.data(), header.size(), error)) return false;
+        if (!msg.empty() && !detail::write_all_handle(pipe, msg.data(), msg.size(), error)) return false;
+        return true;
+    }
+#endif
+};
 
 } // namespace wvz4
 

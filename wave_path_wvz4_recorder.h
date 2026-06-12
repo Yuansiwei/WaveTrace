@@ -52,21 +52,16 @@ public:
         std::size_t async_writer_queue_limit = 256;
         std::size_t async_writer_queue_bytes_limit = 256u * 1024u * 1024u;
 
-        // Crash-consistent WAL mode. When enabled, the simulation process writes
-        // committed layout/cycle records to wal_spool_path instead of writing the
-        // final WVZ4 file directly.  The final WVZ4 is produced by replaying the
-        // spool with wvz4::WalMonitor, either automatically on normal close
-        // (wal_replay_to_output_on_close) or by an external monitor process after
-        // the simulation process exits/is killed.
+        // Crash/kill resistant helper mode. Enabled by default: the simulation
+        // process sends layout/cycle frames to a separate writer process. The
+        // helper owns the real WVZ4 Writer and finalizes the file if the parent
+        // process exits, crashes, or is killed by VS Stop Debugging.
         //
-        // Important: direct Writer/AsyncWriter output is not crash-consistent. If
-        // the process is killed while a WDAT section is being written, the file may
-        // contain a section length larger than the remaining file bytes. Use WAL
-        // mode and open the replayed output, not an in-progress direct file.
-        bool use_wal_spool = false;
-        std::string wal_spool_path;
-        bool wal_finalize_on_close = true;
-        bool wal_replay_to_output_on_close = true;
+        // Disable only for explicit scratch/perf runs where direct in-process
+        // writing is acceptable.
+        bool use_writer_process = true;
+        std::string writer_process_exe_path;
+        unsigned int writer_process_connect_timeout_ms = 10000;
 
         // WVZ4 v4 synthetic periodic clock. Enabled by default. The clock is
         // stored as CLKD(initial_value + period_ticks), not as ordinary WDAT
@@ -137,7 +132,7 @@ public:
            << " pending_samples=" << current_sample_ids_.size()
            << " emit_default_clk=" << (cfg_.emit_default_clk ? 1 : 0)
            << " async=" << (cfg_.async_writer ? 1 : 0)
-           << " wal=" << (cfg_.use_wal_spool ? 1 : 0);
+           << " writer_process=" << (cfg_.use_writer_process ? 1 : 0);
         if (!last_error_.empty()) os << " last_error='" << last_error_ << "'";
         return os.str();
     }
@@ -148,18 +143,8 @@ public:
         bool ok = true;
         std::string local_error;
         if (writer_opened_) {
-            if (cfg_.use_wal_spool) {
-                if (cfg_.wal_finalize_on_close) {
-                    if (!wal_writer_.request_finalize(local_error)) ok = false;
-                }
-                wal_writer_.close();
-                if (ok && cfg_.wal_replay_to_output_on_close) {
-                    const std::string spool_path = effective_wal_spool_path();
-                    if (!wvz4::WalMonitor::replay_committed_spool_to_file(
-                            spool_path, cfg_.file_path, local_error)) {
-                        ok = false;
-                    }
-                }
+            if (cfg_.use_writer_process) {
+                if (!process_writer_.close(local_error)) ok = false;
             } else if (cfg_.async_writer) {
                 if (!async_writer_.close(local_error)) ok = false;
             } else {
@@ -193,9 +178,13 @@ public:
         }
         wvz4::Layout layout;
         if (!build_layout(layout, error)) return false;
-        if (cfg_.use_wal_spool) {
-            const std::string spool_path = effective_wal_spool_path();
-            if (!wal_writer_.open(spool_path, layout, cfg_.options, error)) return false;
+        if (cfg_.use_writer_process) {
+            if (!process_writer_.open(cfg_.file_path,
+                                      layout,
+                                      cfg_.options,
+                                      error,
+                                      cfg_.writer_process_exe_path,
+                                      cfg_.writer_process_connect_timeout_ms)) return false;
         } else if (cfg_.async_writer) {
             if (!async_writer_.open(cfg_.file_path, layout, cfg_.options, error, cfg_.async_writer_queue_limit, cfg_.async_writer_queue_bytes_limit)) return false;
         } else {
@@ -315,7 +304,8 @@ public:
         if (logical_storage_id == 0 || logical_storage_id > max_track_id) {
             set_error("WVZ4 recorder on_track_declared failed: storage_id exceeds signal_id uint32 range"); return;
         }
-        if (decl.node_id == 0 || decl.node_id > static_cast<wave::NodeId>(std::numeric_limits<wvz4::u32>::max())) {
+        if ((!decl.storage_only && decl.node_id == 0) ||
+            decl.node_id > static_cast<wave::NodeId>(std::numeric_limits<wvz4::u32>::max())) {
             set_error("WVZ4 recorder on_track_declared failed: invalid node_id"); return;
         }
         ensure_track_capacity(decl.track_id);
@@ -333,6 +323,8 @@ public:
         st.node_id = static_cast<wvz4::u32>(decl.node_id);
         st.kind = decl.kind;
         st.bit_width = decl.bit_width == 0 ? static_cast<wvz4::u32>(64) : decl.bit_width;
+        st.bit_offset = decl.bit_offset;
+        st.storage_only = decl.storage_only;
         st.value_type = map_value_type(decl.kind, st.bit_width);
         st.radix = default_radix(decl.kind);
         declared_track_ids_.push_back(st.track_id);
@@ -383,7 +375,9 @@ private:
         wave::ValueKind kind = wave::ValueKind::Unknown;
         wvz4::ValueType value_type = wvz4::ValueType::U64;
         wvz4::u32 bit_width = 64;
+        wvz4::u32 bit_offset = 0;
         wvz4::Radix radix = wvz4::Radix::Auto;
+        bool storage_only = false;
     };
 
     struct FrameSlot {
@@ -400,7 +394,7 @@ private:
 
     wvz4::Writer writer_;
     wvz4::AsyncWriter async_writer_;
-    wvz4::WalWriter wal_writer_;
+    wvz4::WriterProcessClient process_writer_;
 
     std::vector<NodeState> node_states_;       // id-indexed, id 0 unused
     std::vector<TrackState> track_states_;     // track-id indexed
@@ -485,14 +479,9 @@ private:
         current_sample_ids_.clear();
     }
 
-    std::string effective_wal_spool_path() const {
-        if (!cfg_.wal_spool_path.empty()) return cfg_.wal_spool_path;
-        return cfg_.file_path + ".spool";
-    }
-
     bool submit_to_writer(const wvz4::CycleSubmission& submission, std::string& error) {
-        if (cfg_.use_wal_spool) {
-            return wal_writer_.submit_cycle(submission, error);
+        if (cfg_.use_writer_process) {
+            return process_writer_.submit_cycle(submission, error);
         }
         if (cfg_.async_writer) {
             wvz4::CycleSubmission copy = submission;
@@ -765,11 +754,17 @@ private:
             const wvz4::u32 tid = track_ids[i];
             if (tid >= track_states_.size() || !track_states_[tid].declared) { error = "WVZ4 layout build found missing track"; return false; }
             const TrackState& ts = track_states_[tid];
-            if (ts.node_id >= node_states_.size() || !node_states_[ts.node_id].declared) {
-                error = "WVZ4 layout build found signal with missing node; "; error += debug_state_summary(); return false;
-            }
-            if (node_states_[ts.node_id].kind != wvz4::NodeKind::SignalLeaf) {
-                error = "WVZ4 layout build found signal whose node is not SignalLeaf"; return false;
+            if (ts.storage_only) {
+                if (ts.node_id != 0) {
+                    error = "WVZ4 layout build found storage-only signal with node"; return false;
+                }
+            } else {
+                if (ts.node_id >= node_states_.size() || !node_states_[ts.node_id].declared) {
+                    error = "WVZ4 layout build found signal with missing node; "; error += debug_state_summary(); return false;
+                }
+                if (node_states_[ts.node_id].kind != wvz4::NodeKind::SignalLeaf) {
+                    error = "WVZ4 layout build found signal whose node is not SignalLeaf"; return false;
+                }
             }
             wvz4::SignalDefinition sig;
             sig.signal_id = ts.signal_id;
@@ -777,7 +772,9 @@ private:
             sig.node_id = ts.node_id;
             sig.type = ts.value_type;
             sig.bit_width = ts.bit_width;
+            sig.bit_offset = ts.bit_offset;
             sig.radix = ts.radix;
+            sig.storage_only = ts.storage_only;
             layout.signals.push_back(sig);
         }
         return true;
@@ -791,4 +788,3 @@ private:
 #pragma pop_macro("min")
 #undef WAVE_PATH_WVZ4_RECORDER_RESTORE_MIN_MACRO_
 #endif
-

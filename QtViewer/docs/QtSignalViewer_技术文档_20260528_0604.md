@@ -15,7 +15,7 @@
 
 | 模块 | 关键文件 | 作用 |
 |---|---|---|
-| WVZ4 写入器 | `wvz4_writer_typed.h` | 负责稳定拓扑、typed value、v3 signal chunk 写入和 WAL 支持。 |
+| WVZ4 写入器 | `wvz4_writer_typed.h` | 负责稳定拓扑、typed value、v3 signal chunk 写入和 writer-helper 进程支持。 |
 | 稳定路径记录器 | `wave_path_wvz4_recorder.h` | 将反射系统中的节点和采样事件转换为 WVZ4 layout 与 cycle submission。 |
 | WVZ4 解析器 | `WaveParser4.cpp/.h` | 读取 NAME/NODE/SIGT/WDAT/FOOT，支持 v1/v2/v3。 |
 | 通用数据结构 | `WaveTypes.h` | 定义信号、样本、树节点、差异区间、rawBits 缓存等。 |
@@ -29,7 +29,7 @@
 系统分为四层：
 
 1. **采集层**：业务仿真或反射系统输出节点声明、信号声明和每周期采样值。
-2. **写入层**：将稳定拓扑和周期采样写入 WVZ4 文件，支持压缩、分块和 WAL。
+2. **写入层**：将稳定拓扑和周期采样写入 WVZ4 文件，支持压缩、分块和 writer-helper 进程保护。
 3. **解析层**：读取文件头、layout section、footer index 和 WDAT tile，并按需返回样本。
 4. **显示层**：Qt 查看器以树模型、选中信号列表和波形画布形式展示数据。
 
@@ -177,9 +177,9 @@ signal_chunk_id = (signal_id - 1) / signals_per_chunk
 
 WVZ4 v2+ 规定所有信号在 cycle 0 有隐式全 0 初值。writer 遇到第一次提交值为 0 的情况不会写 transition；parser 对已加载信号补充隐式 0 sample。如果文件中存在显式 cycle 0 非 0 sample，则显式值覆盖隐式值。
 
-### 5.4 WAL/monitor finalization
+### 5.4 Writer-helper finalization
 
-WAL 方案允许仿真主进程写 spool 文件，由独立 monitor/finalizer 进程在仿真退出或被 kill 后重放已提交记录并生成最终 WVZ4。该能力只能恢复到最后一个 committed WAL record，不能恢复仍在主进程内存或未完成 cycle 中的数据。
+Writer-helper 方案让仿真主进程通过命名管道提交已完成的 layout/cycle frame，由独立 helper 进程持有真实 WVZ4 writer 并直接写最终文件。主进程正常退出、崩溃或被 kill 后，helper 会关闭 writer 并写出 FOOT/footer_offset。该能力只能恢复 helper 已完整收到的 frame，不能恢复仍在主进程内存或未完成 cycle 中的数据。
 
 ## 6. Parser 设计
 
@@ -393,7 +393,7 @@ top
 - WVZ4 当前面向稳定拓扑，不处理运行期动态增删信号；
 - WVZ4 writer 当前不支持 Z/high-impedance；
 - 单个 scalar value 限制在 64 bit 以内；
-- monitor 只能恢复已提交 WAL record；
+- helper 只能恢复已完整收到的 layout/cycle frame；
 - 如果主线程 crash 但进程仍存活，目前不处理；
 - 旧格式仍可能依赖文本 value，需要保留 fallback 逻辑。
 

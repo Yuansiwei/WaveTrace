@@ -25,6 +25,19 @@ public:
         // first N signal entries while still exposing the whole directory when
         // includeAllSignalDefinitions=true. Use 0 for directory-only load.
         int autoLoadFirstSignalCount = -1;
+
+        // Directory-only WVZ4 opens can still prefetch LOD for the first visible
+        // rows so wide views can defer raw sample loading.
+        int autoLoadFirstSignalLodCount = -1;
+
+        // Safety guard for very large files. 0 means unlimited. The count is
+        // checked while WDAT samples are materialized, before appending to memory.
+        quint64 maxDecodedSamples = 0;
+
+        // New WVZ4 writer versions finalize files by writing FOOT and patching
+        // footer_offset in the header. Keep this false in viewer paths so a
+        // killed direct writer cannot be mistaken for a complete waveform.
+        bool allowUnfinalized = false;
     };
 
     static bool loadFromFile(const QString& filePath,

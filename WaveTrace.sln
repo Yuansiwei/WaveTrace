@@ -18,6 +18,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_storage_alias_writer"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_tap_bool_storage", "smoke_tap_bool_storage.vcxproj", "{F7A9A8F7-D69D-4835-8F3B-A5243B88B419}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_business_1m_writer", "smoke_business_1m_writer.vcxproj", "{D146B7F6-3CF4-4CE3-9278-F5D40901CB20}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -56,6 +58,10 @@ Global
 		{F7A9A8F7-D69D-4835-8F3B-A5243B88B419}.Debug|x64.Build.0 = Debug|x64
 		{F7A9A8F7-D69D-4835-8F3B-A5243B88B419}.Release|x64.ActiveCfg = Release|x64
 		{F7A9A8F7-D69D-4835-8F3B-A5243B88B419}.Release|x64.Build.0 = Release|x64
+		{D146B7F6-3CF4-4CE3-9278-F5D40901CB20}.Debug|x64.ActiveCfg = Debug|x64
+		{D146B7F6-3CF4-4CE3-9278-F5D40901CB20}.Debug|x64.Build.0 = Debug|x64
+		{D146B7F6-3CF4-4CE3-9278-F5D40901CB20}.Release|x64.ActiveCfg = Release|x64
+		{D146B7F6-3CF4-4CE3-9278-F5D40901CB20}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

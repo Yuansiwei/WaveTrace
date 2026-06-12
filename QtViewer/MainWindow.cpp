@@ -12,10 +12,12 @@
 #include <QSignalBlocker>
 #include <QWindow>
 #include <QCoreApplication>
+#include <QDialog>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFrame>
 #include <QFont>
+#include <QFormLayout>
 #include <QHBoxLayout>
 #include <QHash>
 #include <QIcon>
@@ -32,12 +34,15 @@
 #include <QStyle>
 #include <QStyleOptionViewItem>
 #include <QStyledItemDelegate>
+#include <QHeaderView>
 #include <QPainter>
 #include <QPaintEvent>
 #include <QPainterPath>
 #include <QPixmap>
 #include <QPushButton>
+#include <QShortcut>
 #include <QSplitter>
+#include <QSpinBox>
 #include <QStringList>
 #include <QTreeView>
 #include <QTreeWidget>
@@ -57,12 +62,14 @@
 #include <QItemSelectionModel>
 #include <QVBoxLayout>
 #include <QTimer>
+#include <QElapsedTimer>
 
 #include <algorithm>
 #include <cmath>
 #include <functional>
 #include <utility>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <cstdint>
 
@@ -73,6 +80,60 @@ constexpr const char* kMimeActiveRows = "application/x-waveviewer-active-rows";
 
 constexpr int kTreeRoleSignalIndex = Qt::UserRole;
 constexpr int kTreeRoleNodeId = Qt::UserRole + 100;
+constexpr int kValueFindRoleFirstHit = Qt::UserRole;
+constexpr int kValueFindRoleSignalIndex = Qt::UserRole + 1;
+constexpr qint64 kLargeWvz4FullLoadLimitBytes = 1024ll * 1024ll * 1024ll;
+constexpr quint64 kViewerOnDemandSampleBudget = 20ull * 1000ull * 1000ull;
+constexpr quint64 kViewerFullLoadSampleBudget = 50ull * 1000ull * 1000ull;
+
+QString formatLargeWvz4FullLoadError(qint64 fileSize, const QString& operation) {
+    return QStringLiteral("WVZ4 %1 full-load is disabled for files over %2 MiB (%3 bytes). "
+                          "Open the file normally and use LOD/on-demand viewing instead.")
+        .arg(operation)
+        .arg(kLargeWvz4FullLoadLimitBytes / (1024ll * 1024ll))
+        .arg(fileSize);
+}
+
+bool viewerPerfLogEnabled() {
+    static const bool enabled = []() {
+        const char* value = std::getenv("WV_VIEWER_PERF_LOG");
+        return value && value[0] && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool viewerDisableLodEnabled() {
+    static const bool enabled = []() {
+        const char* value = std::getenv("WV_VIEWER_DISABLE_LOD");
+        return value && value[0] && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+void viewerPerfLog(const char* step, qint64 elapsedMs, int signalCount, int treeNodeCount, int activeRows = -1) {
+    if (!viewerPerfLogEnabled()) return;
+    std::fprintf(stderr,
+                 "[qtviewer-perf] step=%s elapsed_ms=%lld signals=%d tree_nodes=%d active_rows=%d\n",
+                 step,
+                 static_cast<long long>(elapsedMs),
+                 signalCount,
+                 treeNodeCount,
+                 activeRows);
+    std::fflush(stderr);
+    const char* filePath = std::getenv("WV_VIEWER_PERF_LOG_FILE");
+    if (filePath && filePath[0]) {
+        if (FILE* f = std::fopen(filePath, "ab")) {
+            std::fprintf(f,
+                         "[qtviewer-perf] step=%s elapsed_ms=%lld signals=%d tree_nodes=%d active_rows=%d\n",
+                         step,
+                         static_cast<long long>(elapsedMs),
+                         signalCount,
+                         treeNodeCount,
+                         activeRows);
+            std::fclose(f);
+        }
+    }
+}
 
 static inline uint32_t fnv1aStep(uint32_t h, unsigned char c) {
     return (h ^ uint32_t(c)) * 16777619u;
@@ -953,10 +1014,17 @@ bool loadWaveFileFullyForCompare(const QString& path, WaveFile& wave, QString& e
     const bool isWvz4 = path.endsWith(QStringLiteral(".wvz4"), Qt::CaseInsensitive);
     const bool isWvz3 = path.endsWith(QStringLiteral(".wvz3"), Qt::CaseInsensitive);
     if (isWvz4) {
+        const qint64 fileSize = QFileInfo(path).size();
+        if (fileSize > kLargeWvz4FullLoadLimitBytes) {
+            error = formatLargeWvz4FullLoadError(fileSize, QStringLiteral("compare"));
+            return false;
+        }
+
         WaveParser4::LoadOptions options;
         options.includeAllSignalDefinitions = true;
         options.autoLoadFirstSignalCount = -1;
         options.loadAllIfWindowEmpty = true;
+        options.maxDecodedSamples = kViewerFullLoadSampleBudget;
         return WaveParser4::loadFromFile(path, wave, error, options);
     }
     if (isWvz3) {
@@ -1854,9 +1922,554 @@ private:
         return indexes;
     }
 
+    struct ParsedValueFindTarget {
+        quint64 bits = 0;
+        bool negativeDecimal = false;
+    };
+
+    bool parseValueFindTargetText(const QString& text, ParsedValueFindTarget& target) {
+        const QString raw = text.trimmed();
+        if (raw.isEmpty()) return false;
+
+        bool ok = false;
+        if (raw.startsWith(QLatin1Char('-'))) {
+            const QString body = raw.mid(1);
+            if (!waveIsDecimalDigitsText(body)) return false;
+            const qlonglong signedValue = raw.toLongLong(&ok, 10);
+            if (!ok) return false;
+            target.bits = static_cast<quint64>(signedValue);
+            target.negativeDecimal = true;
+            return true;
+        }
+
+        if (raw.startsWith(QStringLiteral("0x"), Qt::CaseInsensitive)) {
+            const QString body = raw.mid(2);
+            if (!waveIsHexDigitsText(body)) return false;
+            const quint64 value = body.toULongLong(&ok, 16);
+            if (!ok) return false;
+            target.bits = value;
+            return true;
+        }
+
+        if (raw.startsWith(QStringLiteral("0b"), Qt::CaseInsensitive)) {
+            const QString body = raw.mid(2);
+            if (!waveIsBinaryDigitsText(body)) return false;
+            const quint64 value = body.toULongLong(&ok, 2);
+            if (!ok) return false;
+            target.bits = value;
+            return true;
+        }
+
+        if (waveIsDecimalDigitsText(raw)) {
+            const quint64 value = raw.toULongLong(&ok, 10);
+            if (!ok) return false;
+            target.bits = value;
+            return true;
+        }
+
+        if (waveIsHexDigitsText(raw)) {
+            const quint64 value = raw.toULongLong(&ok, 16);
+            if (!ok) return false;
+            target.bits = value;
+            return true;
+        }
+
+        return false;
+    }
+
+    bool valueFindTargetForSignal(const ParsedValueFindTarget& target, int width, quint64& maskedBits) {
+        if (width <= 0) return false;
+        const quint64 mask = waveBitMaskForWidth(width);
+        if (!target.negativeDecimal && width < 64 && target.bits > mask) return false;
+        maskedBits = target.bits & mask;
+        return true;
+    }
+
+    QString stripDisplayRangeSuffix(QString name) {
+        name = name.trimmed();
+        if (!name.endsWith(QLatin1Char(']'))) return name;
+        const int open = name.lastIndexOf(QLatin1Char('['));
+        if (open <= 0) return name;
+
+        const QString body = name.mid(open + 1, name.size() - open - 2).trimmed();
+        if (body.isEmpty()) return name;
+        bool ok = true;
+        bool sawDigit = false;
+        for (int i = 0; i < body.size(); ++i) {
+            const QChar ch = body.at(i);
+            if (ch.isDigit()) {
+                sawDigit = true;
+                continue;
+            }
+            if (ch == QLatin1Char(':') || ch.isSpace()) continue;
+            ok = false;
+            break;
+        }
+        return (ok && sawDigit) ? name.left(open).trimmed() : name;
+    }
+
+    int literalWidthForValue(quint64 value) {
+        int width = 1;
+        while (width < 64 && (value >> width) != 0) ++width;
+        return width;
+    }
+
+    struct DerivedExprNode {
+        enum Kind {
+            Literal,
+            Signal,
+            Unary,
+            Binary
+        };
+
+        Kind kind = Literal;
+        QString op;
+        quint64 literal = 0;
+        int signalIndex = -1;
+        int signalSlot = -1;
+        int left = -1;
+        int right = -1;
+        int width = 1;
+    };
+
+    struct DerivedExpressionProgram {
+        QVector<DerivedExprNode> nodes;
+        QVector<int> dependencyIndexes;
+        int root = -1;
+        int inferredWidth = 1;
+    };
+
+    struct DerivedEvalValue {
+        bool known = false;
+        quint64 bits = 0;
+    };
+
+    class DerivedExpressionParser {
+    public:
+        using SignalResolver = std::function<bool(const QString&, int&, int&, QString&)>;
+
+        DerivedExpressionParser(const QString& expression, SignalResolver resolver)
+            : m_expression(expression), m_resolver(std::move(resolver)) {
+            nextToken();
+        }
+
+        bool parse(DerivedExpressionProgram& out, QString& error) {
+            m_error.clear();
+            const int root = parseExpression(1);
+            if (root < 0) {
+                error = m_error.isEmpty() ? QStringLiteral("Invalid expression.") : m_error;
+                return false;
+            }
+            if (m_token.type != End) {
+                error = QStringLiteral("Unexpected token near '%1'.").arg(m_token.text);
+                return false;
+            }
+
+            out.nodes = std::move(m_nodes);
+            out.dependencyIndexes = std::move(m_dependencyIndexes);
+            out.root = root;
+            out.inferredWidth = qBound(1, out.nodes.at(root).width, 64);
+            return true;
+        }
+
+    private:
+        enum TokenType {
+            End,
+            Number,
+            Identifier,
+            Operator,
+            LParen,
+            RParen
+        };
+
+        struct Token {
+            TokenType type = End;
+            QString text;
+            quint64 value = 0;
+            int width = 1;
+        };
+
+        static bool isIdentStart(QChar ch) {
+            return ch.isLetter() || ch == QLatin1Char('_') || ch == QLatin1Char('$');
+        }
+
+        static bool isIdentChar(QChar ch) {
+            return ch.isLetterOrNumber() ||
+                   ch == QLatin1Char('_') ||
+                   ch == QLatin1Char('$') ||
+                   ch == QLatin1Char('.') ||
+                   ch == QLatin1Char('[') ||
+                   ch == QLatin1Char(']') ||
+                   ch == QLatin1Char(':');
+        }
+
+        void nextToken() {
+            while (m_pos < m_expression.size() && m_expression.at(m_pos).isSpace()) ++m_pos;
+            m_token = Token();
+            if (m_pos >= m_expression.size()) {
+                m_token.type = End;
+                return;
+            }
+
+            const QChar ch = m_expression.at(m_pos);
+            if (ch == QLatin1Char('(')) {
+                ++m_pos;
+                m_token.type = LParen;
+                m_token.text = QStringLiteral("(");
+                return;
+            }
+            if (ch == QLatin1Char(')')) {
+                ++m_pos;
+                m_token.type = RParen;
+                m_token.text = QStringLiteral(")");
+                return;
+            }
+            if (ch == QLatin1Char('`')) {
+                const int start = ++m_pos;
+                while (m_pos < m_expression.size() && m_expression.at(m_pos) != QLatin1Char('`')) ++m_pos;
+                if (m_pos >= m_expression.size()) {
+                    m_error = QStringLiteral("Missing closing backtick in signal name.");
+                    m_token.type = End;
+                    return;
+                }
+                m_token.type = Identifier;
+                m_token.text = m_expression.mid(start, m_pos - start).trimmed();
+                ++m_pos;
+                return;
+            }
+            if (ch.isDigit()) {
+                const int start = m_pos;
+                if (ch == QLatin1Char('0') &&
+                    m_pos + 1 < m_expression.size() &&
+                    (m_expression.at(m_pos + 1) == QLatin1Char('x') || m_expression.at(m_pos + 1) == QLatin1Char('X'))) {
+                    m_pos += 2;
+                    const int bodyStart = m_pos;
+                    while (m_pos < m_expression.size() && m_expression.at(m_pos).isLetterOrNumber()) ++m_pos;
+                    const QString body = m_expression.mid(bodyStart, m_pos - bodyStart);
+                    bool ok = false;
+                    const quint64 value = body.toULongLong(&ok, 16);
+                    if (!ok || !waveIsHexDigitsText(body)) {
+                        m_error = QStringLiteral("Invalid hex literal near '%1'.").arg(m_expression.mid(start, m_pos - start));
+                    }
+                    m_token.type = Number;
+                    m_token.text = m_expression.mid(start, m_pos - start);
+                    m_token.value = value;
+                    m_token.width = qBound(1, body.size() * 4, 64);
+                    return;
+                }
+                if (ch == QLatin1Char('0') &&
+                    m_pos + 1 < m_expression.size() &&
+                    (m_expression.at(m_pos + 1) == QLatin1Char('b') || m_expression.at(m_pos + 1) == QLatin1Char('B'))) {
+                    m_pos += 2;
+                    const int bodyStart = m_pos;
+                    while (m_pos < m_expression.size() && (m_expression.at(m_pos) == QLatin1Char('0') || m_expression.at(m_pos) == QLatin1Char('1'))) ++m_pos;
+                    const QString body = m_expression.mid(bodyStart, m_pos - bodyStart);
+                    bool ok = false;
+                    const quint64 value = body.toULongLong(&ok, 2);
+                    if (!ok || !waveIsBinaryDigitsText(body)) {
+                        m_error = QStringLiteral("Invalid binary literal near '%1'.").arg(m_expression.mid(start, m_pos - start));
+                    }
+                    m_token.type = Number;
+                    m_token.text = m_expression.mid(start, m_pos - start);
+                    m_token.value = value;
+                    m_token.width = qBound(1, body.size(), 64);
+                    return;
+                }
+
+                while (m_pos < m_expression.size() && m_expression.at(m_pos).isDigit()) ++m_pos;
+                const QString raw = m_expression.mid(start, m_pos - start);
+                bool ok = false;
+                const quint64 value = raw.toULongLong(&ok, 10);
+                if (!ok) m_error = QStringLiteral("Invalid decimal literal near '%1'.").arg(raw);
+                m_token.type = Number;
+                m_token.text = raw;
+                m_token.value = value;
+                m_token.width = literalWidthForValue(value);
+                return;
+            }
+            if (isIdentStart(ch)) {
+                const int start = m_pos++;
+                while (m_pos < m_expression.size() && isIdentChar(m_expression.at(m_pos))) ++m_pos;
+                m_token.type = Identifier;
+                m_token.text = m_expression.mid(start, m_pos - start).trimmed();
+                return;
+            }
+
+            const QString two = (m_pos + 1 < m_expression.size()) ? m_expression.mid(m_pos, 2) : QString();
+            if (two == QStringLiteral("&&") || two == QStringLiteral("||") ||
+                two == QStringLiteral("==") || two == QStringLiteral("!=") ||
+                two == QStringLiteral("<=") || two == QStringLiteral(">=") ||
+                two == QStringLiteral("<<") || two == QStringLiteral(">>")) {
+                m_pos += 2;
+                m_token.type = Operator;
+                m_token.text = two;
+                return;
+            }
+            if (QStringLiteral("+-*/%&|^~!<>").contains(ch)) {
+                ++m_pos;
+                m_token.type = Operator;
+                m_token.text = QString(ch);
+                return;
+            }
+
+            m_error = QStringLiteral("Unsupported character '%1'.").arg(ch);
+            ++m_pos;
+            m_token.type = End;
+        }
+
+        int precedence(const QString& op) const {
+            if (op == QStringLiteral("||")) return 1;
+            if (op == QStringLiteral("&&")) return 2;
+            if (op == QStringLiteral("|")) return 3;
+            if (op == QStringLiteral("^")) return 4;
+            if (op == QStringLiteral("&")) return 5;
+            if (op == QStringLiteral("==") || op == QStringLiteral("!=")) return 6;
+            if (op == QStringLiteral("<") || op == QStringLiteral("<=") ||
+                op == QStringLiteral(">") || op == QStringLiteral(">=")) return 7;
+            if (op == QStringLiteral("<<") || op == QStringLiteral(">>")) return 8;
+            if (op == QStringLiteral("+") || op == QStringLiteral("-")) return 9;
+            if (op == QStringLiteral("*") || op == QStringLiteral("/") || op == QStringLiteral("%")) return 10;
+            return 0;
+        }
+
+        int addNode(DerivedExprNode node) {
+            node.width = qBound(1, node.width, 64);
+            const int index = m_nodes.size();
+            m_nodes.push_back(std::move(node));
+            return index;
+        }
+
+        int parseExpression(int minPrecedence) {
+            int lhs = parseUnary();
+            if (lhs < 0) return -1;
+
+            while (m_token.type == Operator) {
+                const QString op = m_token.text;
+                const int prec = precedence(op);
+                if (prec < minPrecedence) break;
+                nextToken();
+                const int rhs = parseExpression(prec + 1);
+                if (rhs < 0) return -1;
+
+                DerivedExprNode node;
+                node.kind = DerivedExprNode::Binary;
+                node.op = op;
+                node.left = lhs;
+                node.right = rhs;
+                if (op == QStringLiteral("&&") || op == QStringLiteral("||") ||
+                    op == QStringLiteral("==") || op == QStringLiteral("!=") ||
+                    op == QStringLiteral("<") || op == QStringLiteral("<=") ||
+                    op == QStringLiteral(">") || op == QStringLiteral(">=")) {
+                    node.width = 1;
+                } else if (op == QStringLiteral("<<") || op == QStringLiteral(">>")) {
+                    node.width = m_nodes.at(lhs).width;
+                } else {
+                    node.width = qMax(m_nodes.at(lhs).width, m_nodes.at(rhs).width);
+                }
+                lhs = addNode(std::move(node));
+            }
+            return lhs;
+        }
+
+        int parseUnary() {
+            if (m_token.type == Operator &&
+                (m_token.text == QStringLiteral("+") ||
+                 m_token.text == QStringLiteral("-") ||
+                 m_token.text == QStringLiteral("!") ||
+                 m_token.text == QStringLiteral("~"))) {
+                const QString op = m_token.text;
+                nextToken();
+                const int child = parseUnary();
+                if (child < 0) return -1;
+
+                DerivedExprNode node;
+                node.kind = DerivedExprNode::Unary;
+                node.op = op;
+                node.left = child;
+                node.width = (op == QStringLiteral("!")) ? 1 : m_nodes.at(child).width;
+                return addNode(std::move(node));
+            }
+            return parsePrimary();
+        }
+
+        int parsePrimary() {
+            if (!m_error.isEmpty()) return -1;
+
+            if (m_token.type == Number) {
+                DerivedExprNode node;
+                node.kind = DerivedExprNode::Literal;
+                node.literal = m_token.value;
+                node.width = m_token.width;
+                nextToken();
+                return addNode(std::move(node));
+            }
+
+            if (m_token.type == Identifier) {
+                const QString name = m_token.text;
+                int signalIndex = -1;
+                int width = 1;
+                QString resolveError;
+                if (!m_resolver(name, signalIndex, width, resolveError)) {
+                    m_error = resolveError.isEmpty() ? QStringLiteral("Unknown signal '%1'.").arg(name) : resolveError;
+                    return -1;
+                }
+
+                int slot = m_depSlotBySignalIndex.value(signalIndex, -1);
+                if (slot < 0) {
+                    slot = m_dependencyIndexes.size();
+                    m_dependencyIndexes.push_back(signalIndex);
+                    m_depSlotBySignalIndex.insert(signalIndex, slot);
+                }
+
+                DerivedExprNode node;
+                node.kind = DerivedExprNode::Signal;
+                node.signalIndex = signalIndex;
+                node.signalSlot = slot;
+                node.width = width;
+                nextToken();
+                return addNode(std::move(node));
+            }
+
+            if (m_token.type == LParen) {
+                nextToken();
+                const int node = parseExpression(1);
+                if (node < 0) return -1;
+                if (m_token.type != RParen) {
+                    m_error = QStringLiteral("Missing closing parenthesis.");
+                    return -1;
+                }
+                nextToken();
+                return node;
+            }
+
+            m_error = QStringLiteral("Expected a number, signal name, or parenthesized expression.");
+            return -1;
+        }
+
+        QString m_expression;
+        SignalResolver m_resolver;
+        int m_pos = 0;
+        Token m_token;
+        QString m_error;
+        QVector<DerivedExprNode> m_nodes;
+        QVector<int> m_dependencyIndexes;
+        QHash<int, int> m_depSlotBySignalIndex;
+    };
+
+    DerivedEvalValue evalDerivedExpressionNode(const DerivedExpressionProgram& program,
+                                               int nodeIndex,
+                                               const QVector<WaveSample>& currentSamples) {
+        if (nodeIndex < 0 || nodeIndex >= program.nodes.size()) return DerivedEvalValue();
+
+        const DerivedExprNode& node = program.nodes.at(nodeIndex);
+        const quint64 mask = waveBitMaskForWidth(node.width);
+
+        if (node.kind == DerivedExprNode::Literal) {
+            DerivedEvalValue out;
+            out.known = true;
+            out.bits = node.literal & mask;
+            return out;
+        }
+
+        if (node.kind == DerivedExprNode::Signal) {
+            if (node.signalSlot < 0 || node.signalSlot >= currentSamples.size()) return DerivedEvalValue();
+            WaveSample sample = currentSamples.at(node.signalSlot);
+            if (!sample.rawFieldsReady) {
+                hydrateWaveSampleRawFields(node.width == 1 ? SignalKind::Bit : SignalKind::Bus, node.width, sample);
+            }
+            if (sample.isAbsent || sample.isZ) return DerivedEvalValue();
+
+            DerivedEvalValue out;
+            out.known = true;
+            out.bits = sample.rawBits & mask;
+            return out;
+        }
+
+        if (node.kind == DerivedExprNode::Unary) {
+            const DerivedEvalValue v = evalDerivedExpressionNode(program, node.left, currentSamples);
+            if (!v.known) return DerivedEvalValue();
+
+            quint64 bits = v.bits;
+            if (node.op == QStringLiteral("-")) bits = quint64(0) - bits;
+            else if (node.op == QStringLiteral("~")) bits = ~bits;
+            else if (node.op == QStringLiteral("!")) bits = bits ? 0ull : 1ull;
+
+            DerivedEvalValue out;
+            out.known = true;
+            out.bits = bits & mask;
+            return out;
+        }
+
+        const DerivedEvalValue lhs = evalDerivedExpressionNode(program, node.left, currentSamples);
+        const DerivedEvalValue rhs = evalDerivedExpressionNode(program, node.right, currentSamples);
+        if (!lhs.known || !rhs.known) return DerivedEvalValue();
+
+        quint64 bits = 0;
+        const QString& op = node.op;
+        if (op == QStringLiteral("+")) bits = lhs.bits + rhs.bits;
+        else if (op == QStringLiteral("-")) bits = lhs.bits - rhs.bits;
+        else if (op == QStringLiteral("*")) bits = lhs.bits * rhs.bits;
+        else if (op == QStringLiteral("/")) {
+            if (rhs.bits == 0) return DerivedEvalValue();
+            bits = lhs.bits / rhs.bits;
+        }
+        else if (op == QStringLiteral("%")) {
+            if (rhs.bits == 0) return DerivedEvalValue();
+            bits = lhs.bits % rhs.bits;
+        }
+        else if (op == QStringLiteral("&")) bits = lhs.bits & rhs.bits;
+        else if (op == QStringLiteral("|")) bits = lhs.bits | rhs.bits;
+        else if (op == QStringLiteral("^")) bits = lhs.bits ^ rhs.bits;
+        else if (op == QStringLiteral("<<")) bits = (rhs.bits >= 64) ? 0ull : (lhs.bits << int(rhs.bits));
+        else if (op == QStringLiteral(">>")) bits = (rhs.bits >= 64) ? 0ull : (lhs.bits >> int(rhs.bits));
+        else if (op == QStringLiteral("&&")) bits = (lhs.bits != 0 && rhs.bits != 0) ? 1ull : 0ull;
+        else if (op == QStringLiteral("||")) bits = (lhs.bits != 0 || rhs.bits != 0) ? 1ull : 0ull;
+        else if (op == QStringLiteral("==")) bits = (lhs.bits == rhs.bits) ? 1ull : 0ull;
+        else if (op == QStringLiteral("!=")) bits = (lhs.bits != rhs.bits) ? 1ull : 0ull;
+        else if (op == QStringLiteral("<")) bits = (lhs.bits < rhs.bits) ? 1ull : 0ull;
+        else if (op == QStringLiteral("<=")) bits = (lhs.bits <= rhs.bits) ? 1ull : 0ull;
+        else if (op == QStringLiteral(">")) bits = (lhs.bits > rhs.bits) ? 1ull : 0ull;
+        else if (op == QStringLiteral(">=")) bits = (lhs.bits >= rhs.bits) ? 1ull : 0ull;
+
+        DerivedEvalValue out;
+        out.known = true;
+        out.bits = bits & mask;
+        return out;
+    }
+
+    bool sameDerivedSampleValue(const WaveSample& a, const WaveSample& b, int width) {
+        if (a.isAbsent != b.isAbsent || a.isZ != b.isZ) return false;
+        if (a.isAbsent || a.isZ) return true;
+        return (a.rawBits & waveBitMaskForWidth(width)) == (b.rawBits & waveBitMaskForWidth(width));
+    }
+
+    WaveSample makeDerivedSample(qint64 time, const DerivedEvalValue& value, int width, ValueRadix radix) {
+        WaveSample sample;
+        sample.time = time;
+        sample.rawFieldsReady = true;
+        if (!value.known) {
+            sample.isZ = true;
+            sample.value = QStringLiteral("Z");
+            return sample;
+        }
+
+        const SignalKind kind = (width <= 1) ? SignalKind::Bit : SignalKind::Bus;
+        sample.rawBits = value.bits & waveBitMaskForWidth(width);
+        sample.value = waveSampleRawText(kind, width, radix, sample);
+        return sample;
+    }
+
+    QString formatInternalDisplayTime(qint64 internalTime) {
+        const double value = double(internalTime) / 10.0;
+        QString text = QString::number(value, 'f', 1);
+        if (text.endsWith(QStringLiteral(".0"))) text.chop(2);
+        return text;
+    }
+
     QColor iconColor(const QString& name) {
         if (name == "open") return QColor("#43C59E");
         if (name == "compare") return QColor("#B86BFF");
+        if (name == "derive") return QColor("#2EBAC6");
         if (name == "save") return QColor("#5CA8FF");
         if (name == "zoom_in" || name == "zoom_out") return QColor("#F0A43A");
         if (name == "left" || name == "right") return QColor("#55B4FF");
@@ -1911,6 +2524,19 @@ private:
             p.drawLine(16, 16, 21, 16);
             p.setPen(QPen(QColor("#FF4D4F"), 2.0, Qt::SolidLine, Qt::RoundCap));
             p.drawLine(11, 22, 17, 4);
+        }
+        else if (kind == "derive") {
+            p.setPen(QPen(dark, 1.8, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            p.setBrush(fillGradient(QRectF(5, 5, 18, 18)));
+            p.drawRoundedRect(QRectF(5, 5, 18, 18), 3, 3);
+            p.setPen(QPen(QColor(255, 255, 255, 190), 1.7, Qt::SolidLine, Qt::RoundCap));
+            p.drawLine(9, 14, 13, 10);
+            p.drawLine(9, 14, 13, 18);
+            p.drawLine(15, 10, 19, 14);
+            p.drawLine(15, 18, 19, 14);
+            p.setPen(QPen(dark, 1.6, Qt::SolidLine, Qt::RoundCap));
+            p.drawLine(9, 8, 19, 8);
+            p.drawLine(9, 20, 19, 20);
         }
         else if (kind == "save") {
             QRectF body(5, 4, 18, 20);
@@ -2164,6 +2790,7 @@ void MainWindow::buildUi() {
 
     auto* btnOpen = new QPushButton(topBarCard);
     auto* btnCompare = new QPushButton(topBarCard);
+    auto* btnDerivedSignal = new QPushButton(topBarCard);
     auto* btnExportCompressed = new QPushButton(topBarCard);
     auto* btnZoomIn = new QPushButton(topBarCard);
     auto* btnZoomOut = new QPushButton(topBarCard);
@@ -2175,6 +2802,7 @@ void MainWindow::buildUi() {
 
     setupToolbarButton(btnOpen, loadImageIconOrFallback("open", "open"), QStringLiteral("toolbarOpenButton"), QString::fromUtf8("打开波形文件"));
     setupToolbarButton(btnCompare, loadImageIconOrFallback("compare", "compare"), QStringLiteral("toolbarCompareButton"), QString::fromUtf8("比较两个波形文件"));
+    setupToolbarButton(btnDerivedSignal, loadImageIconOrFallback("derive", "derive"), QStringLiteral("toolbarDerivedSignalButton"), QStringLiteral("Create temporary signal"));
     setupToolbarButton(btnExportCompressed, loadImageIconOrFallback("save", "save"), QStringLiteral("toolbarExportButton"), QString::fromUtf8("导出波形文件"));
     setupToolbarButton(btnZoomIn, loadImageIconOrFallback("zoom_in", "zoom_in"), QStringLiteral("toolbarZoomInButton"), QString::fromUtf8("放大"));
     setupToolbarButton(btnZoomOut, loadImageIconOrFallback("zoom_out", "zoom_out"), QStringLiteral("toolbarZoomOutButton"), QString::fromUtf8("缩小"));
@@ -2196,6 +2824,7 @@ void MainWindow::buildUi() {
 
     topBarLayout->addWidget(btnOpen);
     topBarLayout->addWidget(btnCompare);
+    topBarLayout->addWidget(btnDerivedSignal);
     topBarLayout->addWidget(btnExportCompressed);
     topBarLayout->addSpacing(4);
     topBarLayout->addWidget(btnZoomIn);
@@ -2225,6 +2854,7 @@ void MainWindow::buildUi() {
 
     connect(btnOpen, &QPushButton::clicked, this, &MainWindow::openWaveFile);
     connect(btnCompare, &QPushButton::clicked, this, &MainWindow::compareWaveFiles);
+    connect(btnDerivedSignal, &QPushButton::clicked, this, &MainWindow::openDerivedSignalDialog);
     connect(btnExportCompressed, &QPushButton::clicked, this, &MainWindow::exportCompressedWaveFile);
     connect(btnZoomIn, &QPushButton::clicked, this, &MainWindow::zoomIn);
     connect(btnZoomOut, &QPushButton::clicked, this, &MainWindow::zoomOut);
@@ -2234,6 +2864,14 @@ void MainWindow::buildUi() {
     connect(btnNextChange, &QPushButton::clicked, this, &MainWindow::jumpToNextChange);
     connect(btnReset, &QPushButton::clicked, this, &MainWindow::resetView);
     connect(m_jumpTimeEdit, &QLineEdit::returnPressed, this, &MainWindow::jumpToTime);
+
+    auto* findValueShortcut = new QShortcut(QKeySequence::Find, this);
+    findValueShortcut->setContext(Qt::WindowShortcut);
+    connect(findValueShortcut, &QShortcut::activated, this, &MainWindow::openValueFindDialog);
+
+    auto* derivedSignalShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+E")), this);
+    derivedSignalShortcut->setContext(Qt::WindowShortcut);
+    connect(derivedSignalShortcut, &QShortcut::activated, this, &MainWindow::openDerivedSignalDialog);
 
     connect(m_tree, &QTreeView::doubleClicked, this, &MainWindow::onTreeIndexDoubleClicked);
     connect(m_treeSearchEdit, &QLineEdit::returnPressed, this, [this]() {
@@ -2544,11 +3182,30 @@ void MainWindow::loadDemoWave() {
         busS(104,"0x1C",32)
         });
 
-    applyWave(wave);
+    applyWave(std::move(wave));
 }
 
-void MainWindow::applyWave(const WaveFile& wave) {
-    m_wave = wave;
+void MainWindow::applyWave(WaveFile&& wave) {
+    const bool perf = viewerPerfLogEnabled();
+    QElapsedTimer totalTimer;
+    QElapsedTimer stepTimer;
+    if (perf) {
+        totalTimer.start();
+        stepTimer.start();
+    }
+
+    m_wave = std::move(wave);
+    m_valueFindHits.clear();
+    m_valueFindSignalIndexes.clear();
+    m_valueFindCurrentHit = -1;
+    m_valueFindSummaryBase = QStringLiteral("No value search has been run for this wave.");
+    if (m_valueFindResults) m_valueFindResults->clear();
+    updateValueFindNavigationState();
+    if (perf) {
+        viewerPerfLog("apply.move_assign", stepTimer.restart(),
+                      m_wave.signalList.size(), m_wave.tree.nodesById.size());
+    }
+
     m_signalIndexBySignalId.clear();
     for (int i = 0; i < m_wave.signalList.size(); ++i) {
         if (m_wave.signalList[i].signalId < 0) m_wave.signalList[i].signalId = i;
@@ -2562,14 +3219,44 @@ void MainWindow::applyWave(const WaveFile& wave) {
             rebuildWaveSignalDerivedCaches(m_wave.signalList[i]);
         }
     }
+    if (perf) {
+        viewerPerfLog("apply.signal_index", stepTimer.restart(),
+                      m_wave.signalList.size(), m_wave.tree.nodesById.size());
+    }
+
     updateMetaLabel();
+    if (perf) {
+        viewerPerfLog("apply.meta", stepTimer.restart(),
+                      m_wave.signalList.size(), m_wave.tree.nodesById.size());
+    }
+
     rebuildTree();
+    if (perf) {
+        viewerPerfLog("apply.rebuild_tree", stepTimer.restart(),
+                      m_wave.signalList.size(), m_wave.tree.nodesById.size());
+    }
+
     m_activeList->clear();
     m_canvas->setWave(&m_wave);
+    if (perf) {
+        viewerPerfLog("apply.canvas_bind", stepTimer.restart(),
+                      m_wave.signalList.size(), m_wave.tree.nodesById.size(), m_activeList->topLevelItemCount());
+    }
 
     for (int i = 0; i < qMin(6, m_wave.signalList.size()); ++i) addSignalToActive(i);
+    if (perf) {
+        viewerPerfLog("apply.first_active", stepTimer.restart(),
+                      m_wave.signalList.size(), m_wave.tree.nodesById.size(), m_activeList->topLevelItemCount());
+    }
+
     rebuildVisibleSignals();
     refreshActiveValueLabels();
+    if (perf) {
+        viewerPerfLog("apply.final_refresh", stepTimer.restart(),
+                      m_wave.signalList.size(), m_wave.tree.nodesById.size(), m_activeList->topLevelItemCount());
+        viewerPerfLog("apply.total", totalTimer.elapsed(),
+                      m_wave.signalList.size(), m_wave.tree.nodesById.size(), m_activeList->topLevelItemCount());
+    }
 }
 
 void MainWindow::updateMetaLabel() {
@@ -2595,8 +3282,16 @@ void MainWindow::updateMetaLabel() {
 
 
 
-bool MainWindow::openWaveFilePath(const QString& path) {
+bool MainWindow::openWaveFilePath(const QString& path, bool showError) {
     if (path.isEmpty()) return false;
+
+    const bool perf = viewerPerfLogEnabled();
+    QElapsedTimer totalTimer;
+    QElapsedTimer stepTimer;
+    if (perf) {
+        totalTimer.start();
+        stepTimer.start();
+    }
 
     WaveFile wave;
     QString error;
@@ -2605,8 +3300,10 @@ bool MainWindow::openWaveFilePath(const QString& path) {
     const bool isWvz4 = path.endsWith(".wvz4", Qt::CaseInsensitive);
     if (isWvz4) {
         WaveParser4::LoadOptions loadOptions;
+        const bool rawOnly = viewerDisableLodEnabled();
         loadOptions.includeAllSignalDefinitions = true;
-        loadOptions.autoLoadFirstSignalCount = 0;
+        loadOptions.autoLoadFirstSignalCount = rawOnly ? 6 : 0;
+        loadOptions.autoLoadFirstSignalLodCount = rawOnly ? 0 : 6;
         loadOptions.loadAllIfWindowEmpty = false;
         ok = WaveParser4::loadFromFile(path, wave, error, loadOptions);
     }
@@ -2623,14 +3320,25 @@ bool MainWindow::openWaveFilePath(const QString& path) {
     else {
         ok = WaveParser::loadFromFile(path, wave, error);
     }
+    if (perf) {
+        viewerPerfLog("open.load", stepTimer.restart(),
+                      wave.signalList.size(), wave.tree.nodesById.size());
+    }
     if (!ok) {
+        if (!showError) return false;
         QMessageBox::critical(this, QString::fromUtf8("打开失败"), error);
         return false;
     }
 
     m_currentWaveFilePath = (isWvz3 || isWvz4) ? path : QString();
     m_currentWaveSupportsOnDemand = (isWvz3 || isWvz4);
-    applyWave(wave);
+    applyWave(std::move(wave));
+    if (perf) {
+        viewerPerfLog("open.apply", stepTimer.restart(),
+                      m_wave.signalList.size(), m_wave.tree.nodesById.size());
+        viewerPerfLog("open.total", totalTimer.elapsed(),
+                      m_wave.signalList.size(), m_wave.tree.nodesById.size());
+    }
     return true;
 }
 
@@ -2689,7 +3397,7 @@ void MainWindow::compareWaveFiles() {
     m_currentWaveFilePath.clear();
     m_currentWaveSupportsOnDemand = false;
     m_signalIndexBySignalId.clear();
-    applyWave(comparedWave);
+    applyWave(std::move(comparedWave));
 }
 
 void MainWindow::exportCompressedWaveFile() {
@@ -2703,6 +3411,16 @@ void MainWindow::exportCompressedWaveFile() {
     if (path.isEmpty()) return;
 
     if (m_currentWaveSupportsOnDemand) {
+        if (m_currentWaveFilePath.endsWith(".wvz4", Qt::CaseInsensitive)) {
+            const qint64 fileSize = QFileInfo(m_currentWaveFilePath).size();
+            if (fileSize > kLargeWvz4FullLoadLimitBytes) {
+                QMessageBox::warning(this,
+                    QStringLiteral("Export disabled"),
+                    formatLargeWvz4FullLoadError(fileSize, QStringLiteral("export")));
+                return;
+            }
+        }
+
         QList<int> allSignalIndexes;
         allSignalIndexes.reserve(m_wave.signalList.size());
         for (int i = 0; i < m_wave.signalList.size(); ++i) {
@@ -2791,6 +3509,316 @@ QList<int> MainWindow::selectedActiveSignalIndexesForJump() const {
         }
     }
     return signalIndexes;
+}
+
+QList<int> MainWindow::selectedActiveSignalIndexesForFind() const {
+    return selectedActiveSignalIndexesForJump();
+}
+
+void MainWindow::openValueFindDialog() {
+    if (!m_valueFindDialog) {
+        m_valueFindDialog = new QDialog(this);
+        m_valueFindDialog->setWindowTitle(QStringLiteral("Find value"));
+        m_valueFindDialog->resize(560, 430);
+
+        auto* root = new QVBoxLayout(m_valueFindDialog);
+        root->setContentsMargins(12, 12, 12, 12);
+        root->setSpacing(8);
+
+        auto* inputRow = new QHBoxLayout();
+        auto* inputLabel = new QLabel(QStringLiteral("Target"), m_valueFindDialog);
+        m_valueFindEdit = new QLineEdit(m_valueFindDialog);
+        m_valueFindEdit->setPlaceholderText(QStringLiteral("10, 0xA, 0b1010, -1"));
+        auto* findButton = new QPushButton(QStringLiteral("Find"), m_valueFindDialog);
+        inputRow->addWidget(inputLabel);
+        inputRow->addWidget(m_valueFindEdit, 1);
+        inputRow->addWidget(findButton);
+        root->addLayout(inputRow);
+
+        m_valueFindSummaryLabel = new QLabel(QStringLiteral("Select highlighted active signals and enter a value."), m_valueFindDialog);
+        m_valueFindSummaryLabel->setWordWrap(true);
+        root->addWidget(m_valueFindSummaryLabel);
+
+        m_valueFindResults = new QTreeWidget(m_valueFindDialog);
+        m_valueFindResults->setColumnCount(3);
+        m_valueFindResults->setHeaderLabels(QStringList() << QStringLiteral("Signal")
+                                                          << QStringLiteral("Count")
+                                                          << QStringLiteral("First time"));
+        m_valueFindResults->setRootIsDecorated(false);
+        m_valueFindResults->setSelectionMode(QAbstractItemView::SingleSelection);
+        m_valueFindResults->setSelectionBehavior(QAbstractItemView::SelectRows);
+        m_valueFindResults->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        m_valueFindResults->header()->setStretchLastSection(false);
+        m_valueFindResults->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+        m_valueFindResults->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+        m_valueFindResults->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+        root->addWidget(m_valueFindResults, 1);
+
+        auto* buttonRow = new QHBoxLayout();
+        m_valueFindPrevButton = new QPushButton(QStringLiteral("Previous"), m_valueFindDialog);
+        m_valueFindNextButton = new QPushButton(QStringLiteral("Next"), m_valueFindDialog);
+        auto* closeButton = new QPushButton(QStringLiteral("Close"), m_valueFindDialog);
+        buttonRow->addWidget(m_valueFindPrevButton);
+        buttonRow->addWidget(m_valueFindNextButton);
+        buttonRow->addStretch(1);
+        buttonRow->addWidget(closeButton);
+        root->addLayout(buttonRow);
+
+        connect(findButton, &QPushButton::clicked, this, &MainWindow::runValueFind);
+        connect(m_valueFindEdit, &QLineEdit::returnPressed, this, &MainWindow::runValueFind);
+        connect(m_valueFindPrevButton, &QPushButton::clicked, this, &MainWindow::jumpToPreviousValueFindHit);
+        connect(m_valueFindNextButton, &QPushButton::clicked, this, &MainWindow::jumpToNextValueFindHit);
+        connect(closeButton, &QPushButton::clicked, m_valueFindDialog, &QDialog::hide);
+        connect(m_valueFindResults, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem* item, int) {
+            if (!item) return;
+            const int hitIndex = item->data(0, kValueFindRoleFirstHit).toInt();
+            if (hitIndex >= 0) jumpToValueFindHit(hitIndex);
+        });
+        connect(m_valueFindResults, &QTreeWidget::currentItemChanged, this, [this](QTreeWidgetItem* current, QTreeWidgetItem*) {
+            if (!current) return;
+            const int hitIndex = current->data(0, kValueFindRoleFirstHit).toInt();
+            if (hitIndex >= 0) {
+                m_valueFindCurrentHit = hitIndex;
+                updateValueFindNavigationState();
+            }
+        });
+    }
+
+    if (m_valueFindHits.isEmpty()) {
+        const int selectedCount = selectedActiveSignalIndexesForFind().size();
+        m_valueFindSummaryBase = selectedCount > 0
+            ? QStringLiteral("%1 highlighted active signal(s) selected.").arg(selectedCount)
+            : QStringLiteral("No highlighted active signal is selected.");
+        updateValueFindNavigationState();
+    }
+
+    m_valueFindDialog->show();
+    m_valueFindDialog->raise();
+    m_valueFindDialog->activateWindow();
+    if (m_valueFindEdit) {
+        m_valueFindEdit->setFocus();
+        m_valueFindEdit->selectAll();
+    }
+}
+
+void MainWindow::runValueFind() {
+    if (!m_valueFindEdit) return;
+
+    ParsedValueFindTarget target;
+    const QString targetText = m_valueFindEdit->text().trimmed();
+    if (!parseValueFindTargetText(targetText, target)) {
+        QMessageBox::warning(this,
+            QStringLiteral("Find value"),
+            QStringLiteral("Enter a numeric target, for example 10, 0xA, 0b1010, or -1."));
+        m_valueFindEdit->setFocus();
+        m_valueFindEdit->selectAll();
+        return;
+    }
+
+    const QList<int> signalIndexes = selectedActiveSignalIndexesForFind();
+    if (signalIndexes.isEmpty()) {
+        QMessageBox::information(this,
+            QStringLiteral("Find value"),
+            QStringLiteral("Highlight one or more active signals before searching."));
+        return;
+    }
+
+    if (!ensureSignalSamplesLoaded(signalIndexes, false)) return;
+
+    QElapsedTimer timer;
+    timer.start();
+
+    m_valueFindHits.clear();
+    m_valueFindSignalIndexes = signalIndexes;
+    m_valueFindCurrentHit = -1;
+
+    int widthSkippedSignals = 0;
+    for (int signalIndex : signalIndexes) {
+        if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
+
+        const WaveSignal& sig = m_wave.signalList.at(signalIndex);
+        quint64 targetBits = 0;
+        if (!valueFindTargetForSignal(target, sig.width, targetBits)) {
+            ++widthSkippedSignals;
+            continue;
+        }
+
+        const quint64 mask = waveBitMaskForWidth(sig.width);
+        bool previousMatched = false;
+        for (int sampleIndex = 0; sampleIndex < sig.samples.size(); ++sampleIndex) {
+            const WaveSample& sample = sig.samples.at(sampleIndex);
+            bool matched = false;
+
+            if (!sample.isAbsent && !sample.isZ) {
+                if (sample.rawFieldsReady) {
+                    matched = ((sample.rawBits & mask) == targetBits);
+                } else {
+                    WaveSample hydrated = sample;
+                    hydrateWaveSampleRawFields(sig.kind, sig.width, hydrated);
+                    matched = !hydrated.isAbsent && !hydrated.isZ && ((hydrated.rawBits & mask) == targetBits);
+                }
+            }
+
+            if (matched && !previousMatched) {
+                ValueFindHit hit;
+                hit.signalIndex = signalIndex;
+                hit.sampleIndex = sampleIndex;
+                hit.time = sample.time;
+                m_valueFindHits.push_back(hit);
+            }
+            previousMatched = matched;
+        }
+    }
+
+    std::stable_sort(m_valueFindHits.begin(), m_valueFindHits.end(), [](const ValueFindHit& a, const ValueFindHit& b) {
+        if (a.time != b.time) return a.time < b.time;
+        if (a.signalIndex != b.signalIndex) return a.signalIndex < b.signalIndex;
+        return a.sampleIndex < b.sampleIndex;
+    });
+
+    QSet<int> matchedSignals;
+    for (const ValueFindHit& hit : m_valueFindHits) matchedSignals.insert(hit.signalIndex);
+
+    m_valueFindSummaryBase = QStringLiteral("%1 target segment(s) in %2/%3 highlighted signal(s), scanned in %4 ms.")
+        .arg(m_valueFindHits.size())
+        .arg(matchedSignals.size())
+        .arg(signalIndexes.size())
+        .arg(timer.elapsed());
+    if (widthSkippedSignals > 0) {
+        m_valueFindSummaryBase += QStringLiteral(" %1 signal(s) skipped because the positive target exceeds their width.")
+            .arg(widthSkippedSignals);
+    }
+
+    rebuildValueFindResults();
+    if (!m_valueFindHits.isEmpty()) {
+        jumpToValueFindHit(0);
+    } else {
+        updateValueFindNavigationState();
+    }
+}
+
+void MainWindow::rebuildValueFindResults() {
+    if (!m_valueFindResults) return;
+
+    QHash<int, int> countBySignal;
+    QHash<int, int> firstHitBySignal;
+    for (int i = 0; i < m_valueFindHits.size(); ++i) {
+        const ValueFindHit& hit = m_valueFindHits.at(i);
+        countBySignal[hit.signalIndex] = countBySignal.value(hit.signalIndex) + 1;
+        if (!firstHitBySignal.contains(hit.signalIndex)) firstHitBySignal.insert(hit.signalIndex, i);
+    }
+
+    m_valueFindResults->clear();
+    for (int signalIndex : m_valueFindSignalIndexes) {
+        if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
+
+        const int count = countBySignal.value(signalIndex, 0);
+        const int firstHit = firstHitBySignal.value(signalIndex, -1);
+        auto* item = new QTreeWidgetItem(m_valueFindResults);
+        item->setText(0, signalDisplayName(signalIndex));
+        item->setText(1, QString::number(count));
+        item->setText(2, firstHit >= 0 ? formatInternalDisplayTime(m_valueFindHits.at(firstHit).time) : QStringLiteral("-"));
+        item->setData(0, kValueFindRoleFirstHit, firstHit);
+        item->setData(0, kValueFindRoleSignalIndex, signalIndex);
+        if (count <= 0) {
+            item->setForeground(1, QBrush(QColor("#AAB3BC")));
+            item->setForeground(2, QBrush(QColor("#AAB3BC")));
+        }
+    }
+}
+
+void MainWindow::updateValueFindNavigationState() {
+    const bool hasHits = !m_valueFindHits.isEmpty();
+    if (m_valueFindPrevButton) m_valueFindPrevButton->setEnabled(hasHits);
+    if (m_valueFindNextButton) m_valueFindNextButton->setEnabled(hasHits);
+
+    if (!m_valueFindSummaryLabel) return;
+
+    QString summary = m_valueFindSummaryBase;
+    if (m_valueFindCurrentHit >= 0 && m_valueFindCurrentHit < m_valueFindHits.size()) {
+        const ValueFindHit& hit = m_valueFindHits.at(m_valueFindCurrentHit);
+        summary += QStringLiteral(" Current: %1 @ %2 (%3/%4).")
+            .arg(signalDisplayName(hit.signalIndex))
+            .arg(formatInternalDisplayTime(hit.time))
+            .arg(m_valueFindCurrentHit + 1)
+            .arg(m_valueFindHits.size());
+    }
+    m_valueFindSummaryLabel->setText(summary);
+}
+
+void MainWindow::jumpToValueFindHit(int hitIndex) {
+    if (hitIndex < 0 || hitIndex >= m_valueFindHits.size() || !m_canvas) return;
+
+    const ValueFindHit hit = m_valueFindHits.at(hitIndex);
+    if (!m_canvas->jumpToTime(hit.time)) return;
+
+    m_valueFindCurrentHit = hitIndex;
+
+    if (m_activeList) {
+        for (int row = 0; row < m_activeList->topLevelItemCount(); ++row) {
+            QTreeWidgetItem* item = m_activeList->topLevelItem(row);
+            if (!item || signalIndexFromActiveItem(item) != hit.signalIndex) continue;
+            m_activeList->setCurrentItem(item, 0, QItemSelectionModel::NoUpdate);
+            m_activeList->scrollToItem(item);
+            break;
+        }
+        m_canvas->setSelectedEntryIndexes(selectedTopLevelIndexes(m_activeList));
+    }
+
+    if (m_valueFindResults) {
+        QSignalBlocker blocker(m_valueFindResults);
+        for (int row = 0; row < m_valueFindResults->topLevelItemCount(); ++row) {
+            QTreeWidgetItem* item = m_valueFindResults->topLevelItem(row);
+            if (!item || item->data(0, kValueFindRoleSignalIndex).toInt() != hit.signalIndex) continue;
+            m_valueFindResults->setCurrentItem(item);
+            m_valueFindResults->scrollToItem(item);
+            break;
+        }
+    }
+
+    refreshActiveValueLabels();
+    updateValueFindNavigationState();
+}
+
+void MainWindow::jumpToAdjacentValueFindHit(bool forward) {
+    if (m_valueFindHits.isEmpty()) return;
+
+    int targetIndex = -1;
+    if (m_valueFindCurrentHit >= 0 && m_valueFindCurrentHit < m_valueFindHits.size()) {
+        targetIndex = m_valueFindCurrentHit + (forward ? 1 : -1);
+        if (targetIndex < 0) targetIndex = m_valueFindHits.size() - 1;
+        if (targetIndex >= m_valueFindHits.size()) targetIndex = 0;
+    } else {
+        const qint64 cursor = m_canvas ? m_canvas->cursorTime() : -1;
+        if (cursor >= 0) {
+            if (forward) {
+                for (int i = 0; i < m_valueFindHits.size(); ++i) {
+                    if (m_valueFindHits.at(i).time > cursor) {
+                        targetIndex = i;
+                        break;
+                    }
+                }
+            } else {
+                for (int i = m_valueFindHits.size() - 1; i >= 0; --i) {
+                    if (m_valueFindHits.at(i).time < cursor) {
+                        targetIndex = i;
+                        break;
+                    }
+                }
+            }
+        }
+        if (targetIndex < 0) targetIndex = forward ? 0 : (m_valueFindHits.size() - 1);
+    }
+
+    jumpToValueFindHit(targetIndex);
+}
+
+void MainWindow::jumpToPreviousValueFindHit() {
+    jumpToAdjacentValueFindHit(false);
+}
+
+void MainWindow::jumpToNextValueFindHit() {
+    jumpToAdjacentValueFindHit(true);
 }
 
 void MainWindow::jumpToPrevChange() {
@@ -2886,6 +3914,341 @@ void MainWindow::jumpToTime() {
         m_jumpTimeEdit->selectAll();
     }
     refreshActiveValueLabels();
+}
+
+void MainWindow::openDerivedSignalDialog() {
+    if (m_wave.signalList.isEmpty()) {
+        QMessageBox::information(this,
+            QStringLiteral("Create temporary signal"),
+            QStringLiteral("Open a waveform before creating a temporary signal."));
+        return;
+    }
+
+    auto* dialog = new QDialog(this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setModal(false);
+    dialog->setWindowTitle(QStringLiteral("Create temporary signal"));
+    dialog->resize(680, 230);
+
+    auto* root = new QVBoxLayout(dialog);
+    root->setContentsMargins(12, 12, 12, 12);
+    root->setSpacing(8);
+
+    auto* form = new QFormLayout();
+    form->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+    auto* nameEdit = new QLineEdit(dialog);
+    nameEdit->setText(QStringLiteral("tmp_expr"));
+    nameEdit->setPlaceholderText(QStringLiteral("tmp_expr"));
+    form->addRow(QStringLiteral("Name"), nameEdit);
+
+    auto* exprEdit = new QLineEdit(dialog);
+    exprEdit->setPlaceholderText(QStringLiteral("`top.a` & `top.b`, (`valid` && `ready`), `bus` + 4"));
+
+    auto* exprRow = new QHBoxLayout();
+    exprRow->setSpacing(6);
+    auto* insertSelectedButton = new QPushButton(QStringLiteral("Insert selected"), dialog);
+    exprRow->addWidget(exprEdit, 1);
+    exprRow->addWidget(insertSelectedButton);
+    form->addRow(QStringLiteral("Expression"), exprRow);
+
+    auto* widthSpin = new QSpinBox(dialog);
+    widthSpin->setRange(0, 64);
+    widthSpin->setValue(0);
+    widthSpin->setSpecialValueText(QStringLiteral("auto"));
+    form->addRow(QStringLiteral("Width"), widthSpin);
+    root->addLayout(form);
+
+    auto* hint = new QLabel(QStringLiteral("This window is non-modal: select/copy signal names from the main viewer while it stays open. Supported operators: + - * / % & | ^ ~ << >> && || ! == != < <= > >=."), dialog);
+    hint->setWordWrap(true);
+    root->addWidget(hint);
+
+    auto* buttonRow = new QHBoxLayout();
+    auto* createButton = new QPushButton(QStringLiteral("Create"), dialog);
+    auto* closeButton = new QPushButton(QStringLiteral("Close"), dialog);
+    buttonRow->addStretch(1);
+    buttonRow->addWidget(createButton);
+    buttonRow->addWidget(closeButton);
+    root->addLayout(buttonRow);
+
+    auto selectedSignalIndex = [this]() -> int {
+        if (m_activeList) {
+            if (QTreeWidgetItem* item = m_activeList->currentItem()) {
+                const int signalIndex = signalIndexFromActiveItem(item);
+                if (signalIndex >= 0 && signalIndex < m_wave.signalList.size()) return signalIndex;
+            }
+            const QList<QTreeWidgetItem*> picked = m_activeList->selectedItems();
+            for (QTreeWidgetItem* item : picked) {
+                const int signalIndex = signalIndexFromActiveItem(item);
+                if (signalIndex >= 0 && signalIndex < m_wave.signalList.size()) return signalIndex;
+            }
+        }
+
+        if (m_tree && m_tree->selectionModel()) {
+            const QModelIndex current = m_tree->currentIndex();
+            const QVariant currentSignal = current.data(kTreeRoleSignalIndex);
+            if (currentSignal.isValid()) {
+                const int signalIndex = currentSignal.toInt();
+                if (signalIndex >= 0 && signalIndex < m_wave.signalList.size()) return signalIndex;
+            }
+
+            const QModelIndexList picked = m_tree->selectionModel()->selectedRows(0);
+            for (const QModelIndex& index : picked) {
+                const QVariant signal = index.data(kTreeRoleSignalIndex);
+                if (!signal.isValid()) continue;
+                const int signalIndex = signal.toInt();
+                if (signalIndex >= 0 && signalIndex < m_wave.signalList.size()) return signalIndex;
+            }
+        }
+
+        return -1;
+    };
+
+    auto quoteSignalName = [](QString name) {
+        name.replace(QLatin1Char('`'), QLatin1Char('_'));
+        return QStringLiteral("`") + name + QStringLiteral("`");
+    };
+
+    connect(insertSelectedButton, &QPushButton::clicked, this, [this, exprEdit, selectedSignalIndex, quoteSignalName]() {
+        const int signalIndex = selectedSignalIndex();
+        if (signalIndex < 0) {
+            QMessageBox::information(this,
+                QStringLiteral("Create temporary signal"),
+                QStringLiteral("Select a signal in the active list or signal tree first."));
+            return;
+        }
+
+        const QString text = quoteSignalName(signalDisplayName(signalIndex));
+        if (!exprEdit->text().isEmpty()) exprEdit->insert(QStringLiteral(" "));
+        exprEdit->insert(text);
+        exprEdit->setFocus();
+    });
+
+    connect(createButton, &QPushButton::clicked, this, [this, dialog, nameEdit, exprEdit, widthSpin]() {
+        if (createDerivedSignal(nameEdit->text(), exprEdit->text(), widthSpin->value())) {
+            dialog->close();
+        }
+    });
+    connect(closeButton, &QPushButton::clicked, dialog, &QDialog::close);
+
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
+    exprEdit->setFocus();
+}
+
+bool MainWindow::createDerivedSignal(const QString& name, const QString& expression, int widthOverride) {
+    const QString signalName = name.trimmed();
+    const QString expr = expression.trimmed();
+    if (signalName.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Create temporary signal"), QStringLiteral("Enter a signal name."));
+        return false;
+    }
+    if (expr.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Create temporary signal"), QStringLiteral("Enter an expression."));
+        return false;
+    }
+
+    QHash<QString, int> exactByName;
+    QHash<QString, int> leafByName;
+    QSet<QString> duplicateExact;
+    QSet<QString> duplicateLeaf;
+
+    auto addExact = [&](const QString& rawName, int signalIndex) {
+        const QString key = stripDisplayRangeSuffix(rawName);
+        if (key.isEmpty()) return;
+        if (exactByName.contains(key) && exactByName.value(key) != signalIndex) {
+            duplicateExact.insert(key);
+        } else {
+            exactByName.insert(key, signalIndex);
+        }
+    };
+
+    auto addLeaf = [&](const QString& rawName, int signalIndex) {
+        const QString key = stripDisplayRangeSuffix(rawName);
+        if (key.isEmpty()) return;
+        const int dot = key.lastIndexOf(QLatin1Char('.'));
+        const QString leaf = (dot >= 0) ? key.mid(dot + 1) : key;
+        if (leaf.isEmpty()) return;
+        if (leafByName.contains(leaf) && leafByName.value(leaf) != signalIndex) {
+            duplicateLeaf.insert(leaf);
+        } else {
+            leafByName.insert(leaf, signalIndex);
+        }
+    };
+
+    for (int i = 0; i < m_wave.signalList.size(); ++i) {
+        const QString fullName = signalDisplayName(i);
+        const QString rawName = m_wave.signalList.at(i).name;
+        addExact(fullName, i);
+        addExact(rawName, i);
+        addLeaf(fullName, i);
+        addLeaf(rawName, i);
+    }
+
+    if (exactByName.contains(stripDisplayRangeSuffix(signalName))) {
+        QMessageBox::warning(this,
+            QStringLiteral("Create temporary signal"),
+            QStringLiteral("Signal name already exists. Choose another name."));
+        return false;
+    }
+
+    auto resolveSignal = [&](const QString& rawName, int& signalIndex, int& width, QString& error) -> bool {
+        const QString key = stripDisplayRangeSuffix(rawName);
+        if (key.isEmpty()) {
+            error = QStringLiteral("Empty signal name in expression.");
+            return false;
+        }
+        if (duplicateExact.contains(key)) {
+            error = QStringLiteral("Signal name '%1' is ambiguous; use the full path in backticks.").arg(rawName);
+            return false;
+        }
+        if (exactByName.contains(key)) {
+            signalIndex = exactByName.value(key);
+            if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) return false;
+            width = qBound(1, m_wave.signalList.at(signalIndex).width, 64);
+            return true;
+        }
+        if (duplicateLeaf.contains(key)) {
+            error = QStringLiteral("Leaf signal name '%1' is ambiguous; use the full path in backticks.").arg(rawName);
+            return false;
+        }
+        if (leafByName.contains(key)) {
+            signalIndex = leafByName.value(key);
+            if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) return false;
+            width = qBound(1, m_wave.signalList.at(signalIndex).width, 64);
+            return true;
+        }
+
+        error = QStringLiteral("Unknown signal '%1'.").arg(rawName);
+        return false;
+    };
+
+    DerivedExpressionProgram program;
+    QString parseError;
+    DerivedExpressionParser parser(expr, resolveSignal);
+    if (!parser.parse(program, parseError)) {
+        QMessageBox::warning(this, QStringLiteral("Create temporary signal"), parseError);
+        return false;
+    }
+
+    if (!ensureSignalSamplesLoaded(program.dependencyIndexes, false)) {
+        return false;
+    }
+
+    const int outputWidth = qBound(1, widthOverride > 0 ? widthOverride : program.inferredWidth, 64);
+    const SignalKind outputKind = (outputWidth <= 1) ? SignalKind::Bit : SignalKind::Bus;
+    const ValueRadix outputRadix = (outputWidth <= 1) ? ValueRadix::Bin : ValueRadix::Hex;
+
+    WaveSample absent;
+    absent.time = m_wave.meta.start;
+    absent.value = waveAbsentValue();
+    absent.isAbsent = true;
+    absent.rawFieldsReady = true;
+
+    QVector<int> samplePositions(program.dependencyIndexes.size(), 0);
+    QVector<WaveSample> currentSamples(program.dependencyIndexes.size(), absent);
+    QVector<WaveSample> outputSamples;
+    outputSamples.reserve(qMin(1024, qMax(1, program.dependencyIndexes.size() * 16)));
+
+    auto consumeSamplesAtOrBefore = [&](qint64 t) {
+        for (int slot = 0; slot < program.dependencyIndexes.size(); ++slot) {
+            const int signalIndex = program.dependencyIndexes.at(slot);
+            if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
+            const WaveSignal& sig = m_wave.signalList.at(signalIndex);
+            int& pos = samplePositions[slot];
+            while (pos < sig.samples.size() && sig.samples.at(pos).time <= t) {
+                WaveSample sample = sig.samples.at(pos++);
+                if (!sample.rawFieldsReady) {
+                    hydrateWaveSampleRawFields(sig.kind, sig.width, sample);
+                }
+                currentSamples[slot] = sample;
+            }
+        }
+    };
+
+    auto appendResultAt = [&](qint64 t) -> bool {
+        DerivedEvalValue value = evalDerivedExpressionNode(program, program.root, currentSamples);
+        if (value.known) value.bits &= waveBitMaskForWidth(outputWidth);
+        WaveSample sample = makeDerivedSample(t, value, outputWidth, outputRadix);
+        if (outputSamples.isEmpty() || !sameDerivedSampleValue(outputSamples.last(), sample, outputWidth)) {
+            outputSamples.push_back(sample);
+            if (outputSamples.size() > int(kViewerOnDemandSampleBudget)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    const qint64 startTime = m_wave.meta.start;
+    consumeSamplesAtOrBefore(startTime);
+    if (!appendResultAt(startTime)) {
+        QMessageBox::warning(this,
+            QStringLiteral("Create temporary signal"),
+            QStringLiteral("The derived signal generated too many transitions."));
+        return false;
+    }
+
+    for (;;) {
+        qint64 nextTime = std::numeric_limits<qint64>::max();
+        for (int slot = 0; slot < program.dependencyIndexes.size(); ++slot) {
+            const int signalIndex = program.dependencyIndexes.at(slot);
+            if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
+            const WaveSignal& sig = m_wave.signalList.at(signalIndex);
+            const int pos = samplePositions.at(slot);
+            if (pos < sig.samples.size()) nextTime = qMin(nextTime, sig.samples.at(pos).time);
+        }
+        if (nextTime == std::numeric_limits<qint64>::max()) break;
+        consumeSamplesAtOrBefore(nextTime);
+        if (!appendResultAt(nextTime)) {
+            QMessageBox::warning(this,
+                QStringLiteral("Create temporary signal"),
+                QStringLiteral("The derived signal generated too many transitions."));
+            return false;
+        }
+    }
+
+    if (outputSamples.isEmpty()) {
+        QMessageBox::warning(this,
+            QStringLiteral("Create temporary signal"),
+            QStringLiteral("Expression produced no samples."));
+        return false;
+    }
+
+    int maxSignalId = -1;
+    for (const WaveSignal& sig : m_wave.signalList) {
+        maxSignalId = qMax(maxSignalId, sig.signalId);
+    }
+
+    WaveSignal derived;
+    derived.signalId = maxSignalId + 1;
+    derived.storageId = -1;
+    derived.name = signalName;
+    derived.kind = outputKind;
+    derived.width = outputWidth;
+    derived.defaultRadix = outputRadix;
+    derived.currentRadix = outputRadix;
+    derived.supportsZState = true;
+    derived.samplesLoaded = true;
+    derived.samples = std::move(outputSamples);
+    rebuildWaveSignalDerivedCaches(derived);
+
+    const int newSignalIndex = m_wave.signalList.size();
+    m_wave.signalList.push_back(std::move(derived));
+    if (m_signalIndexBySignalId.size() <= maxSignalId + 1) {
+        m_signalIndexBySignalId.resize(maxSignalId + 2);
+    }
+    m_signalIndexBySignalId[maxSignalId + 1] = newSignalIndex + 1;
+
+    addSignalToActive(newSignalIndex);
+    if (m_canvas) m_canvas->update();
+
+    QMessageBox::information(this,
+        QStringLiteral("Create temporary signal"),
+        QStringLiteral("Temporary signal '%1' created with %2 transition sample(s).")
+            .arg(signalName)
+            .arg(m_wave.signalList.at(newSignalIndex).samples.size()));
+    return true;
 }
 
 void MainWindow::resetView() { m_canvas->resetView(); refreshActiveValueLabels(); }
@@ -3049,6 +4412,7 @@ void MainWindow::setActiveItemFormat(QTreeWidgetItem* item, const QString& text)
 }
 
 bool MainWindow::canDeferSamplesWithLod(const WaveSignal& sig) const {
+    if (viewerDisableLodEnabled()) return false;
     if (sig.lodLevels.isEmpty() || !m_canvas) return false;
     const int plotWidth = qMax(1, m_canvas->width() - 20);
     const qint64 span = qMax<qint64>(1, m_canvas->viewEnd() - m_canvas->viewStart());
@@ -3086,6 +4450,7 @@ bool MainWindow::ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool
         loadOptions.signalIds = signalIdsToLoad;
         loadOptions.includeAllSignalDefinitions = false;
         loadOptions.loadAllIfWindowEmpty = false;
+        loadOptions.maxDecodedSamples = kViewerOnDemandSampleBudget;
         loadOk = WaveParser4::loadFromFile(m_currentWaveFilePath, loadedWave, error, loadOptions);
     } else {
         WaveParser3::LoadOptions loadOptions;
@@ -3143,7 +4508,7 @@ void MainWindow::addSignalToActive(int signalIndex) {
 
 void MainWindow::addSignalIndexesToActive(const QList<int>& signalIndexes) {
     if (signalIndexes.isEmpty()) return;
-    if (!ensureSignalSamplesLoaded(signalIndexes)) return;
+    if (!ensureSignalSamplesLoaded(signalIndexes, false)) return;
 
     QList<QTreeWidgetItem*> addedItems;
     addedItems.reserve(signalIndexes.size());

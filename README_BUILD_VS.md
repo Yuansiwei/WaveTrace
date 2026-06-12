@@ -5,7 +5,7 @@ Open `WaveTrace.sln` in Visual Studio 2019/2022 and build `Release|x64`.
 Projects:
 
 - `ReflectGen`: builds the current `ReflectGen.cpp` and uses local `third_party\llvm\llvm-local`.
-- `wvz4_writer_monitor`: builds the WAL monitor/finalizer.
+- `wvz4_writer_monitor`: builds the helper writer process used by `PathStableWvz4Recorder`.
 - `smoke*`: small compile/runtime checks for the reflection-waveform runtime and WVZ4 writer.
 
 Dependency property sheets:

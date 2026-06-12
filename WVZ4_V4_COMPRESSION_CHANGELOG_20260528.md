@@ -29,10 +29,10 @@
    - `open()` rejects duplicate open calls.
    - `close()` resets topology/session state.
    - Same recorder object can be reused after close without duplicate track/node residue.
-8. Hardened WAL replay:
+8. Added writer-helper finalization path:
    - New v4 options/layout serialization includes clock and compression options.
-   - WAL payload size now has a 256 MiB sanity cap before allocation.
-   - Replay stats log is written next to the final output path, not the temporary replay file.
+   - Parent processes submit committed layout/cycle frames over a named pipe.
+   - The helper owns the real writer and writes stats next to the final output path.
 
 ## Compatibility note
 
@@ -41,7 +41,7 @@ This version intentionally breaks older WVZ4 v3 reader assumptions:
 - WDAT records now include a per-record `ValueRecordCodec` byte.
 - WDAT tiles may be sparse and no longer always contain a dense offset table.
 - Clocks may appear only in `CLKD` and have no ordinary WDAT events.
-- WAL layout/options payloads include new fields.
+- Writer-helper layout/options payloads include new fields.
 
 Update readers/viewers to parse `kFormatVersion == 4`, `CLKD`, `kWdatSparseSignalRecords`, and `kWdatPerRecordValueCodec`.
 
@@ -52,7 +52,7 @@ Compiled and ran local smoke tests for:
 - direct writer with `CLKD`, sparse tile, byte-mask record, and log output;
 - `PathStableWvz4Recorder` default clock path;
 - recorder close/open reuse;
-- WAL write + replay;
+- writer-helper write + finalization;
 - `WVZ4_NO_ZSTD` direct writer build;
 - `wave_tap.h` inclusion under C++14;
 - monitor source compilation.
