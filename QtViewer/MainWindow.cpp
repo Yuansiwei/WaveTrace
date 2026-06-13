@@ -2460,10 +2460,7 @@ private:
     }
 
     QString formatInternalDisplayTime(qint64 internalTime) {
-        const double value = double(internalTime) / 10.0;
-        QString text = QString::number(value, 'f', 1);
-        if (text.endsWith(QStringLiteral(".0"))) text.chop(2);
-        return text;
+        return QString::number(internalTime);
     }
 
     QColor iconColor(const QString& name) {
@@ -3261,10 +3258,7 @@ void MainWindow::applyWave(WaveFile&& wave) {
 
 void MainWindow::updateMetaLabel() {
     auto displayTimeText = [](qint64 internalTime) -> QString {
-        const double value = double(internalTime) / 10.0;
-        QString text = QString::number(value, 'f', 1);
-        if (text.endsWith(QStringLiteral(".0"))) text.chop(2);
-        return text;
+        return QString::number(internalTime);
     };
 
     const QString rangeText = QStringLiteral("%1 ~ %2")
@@ -3846,10 +3840,7 @@ void MainWindow::jumpToTime() {
     const qint64 rangeEnd = m_canvas->fullEndTime();
 
     auto displayTimeText = [](qint64 internalTime) -> QString {
-        const double value = double(internalTime) / 10.0;
-        QString text = QString::number(value, 'f', 1);
-        if (text.endsWith(QStringLiteral(".0"))) text.chop(2);
-        return text;
+        return QString::number(internalTime);
     };
 
     const QString minText = displayTimeText(rangeStart);
@@ -3873,7 +3864,7 @@ void MainWindow::jumpToTime() {
     }
 
     bool parsed = false;
-    const double userTime = input.toDouble(&parsed);
+    const qint64 internalTime = input.toLongLong(&parsed, 10);
     if (!parsed) {
         QMessageBox::warning(this,
             QString::fromUtf8("时间格式不正确"),
@@ -3882,9 +3873,7 @@ void MainWindow::jumpToTime() {
         return;
     }
 
-    const double minUserTime = double(rangeStart) / 10.0;
-    const double maxUserTime = double(rangeEnd) / 10.0;
-    if (userTime < minUserTime || userTime > maxUserTime) {
+    if (internalTime < rangeStart || internalTime > rangeEnd) {
         QMessageBox::warning(this,
             QString::fromUtf8("时间超出范围"),
             QString::fromUtf8("输入时间不在合理范围内。\\n合理范围：%1").arg(rangeText));
@@ -3892,7 +3881,6 @@ void MainWindow::jumpToTime() {
         return;
     }
 
-    const qint64 internalTime = static_cast<qint64>(std::llround(userTime * 10.0));
     if (internalTime < rangeStart || internalTime > rangeEnd) {
         QMessageBox::warning(this,
             QString::fromUtf8("时间超出范围"),

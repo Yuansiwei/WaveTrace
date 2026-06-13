@@ -225,10 +225,7 @@ static QString csvField(QString text) {
 }
 
 static QString benchmarkDisplayTime(qint64 internalTime) {
-    const double value = double(internalTime) / 10.0;
-    QString text = QString::number(value, 'f', 1);
-    if (text.endsWith(QStringLiteral(".0"))) text.chop(2);
-    return text;
+    return QString::number(internalTime);
 }
 
 static QString benchmarkSignalName(const WaveFile& wave, int signalIndex) {
@@ -567,6 +564,7 @@ int main(int argc, char *argv[]) {
     const QStringList args = a.arguments();
 
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--capture-zoom-sequence")) {
+        qputenv("WV_VIEWER_STRICT_RENDER_CHECKS", QByteArray("1"));
         return runZoomCaptureSequence(a, args);
     }
 
