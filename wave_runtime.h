@@ -908,26 +908,23 @@ struct weak_ptr_target;
 template <typename T>
 struct weak_ptr_target<std::weak_ptr<T> > { typedef T type; };
 
-// VSIP-style ports/interfaces are treated as peek value sources.
-//
-// There are two supported cases:
-//   1. Exact project port wrappers:
-//        vsipIN<T,N,POL>, vsipOUT<T,N,POL>, vsipINOUT<T,N,POL>
-//      These are sc_port-like objects.  Their sampled value is obtained through
-//      the bound IF, i.e. port->peek().  Tracer receives const Port* and calls
-//      read_vsip_peek(...), which uses operator->().
-//
-//   2. Project channel/interface classes whose inheritance chain contains one
-//      of the IF templates:
-//        vsiiIN<T>, vsiiOUT<T>, vsiiINOUT<T>
-//      These are treated as value sources too, but their sampled value is
-//      obtained by calling peek() through the vsii* base template, not by
-//      guessing a non-template interface and not by checking vsip* inheritance.
-//      This is important because vsiiIN/OUT/INOUT are templates.
-//
-// Exact vsip* ports use port->peek(); classes derived from vsii* use .peek()
-// through the appropriate vsii<T> base.  Classes merely derived from vsip* are
-// not treated as direct-dot peek wrappers.
+template <typename T, bool Complete = is_complete_type<typename remove_cvref<T>::type>::value>
+struct is_peek_trace_source_impl : std::false_type {};
+
+template <typename T>
+struct is_peek_trace_source_impl<T, true> : std::integral_constant<bool,
+    !std::is_void<typename remove_cvref<T>::type>::value &&
+    std::is_base_of<
+    ::wave::PeekTraceSource,
+    typename remove_cvref<T>::type>::value> {};
+
+template <typename T>
+struct is_peek_trace_source : is_peek_trace_source_impl<T> {};
+
+// Exact VSIP project port wrappers are sc_port-like handles.  They are followed
+// to their bound interface object, and that object must explicitly opt in with
+// PeekTraceSource/PeekTraceSourceFor before peek() expansion is used.  Merely
+// inheriting vsiiIN/OUT/INOUT is intentionally not a value-source signal.
 template <typename T>
 struct type_identity { typedef T type; };
 
@@ -940,46 +937,9 @@ struct is_vsip_out : std::false_type {};
 template <typename T>
 struct is_vsip_inout : std::false_type {};
 
-#ifndef WAVE_DISABLE_VSIP_PORT_FORWARD_DECLS
-// Inheritance-based value-source detection is intentionally tied to the
-// interface templates, not the port templates.  vsiiIN/OUT/INOUT are templates:
-//   vsiiIN<T>, vsiiOUT<T>, vsiiINOUT<T>
-// The overloads below recover T when CleanT is derived from one of them.
-template <typename V>
-type_identity<V> infer_vsii_in_base(const ::vsiiIN<V>*);
-
-template <typename V>
-type_identity<V> infer_vsii_out_base(const ::vsiiOUT<V>*);
-
-template <typename V>
-type_identity<V> infer_vsii_inout_base(const ::vsiiINOUT<V>*);
-#endif
-
-type_identity<void> infer_vsii_in_base(...);
-type_identity<void> infer_vsii_out_base(...);
-type_identity<void> infer_vsii_inout_base(...);
-
-template <typename T>
-struct inferred_vsip_value_type {
-    typedef typename remove_cvref<T>::type CleanT;
-    typedef typename decltype(infer_vsii_inout_base(static_cast<const CleanT*>(NULL)))::type InOutValue;
-    typedef typename decltype(infer_vsii_in_base(static_cast<const CleanT*>(NULL)))::type InValue;
-    typedef typename decltype(infer_vsii_out_base(static_cast<const CleanT*>(NULL)))::type OutValue;
-
-    typedef typename std::conditional<
-        !std::is_void<InOutValue>::value,
-        InOutValue,
-        typename std::conditional<
-            !std::is_void<InValue>::value,
-            InValue,
-            OutValue
-        >::type
-    >::type type;
-};
-
 template <typename T>
 struct vsip_port_value_type {
-    typedef typename inferred_vsip_value_type<T>::type type;
+    typedef void type;
 };
 
 #ifndef WAVE_DISABLE_VSIP_PORT_FORWARD_DECLS
@@ -1118,6 +1078,26 @@ struct sc_port_value_type<sc_core::sc_out<T> > { typedef T type; };
 template <typename T>
 struct sc_port_value_type<sc_core::sc_inout<T> > { typedef T type; };
 
+template <typename IFace>
+type_identity<IFace> infer_sc_port_base(const sc_core::sc_port_b<IFace>*);
+
+type_identity<void> infer_sc_port_base(...);
+
+template <typename T>
+struct sc_generic_port_iface_type {
+    typedef typename remove_cvref<T>::type CleanT;
+    typedef typename decltype(infer_sc_port_base(static_cast<const CleanT*>(NULL)))::type type;
+};
+
+template <typename T>
+struct is_sc_port : std::integral_constant<bool,
+    !is_peek_trace_source<typename remove_cvref<T>::type>::value &&
+    !is_vsip_read_port<typename remove_cvref<T>::type>::value &&
+    !is_sc_in<typename remove_cvref<T>::type>::value &&
+    !is_sc_out<typename remove_cvref<T>::type>::value &&
+    !is_sc_inout<typename remove_cvref<T>::type>::value &&
+    !std::is_void<typename sc_generic_port_iface_type<T>::type>::value> {};
+
 template <typename T>
 struct is_sc_signal : std::false_type {};
 
@@ -1192,6 +1172,7 @@ struct is_sc_namespace_blacklisted : std::integral_constant<bool, sc_namespace_b
 template <typename T> struct is_sc_in : std::false_type {};
 template <typename T> struct is_sc_out : std::false_type {};
 template <typename T> struct is_sc_inout : std::false_type {};
+template <typename T> struct is_sc_port : std::false_type {};
 template <typename T> struct is_sc_signal : std::false_type {};
 template <typename T> struct is_sc_buffer : std::false_type {};
 template <typename T> struct is_sc_vector : std::false_type {};
@@ -1199,6 +1180,7 @@ template <typename T> struct is_sc_clock : std::false_type {};
 template <typename T> struct is_sc_namespace_blacklisted : std::false_type {};
 
 template <typename T> struct sc_port_value_type { typedef void type; };
+template <typename T> struct sc_generic_port_iface_type { typedef void type; };
 template <typename T> struct sc_signal_value_type { typedef void type; };
 
 #endif
@@ -1393,8 +1375,6 @@ inline ThreadTraceLocal& current_thread_trace_local() {
     return tls;
 }
 
-typedef NodeId (*DynamicExpandFn)(Tracer&, const std::string&, NodeId, const void*);
-
 inline std::unordered_map<const void*, DynamicExpandFn>& dynamic_expand_registry() {
     static std::unordered_map<const void*, DynamicExpandFn>* registry = new std::unordered_map<const void*, DynamicExpandFn>();
     return *registry;
@@ -1412,14 +1392,17 @@ inline DynamicExpandFn find_dynamic_expander(const void* type_tag) {
 }
 
 template <typename T>
-NodeId dynamic_expand_bridge(Tracer& tracer, const std::string& path, NodeId parent_id, const void* obj);
-
-template <typename T>
 struct DynamicTypeRegistration {
     DynamicTypeRegistration() {
         register_dynamic_expander(reflect::type_tag_of<T>(), &dynamic_expand_bridge<T>);
     }
 };
+
+template <typename T>
+inline void ensure_dynamic_type_registered() {
+    static DynamicTypeRegistration<T> registration;
+    (void)registration;
+}
 
 
 
@@ -8285,6 +8268,148 @@ private:
         }
     }
 
+    NodeId add_dynamic_trace_target_object(const std::string& path,
+                                           NodeId parent_id,
+                                           const DynamicTraceTarget* target) {
+        if (!target) return 0;
+        const void* target_ptr = target->wave_trace_target_ptr();
+        const void* type_tag = target->wave_trace_target_type_tag();
+        if (!target_ptr || !type_tag) {
+            if (options_.debug_log) {
+                debug_log_msg(std::string("dynamic target missing path=") + path +
+                              " target=" + detail::pointer_to_string(target_ptr) +
+                              " type_tag=" + detail::pointer_to_string(type_tag));
+            }
+            return 0;
+        }
+
+        DynamicExpandFn fn = find_dynamic_expander(type_tag);
+        if (!fn) {
+            fn = target->wave_trace_dynamic_expander();
+        }
+        if (!fn) {
+            if (options_.debug_log) {
+                debug_log_msg(std::string("dynamic target unregistered path=") + path +
+                              " target=" + detail::pointer_to_string(target_ptr) +
+                              " type_tag=" + detail::pointer_to_string(type_tag));
+            }
+            return 0;
+        }
+
+        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
+        const std::uint32_t group_id = get_or_create_dirty_peek_group(
+            target_ptr,
+            type_tag,
+            target->wave_trace_target_byte_width());
+
+        const std::uint32_t previous_group = active_dirty_peek_group_id_;
+        const std::uint32_t previous_range = active_dirty_peek_range_id_;
+        const std::uint32_t first_new_range = static_cast<std::uint32_t>(dirty_peek_ranges_.size());
+        if (group_id != kInvalidIndex) {
+            active_dirty_peek_group_id_ = group_id;
+            active_dirty_peek_range_id_ = kInvalidIndex;
+        }
+        const NodeId result = fn(*this, path, parent_id, target_ptr);
+        const std::uint32_t end_new_range = static_cast<std::uint32_t>(dirty_peek_ranges_.size());
+        active_dirty_peek_group_id_ = previous_group;
+        active_dirty_peek_range_id_ = previous_range;
+
+        if (result == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+
+        if (first_new_range != end_new_range) {
+            WaveDirtyHook* hook = target->wave_trace_dirty_hook();
+            bind_dirty_hook_to_group(hook, group_id);
+            if (hook) {
+                mark_dirty_peek_ranges_hooked(group_id, first_new_range, end_new_range);
+            }
+        }
+        return result;
+    }
+
+    NodeId add_peek_trace_source_object(const std::string& path,
+                                        NodeId parent_id,
+                                        const PeekTraceSource* source) {
+        if (!source) return 0;
+        const void* value_ptr = source->wave_trace_peek_ptr();
+        const void* type_tag = source->wave_trace_peek_type_tag();
+        if (!value_ptr || !type_tag) {
+            if (options_.debug_log) {
+                debug_log_msg(std::string("peek source missing value path=") + path +
+                              " value=" + detail::pointer_to_string(value_ptr) +
+                              " type_tag=" + detail::pointer_to_string(type_tag));
+            }
+            return 0;
+        }
+
+        DynamicExpandFn fn = find_dynamic_expander(type_tag);
+        if (!fn) {
+            fn = source->wave_trace_peek_dynamic_expander();
+        }
+        if (!fn) {
+            if (options_.debug_log) {
+                debug_log_msg(std::string("peek source unregistered path=") + path +
+                              " value=" + detail::pointer_to_string(value_ptr) +
+                              " type_tag=" + detail::pointer_to_string(type_tag));
+            }
+            return 0;
+        }
+
+        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
+        const std::uint32_t group_id = get_or_create_dirty_peek_group(
+            value_ptr,
+            type_tag,
+            source->wave_trace_peek_byte_width());
+
+        const std::uint32_t previous_group = active_dirty_peek_group_id_;
+        const std::uint32_t previous_range = active_dirty_peek_range_id_;
+        const std::uint32_t first_new_range = static_cast<std::uint32_t>(dirty_peek_ranges_.size());
+        if (group_id != kInvalidIndex) {
+            active_dirty_peek_group_id_ = group_id;
+            active_dirty_peek_range_id_ = kInvalidIndex;
+        }
+        const NodeId result = fn(*this, path, parent_id, value_ptr);
+        const std::uint32_t end_new_range = static_cast<std::uint32_t>(dirty_peek_ranges_.size());
+        active_dirty_peek_group_id_ = previous_group;
+        active_dirty_peek_range_id_ = previous_range;
+
+        if (result == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+
+        if (first_new_range != end_new_range) {
+            WaveDirtyHook* hook = source->wave_trace_peek_dirty_hook();
+            bind_dirty_hook_to_group(hook, group_id);
+            if (hook) {
+                mark_dirty_peek_ranges_hooked(group_id, first_new_range, end_new_range);
+            }
+        }
+        return result;
+    }
+
+    template <typename IFace>
+    NodeId expand_dynamic_trace_interface_target(const std::string& path, NodeId parent_id, const IFace* iface) {
+        if (!iface) return 0;
+        const PeekTraceSource* peek_source = dynamic_cast<const PeekTraceSource*>(iface);
+        if (peek_source) {
+            return add_peek_trace_source_object(path, parent_id, peek_source);
+        }
+
+        const DynamicTraceTarget* target = dynamic_cast<const DynamicTraceTarget*>(iface);
+        if (!target) {
+            if (options_.debug_log) {
+                debug_log_msg(std::string("dynamic interface target missing marker path=") + path +
+                              " iface=" + detail::pointer_to_string(detail::pointer_address(iface)) +
+                              " type=" + typeid(IFace).name());
+            }
+            return expand_field(path, parent_id, iface);
+        }
+        return add_dynamic_trace_target_object(path, parent_id, target);
+    }
+
     template <typename V, typename Reader>
     NodeId add_lazy_value_object(const std::string& path,
                                  NodeId parent_id,
@@ -9075,46 +9200,76 @@ private:
 #ifndef WAVE_DISABLE_VSIP_PORT_FORWARD_DECLS
 #  if WAVE_HAS_SYSTEMC
     template <typename V, int N, sc_core::sc_port_policy POL>
-    const V* read_vsip_peek(const ::vsipIN<V, N, POL>* port) const {
+    const ::vsiiIN<V>* read_vsip_exact_interface(const ::vsipIN<V, N, POL>* port) const {
         if (!port || port->size() == 0) return NULL;
-        const ::vsiiIN<V>* iface = (*port).operator->();
+        return (*port).operator->();
+    }
+
+    template <typename V, int N, sc_core::sc_port_policy POL>
+    const ::vsiiOUT<V>* read_vsip_exact_interface(const ::vsipOUT<V, N, POL>* port) const {
+        if (!port || port->size() == 0) return NULL;
+        return (*port).operator->();
+    }
+
+    template <typename V, int N, sc_core::sc_port_policy POL>
+    const ::vsiiINOUT<V>* read_vsip_exact_interface(const ::vsipINOUT<V, N, POL>* port) const {
+        if (!port || port->size() == 0) return NULL;
+        return (*port).operator->();
+    }
+
+    template <typename V, int N, sc_core::sc_port_policy POL>
+    const V* read_vsip_peek(const ::vsipIN<V, N, POL>* port) const {
+        const ::vsiiIN<V>* iface = read_vsip_exact_interface(port);
         return iface ? const_cast< ::vsiiIN<V>* >(iface)->peek() : static_cast<const V*>(NULL);
     }
 
     template <typename V, int N, sc_core::sc_port_policy POL>
     const V* read_vsip_peek(const ::vsipOUT<V, N, POL>* port) const {
-        if (!port || port->size() == 0) return NULL;
-        const ::vsiiOUT<V>* iface = (*port).operator->();
+        const ::vsiiOUT<V>* iface = read_vsip_exact_interface(port);
         return iface ? const_cast< ::vsiiOUT<V>* >(iface)->peek() : static_cast<const V*>(NULL);
     }
 
     template <typename V, int N, sc_core::sc_port_policy POL>
     const V* read_vsip_peek(const ::vsipINOUT<V, N, POL>* port) const {
-        if (!port || port->size() == 0) return NULL;
-        const ::vsiiINOUT<V>* iface = (*port).operator->();
+        const ::vsiiINOUT<V>* iface = read_vsip_exact_interface(port);
         if (!iface) return NULL;
         ::vsiiIN<V>* in_iface = const_cast< ::vsiiIN<V>* >(static_cast<const ::vsiiIN<V>* >(iface));
         return in_iface ? in_iface->peek() : static_cast<const V*>(NULL);
     }
 #  else
     template <typename V>
-    const V* read_vsip_peek(const ::vsipIN<V>* port) const {
+    const ::vsiiIN<V>* read_vsip_exact_interface(const ::vsipIN<V>* port) const {
         if (!port || port->size() == 0) return NULL;
-        const ::vsiiIN<V>* iface = (*port).operator->();
+        return (*port).operator->();
+    }
+
+    template <typename V>
+    const ::vsiiOUT<V>* read_vsip_exact_interface(const ::vsipOUT<V>* port) const {
+        if (!port || port->size() == 0) return NULL;
+        return (*port).operator->();
+    }
+
+    template <typename V>
+    const ::vsiiINOUT<V>* read_vsip_exact_interface(const ::vsipINOUT<V>* port) const {
+        if (!port || port->size() == 0) return NULL;
+        return (*port).operator->();
+    }
+
+    template <typename V>
+    const V* read_vsip_peek(const ::vsipIN<V>* port) const {
+        const ::vsiiIN<V>* iface = read_vsip_exact_interface(port);
         return iface ? const_cast< ::vsiiIN<V>* >(iface)->peek() : static_cast<const V*>(NULL);
     }
 
     template <typename V>
     const V* read_vsip_peek(const ::vsipOUT<V>* port) const {
-        if (!port || port->size() == 0) return NULL;
-        const ::vsiiOUT<V>* iface = (*port).operator->();
+        const ::vsiiOUT<V>* iface = read_vsip_exact_interface(port);
         return iface ? const_cast< ::vsiiOUT<V>* >(iface)->peek() : static_cast<const V*>(NULL);
     }
 
     template <typename V>
     const V* read_vsip_peek(const ::vsipINOUT<V>* port) const {
-        if (!port || port->size() == 0) return NULL;
-        const ::vsiiINOUT<V>* iface = (*port).operator->();
+        const ::vsiiINOUT<V>* iface = read_vsip_exact_interface(port);
         if (!iface) return NULL;
         ::vsiiIN<V>* in_iface = const_cast< ::vsiiIN<V>* >(static_cast<const ::vsiiIN<V>* >(iface));
         return in_iface ? in_iface->peek() : static_cast<const V*>(NULL);
@@ -9162,11 +9317,9 @@ private:
     template <typename Port, typename V>
     typename std::enable_if<!detail::is_vsip_exact_port<Port>::value && detail::is_vsip_read_port<Port>::value, const V*>::type
     read_vsip_value(const Port* port) const {
-        // IF-derived channel/wrapper classes are detected through the template
-        // bases vsiiIN<V>, vsiiOUT<V>, or vsiiINOUT<V>.  Call peek() through the
-        // selected vsii<T> base.  This avoids ambiguous .peek() lookup on
-        // vsiiINOUT-derived classes, where both vsiiIN<T> and vsiiOUT<T> may
-        // declare peek().
+        // Legacy explicit trait hook: only types with a custom
+        // vsip_port_value_type<T> specialization can arrive here.  Ordinary
+        // vsii* inheritance no longer opts a type into peek expansion.
         return read_vsii_object_peek<Port, V>(port);
     }
 
@@ -9230,18 +9383,31 @@ private:
     template <typename Obj, typename V>
     typename std::enable_if<!detail::is_vsip_exact_port<Obj>::value && detail::is_vsip_read_port<Obj>::value, WaveDirtyHook*>::type
     read_vsip_dirty_hook(const Obj* obj) const {
-        // vsii-derived objects are real value-source objects, so access the hook
-        // directly through the object itself.
+        // Legacy explicit trait hook: access the object's own dirty hook.
         return detail::maybe_wave_dirty_hook(obj);
     }
 
     template <typename T>
-    typename std::enable_if<detail::is_vsip_read_port<T>::value, NodeId>::type
+    typename std::enable_if<detail::is_peek_trace_source<T>::value, NodeId>::type
+    expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
+        return add_peek_trace_source_object(path, parent_id, static_cast<const PeekTraceSource*>(ptr));
+    }
+
+    template <typename T>
+    typename std::enable_if<!detail::is_peek_trace_source<T>::value && detail::is_vsip_exact_port<T>::value, NodeId>::type
+    expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
+        // vsip* is sc_port-like.  Treat it as a pointer to its bound vsii*
+        // interface, then let the bound object explicitly decide how to expand.
+        auto iface = read_vsip_exact_interface(ptr);
+        return iface ? expand_dynamic_trace_interface_target(path, parent_id, iface) : 0;
+    }
+
+    template <typename T>
+    typename std::enable_if<!detail::is_peek_trace_source<T>::value && !detail::is_vsip_exact_port<T>::value && detail::is_vsip_read_port<T>::value, NodeId>::type
     expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
         typedef typename detail::vsip_port_value_type<T>::type V;
-        // High-performance source handling: vsip/vsii peek() already returns a
-        // stable pointer.  Defer the first peek until sampling time so ports may
-        // finish binding, then expand the returned object by pointer.
+        // Legacy explicit trait hook: peek() returns a stable pointer.  Expand
+        // the returned object by pointer.
         // If V is scalar this creates a scalar_ptr_track; if V is reflected or a
         // container it recursively expands its members until scalar leaves.
         return add_lazy_value_object<V>(path, parent_id, [this, ptr]() -> const V* {
@@ -9251,6 +9417,15 @@ private:
     }
 
 #if WAVE_HAS_SYSTEMC
+    template <typename T>
+    typename std::enable_if<detail::is_sc_port<T>::value, NodeId>::type
+    expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
+        typedef typename detail::sc_generic_port_iface_type<T>::type IFace;
+        if (!ptr || ptr->size() == 0) return 0;
+        const IFace* iface = (*ptr).operator->();
+        return expand_dynamic_trace_interface_target<IFace>(path, parent_id, iface);
+    }
+
     template <typename T>
     typename std::enable_if<detail::is_sc_vector<T>::value, NodeId>::type
     expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
@@ -9423,6 +9598,15 @@ private:
     NodeId expand_member_clean_dispatch_selected(const std::string& path,
                                                  NodeId parent_id,
                                                  const FieldT* clean_ptr,
+                                                 std::integral_constant<int, 14>) {
+        if (options_.debug_log) debug_log_msg(std::string("member dispatch branch=peek_source path=") + path);
+        return add_peek_trace_source_object(path, parent_id, static_cast<const PeekTraceSource*>(clean_ptr));
+    }
+
+    template <typename FieldT>
+    NodeId expand_member_clean_dispatch_selected(const std::string& path,
+                                                 NodeId parent_id,
+                                                 const FieldT* clean_ptr,
                                                  std::integral_constant<int, 13>) {
         if (options_.debug_log) debug_log_msg(std::string("member dispatch branch=wave_array path=") + path);
         return expand_wave_array_field_impl<FieldT>(path, parent_id, clean_ptr);
@@ -9453,9 +9637,7 @@ private:
                                                  const FieldT* clean_ptr,
                                                  std::integral_constant<int, 10>) {
         if (options_.debug_log) debug_log_msg(std::string("member dispatch branch=vsip path=") + path);
-        typedef typename detail::vsip_port_value_type<FieldT>::type V;
-        return expand_member_vsip_dispatch<FieldT, V>(path, parent_id, clean_ptr,
-                                                      typename detail::is_leaf_scalar<V>::type());
+        return this->template expand_field<FieldT>(path, parent_id, clean_ptr);
     }
 
     template <typename FieldT, typename V, typename IsScalar>
@@ -9464,9 +9646,7 @@ private:
                                        const FieldT* clean_ptr,
                                        IsScalar) {
         (void)sizeof(IsScalar);
-        // Member vsip/vsii ports use the same stable-pointer path as root
-        // vsip/vsii ports.  peek() returns const V*, and the pointed V object is
-        // recursively expanded; scalar V becomes a scalar_ptr_track.
+        // Legacy explicit trait hook for non-exact custom wrappers.
         return add_lazy_value_object<V>(path, parent_id, [this, clean_ptr]() -> const V* {
             return this->template read_vsip_value<FieldT, V>(clean_ptr);
         }, this->template read_vsip_dirty_hook<FieldT, V>(clean_ptr),
@@ -9685,6 +9865,7 @@ private:
                                   detail::is_weak_ptr<FieldT>::value,
 #if WAVE_HAS_SYSTEMC
             is_systemc_whitelist = detail::is_sc_vector<FieldT>::value ||
+                                   detail::is_sc_port<FieldT>::value ||
                                    detail::is_sc_in<FieldT>::value ||
                                    detail::is_sc_out<FieldT>::value ||
                                    detail::is_sc_inout<FieldT>::value ||
@@ -9694,7 +9875,8 @@ private:
 #else
             is_systemc_whitelist = false,
 #endif
-            value = is_wave_array ? 13 :
+            value = detail::is_peek_trace_source<FieldT>::value ? 14 :
+                    is_wave_array ? 13 :
                     is_wave_value ? 12 :
                     is_c_string ? 11 :
                     detail::is_vsip_read_port<FieldT>::value ? 10 :
@@ -9780,10 +9962,12 @@ private:
         !detail::is_unique_ptr_array<T>::value &&
         !detail::is_shared_ptr<T>::value &&
         !detail::is_weak_ptr<T>::value &&
+        !detail::is_peek_trace_source<T>::value &&
         !detail::is_vsip_read_port<T>::value &&
         !detail::is_sc_in<T>::value &&
         !detail::is_sc_out<T>::value &&
         !detail::is_sc_inout<T>::value &&
+        !detail::is_sc_port<T>::value &&
         !detail::is_sc_signal<T>::value &&
         !detail::is_sc_buffer<T>::value &&
         !detail::is_sc_vector<T>::value &&
@@ -9795,7 +9979,7 @@ private:
     }
 
     template <typename T>
-    typename std::enable_if<reflect::is_reflected<T>::value && !detail::is_vsip_read_port<T>::value && !detail::is_sc_namespace_blacklisted<T>::value, NodeId>::type
+    typename std::enable_if<reflect::is_reflected<T>::value && !detail::is_peek_trace_source<T>::value && !detail::is_vsip_read_port<T>::value && !detail::is_sc_namespace_blacklisted<T>::value, NodeId>::type
     expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
         if (!ptr) return 0;
         const ObjectKey key(detail::pointer_address(ptr), reflect::type_tag_of<T>());
@@ -9850,10 +10034,12 @@ private:
                             !detail::is_unique_ptr_array<T>::value &&
                             !detail::is_shared_ptr<T>::value &&
                             !detail::is_weak_ptr<T>::value &&
+                            !detail::is_peek_trace_source<T>::value &&
                             !detail::is_vsip_read_port<T>::value &&
                             !detail::is_sc_in<T>::value &&
                             !detail::is_sc_out<T>::value &&
                             !detail::is_sc_inout<T>::value &&
+                            !detail::is_sc_port<T>::value &&
                             !detail::is_sc_signal<T>::value &&
                             !detail::is_sc_buffer<T>::value &&
                             !detail::is_sc_vector<T>::value &&

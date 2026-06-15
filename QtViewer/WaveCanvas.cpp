@@ -3,6 +3,7 @@
 
 #include <QEvent>
 #include <QEasingCurve>
+#include <QFile>
 #include <QMouseEvent>
 #include <QBrush>
 #include <QColor>
@@ -11,6 +12,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPen>
+#include <QTextStream>
 #include <QTransform>
 #include <QVariantAnimation>
 #include <QWheelEvent>
@@ -172,11 +174,13 @@ namespace {
         if (x2 <= x1) return;
         const int right = x2 - 1;
         const int edgeX = x1 + (right - x1) / 2;
-        validateBitHorizontalPrimitive(context, signalIndex, row, x1, right, yHigh, yHigh, yLow);
-        validateBitHorizontalPrimitive(context, signalIndex, row, x1, right, yLow, yHigh, yLow);
+        if (right > x1) {
+            validateBitHorizontalPrimitive(context, signalIndex, row, x1, right, yHigh, yHigh, yLow);
+            validateBitHorizontalPrimitive(context, signalIndex, row, x1, right, yLow, yHigh, yLow);
+            drawHorizontalPixelBlock(p, x1, right, yHigh, color);
+            drawHorizontalPixelBlock(p, x1, right, yLow, color);
+        }
         validateBitVerticalPrimitive(context, signalIndex, row, edgeX, edgeX, yHigh, yLow, yHigh, yLow);
-        drawHorizontalPixelBlock(p, x1, right, yHigh, color);
-        drawHorizontalPixelBlock(p, x1, right, yLow, color);
         drawVerticalPixelBlock(p, edgeX, edgeX, yHigh, yLow, color);
     }
 
@@ -186,6 +190,91 @@ namespace {
             return value && value[0] && std::strcmp(value, "0") != 0;
         }();
         return enabled;
+    }
+
+    QString lodRenderLogPath() {
+        static const QString path = []() {
+            const char* value = std::getenv("WV_VIEWER_LOD_LOG");
+            if (!value || !value[0] || std::strcmp(value, "0") == 0) return QString();
+            const QString raw = QString::fromLocal8Bit(value);
+            return (raw == QStringLiteral("1")) ? QStringLiteral("wv_lod_render.log") : raw;
+        }();
+        return path;
+    }
+
+    void appendLodRenderLogLine(const QString& line) {
+        const QString path = lodRenderLogPath();
+        if (path.isEmpty()) return;
+
+        static QSet<QString> seen;
+        if (seen.contains(line)) return;
+        seen.insert(line);
+
+        QFile file(path);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) return;
+        QTextStream out(&file);
+        out << line << '\n';
+    }
+
+    QString csvEscape(QString value) {
+        value.replace(QStringLiteral("\""), QStringLiteral("\"\""));
+        return QStringLiteral("\"") + value + QStringLiteral("\"");
+    }
+
+    void logLodUse(const char* phase,
+                   const WaveSignal& sig,
+                   int signalIndex,
+                   int row,
+                   qint64 viewportStart,
+                   qint64 viewportEnd,
+                   qint64 drawStart,
+                   qint64 drawEnd,
+                   int levelIndex,
+                   const WaveLodLevel& level) {
+        if (lodRenderLogPath().isEmpty()) return;
+
+        const QString mode = level.samples.isEmpty()
+            ? QStringLiteral("buckets")
+            : QStringLiteral("samples");
+        const QString line = QStringLiteral("%1,signal=%2,row=%3,name=%4,kind=%5,width=%6,viewport=%7..%8,draw=%9..%10,level=%11,bucketCycles=%12,mode=%13,lodSamples=%14,lodBuckets=%15,validRanges=%16")
+            .arg(QString::fromLatin1(phase ? phase : "lod"))
+            .arg(signalIndex)
+            .arg(row)
+            .arg(csvEscape(sig.name))
+            .arg(sig.kind == SignalKind::Bit ? QStringLiteral("bit") : QStringLiteral("bus"))
+            .arg(sig.width)
+            .arg(viewportStart)
+            .arg(viewportEnd)
+            .arg(drawStart)
+            .arg(drawEnd)
+            .arg(levelIndex)
+            .arg(level.bucketCycles)
+            .arg(mode)
+            .arg(level.samples.size())
+            .arg(level.buckets.size())
+            .arg(level.validRanges.size());
+        appendLodRenderLogLine(line);
+    }
+
+    void logLodRawFallback(const WaveSignal& sig,
+                           int signalIndex,
+                           int row,
+                           qint64 viewportStart,
+                           qint64 viewportEnd,
+                           qint64 drawStart,
+                           qint64 drawEnd) {
+        if (lodRenderLogPath().isEmpty()) return;
+        const QString line = QStringLiteral("raw-fallback,signal=%1,row=%2,name=%3,kind=%4,width=%5,viewport=%6..%7,draw=%8..%9")
+            .arg(signalIndex)
+            .arg(row)
+            .arg(csvEscape(sig.name))
+            .arg(sig.kind == SignalKind::Bit ? QStringLiteral("bit") : QStringLiteral("bus"))
+            .arg(sig.width)
+            .arg(viewportStart)
+            .arg(viewportEnd)
+            .arg(drawStart)
+            .arg(drawEnd);
+        appendLodRenderLogLine(line);
     }
 
     int plotSpanPxForWidth(int widgetWidth, int padX) {
@@ -1614,22 +1703,33 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
         const int plotRight = plotRightPixel;
         const int plotWidth = plotSpanPx;
         const bool preferRawSamples = viewerDisableLodEnabled() ||
-            (sig.kind == SignalKind::Bit && sig.samplesLoaded && !sig.samples.isEmpty()) ||
             (sig.samplesLoaded && !sig.samples.isEmpty() &&
              sig.samples.size() <= qMax(2000, plotWidth * 8));
         if (!preferRawSamples) if (const WaveLodLevel* lodLevel = chooseLodLevelForViewport(sig, m_viewStart, m_viewEnd, spanValue, plotWidth)) {
-            if (!lodLevel->samples.isEmpty()) {
-                int selectedLodIndex = -1;
-                for (int levelIndex = 0; levelIndex < sig.lodLevels.size(); ++levelIndex) {
-                    if (&sig.lodLevels.at(levelIndex) == lodLevel) {
-                        selectedLodIndex = levelIndex;
-                        break;
-                    }
+            int selectedLodIndex = -1;
+            for (int levelIndex = 0; levelIndex < sig.lodLevels.size(); ++levelIndex) {
+                if (&sig.lodLevels.at(levelIndex) == lodLevel) {
+                    selectedLodIndex = levelIndex;
+                    break;
                 }
-                if (selectedLodIndex < 0) selectedLodIndex = 0;
+            }
+            if (selectedLodIndex < 0) selectedLodIndex = 0;
+            logLodUse("select", sig, entry.signalIndex, absoluteRow,
+                      m_viewStart, m_viewEnd, m_viewStart, m_viewEnd,
+                      selectedLodIndex, *lodLevel);
+
+            if (!lodLevel->samples.isEmpty()) {
+                auto lodLevelIndexFor = [&](const WaveLodLevel& level) {
+                    for (int levelIndex = 0; levelIndex < sig.lodLevels.size(); ++levelIndex) {
+                        if (&sig.lodLevels.at(levelIndex) == &level) return levelIndex;
+                    }
+                    return -1;
+                };
 
                 auto drawRawLastResortRange = [&](qint64 start, qint64 end) {
                     if (!sig.samplesLoaded || sig.samples.isEmpty() || end <= start) return;
+                    logLodRawFallback(sig, entry.signalIndex, absoluteRow,
+                                      m_viewStart, m_viewEnd, start, end);
                     const int x1 = fastX(start);
                     const int x2 = fastX(end);
                     if (x2 <= x1) return;
@@ -1649,13 +1749,17 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                             ((state == QLatin1Char('a')) ? absentColor : (isSelectedRow ? selectedKnownColor : waveGreen));
                         if (state == QLatin1Char('z')) {
                             p.setPen(waveStrokePen(color, Qt::DashLine));
-                            validateBitHorizontalPrimitive("lod-fallback-raw-z", entry.signalIndex, absoluteRow,
-                                                           x1, x2 - 1, y, yHigh, yLow, yMid);
-                            p.drawLine(x1, y, x2 - 1, y);
+                            if (x2 - x1 > 1) {
+                                validateBitHorizontalPrimitive("lod-fallback-raw-z", entry.signalIndex, absoluteRow,
+                                                               x1, x2 - 1, y, yHigh, yLow, yMid);
+                                p.drawLine(x1, y, x2 - 1, y);
+                            }
                         } else {
-                            validateBitHorizontalPrimitive("lod-fallback-raw-stable", entry.signalIndex, absoluteRow,
-                                                           x1, x2 - 1, y, yHigh, yLow, yMid);
-                            drawHorizontalPixelBlock(p, x1, x2 - 1, y, color);
+                            if (x2 - x1 > 1) {
+                                validateBitHorizontalPrimitive("lod-fallback-raw-stable", entry.signalIndex, absoluteRow,
+                                                               x1, x2 - 1, y, yHigh, yLow, yMid);
+                                drawHorizontalPixelBlock(p, x1, x2 - 1, y, color);
+                            }
                         }
                     } else {
                         const int yBusTop = yTop + 8;
@@ -1680,6 +1784,10 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
 
                 auto drawLodSampleRange = [&](const WaveLodLevel& level, qint64 visibleStart, qint64 visibleEnd) {
                     if (level.samples.isEmpty() || visibleEnd <= visibleStart) return;
+                    const int drawLevelIndex = lodLevelIndexFor(level);
+                    logLodUse("draw-samples", sig, entry.signalIndex, absoluteRow,
+                              m_viewStart, m_viewEnd, visibleStart, visibleEnd,
+                              drawLevelIndex, level);
 
                     const QVector<WaveSample>& lodSamples = level.samples;
                     const qint64 lodBucketCycles = qMax<qint64>(1, level.bucketCycles);
@@ -1696,24 +1804,39 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     if (lastExclusive <= firstIdx) lastExclusive = qMin(lodSamples.size(), firstIdx + 1);
 
                     if (sig.kind == SignalKind::Bit) {
-                        QVector<QLine> knownSolid;
-                        QVector<QLine> selectedSolid;
-                        QVector<QLine> zDashed;
-                        QVector<QLine> absentSolid;
-                        knownSolid.reserve((lastExclusive - firstIdx) * 2);
-                        selectedSolid.reserve((lastExclusive - firstIdx) * 2);
-                        zDashed.reserve((lastExclusive - firstIdx) / 2 + 4);
-                        absentSolid.reserve((lastExclusive - firstIdx) / 2 + 4);
-                        QVector<QLine> knownVerticalLines;
-                        QVector<QLine> selectedVerticalLines;
-                        QVector<QLine> absentVerticalLines;
-                        knownVerticalLines.reserve((lastExclusive - firstIdx) / 2 + 4);
-                        selectedVerticalLines.reserve((lastExclusive - firstIdx) / 2 + 4);
-                        absentVerticalLines.reserve((lastExclusive - firstIdx) / 2 + 4);
+                        enum class DenseBitBlockKind { Known, Z, Absent };
+                        const int yBitTop = yHigh;
+                        const int yBitBottom = yLow + 1;
+                        QVector<QRect> knownMiniRects;
+                        QVector<QRect> zMiniRects;
+                        QVector<QRect> absentMiniRects;
+                        QVector<int> knownBoundaryXs;
+                        QVector<int> zBoundaryXs;
+                        QVector<int> absentBoundaryXs;
+                        knownMiniRects.reserve(lastExclusive - firstIdx);
+                        zMiniRects.reserve((lastExclusive - firstIdx) / 2 + 4);
+                        absentMiniRects.reserve((lastExclusive - firstIdx) / 2 + 4);
 
-                        auto bitY = [&](const WaveSample& sample) {
-                            const QChar state = classifyBitStateChar(sample);
-                            return (state == QLatin1Char('1')) ? yHigh : ((state == QLatin1Char('0')) ? yLow : yMid);
+                        auto denseBitLineColor = [&](DenseBitBlockKind kind) {
+                            if (kind == DenseBitBlockKind::Z) return zColor;
+                            if (kind == DenseBitBlockKind::Absent) return absentColor;
+                            return isSelectedRow ? selectedKnownColor : waveGreen;
+                        };
+                        auto denseBitFillColor = [&](DenseBitBlockKind kind) {
+                            QColor fill = denseBitLineColor(kind);
+                            if (kind == DenseBitBlockKind::Known) return fill;
+                            fill.setAlpha(kind == DenseBitBlockKind::Absent ? 80 : (kind == DenseBitBlockKind::Z ? 95 : (isSelectedRow ? 118 : 105)));
+                            return fill;
+                        };
+                        auto addMiniRect = [&](const QRect& rect, DenseBitBlockKind kind) {
+                            QVector<QRect>& target = (kind == DenseBitBlockKind::Absent) ? absentMiniRects :
+                                ((kind == DenseBitBlockKind::Z) ? zMiniRects : knownMiniRects);
+                            target.push_back(rect);
+
+                            QVector<int>& boundaryTarget = (kind == DenseBitBlockKind::Absent) ? absentBoundaryXs :
+                                ((kind == DenseBitBlockKind::Z) ? zBoundaryXs : knownBoundaryXs);
+                            boundaryTarget.push_back(rect.left());
+                            boundaryTarget.push_back(rect.right());
                         };
 
                         for (int i = firstIdx; i < lastExclusive; ++i) {
@@ -1725,97 +1848,25 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                             if (segEnd <= segStart) continue;
 
                             const QChar state = classifyBitStateChar(sample);
-                            const int y = bitY(sample);
-                            const bool isZ = (state == QLatin1Char('z'));
-                            const bool isAbsent = (state == QLatin1Char('a'));
-                            QVector<QLine>& target = isAbsent ? absentSolid : (isZ ? zDashed : (isSelectedRow ? selectedSolid : knownSolid));
-
+                            const DenseBitBlockKind kind = (state == QLatin1Char('a')) ? DenseBitBlockKind::Absent :
+                                ((state == QLatin1Char('z')) ? DenseBitBlockKind::Z : DenseBitBlockKind::Known);
                             const int x1 = fastX(segStart);
-                            const int x2 = fastX(segEnd);
-
-                            if (i > 0 && t0 >= visibleStart && t0 <= visibleEnd) {
-                                const WaveSample& prev = lodSamples.at(i - 1);
-                                const QChar prevState = classifyBitStateChar(prev);
-                                const int py = bitY(prev);
-                                if (py != y || prevState != state) {
-                                    const int xs = fastX(t0);
-                                    if (isAbsent || prevState == QLatin1Char('a')) {
-                                        absentVerticalLines.push_back(QLine(xs, py, xs, y));
-                                    }
-                                    else if (isZ || prevState == QLatin1Char('z')) {
-                                        zDashed.push_back(QLine(xs, py, xs, y));
-                                    }
-                                    else if (isSelectedRow) {
-                                        selectedVerticalLines.push_back(QLine(xs, py, xs, y));
-                                    }
-                                    else {
-                                        knownVerticalLines.push_back(QLine(xs, py, xs, y));
-                                    }
-                                }
-                            }
-
-                            if (x2 > x1) {
-                                target.push_back(QLine(x1, y, x2 - 1, y));
-                            }
-
-                            if (isZ && (x2 - x1) >= 18) {
-                                p.setPen(zColor.lighter(140));
-                                p.drawText(QRect(x1 + 2, yTop + 2, qMax(1, x2 - x1 - 4), m_rowHeight - 4), Qt::AlignCenter,
-                                    QStringLiteral("Z"));
-                            }
+                            const int x2 = qMax(x1 + 1, fastX(segEnd));
+                            addMiniRect(QRect(x1, yBitTop, x2 - x1, qMax(1, yBitBottom - yBitTop)), kind);
                         }
 
-                        auto validateDashedBitLines = [&](const QVector<QLine>& lines, const char* context) {
-                            for (const QLine& line : lines) {
-                                if (line.y1() == line.y2()) {
-                                    validateBitHorizontalPrimitive(context, entry.signalIndex, absoluteRow,
-                                                                   qMin(line.x1(), line.x2()), qMax(line.x1(), line.x2()),
-                                                                   line.y1(), yHigh, yLow, yMid);
-                                } else {
-                                    validateBitVerticalPrimitive(context, entry.signalIndex, absoluteRow,
-                                                                 line.x1(), line.x2(),
-                                                                 qMin(line.y1(), line.y2()), qMax(line.y1(), line.y2()),
-                                                                 yHigh, yLow);
-                                }
-                            }
-                        };
-
-                        auto drawSolidBitLines = [&](const QVector<QLine>& lines, const QColor& color, const char* context) {
-                            for (const QLine& line : lines) {
-                                if (line.y1() == line.y2()) {
-                                    validateBitHorizontalPrimitive(context, entry.signalIndex, absoluteRow,
-                                                                   qMin(line.x1(), line.x2()), qMax(line.x1(), line.x2()),
-                                                                   line.y1(), yHigh, yLow, yMid);
-                                    drawHorizontalPixelBlock(p, qMin(line.x1(), line.x2()), qMax(line.x1(), line.x2()),
-                                                             line.y1(), color);
-                                } else {
-                                    validateBitVerticalPrimitive(context, entry.signalIndex, absoluteRow,
-                                                                 line.x1(), line.x1(),
-                                                                 qMin(line.y1(), line.y2()), qMax(line.y1(), line.y2()),
-                                                                 yHigh, yLow);
-                                    drawVerticalPixelBlock(p, line.x1(), line.x1(),
-                                                           qMin(line.y1(), line.y2()), qMax(line.y1(), line.y2()), color);
-                                }
-                            }
-                        };
-
-                        if (!knownSolid.isEmpty() || !knownVerticalLines.isEmpty()) {
-                            drawSolidBitLines(knownSolid, waveGreen, "lod-sample-known-horizontal");
-                            drawSolidBitLines(knownVerticalLines, waveGreen, "lod-sample-known-vertical");
-                        }
-                        if (!selectedSolid.isEmpty() || !selectedVerticalLines.isEmpty()) {
-                            drawSolidBitLines(selectedSolid, selectedKnownColor, "lod-sample-selected-horizontal");
-                            drawSolidBitLines(selectedVerticalLines, selectedKnownColor, "lod-sample-selected-vertical");
-                        }
-                        if (!zDashed.isEmpty()) {
-                            p.setPen(waveStrokePen(zColor, Qt::DashLine));
-                            validateDashedBitLines(zDashed, "lod-sample-z-dashed");
-                            p.drawLines(zDashed);
-                        }
-                        if (!absentSolid.isEmpty() || !absentVerticalLines.isEmpty()) {
-                            drawSolidBitLines(absentSolid, absentColor, "lod-sample-absent-horizontal");
-                            drawSolidBitLines(absentVerticalLines, absentColor, "lod-sample-absent-vertical");
-                        }
+                        drawMergedDenseBusMiniRects(p, knownMiniRects, denseBitLineColor(DenseBitBlockKind::Known),
+                                                    denseBitFillColor(DenseBitBlockKind::Known), kWaveStrokeWidth);
+                        drawMergedDenseBusMiniRects(p, zMiniRects, denseBitLineColor(DenseBitBlockKind::Z),
+                                                    denseBitFillColor(DenseBitBlockKind::Z), kWaveStrokeWidth);
+                        drawMergedDenseBusMiniRects(p, absentMiniRects, denseBitLineColor(DenseBitBlockKind::Absent),
+                                                    denseBitFillColor(DenseBitBlockKind::Absent), kWaveStrokeWidth);
+                        drawMergedBoundaryBlocks(p, knownBoundaryXs, yBitTop, yBitBottom,
+                                                 denseBitLineColor(DenseBitBlockKind::Known));
+                        drawMergedBoundaryBlocks(p, zBoundaryXs, yBitTop, yBitBottom,
+                                                 denseBitLineColor(DenseBitBlockKind::Z));
+                        drawMergedBoundaryBlocks(p, absentBoundaryXs, yBitTop, yBitBottom,
+                                                 denseBitLineColor(DenseBitBlockKind::Absent));
                     } else {
                         const int yBusTop = yTop + 8;
                         const int yBusBottom = yTop + m_rowHeight - 8;
@@ -1987,6 +2038,9 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
             }
 
             const QVector<WaveLodBucket>& buckets = lodLevel->buckets;
+            logLodUse("draw-buckets", sig, entry.signalIndex, absoluteRow,
+                      m_viewStart, m_viewEnd, m_viewStart, m_viewEnd,
+                      selectedLodIndex, *lodLevel);
             int lodIndex = lowerLodBucketByEnd(buckets, m_viewStart);
             quint64 currentRaw = (lodIndex > 0) ? buckets.at(lodIndex - 1).lastRawBits : 0ull;
             qint64 cursor = m_viewStart;
@@ -1998,6 +2052,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                 if (x2 <= x1) return;
                 const int right = x2 - 1;
                 auto drawMaskLine = [&](int y, const QColor& color) {
+                    if (right <= x1) return;
                     validateBitHorizontalPrimitive("lod-bucket-mask", entry.signalIndex, absoluteRow,
                                                    x1, right, y, yHigh, yLow, yMid);
                     drawHorizontalPixelBlock(p, x1, right, y, color);
@@ -2125,7 +2180,80 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
 
         if (sig.kind == SignalKind::Bit) {
             const int visibleCount = lastExclusive - firstIdx;
-            {
+            const bool highDensity = visibleCount > qMax(4000, plotWidth * 8);
+            if (highDensity) {
+                enum class DenseBitBlockKind { Known, Z, Absent };
+                const int yBitTop = yHigh;
+                const int yBitBottom = yLow + 1;
+                QVector<QRect> knownMiniRects;
+                QVector<QRect> zMiniRects;
+                QVector<QRect> absentMiniRects;
+                QVector<int> knownBoundaryXs;
+                QVector<int> zBoundaryXs;
+                QVector<int> absentBoundaryXs;
+                QVector<int> sampled = collectBitAlternatingSampleIndicesForWindow(
+                    sig, entry.signalIndex, m_viewStart, m_viewEnd, qMax(64, plotWidth * 3));
+                std::sort(sampled.begin(), sampled.end());
+                sampled.erase(std::unique(sampled.begin(), sampled.end()), sampled.end());
+
+                auto denseBitLineColor = [&](DenseBitBlockKind kind) {
+                    if (kind == DenseBitBlockKind::Z) return zColor;
+                    if (kind == DenseBitBlockKind::Absent) return absentColor;
+                    return isSelectedRow ? selectedKnownColor : waveGreen;
+                };
+                auto denseBitFillColor = [&](DenseBitBlockKind kind) {
+                    QColor fill = denseBitLineColor(kind);
+                    if (kind == DenseBitBlockKind::Known) return fill;
+                    fill.setAlpha(kind == DenseBitBlockKind::Absent ? 80 : (kind == DenseBitBlockKind::Z ? 95 : (isSelectedRow ? 118 : 105)));
+                    return fill;
+                };
+                auto addMiniRect = [&](const QRect& rect, DenseBitBlockKind kind) {
+                    QVector<QRect>& target = (kind == DenseBitBlockKind::Absent) ? absentMiniRects :
+                        ((kind == DenseBitBlockKind::Z) ? zMiniRects : knownMiniRects);
+                    target.push_back(rect);
+
+                    QVector<int>& boundaryTarget = (kind == DenseBitBlockKind::Absent) ? absentBoundaryXs :
+                        ((kind == DenseBitBlockKind::Z) ? zBoundaryXs : knownBoundaryXs);
+                    boundaryTarget.push_back(rect.left());
+                    boundaryTarget.push_back(rect.right());
+                };
+
+                for (int s = 0; s < sampled.size(); ++s) {
+                    const int i = sampled.at(s);
+                    if (i < firstIdx || i >= lastExclusive) continue;
+                    const WaveSample& sample = sig.samples.at(i);
+                    const qint64 t0 = sample.time;
+                    qint64 t1 = m_viewEnd;
+                    if (s + 1 < sampled.size()) t1 = sig.samples.at(sampled.at(s + 1)).time;
+                    else if (i + 1 < sig.samples.size()) t1 = sig.samples.at(i + 1).time;
+                    else t1 = fullEnd();
+
+                    const qint64 segStart = qMax(t0, m_viewStart);
+                    const qint64 segEnd = qMin(qMax(t1, t0 + 1), m_viewEnd);
+                    if (segEnd <= segStart) continue;
+
+                    const QChar state = classifyBitStateChar(sample);
+                    const DenseBitBlockKind kind = (state == QLatin1Char('a')) ? DenseBitBlockKind::Absent :
+                        ((state == QLatin1Char('z')) ? DenseBitBlockKind::Z : DenseBitBlockKind::Known);
+                    const int x1 = fastX(segStart);
+                    const int x2 = qMax(x1 + 1, fastX(segEnd));
+                    const QRect rect(x1, yBitTop, x2 - x1, qMax(1, yBitBottom - yBitTop));
+                    addMiniRect(rect, kind);
+                }
+
+                drawMergedDenseBusMiniRects(p, knownMiniRects, denseBitLineColor(DenseBitBlockKind::Known),
+                                            denseBitFillColor(DenseBitBlockKind::Known), kWaveStrokeWidth);
+                drawMergedDenseBusMiniRects(p, zMiniRects, denseBitLineColor(DenseBitBlockKind::Z),
+                                            denseBitFillColor(DenseBitBlockKind::Z), kWaveStrokeWidth);
+                drawMergedDenseBusMiniRects(p, absentMiniRects, denseBitLineColor(DenseBitBlockKind::Absent),
+                                            denseBitFillColor(DenseBitBlockKind::Absent), kWaveStrokeWidth);
+                drawMergedBoundaryBlocks(p, knownBoundaryXs, yBitTop, yBitBottom,
+                                         denseBitLineColor(DenseBitBlockKind::Known));
+                drawMergedBoundaryBlocks(p, zBoundaryXs, yBitTop, yBitBottom,
+                                         denseBitLineColor(DenseBitBlockKind::Z));
+                drawMergedBoundaryBlocks(p, absentBoundaryXs, yBitTop, yBitBottom,
+                                         denseBitLineColor(DenseBitBlockKind::Absent));
+            } else {
                 std::vector<int> lowDiff(plotWidth + 1, 0);
                 std::vector<int> highDiff(plotWidth + 1, 0);
                 std::vector<int> zDiff(plotWidth + 1, 0);
@@ -2216,6 +2344,10 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                         if (active && runStart < 0) runStart = x;
                         if ((!active || x + 1 == plotWidth) && runStart >= 0) {
                             const int endX = active && x + 1 == plotWidth ? x : x - 1;
+                            if (endX <= runStart) {
+                                runStart = -1;
+                                continue;
+                            }
                             if (style == Qt::SolidLine) {
                                 validateBitHorizontalPrimitive(context, entry.signalIndex, absoluteRow,
                                                                plotLeft + runStart, plotLeft + qMax(runStart, endX),

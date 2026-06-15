@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <type_traits>
 
 namespace reflect {
@@ -37,13 +38,138 @@ inline const void* type_tag_of() {
 namespace wave {
 
 class Tracer;
+typedef std::uint64_t NodeId;
+typedef NodeId (*DynamicExpandFn)(Tracer&, const std::string&, NodeId, const void*);
+
+template <typename T>
+NodeId dynamic_expand_bridge(Tracer& tracer, const std::string& path, NodeId parent_id, const void* obj);
 
 static constexpr std::uint32_t kInvalidIndex = 0xFFFFFFFFu;
+
+struct WaveDirtyHook {
+    typedef void (*MarkFn)(void*, std::uint32_t);
+
+    void* tracer;
+    std::uint32_t group_id;
+    MarkFn mark_fn;
+
+    WaveDirtyHook() noexcept : tracer(NULL), group_id(kInvalidIndex), mark_fn(NULL) {}
+    WaveDirtyHook(const WaveDirtyHook&) noexcept : tracer(NULL), group_id(kInvalidIndex), mark_fn(NULL) {}
+    WaveDirtyHook(WaveDirtyHook&&) noexcept : tracer(NULL), group_id(kInvalidIndex), mark_fn(NULL) {}
+
+    WaveDirtyHook& operator=(const WaveDirtyHook&) noexcept {
+        clear();
+        return *this;
+    }
+
+    WaveDirtyHook& operator=(WaveDirtyHook&&) noexcept {
+        clear();
+        return *this;
+    }
+
+    void clear() noexcept {
+        tracer = NULL;
+        group_id = kInvalidIndex;
+        mark_fn = NULL;
+    }
+
+    void bind(void* t, std::uint32_t gid, MarkFn fn) noexcept {
+        tracer = t;
+        group_id = gid;
+        mark_fn = fn;
+    }
+
+    void mark_dirty() const noexcept {
+        if (tracer && mark_fn && group_id != kInvalidIndex) {
+            mark_fn(tracer, group_id);
+        }
+    }
+};
 
 // Business opt-in marker: pointers/smart pointers to types derived from this
 // marker may be expanded directly by wave_runtime.h.  No allocation tracking is
 // performed, so the business model owns lifetime correctness.
 struct DirectReflectPointerTarget {};
+
+// Runtime-typed opt-in marker for interface pointers such as sc_port<IF>.
+// A concrete object can inherit DynamicTraceTargetFor<ConcreteT>; wave_runtime.h
+// can then recover the concrete target from an IF* through dynamic_cast and
+// expand the registered ConcreteT reflection tree.
+struct DynamicTraceTarget {
+    virtual ~DynamicTraceTarget() {}
+    virtual const void* wave_trace_target_ptr() const = 0;
+    virtual const void* wave_trace_target_type_tag() const = 0;
+    virtual std::uint32_t wave_trace_target_byte_width() const { return 0u; }
+    virtual WaveDirtyHook* wave_trace_dirty_hook() const { return NULL; }
+    virtual DynamicExpandFn wave_trace_dynamic_expander() const { return NULL; }
+};
+
+template <typename T>
+struct DynamicTraceTargetFor : DynamicTraceTarget {
+protected:
+    mutable WaveDirtyHook dynamic_trace_dirty_hook_;
+
+public:
+    const void* wave_trace_target_ptr() const override {
+        return static_cast<const T*>(this);
+    }
+
+    const void* wave_trace_target_type_tag() const override {
+        return reflect::type_tag_of<T>();
+    }
+
+    std::uint32_t wave_trace_target_byte_width() const override {
+        return static_cast<std::uint32_t>(sizeof(T));
+    }
+
+    DynamicExpandFn wave_trace_dynamic_expander() const override {
+        return &dynamic_expand_bridge<T>;
+    }
+
+    WaveDirtyHook* wave_trace_dirty_hook() const override {
+        return wave_dirty_hook();
+    }
+
+    WaveDirtyHook* wave_dirty_hook() const {
+        return &dynamic_trace_dirty_hook_;
+    }
+};
+
+// Runtime-typed opt-in marker for interface/channel objects whose sampled value
+// is exposed through peek().  Business code should inherit this only on objects
+// that are meant to expand through peek(); merely inheriting a project interface
+// such as vsii* is intentionally not enough.
+struct PeekTraceSource {
+    virtual ~PeekTraceSource() {}
+    virtual const void* wave_trace_peek_ptr() const = 0;
+    virtual const void* wave_trace_peek_type_tag() const = 0;
+    virtual std::uint32_t wave_trace_peek_byte_width() const { return 0u; }
+    virtual WaveDirtyHook* wave_trace_peek_dirty_hook() const { return NULL; }
+    virtual DynamicExpandFn wave_trace_peek_dynamic_expander() const { return NULL; }
+};
+
+template <typename DerivedT, typename ValueT>
+struct PeekTraceSourceFor : PeekTraceSource {
+    typedef ValueT wave_trace_peek_value_type;
+
+    const void* wave_trace_peek_ptr() const override {
+        const DerivedT* self = static_cast<const DerivedT*>(this);
+        const ValueT* value = const_cast<DerivedT*>(self)->peek();
+        return static_cast<const void*>(value);
+    }
+
+    const void* wave_trace_peek_type_tag() const override {
+        return reflect::type_tag_of<ValueT>();
+    }
+
+    std::uint32_t wave_trace_peek_byte_width() const override {
+        return static_cast<std::uint32_t>(sizeof(ValueT));
+    }
+
+    DynamicExpandFn wave_trace_peek_dynamic_expander() const override {
+        return &dynamic_expand_bridge<ValueT>;
+    }
+};
 
 // Generated reflection code places private/protected member access in this
 // template.  Business classes that want private reflection should write:
@@ -163,34 +289,6 @@ inline void notify_wave_array_index_access(std::size_t index,
     detail::WaveArrayIndexNotifyFn fn = detail::wave_array_index_notify_slot();
     if (fn) fn(index, element_address, element_type_tag, element_size);
 }
-
-struct WaveDirtyHook {
-    typedef void (*MarkFn)(void*, std::uint32_t);
-
-    void* tracer;
-    std::uint32_t group_id;
-    MarkFn mark_fn;
-
-    WaveDirtyHook() noexcept : tracer(NULL), group_id(kInvalidIndex), mark_fn(NULL) {}
-
-    void clear() noexcept {
-        tracer = NULL;
-        group_id = kInvalidIndex;
-        mark_fn = NULL;
-    }
-
-    void bind(void* t, std::uint32_t gid, MarkFn fn) noexcept {
-        tracer = t;
-        group_id = gid;
-        mark_fn = fn;
-    }
-
-    void mark_dirty() const noexcept {
-        if (tracer && mark_fn && group_id != kInvalidIndex) {
-            mark_fn(tracer, group_id);
-        }
-    }
-};
 
 // WaveValue<T> is a size-preserving scalar wrapper for write-driven waveform
 // tracing.  It intentionally stores only the wrapped value; no tracer pointer,
