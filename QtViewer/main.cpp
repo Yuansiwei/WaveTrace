@@ -579,6 +579,27 @@ int main(int argc, char *argv[]) {
     const QIcon appIcon = loadApplicationIcon();
     a.setWindowIcon(appIcon);
 
+    if (args.size() >= 4 && args.at(1) == QStringLiteral("--compare-and-exit")) {
+        MainWindow w;
+        w.setWindowIcon(appIcon);
+        QString error;
+        qint64 elapsedMs = 0;
+        int resultSignals = 0;
+        const bool ok = w.compareWaveFilePaths(args.at(2), args.at(3),
+                                               false, false,
+                                               &error, &elapsedMs, &resultSignals);
+        const bool noDifference =
+            error.startsWith(QStringLiteral("No matching-path signal differs")) ||
+            error.startsWith(QStringLiteral("No signal differences"));
+        QTextStream out(stdout);
+        out << "ok," << ((ok || noDifference) ? 1 : 0) << "\n";
+        out << "elapsed_ms," << elapsedMs << "\n";
+        out << "result_signals," << resultSignals << "\n";
+        if (noDifference) out << "note," << error << "\n";
+        else if (!ok) out << "error," << error << "\n";
+        return (ok || noDifference) ? 0 : 7;
+    }
+
     if (args.size() >= 3 && args.at(1) == QStringLiteral("--open-and-exit")) {
         const int settleMs = (args.size() >= 4) ? qMax(0, args.at(3).toInt()) : 200;
         MainWindow w;

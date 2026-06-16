@@ -40,6 +40,7 @@
 #include <QPainterPath>
 #include <QPixmap>
 #include <QPushButton>
+#include <QProgressDialog>
 #include <QShortcut>
 #include <QSplitter>
 #include <QSpinBox>
@@ -55,23 +56,52 @@
 #include <QDragEnterEvent>
 #include <QDragMoveEvent>
 #include <QDropEvent>
+#include <QEvent>
 #include <QMimeData>
 #include <QIODevice>
 #include <QSet>
 #include <QTreeWidgetItem>
 #include <QItemSelectionModel>
+#include <QUrl>
 #include <QVBoxLayout>
 #include <QTimer>
 #include <QElapsedTimer>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <future>
 #include <functional>
 #include <utility>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <thread>
+#include <vector>
+
+#if defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2) || defined(__SSE2__)
+#define WAVETRACE_COMPARE_HAS_SSE2 1
+#else
+#define WAVETRACE_COMPARE_HAS_SSE2 0
+#endif
+
+#if defined(__AVX2__)
+#define WAVETRACE_COMPARE_HAS_AVX2 1
+#else
+#define WAVETRACE_COMPARE_HAS_AVX2 0
+#endif
+
+#if defined(__AVX512F__)
+#define WAVETRACE_COMPARE_HAS_AVX512F 1
+#else
+#define WAVETRACE_COMPARE_HAS_AVX512F 0
+#endif
+
+#if WAVETRACE_COMPARE_HAS_SSE2 || WAVETRACE_COMPARE_HAS_AVX2 || WAVETRACE_COMPARE_HAS_AVX512F
+#include <immintrin.h>
+#endif
 
 namespace {
 
@@ -85,6 +115,34 @@ constexpr int kValueFindRoleSignalIndex = Qt::UserRole + 1;
 constexpr qint64 kLargeWvz4FullLoadLimitBytes = 1024ll * 1024ll * 1024ll;
 constexpr quint64 kViewerOnDemandSampleBudget = 20ull * 1000ull * 1000ull;
 constexpr quint64 kViewerFullLoadSampleBudget = 50ull * 1000ull * 1000ull;
+constexpr int kCompareStreamingDefaultSignalBatchSize = 32768;
+constexpr int kCompareStreamingHugeFileSignalBatchSize = 2048;
+constexpr qint64 kCompareStreamingHugeFileThresholdBytes = 2ll * 1024ll * 1024ll * 1024ll;
+constexpr quint64 kCompareStreamingBatchSampleBudget = 6ull * 1000ull * 1000ull;
+
+bool isSupportedWaveFilePath(const QString& path) {
+    if (path.isEmpty()) return false;
+    const QFileInfo info(path);
+    if (!info.exists() || !info.isFile()) return false;
+    const QString suffix = info.suffix().toLower();
+    return suffix == QStringLiteral("json") ||
+           suffix == QStringLiteral("wvjson") ||
+           suffix == QStringLiteral("wvz") ||
+           suffix == QStringLiteral("wvz2") ||
+           suffix == QStringLiteral("wvz3") ||
+           suffix == QStringLiteral("wvz4");
+}
+
+QString firstSupportedWaveFilePathFromMime(const QMimeData* mime) {
+    if (!mime || !mime->hasUrls()) return QString();
+    const QList<QUrl> urls = mime->urls();
+    for (const QUrl& url : urls) {
+        if (!url.isLocalFile()) continue;
+        const QString path = url.toLocalFile();
+        if (isSupportedWaveFilePath(path)) return path;
+    }
+    return QString();
+}
 
 QString formatLargeWvz4FullLoadError(qint64 fileSize, const QString& operation) {
     return QStringLiteral("WVZ4 %1 full-load is disabled for files over %2 MiB (%3 bytes). "
@@ -133,6 +191,46 @@ void viewerPerfLog(const char* step, qint64 elapsedMs, int signalCount, int tree
             std::fclose(f);
         }
     }
+}
+
+void comparePerfLog(const char* step,
+                    qint64 elapsedMs,
+                    int batchStart,
+                    int batchCount,
+                    int leftCount,
+                    int rightCount,
+                    int outputPairs) {
+    if (!viewerPerfLogEnabled()) return;
+    std::fprintf(stderr,
+                 "[qtviewer-perf] step=%s elapsed_ms=%lld batch_start=%d batch_count=%d left=%d right=%d output_pairs=%d\n",
+                 step,
+                 static_cast<long long>(elapsedMs),
+                 batchStart,
+                 batchCount,
+                 leftCount,
+                 rightCount,
+                 outputPairs);
+    std::fflush(stderr);
+    const char* filePath = std::getenv("WV_VIEWER_PERF_LOG_FILE");
+    if (filePath && filePath[0]) {
+        if (FILE* f = std::fopen(filePath, "ab")) {
+            std::fprintf(f,
+                         "[qtviewer-perf] step=%s elapsed_ms=%lld batch_start=%d batch_count=%d left=%d right=%d output_pairs=%d\n",
+                         step,
+                         static_cast<long long>(elapsedMs),
+                         batchStart,
+                         batchCount,
+                         leftCount,
+                         rightCount,
+                         outputPairs);
+            std::fclose(f);
+        }
+    }
+}
+
+bool rawBlockCompareDisabledByEnv() {
+    const char* value = std::getenv("WV_VIEWER_DISABLE_RAW_BLOCK_COMPARE");
+    return value && value[0] && value[0] != '0';
 }
 
 static inline uint32_t fnv1aStep(uint32_t h, unsigned char c) {
@@ -1009,6 +1107,31 @@ QString fullSignalPathFromWave(const WaveFile& wave, int signalIndex) {
     return wave.signalList.at(signalIndex).name.trimmed();
 }
 
+bool waveDirectoriesEquivalentForRawBlockCompare(const WaveFile& leftWave,
+                                                 const WaveFile& rightWave) {
+    if (leftWave.signalList.size() != rightWave.signalList.size()) return false;
+    if (leftWave.meta.timescale != rightWave.meta.timescale ||
+        leftWave.meta.start != rightWave.meta.start ||
+        leftWave.meta.end != rightWave.meta.end) {
+        return false;
+    }
+
+    for (int i = 0; i < leftWave.signalList.size(); ++i) {
+        const WaveSignal& left = leftWave.signalList.at(i);
+        const WaveSignal& right = rightWave.signalList.at(i);
+        if (fullSignalPathFromWave(leftWave, i) != fullSignalPathFromWave(rightWave, i)) return false;
+        if (left.signalId != right.signalId ||
+            left.storageId != right.storageId ||
+            left.bitOffset != right.bitOffset ||
+            left.kind != right.kind ||
+            left.width != right.width ||
+            left.defaultRadix != right.defaultRadix) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool loadWaveFileFullyForCompare(const QString& path, WaveFile& wave, QString& error) {
     error.clear();
     const bool isWvz4 = path.endsWith(QStringLiteral(".wvz4"), Qt::CaseInsensitive);
@@ -1055,6 +1178,160 @@ bool compareValueEquivalent(const WaveSample& a, const WaveSample& b) {
     return waveSamplesEquivalent(a, b);
 }
 
+bool rawSamplePairComparable(const WaveSample& left, const WaveSample& right) {
+    return left.rawFieldsReady && right.rawFieldsReady &&
+           !left.isAbsent && !right.isAbsent &&
+           !left.isZ && !right.isZ;
+}
+
+bool rawSampleBlockComparable(const WaveSample* left, const WaveSample* right, int count) {
+    for (int i = 0; i < count; ++i) {
+        if (!rawSamplePairComparable(left[i], right[i])) return false;
+    }
+    return true;
+}
+
+bool rawSampleStreamsComparable(const WaveSample* left, const WaveSample* right, int count) {
+    for (int i = 0; i < count; ++i) {
+        if (!rawSamplePairComparable(left[i], right[i])) return false;
+    }
+    return true;
+}
+
+bool compareRawSampleTimeAndBitsScalarBlock(const WaveSample* left, const WaveSample* right, int count) {
+    for (int i = 0; i < count; ++i) {
+        if (left[i].time != right[i].time || left[i].rawBits != right[i].rawBits) return false;
+    }
+    return true;
+}
+
+#if WAVETRACE_COMPARE_HAS_AVX512F
+bool compareRawSampleTimeAndBitsAvx512(const WaveSample* left, const WaveSample* right) {
+    if ((sizeof(WaveSample) % sizeof(qint64)) != 0 ||
+        sizeof(qint64) != sizeof(long long) ||
+        sizeof(quint64) != sizeof(long long)) {
+        return compareRawSampleTimeAndBitsScalarBlock(left, right, 8);
+    }
+
+    const long long strideWords = static_cast<long long>(sizeof(WaveSample) / sizeof(qint64));
+    const __m512i indexes = _mm512_set_epi64(7 * strideWords, 6 * strideWords,
+                                            5 * strideWords, 4 * strideWords,
+                                            3 * strideWords, 2 * strideWords,
+                                            strideWords, 0);
+    const __m512i leftTimes = _mm512_i64gather_epi64(indexes, reinterpret_cast<const void*>(&left[0].time), 8);
+    const __m512i rightTimes = _mm512_i64gather_epi64(indexes, reinterpret_cast<const void*>(&right[0].time), 8);
+    const __m512i leftRaw = _mm512_i64gather_epi64(indexes, reinterpret_cast<const void*>(&left[0].rawBits), 8);
+    const __m512i rightRaw = _mm512_i64gather_epi64(indexes, reinterpret_cast<const void*>(&right[0].rawBits), 8);
+    const __mmask8 timeMask = _mm512_cmpeq_epi64_mask(leftTimes, rightTimes);
+    const __mmask8 rawMask = _mm512_cmpeq_epi64_mask(leftRaw, rightRaw);
+    return (timeMask & rawMask) == 0xffu;
+}
+#endif
+
+#if WAVETRACE_COMPARE_HAS_AVX2
+bool compareRawSampleTimeAndBitsAvx2(const WaveSample* left, const WaveSample* right) {
+    if ((sizeof(WaveSample) % sizeof(qint64)) != 0 ||
+        sizeof(qint64) != sizeof(long long) ||
+        sizeof(quint64) != sizeof(long long)) {
+        return compareRawSampleTimeAndBitsScalarBlock(left, right, 4);
+    }
+
+    const long long strideWords = static_cast<long long>(sizeof(WaveSample) / sizeof(qint64));
+    const __m256i indexes = _mm256_set_epi64x(3 * strideWords, 2 * strideWords, strideWords, 0);
+    const __m256i leftTimes = _mm256_i64gather_epi64(reinterpret_cast<const long long*>(&left[0].time), indexes, 8);
+    const __m256i rightTimes = _mm256_i64gather_epi64(reinterpret_cast<const long long*>(&right[0].time), indexes, 8);
+    const __m256i leftRaw = _mm256_i64gather_epi64(reinterpret_cast<const long long*>(&left[0].rawBits), indexes, 8);
+    const __m256i rightRaw = _mm256_i64gather_epi64(reinterpret_cast<const long long*>(&right[0].rawBits), indexes, 8);
+    const __m256i timeEq = _mm256_cmpeq_epi64(leftTimes, rightTimes);
+    const __m256i rawEq = _mm256_cmpeq_epi64(leftRaw, rightRaw);
+    const __m256i eq = _mm256_and_si256(timeEq, rawEq);
+    return _mm256_movemask_pd(_mm256_castsi256_pd(eq)) == 0x0f;
+}
+#endif
+
+bool compareRawSampleTimeAndBitsSimd(qint64 leftTime,
+                                     quint64 leftRaw,
+                                     qint64 rightTime,
+                                     quint64 rightRaw) {
+#if WAVETRACE_COMPARE_HAS_SSE2
+    const __m128i left = _mm_set_epi64x(static_cast<long long>(leftRaw),
+                                       static_cast<long long>(leftTime));
+    const __m128i right = _mm_set_epi64x(static_cast<long long>(rightRaw),
+                                        static_cast<long long>(rightTime));
+    const __m128i eq = _mm_cmpeq_epi8(left, right);
+    return _mm_movemask_epi8(eq) == 0xffff;
+#else
+    return leftTime == rightTime && leftRaw == rightRaw;
+#endif
+}
+
+bool compareRawSampleTimeAndBitsSimdBlock(const WaveSample* left, const WaveSample* right, int count) {
+    int i = 0;
+#if WAVETRACE_COMPARE_HAS_AVX512F
+    for (; i + 8 <= count; i += 8) {
+        if (!compareRawSampleTimeAndBitsAvx512(left + i, right + i)) return false;
+    }
+#endif
+#if WAVETRACE_COMPARE_HAS_AVX2
+    for (; i + 4 <= count; i += 4) {
+        if (!compareRawSampleTimeAndBitsAvx2(left + i, right + i)) return false;
+    }
+#endif
+    for (; i < count; ++i) {
+        if (!compareRawSampleTimeAndBitsSimd(left[i].time, left[i].rawBits,
+                                            right[i].time, right[i].rawBits)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool compareSamplesExactlyEquivalentFast(const WaveSample& left, const WaveSample& right) {
+    if (left.isAbsent != right.isAbsent || left.isZ != right.isZ) return false;
+    if (rawSamplePairComparable(left, right)) {
+        return compareRawSampleTimeAndBitsSimd(left.time, left.rawBits, right.time, right.rawBits);
+    }
+    if (left.time != right.time) return false;
+    if (left.rawFieldsReady && right.rawFieldsReady) return left.rawBits == right.rawBits;
+    if (!left.rawFieldsReady && !right.rawFieldsReady) return left.value == right.value;
+    return false;
+}
+
+bool compareSampleStreamsExactlyEquivalentFast(const WaveSignal& left,
+                                               const WaveSignal& right,
+                                               qint64 leftEnd,
+                                               qint64 rightEnd) {
+    if (left.kind != right.kind || left.width != right.width || leftEnd != rightEnd) return false;
+    const int count = left.samples.size();
+    if (count != right.samples.size()) return false;
+    const WaveSample* leftSamples = left.samples.constData();
+    const WaveSample* rightSamples = right.samples.constData();
+    if (rawSampleStreamsComparable(leftSamples, rightSamples, count)) {
+        return compareRawSampleTimeAndBitsSimdBlock(leftSamples, rightSamples, count);
+    }
+
+    int i = 0;
+    while (i < count) {
+#if WAVETRACE_COMPARE_HAS_AVX512F
+        if (i + 8 <= count && rawSampleBlockComparable(leftSamples + i, rightSamples + i, 8)) {
+            if (!compareRawSampleTimeAndBitsAvx512(leftSamples + i, rightSamples + i)) return false;
+            i += 8;
+            continue;
+        }
+#endif
+#if WAVETRACE_COMPARE_HAS_AVX2
+        if (i + 4 <= count && rawSampleBlockComparable(leftSamples + i, rightSamples + i, 4)) {
+            if (!compareRawSampleTimeAndBitsAvx2(leftSamples + i, rightSamples + i)) return false;
+            i += 4;
+            continue;
+        }
+#endif
+        if (!compareSamplesExactlyEquivalentFast(leftSamples[i], rightSamples[i])) return false;
+        ++i;
+    }
+    return true;
+}
+
 void appendCompareDiffRegion(QVector<WaveDiffRegion>& regions, qint64 start, qint64 end, qint64 clipStart, qint64 clipEnd) {
     start = qMax(start, clipStart);
     end = qMin(end, clipEnd);
@@ -1082,6 +1359,9 @@ QVector<WaveDiffRegion> computeSignalDiffRegions(const WaveSignal& left,
 
     if (left.kind != right.kind || left.width != right.width) {
         appendCompareDiffRegion(regions, compareStart, compareEnd, compareStart, compareEnd);
+        return regions;
+    }
+    if (compareSampleStreamsExactlyEquivalentFast(left, right, leftEnd, rightEnd)) {
         return regions;
     }
 
@@ -1178,6 +1458,37 @@ WaveSignal makeComparedSideSignal(const QString& fullName,
     return out;
 }
 
+QVector<WaveDiffRegion> makeFullCompareDiffRegions(qint64 start, qint64 end) {
+    QVector<WaveDiffRegion> regions;
+    appendCompareDiffRegion(regions, start, qMax(end, start + 1), start, qMax(end, start + 1));
+    return regions;
+}
+
+WaveSignal makeAbsentComparedSideSignal(const QString& fullName,
+                                         const WaveSignal& reference,
+                                         int signalId,
+                                         qint64 time,
+                                         const QVector<WaveDiffRegion>& diffRegions) {
+    WaveSignal out;
+    out.signalId = signalId;
+    out.storageId = -1;
+    out.bitOffset = reference.bitOffset;
+    out.name = fullName;
+    out.kind = reference.kind;
+    out.width = reference.width;
+    out.defaultRadix = reference.defaultRadix;
+    out.currentRadix = reference.currentRadix;
+    out.supportsZState = reference.supportsZState;
+    out.samplesLoaded = true;
+    out.diffRegions = diffRegions;
+
+    WaveSample absent = makeAbsentCompareSample();
+    absent.time = time;
+    out.samples.push_back(absent);
+    hydrateSignalSamplesForCompare(out);
+    return out;
+}
+
 bool buildComparedWaveFile(const QString& leftPath,
                            const WaveFile& leftWave,
                            const QString& rightPath,
@@ -1241,6 +1552,513 @@ bool buildComparedWaveFile(const QString& leftPath,
     if (outWave.signalList.isEmpty()) {
         error = QString::fromUtf8("没有发现路径相同且任意 cycle 数据不同的信号。");
         return false;
+    }
+    return true;
+}
+
+struct CompareSignalJob {
+    QString path;
+    int leftIndex = -1;
+    int rightIndex = -1;
+};
+
+struct CompareSignalResult {
+    int leftIndex = -1;
+    int rightIndex = -1;
+    QVector<WaveDiffRegion> diffRegions;
+};
+
+struct CompareProgressState {
+    std::atomic<int> totalJobs{0};
+    std::atomic<int> completedJobs{0};
+    std::atomic<int> outputSignalPairs{0};
+    std::atomic<bool> cancelRequested{false};
+};
+
+bool buildComparedWaveFileOptimized(const QString& leftPath,
+                                    const WaveFile& leftWave,
+                                    const QString& rightPath,
+                                    const WaveFile& rightWave,
+                                    WaveFile& outWave,
+                                    QString& error,
+                                    CompareProgressState* progress = nullptr) {
+    error.clear();
+    outWave = WaveFile();
+
+    QHash<QString, int> leftByPath;
+    QVector<QString> leftPathOrder;
+    leftByPath.reserve(leftWave.signalList.size() * 2 + 1);
+    leftPathOrder.reserve(leftWave.signalList.size());
+    for (int i = 0; i < leftWave.signalList.size(); ++i) {
+        const QString path = fullSignalPathFromWave(leftWave, i);
+        if (path.isEmpty() || leftByPath.contains(path)) continue;
+        leftByPath.insert(path, i);
+        leftPathOrder.push_back(path);
+    }
+
+    QHash<QString, int> rightByPath;
+    QVector<QString> rightPathOrder;
+    rightByPath.reserve(rightWave.signalList.size() * 2 + 1);
+    rightPathOrder.reserve(rightWave.signalList.size());
+    for (int i = 0; i < rightWave.signalList.size(); ++i) {
+        const QString path = fullSignalPathFromWave(rightWave, i);
+        if (path.isEmpty() || rightByPath.contains(path)) continue;
+        rightByPath.insert(path, i);
+        rightPathOrder.push_back(path);
+    }
+
+    outWave.meta.title = QStringLiteral("Compare_%1_vs_%2")
+        .arg(QFileInfo(leftPath).completeBaseName(), QFileInfo(rightPath).completeBaseName());
+    outWave.meta.timescale = (leftWave.meta.timescale == rightWave.meta.timescale)
+        ? leftWave.meta.timescale
+        : QStringLiteral("cycle");
+    outWave.meta.start = qMin(leftWave.meta.start, rightWave.meta.start);
+    outWave.meta.end = qMax(qMax(leftWave.meta.end, rightWave.meta.end), outWave.meta.start + 1);
+
+    std::vector<CompareSignalJob> jobs;
+    jobs.reserve(std::size_t(leftPathOrder.size() + rightPathOrder.size()));
+    int commonPathCount = 0;
+    for (const QString& path : leftPathOrder) {
+        const int li = leftByPath.value(path, -1);
+        const int ri = rightByPath.value(path, -1);
+        if (li < 0) continue;
+        if (ri >= 0) ++commonPathCount;
+        CompareSignalJob job;
+        job.path = path;
+        job.leftIndex = li;
+        job.rightIndex = ri;
+        jobs.push_back(std::move(job));
+    }
+    for (const QString& path : rightPathOrder) {
+        if (leftByPath.contains(path)) continue;
+        const int ri = rightByPath.value(path, -1);
+        if (ri < 0) continue;
+        CompareSignalJob job;
+        job.path = path;
+        job.leftIndex = -1;
+        job.rightIndex = ri;
+        jobs.push_back(std::move(job));
+    }
+
+    if (jobs.empty()) {
+        error = QStringLiteral("The two files have no signals to compare.");
+        return false;
+    }
+    if (progress) {
+        progress->totalJobs.store(int(jobs.size()), std::memory_order_release);
+        progress->completedJobs.store(0, std::memory_order_release);
+        progress->outputSignalPairs.store(0, std::memory_order_release);
+    }
+
+    std::vector<CompareSignalResult> results(jobs.size());
+    std::atomic<int> nextJob(0);
+    const unsigned hw = std::thread::hardware_concurrency();
+    const int maxWorkers = int(hw == 0 ? 1 : hw);
+    const int workerCount = qBound(1, maxWorkers, int(qMax<std::size_t>(std::size_t(1), jobs.size())));
+    std::vector<std::thread> workers;
+    workers.reserve(std::size_t(workerCount));
+    for (int worker = 0; worker < workerCount; ++worker) {
+        Q_UNUSED(worker);
+        workers.emplace_back([&]() {
+            for (;;) {
+                if (progress && progress->cancelRequested.load(std::memory_order_acquire)) break;
+                const int jobIndex = nextJob.fetch_add(1, std::memory_order_relaxed);
+                if (jobIndex < 0 || jobIndex >= int(jobs.size())) break;
+                const CompareSignalJob& job = jobs[std::size_t(jobIndex)];
+                QVector<WaveDiffRegion> diffRegions;
+                if (job.leftIndex >= 0 && job.rightIndex >= 0) {
+                    const WaveSignal& leftSig = leftWave.signalList.at(job.leftIndex);
+                    const WaveSignal& rightSig = rightWave.signalList.at(job.rightIndex);
+                    diffRegions = computeSignalDiffRegions(leftSig, rightSig,
+                                                           outWave.meta.start, outWave.meta.end,
+                                                           leftWave.meta.end, rightWave.meta.end);
+                } else {
+                    diffRegions = makeFullCompareDiffRegions(outWave.meta.start, outWave.meta.end);
+                }
+                if (progress) progress->completedJobs.fetch_add(1, std::memory_order_release);
+                if (diffRegions.isEmpty()) continue;
+                CompareSignalResult& result = results[std::size_t(jobIndex)];
+                result.leftIndex = job.leftIndex;
+                result.rightIndex = job.rightIndex;
+                result.diffRegions = std::move(diffRegions);
+                if (progress) progress->outputSignalPairs.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (std::thread& worker : workers) {
+        if (worker.joinable()) worker.join();
+    }
+    if (progress && progress->cancelRequested.load(std::memory_order_acquire)) {
+        error = QStringLiteral("Compare cancelled.");
+        return false;
+    }
+
+    int diffSignalCount = 0;
+    for (const CompareSignalResult& result : results) {
+        if (!result.diffRegions.isEmpty()) ++diffSignalCount;
+    }
+    if (diffSignalCount == 0) {
+        if (commonPathCount > 0) {
+            error = QStringLiteral("No matching-path signal differs at any cycle.");
+        } else {
+            error = QStringLiteral("No signal differences were found.");
+        }
+        return false;
+    }
+
+    outWave.signalList.reserve(diffSignalCount * 2);
+    int nextSignalId = 1;
+    for (std::size_t i = 0; i < jobs.size(); ++i) {
+        const CompareSignalResult& result = results[i];
+        if (result.diffRegions.isEmpty()) continue;
+        const QString leftName = comparedSideFullPath(jobs[i].path, QStringLiteral("A"));
+        const QString rightName = comparedSideFullPath(jobs[i].path, QStringLiteral("B"));
+        if (result.leftIndex >= 0 && result.rightIndex >= 0) {
+            const WaveSignal& leftSig = leftWave.signalList.at(result.leftIndex);
+            const WaveSignal& rightSig = rightWave.signalList.at(result.rightIndex);
+            outWave.signalList.push_back(makeComparedSideSignal(leftName, leftSig, nextSignalId++, result.diffRegions));
+            outWave.signalList.push_back(makeComparedSideSignal(rightName, rightSig, nextSignalId++, result.diffRegions));
+        } else if (result.leftIndex >= 0) {
+            const WaveSignal& leftSig = leftWave.signalList.at(result.leftIndex);
+            outWave.signalList.push_back(makeComparedSideSignal(leftName, leftSig, nextSignalId++, result.diffRegions));
+            outWave.signalList.push_back(makeAbsentComparedSideSignal(rightName, leftSig, nextSignalId++,
+                                                                      outWave.meta.start, result.diffRegions));
+        } else if (result.rightIndex >= 0) {
+            const WaveSignal& rightSig = rightWave.signalList.at(result.rightIndex);
+            outWave.signalList.push_back(makeAbsentComparedSideSignal(leftName, rightSig, nextSignalId++,
+                                                                      outWave.meta.start, result.diffRegions));
+            outWave.signalList.push_back(makeComparedSideSignal(rightName, rightSig, nextSignalId++, result.diffRegions));
+        }
+    }
+    return true;
+}
+
+bool isDecodedSampleBudgetError(const QString& error) {
+    return error.contains(QStringLiteral("decoded sample limit exceeded"), Qt::CaseInsensitive);
+}
+
+bool loadWvz4SignalBatchIntoMapForCompare(const WaveParser4Reader& reader,
+                                          const QVector<int>& signalIds,
+                                          QHash<int, WaveSignal>& signalsById,
+                                          QString& error,
+                                          quint64 sampleBudget = kCompareStreamingBatchSampleBudget) {
+    if (signalIds.isEmpty()) return true;
+
+    WaveFile loadedWave;
+    QString loadError;
+    if (reader.loadSignals(signalIds, loadedWave, loadError, sampleBudget)) {
+        for (WaveSignal& sig : loadedWave.signalList) {
+            signalsById.insert(sig.signalId, std::move(sig));
+        }
+        return true;
+    }
+
+    if (sampleBudget > 0 && isDecodedSampleBudgetError(loadError)) {
+        if (signalIds.size() > 1) {
+            const int mid = signalIds.size() / 2;
+            QVector<int> leftIds;
+            QVector<int> rightIds;
+            leftIds.reserve(mid);
+            rightIds.reserve(signalIds.size() - mid);
+            for (int i = 0; i < signalIds.size(); ++i) {
+                if (i < mid) leftIds.push_back(signalIds.at(i));
+                else rightIds.push_back(signalIds.at(i));
+            }
+            if (!loadWvz4SignalBatchIntoMapForCompare(reader, leftIds, signalsById, error, sampleBudget)) return false;
+            return loadWvz4SignalBatchIntoMapForCompare(reader, rightIds, signalsById, error, sampleBudget);
+        }
+
+        loadedWave = WaveFile();
+        loadError.clear();
+        if (reader.loadSignals(signalIds, loadedWave, loadError, 0)) {
+            for (WaveSignal& sig : loadedWave.signalList) {
+                signalsById.insert(sig.signalId, std::move(sig));
+            }
+            return true;
+        }
+    }
+
+    error = loadError;
+    return false;
+}
+
+bool buildComparedWaveFileWvz4Streaming(const QString& leftPath,
+                                        const QString& rightPath,
+                                        WaveFile& outWave,
+                                        QString& error,
+                                        CompareProgressState* progress = nullptr) {
+    error.clear();
+    outWave = WaveFile();
+    QElapsedTimer totalTimer;
+    QElapsedTimer stageTimer;
+    if (viewerPerfLogEnabled()) {
+        totalTimer.start();
+        stageTimer.start();
+    }
+
+    WaveParser4Reader leftReader;
+    WaveParser4Reader rightReader;
+    QString leftError;
+    QString rightError;
+
+    auto leftLoad = std::async(std::launch::async, [&]() {
+        return leftReader.open(leftPath, leftError);
+    });
+    auto rightLoad = std::async(std::launch::async, [&]() {
+        return rightReader.open(rightPath, rightError);
+    });
+
+    if (!leftLoad.get()) {
+        error = QStringLiteral("Failed to load first WVZ4 directory:\n%1").arg(leftError);
+        return false;
+    }
+    if (!rightLoad.get()) {
+        error = QStringLiteral("Failed to load second WVZ4 directory:\n%1").arg(rightError);
+        return false;
+    }
+    const WaveFile& leftDirectory = leftReader.directoryWave();
+    const WaveFile& rightDirectory = rightReader.directoryWave();
+    if (viewerPerfLogEnabled()) {
+        comparePerfLog("compare.streaming.directory_load", stageTimer.restart(),
+                       0, 0, leftDirectory.signalList.size(), rightDirectory.signalList.size(), 0);
+    }
+
+    QHash<QString, int> leftByPath;
+    QVector<QString> leftPathOrder;
+    leftByPath.reserve(leftDirectory.signalList.size() * 2 + 1);
+    leftPathOrder.reserve(leftDirectory.signalList.size());
+    for (int i = 0; i < leftDirectory.signalList.size(); ++i) {
+        const QString path = fullSignalPathFromWave(leftDirectory, i);
+        if (path.isEmpty() || leftByPath.contains(path)) continue;
+        leftByPath.insert(path, i);
+        leftPathOrder.push_back(path);
+    }
+
+    QHash<QString, int> rightByPath;
+    QVector<QString> rightPathOrder;
+    rightByPath.reserve(rightDirectory.signalList.size() * 2 + 1);
+    rightPathOrder.reserve(rightDirectory.signalList.size());
+    for (int i = 0; i < rightDirectory.signalList.size(); ++i) {
+        const QString path = fullSignalPathFromWave(rightDirectory, i);
+        if (path.isEmpty() || rightByPath.contains(path)) continue;
+        rightByPath.insert(path, i);
+        rightPathOrder.push_back(path);
+    }
+
+    QVector<CompareSignalJob> jobs;
+    jobs.reserve(leftPathOrder.size() + rightPathOrder.size());
+    for (const QString& path : leftPathOrder) {
+        const int li = leftByPath.value(path, -1);
+        if (li < 0) continue;
+        CompareSignalJob job;
+        job.path = path;
+        job.leftIndex = li;
+        job.rightIndex = rightByPath.value(path, -1);
+        jobs.push_back(job);
+    }
+    for (const QString& path : rightPathOrder) {
+        if (leftByPath.contains(path)) continue;
+        const int ri = rightByPath.value(path, -1);
+        if (ri < 0) continue;
+        CompareSignalJob job;
+        job.path = path;
+        job.leftIndex = -1;
+        job.rightIndex = ri;
+        jobs.push_back(job);
+    }
+    if (viewerPerfLogEnabled()) {
+        comparePerfLog("compare.streaming.job_build", stageTimer.restart(),
+                       0, jobs.size(), leftPathOrder.size(), rightPathOrder.size(), 0);
+    }
+
+    if (jobs.isEmpty()) {
+        error = QStringLiteral("The two WVZ4 files have no signals to compare.");
+        return false;
+    }
+
+    if (!rawBlockCompareDisabledByEnv() &&
+        waveDirectoriesEquivalentForRawBlockCompare(leftDirectory, rightDirectory)) {
+        QElapsedTimer rawCompareTimer;
+        if (viewerPerfLogEnabled()) rawCompareTimer.start();
+        QString rawCompareError;
+        const WaveParser4Reader::RawBlockCompareResult rawCompare =
+            leftReader.compareRawBlocksWith(rightReader, rawCompareError);
+        if (viewerPerfLogEnabled()) {
+            comparePerfLog("compare.streaming.raw_block_compare",
+                           rawCompareTimer.elapsed(),
+                           0,
+                           jobs.size(),
+                           leftDirectory.signalList.size(),
+                           rightDirectory.signalList.size(),
+                           int(rawCompare));
+        }
+        if (rawCompare == WaveParser4Reader::RawBlockCompareResult::Equal) {
+            error = QStringLiteral("No matching-path signal differs at any cycle.");
+            if (viewerPerfLogEnabled()) {
+                comparePerfLog("compare.streaming.total", totalTimer.elapsed(),
+                               0, jobs.size(), leftDirectory.signalList.size(), rightDirectory.signalList.size(), 0);
+            }
+            return false;
+        }
+        // Different/unsupported/error fall back to the materialized signal path so
+        // the viewer can still build precise diff regions and report format errors.
+        Q_UNUSED(rawCompareError);
+    }
+
+    outWave.meta.title = QStringLiteral("Compare_%1_vs_%2")
+        .arg(QFileInfo(leftPath).completeBaseName(), QFileInfo(rightPath).completeBaseName());
+    outWave.meta.timescale = (leftDirectory.meta.timescale == rightDirectory.meta.timescale)
+        ? leftDirectory.meta.timescale
+        : QStringLiteral("cycle");
+    outWave.meta.start = qMin(leftDirectory.meta.start, rightDirectory.meta.start);
+    outWave.meta.end = qMax(qMax(leftDirectory.meta.end, rightDirectory.meta.end), outWave.meta.start + 1);
+
+    if (progress) {
+        progress->totalJobs.store(jobs.size(), std::memory_order_release);
+        progress->completedJobs.store(0, std::memory_order_release);
+        progress->outputSignalPairs.store(0, std::memory_order_release);
+    }
+
+    int nextSignalId = 1;
+    const qint64 maxInputBytes = qMax(QFileInfo(leftPath).size(), QFileInfo(rightPath).size());
+    const int signalBatchSize = (maxInputBytes >= kCompareStreamingHugeFileThresholdBytes)
+        ? kCompareStreamingHugeFileSignalBatchSize
+        : kCompareStreamingDefaultSignalBatchSize;
+    for (int batchStart = 0; batchStart < jobs.size(); batchStart += signalBatchSize) {
+        QElapsedTimer batchTimer;
+        if (viewerPerfLogEnabled()) batchTimer.start();
+        if (progress && progress->cancelRequested.load(std::memory_order_acquire)) {
+            error = QStringLiteral("Compare cancelled.");
+            return false;
+        }
+
+        const int batchEnd = qMin(jobs.size(), batchStart + signalBatchSize);
+        const int batchCount = batchEnd - batchStart;
+        QVector<int> leftIds;
+        QVector<int> rightIds;
+        leftIds.reserve(batchCount);
+        rightIds.reserve(batchCount);
+        for (int i = batchStart; i < batchEnd; ++i) {
+            const CompareSignalJob& job = jobs.at(i);
+            if (job.leftIndex >= 0) {
+                const int sid = leftDirectory.signalList.at(job.leftIndex).signalId;
+                if (sid > 0) leftIds.push_back(sid);
+            }
+            if (job.rightIndex >= 0) {
+                const int sid = rightDirectory.signalList.at(job.rightIndex).signalId;
+                if (sid > 0) rightIds.push_back(sid);
+            }
+        }
+        if (viewerPerfLogEnabled()) {
+            comparePerfLog("compare.streaming.batch_collect_ids", batchTimer.restart(),
+                           batchStart, batchCount, leftIds.size(), rightIds.size(), 0);
+        }
+
+        QHash<int, WaveSignal> leftSignalsById;
+        QHash<int, WaveSignal> rightSignalsById;
+        leftSignalsById.reserve(leftIds.size() * 2 + 1);
+        rightSignalsById.reserve(rightIds.size() * 2 + 1);
+
+        QString leftBatchError;
+        QString rightBatchError;
+        auto leftBatchLoad = std::async(std::launch::async, [&]() {
+            return loadWvz4SignalBatchIntoMapForCompare(leftReader, leftIds, leftSignalsById, leftBatchError);
+        });
+        auto rightBatchLoad = std::async(std::launch::async, [&]() {
+            return loadWvz4SignalBatchIntoMapForCompare(rightReader, rightIds, rightSignalsById, rightBatchError);
+        });
+        if (!leftBatchLoad.get()) {
+            error = QStringLiteral("Failed to load first WVZ4 signal batch:\n%1").arg(leftBatchError);
+            return false;
+        }
+        if (!rightBatchLoad.get()) {
+            error = QStringLiteral("Failed to load second WVZ4 signal batch:\n%1").arg(rightBatchError);
+            return false;
+        }
+        if (viewerPerfLogEnabled()) {
+            comparePerfLog("compare.streaming.batch_load", batchTimer.restart(),
+                           batchStart, batchCount, leftSignalsById.size(), rightSignalsById.size(), 0);
+        }
+
+        int batchOutputPairs = 0;
+        for (int i = batchStart; i < batchEnd; ++i) {
+            if (progress && progress->cancelRequested.load(std::memory_order_acquire)) {
+                error = QStringLiteral("Compare cancelled.");
+                return false;
+            }
+
+            const CompareSignalJob& job = jobs.at(i);
+            QVector<WaveDiffRegion> diffRegions;
+            const WaveSignal* leftSig = nullptr;
+            const WaveSignal* rightSig = nullptr;
+
+            if (job.leftIndex >= 0) {
+                const int sid = leftDirectory.signalList.at(job.leftIndex).signalId;
+                const auto it = leftSignalsById.constFind(sid);
+                if (it == leftSignalsById.constEnd()) {
+                    error = QStringLiteral("First WVZ4 batch did not return signal_id %1").arg(sid);
+                    return false;
+                }
+                leftSig = &it.value();
+            }
+            if (job.rightIndex >= 0) {
+                const int sid = rightDirectory.signalList.at(job.rightIndex).signalId;
+                const auto it = rightSignalsById.constFind(sid);
+                if (it == rightSignalsById.constEnd()) {
+                    error = QStringLiteral("Second WVZ4 batch did not return signal_id %1").arg(sid);
+                    return false;
+                }
+                rightSig = &it.value();
+            }
+
+            if (leftSig && rightSig) {
+                diffRegions = computeSignalDiffRegions(*leftSig, *rightSig,
+                                                       outWave.meta.start, outWave.meta.end,
+                                                       leftDirectory.meta.end, rightDirectory.meta.end);
+            } else {
+                diffRegions = makeFullCompareDiffRegions(outWave.meta.start, outWave.meta.end);
+            }
+
+            if (!diffRegions.isEmpty()) {
+                const QString leftName = comparedSideFullPath(job.path, QStringLiteral("A"));
+                const QString rightName = comparedSideFullPath(job.path, QStringLiteral("B"));
+                if (leftSig && rightSig) {
+                    outWave.signalList.push_back(makeComparedSideSignal(leftName, *leftSig, nextSignalId++, diffRegions));
+                    outWave.signalList.push_back(makeComparedSideSignal(rightName, *rightSig, nextSignalId++, diffRegions));
+                } else if (leftSig) {
+                    outWave.signalList.push_back(makeComparedSideSignal(leftName, *leftSig, nextSignalId++, diffRegions));
+                    outWave.signalList.push_back(makeAbsentComparedSideSignal(rightName, *leftSig, nextSignalId++,
+                                                                              outWave.meta.start, diffRegions));
+                } else if (rightSig) {
+                    outWave.signalList.push_back(makeAbsentComparedSideSignal(leftName, *rightSig, nextSignalId++,
+                                                                              outWave.meta.start, diffRegions));
+                    outWave.signalList.push_back(makeComparedSideSignal(rightName, *rightSig, nextSignalId++, diffRegions));
+                }
+                if (progress) progress->outputSignalPairs.fetch_add(1, std::memory_order_relaxed);
+                ++batchOutputPairs;
+            }
+
+            if (progress) progress->completedJobs.fetch_add(1, std::memory_order_release);
+        }
+        if (viewerPerfLogEnabled()) {
+            comparePerfLog("compare.streaming.batch_compare", batchTimer.restart(),
+                           batchStart, batchCount, leftSignalsById.size(), rightSignalsById.size(), batchOutputPairs);
+        }
+    }
+
+    if (outWave.signalList.isEmpty()) {
+        error = QStringLiteral("No matching-path signal differs at any cycle.");
+        if (viewerPerfLogEnabled()) {
+            comparePerfLog("compare.streaming.total", totalTimer.elapsed(),
+                           0, jobs.size(), leftDirectory.signalList.size(), rightDirectory.signalList.size(), 0);
+        }
+        return false;
+    }
+
+    if (viewerPerfLogEnabled()) {
+        comparePerfLog("compare.streaming.total", totalTimer.elapsed(),
+                       0, jobs.size(), leftDirectory.signalList.size(), rightDirectory.signalList.size(),
+                       outWave.signalList.size() / 2);
     }
     return true;
 }
@@ -2679,11 +3497,75 @@ MainWindow::MainWindow(QWidget* parent)
     setWindowIcon(loadImageIconOrFallback("app", "app"));
     if (windowIcon().isNull()) setWindowIcon(makeAppIcon());
     buildUi();
+    setAcceptDrops(true);
+    const QList<QWidget*> dropTargets = { m_central, m_splitter, m_tree, m_activeList, m_canvas };
+    for (QWidget* widget : dropTargets) {
+        if (!widget) continue;
+        widget->setAcceptDrops(true);
+        widget->installEventFilter(this);
+    }
     applyTheme();
     loadDemoWave();
 }
 
 MainWindow::~MainWindow() = default;
+
+bool MainWindow::handleWaveFileDropEvent(QEvent* event) {
+    if (!event) return false;
+
+    if (event->type() == QEvent::DragEnter) {
+        auto* drag = static_cast<QDragEnterEvent*>(event);
+        if (!firstSupportedWaveFilePathFromMime(drag->mimeData()).isEmpty()) {
+            drag->setDropAction(Qt::CopyAction);
+            drag->accept();
+            return true;
+        }
+        return false;
+    }
+
+    if (event->type() == QEvent::DragMove) {
+        auto* drag = static_cast<QDragMoveEvent*>(event);
+        if (!firstSupportedWaveFilePathFromMime(drag->mimeData()).isEmpty()) {
+            drag->setDropAction(Qt::CopyAction);
+            drag->accept();
+            return true;
+        }
+        return false;
+    }
+
+    if (event->type() == QEvent::Drop) {
+        auto* drop = static_cast<QDropEvent*>(event);
+        const QString path = firstSupportedWaveFilePathFromMime(drop->mimeData());
+        if (!path.isEmpty()) {
+            drop->setDropAction(Qt::CopyAction);
+            drop->accept();
+            openWaveFilePath(path);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
+    if (handleWaveFileDropEvent(event)) return true;
+    return QMainWindow::eventFilter(watched, event);
+}
+
+void MainWindow::dragEnterEvent(QDragEnterEvent* event) {
+    if (handleWaveFileDropEvent(event)) return;
+    QMainWindow::dragEnterEvent(event);
+}
+
+void MainWindow::dragMoveEvent(QDragMoveEvent* event) {
+    if (handleWaveFileDropEvent(event)) return;
+    QMainWindow::dragMoveEvent(event);
+}
+
+void MainWindow::dropEvent(QDropEvent* event) {
+    if (handleWaveFileDropEvent(event)) return;
+    QMainWindow::dropEvent(event);
+}
 
 void MainWindow::setupToolbarButton(QPushButton* button, const QIcon& icon, const QString& objectName, const QString& tip) {
     button->setObjectName(objectName);
@@ -3347,6 +4229,241 @@ void MainWindow::openWaveFile() {
     openWaveFilePath(path);
 }
 
+bool MainWindow::compareWaveFilePaths(const QString& leftPath,
+                                      const QString& rightPath,
+                                      bool showProgress,
+                                      bool showMessages,
+                                      QString* errorMessage,
+                                      qint64* elapsedMs,
+                                      int* resultSignalCount) {
+    if (errorMessage) errorMessage->clear();
+    if (elapsedMs) *elapsedMs = 0;
+    if (resultSignalCount) *resultSignalCount = 0;
+
+    QElapsedTimer totalTimer;
+    totalTimer.start();
+
+    const QFileInfo leftInfo(leftPath);
+    const QFileInfo rightInfo(rightPath);
+    const QString leftCanonical = leftInfo.exists() ? leftInfo.canonicalFilePath() : QString();
+    const QString rightCanonical = rightInfo.exists() ? rightInfo.canonicalFilePath() : QString();
+    if (!leftCanonical.isEmpty() && leftCanonical == rightCanonical) {
+        const QString error = QStringLiteral("No matching-path signal differs at any cycle.");
+        if (errorMessage) *errorMessage = error;
+        if (elapsedMs) *elapsedMs = totalTimer.elapsed();
+        if (showMessages) {
+            QMessageBox::information(this, QStringLiteral("Compare finished"), error);
+        }
+        return false;
+    }
+
+    const bool streamingWvz4Compare =
+        leftPath.endsWith(QStringLiteral(".wvz4"), Qt::CaseInsensitive) &&
+        rightPath.endsWith(QStringLiteral(".wvz4"), Qt::CaseInsensitive);
+    if (streamingWvz4Compare) {
+        WaveFile comparedWave;
+        QString error;
+        bool ok = false;
+        CompareProgressState progressState;
+
+        if (showProgress) {
+            QProgressDialog compareProgress(QStringLiteral("Loading WVZ4 directories..."),
+                                            QStringLiteral("Cancel"), 0, 0, this);
+            compareProgress.setWindowTitle(QStringLiteral("Compare wave files"));
+            compareProgress.setWindowModality(Qt::WindowModal);
+            compareProgress.setMinimumDuration(0);
+            compareProgress.setAutoClose(false);
+            compareProgress.show();
+
+            auto compareFuture = std::async(std::launch::async, [&]() {
+                return buildComparedWaveFileWvz4Streaming(leftPath, rightPath,
+                                                          comparedWave, error, &progressState);
+            });
+
+            int lastTotal = 0;
+            while (compareFuture.wait_for(std::chrono::milliseconds(20)) != std::future_status::ready) {
+                if (compareProgress.wasCanceled()) {
+                    progressState.cancelRequested.store(true, std::memory_order_release);
+                    compareProgress.setLabelText(QStringLiteral("Cancelling comparison..."));
+                } else {
+                    const int total = progressState.totalJobs.load(std::memory_order_acquire);
+                    const int done = progressState.completedJobs.load(std::memory_order_acquire);
+                    if (total > 0) {
+                        if (total != lastTotal) {
+                            compareProgress.setRange(0, total);
+                            lastTotal = total;
+                        }
+                        compareProgress.setValue(qBound(0, done, total));
+                        compareProgress.setLabelText(QStringLiteral("Streaming compare %1 / %2 signals...")
+                                                     .arg(done).arg(total));
+                    }
+                }
+                QCoreApplication::processEvents();
+            }
+            ok = compareFuture.get();
+            const int total = progressState.totalJobs.load(std::memory_order_acquire);
+            if (total > 0) {
+                compareProgress.setRange(0, total);
+                compareProgress.setValue(qMin(total, progressState.completedJobs.load(std::memory_order_acquire)));
+            }
+            compareProgress.setLabelText(QStringLiteral("Building result tree..."));
+            QCoreApplication::processEvents();
+            compareProgress.close();
+        } else {
+            ok = buildComparedWaveFileWvz4Streaming(leftPath, rightPath,
+                                                    comparedWave, error, nullptr);
+        }
+
+        if (!ok) {
+            if (errorMessage) *errorMessage = error;
+            if (elapsedMs) *elapsedMs = totalTimer.elapsed();
+            if (showMessages) {
+                QMessageBox::information(this,
+                    QStringLiteral("Compare finished"),
+                    error.isEmpty() ? QStringLiteral("No signal differences were found.") : error);
+            }
+            return false;
+        }
+
+        const int comparedSignalCount = comparedWave.signalList.size();
+        m_currentWaveFilePath.clear();
+        m_currentWaveSupportsOnDemand = false;
+        m_signalIndexBySignalId.clear();
+        applyWave(std::move(comparedWave));
+
+        if (resultSignalCount) *resultSignalCount = comparedSignalCount;
+        if (elapsedMs) *elapsedMs = totalTimer.elapsed();
+        return true;
+    }
+
+    WaveFile leftWave;
+    WaveFile rightWave;
+    QString leftError;
+    QString rightError;
+
+    auto leftLoad = std::async(std::launch::async, [&]() {
+        return loadWaveFileFullyForCompare(leftPath, leftWave, leftError);
+    });
+    auto rightLoad = std::async(std::launch::async, [&]() {
+        return loadWaveFileFullyForCompare(rightPath, rightWave, rightError);
+    });
+
+    if (showProgress) {
+        QProgressDialog loadProgress(QStringLiteral("Loading wave files..."), QString(), 0, 0, this);
+        loadProgress.setWindowTitle(QStringLiteral("Compare wave files"));
+        loadProgress.setWindowModality(Qt::WindowModal);
+        loadProgress.setCancelButton(nullptr);
+        loadProgress.setMinimumDuration(0);
+        loadProgress.show();
+
+        bool leftReady = false;
+        bool rightReady = false;
+        while (!leftReady || !rightReady) {
+            if (!leftReady) {
+                leftReady = leftLoad.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+            }
+            if (!rightReady) {
+                rightReady = rightLoad.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+            }
+            QCoreApplication::processEvents();
+            if (!leftReady || !rightReady) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        loadProgress.close();
+    }
+
+    if (!leftLoad.get()) {
+        const QString error = QStringLiteral("Failed to load first file:\n%1").arg(leftError);
+        if (errorMessage) *errorMessage = error;
+        if (elapsedMs) *elapsedMs = totalTimer.elapsed();
+        if (showMessages) QMessageBox::critical(this, QStringLiteral("Compare failed"), error);
+        return false;
+    }
+    if (!rightLoad.get()) {
+        const QString error = QStringLiteral("Failed to load second file:\n%1").arg(rightError);
+        if (errorMessage) *errorMessage = error;
+        if (elapsedMs) *elapsedMs = totalTimer.elapsed();
+        if (showMessages) QMessageBox::critical(this, QStringLiteral("Compare failed"), error);
+        return false;
+    }
+
+    rebuildWaveFileDerivedCaches(leftWave);
+    rebuildWaveFileDerivedCaches(rightWave);
+
+    WaveFile comparedWave;
+    QString error;
+    bool ok = false;
+    CompareProgressState progressState;
+
+    if (showProgress) {
+        QProgressDialog compareProgress(QStringLiteral("Preparing comparison..."),
+                                        QStringLiteral("Cancel"), 0, 0, this);
+        compareProgress.setWindowTitle(QStringLiteral("Compare wave files"));
+        compareProgress.setWindowModality(Qt::WindowModal);
+        compareProgress.setMinimumDuration(0);
+        compareProgress.setAutoClose(false);
+        compareProgress.show();
+
+        auto compareFuture = std::async(std::launch::async, [&]() {
+            return buildComparedWaveFileOptimized(leftPath, leftWave, rightPath, rightWave,
+                                                  comparedWave, error, &progressState);
+        });
+
+        int lastTotal = 0;
+        while (compareFuture.wait_for(std::chrono::milliseconds(20)) != std::future_status::ready) {
+            if (compareProgress.wasCanceled()) {
+                progressState.cancelRequested.store(true, std::memory_order_release);
+                compareProgress.setLabelText(QStringLiteral("Cancelling comparison..."));
+            } else {
+                const int total = progressState.totalJobs.load(std::memory_order_acquire);
+                const int done = progressState.completedJobs.load(std::memory_order_acquire);
+                if (total > 0) {
+                    if (total != lastTotal) {
+                        compareProgress.setRange(0, total);
+                        lastTotal = total;
+                    }
+                    compareProgress.setValue(qBound(0, done, total));
+                    compareProgress.setLabelText(QStringLiteral("Comparing signals %1 / %2...")
+                                                 .arg(done).arg(total));
+                }
+            }
+            QCoreApplication::processEvents();
+        }
+        ok = compareFuture.get();
+        const int total = progressState.totalJobs.load(std::memory_order_acquire);
+        if (total > 0) {
+            compareProgress.setRange(0, total);
+            compareProgress.setValue(qMin(total, progressState.completedJobs.load(std::memory_order_acquire)));
+        }
+        compareProgress.setLabelText(QStringLiteral("Building result tree..."));
+        QCoreApplication::processEvents();
+        compareProgress.close();
+    } else {
+        ok = buildComparedWaveFileOptimized(leftPath, leftWave, rightPath, rightWave,
+                                            comparedWave, error, nullptr);
+    }
+
+    if (!ok) {
+        if (errorMessage) *errorMessage = error;
+        if (elapsedMs) *elapsedMs = totalTimer.elapsed();
+        if (showMessages) {
+            QMessageBox::information(this,
+                QStringLiteral("Compare finished"),
+                error.isEmpty() ? QStringLiteral("No signal differences were found.") : error);
+        }
+        return false;
+    }
+
+    const int comparedSignalCount = comparedWave.signalList.size();
+    m_currentWaveFilePath.clear();
+    m_currentWaveSupportsOnDemand = false;
+    m_signalIndexBySignalId.clear();
+    applyWave(std::move(comparedWave));
+
+    if (resultSignalCount) *resultSignalCount = comparedSignalCount;
+    if (elapsedMs) *elapsedMs = totalTimer.elapsed();
+    return true;
+}
+
 void MainWindow::compareWaveFiles() {
     const QStringList paths = QFileDialog::getOpenFileNames(
         this,
@@ -3358,6 +4475,51 @@ void MainWindow::compareWaveFiles() {
         QMessageBox::warning(this,
             QString::fromUtf8("比较失败"),
             QString::fromUtf8("请一次选择且只选择两个波形文件。"));
+        return;
+    }
+
+    compareWaveFilePaths(paths.at(0), paths.at(1), true, true);
+    return;
+
+    {
+        WaveFile leftWave;
+        WaveFile rightWave;
+        QString leftError;
+        QString rightError;
+        auto leftLoad = std::async(std::launch::async, [&]() {
+            return loadWaveFileFullyForCompare(paths.at(0), leftWave, leftError);
+        });
+        auto rightLoad = std::async(std::launch::async, [&]() {
+            return loadWaveFileFullyForCompare(paths.at(1), rightWave, rightError);
+        });
+
+        if (!leftLoad.get()) {
+            QMessageBox::critical(this, QStringLiteral("Compare failed"),
+                                  QStringLiteral("Failed to load first file:\n%1").arg(leftError));
+            return;
+        }
+        if (!rightLoad.get()) {
+            QMessageBox::critical(this, QStringLiteral("Compare failed"),
+                                  QStringLiteral("Failed to load second file:\n%1").arg(rightError));
+            return;
+        }
+
+        rebuildWaveFileDerivedCaches(leftWave);
+        rebuildWaveFileDerivedCaches(rightWave);
+
+        WaveFile comparedWave;
+        QString error;
+        if (!buildComparedWaveFileOptimized(paths.at(0), leftWave, paths.at(1), rightWave, comparedWave, error)) {
+            QMessageBox::information(this,
+                QStringLiteral("Compare finished"),
+                error.isEmpty() ? QStringLiteral("No differing signal with the same path was found.") : error);
+            return;
+        }
+
+        m_currentWaveFilePath.clear();
+        m_currentWaveSupportsOnDemand = false;
+        m_signalIndexBySignalId.clear();
+        applyWave(std::move(comparedWave));
         return;
     }
 
@@ -3381,7 +4543,7 @@ void MainWindow::compareWaveFiles() {
     rebuildWaveFileDerivedCaches(rightWave);
 
     WaveFile comparedWave;
-    if (!buildComparedWaveFile(paths.at(0), leftWave, paths.at(1), rightWave, comparedWave, error)) {
+    if (!buildComparedWaveFileOptimized(paths.at(0), leftWave, paths.at(1), rightWave, comparedWave, error)) {
         QMessageBox::information(this,
             QString::fromUtf8("比较完成"),
             error.isEmpty() ? QString::fromUtf8("没有发现路径相同且数据不同的信号。") : error);

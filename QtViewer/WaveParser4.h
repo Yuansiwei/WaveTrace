@@ -5,6 +5,7 @@
 #include <QString>
 #include <QVector>
 #include <limits>
+#include <memory>
 
 class WaveParser4 {
 public:
@@ -44,4 +45,37 @@ public:
                              WaveFile& outWave,
                              QString& error,
                              const LoadOptions& options = LoadOptions());
+};
+
+class WaveParser4Reader {
+public:
+    enum class RawBlockCompareResult {
+        Equal,
+        Different,
+        Unsupported,
+        Error
+    };
+
+    WaveParser4Reader();
+    ~WaveParser4Reader();
+
+    WaveParser4Reader(WaveParser4Reader&&) noexcept;
+    WaveParser4Reader& operator=(WaveParser4Reader&&) noexcept;
+    WaveParser4Reader(const WaveParser4Reader&) = delete;
+    WaveParser4Reader& operator=(const WaveParser4Reader&) = delete;
+
+    bool open(const QString& filePath, QString& error, bool allowUnfinalized = false);
+    const WaveFile& directoryWave() const;
+    bool loadSignals(const QVector<int>& signalIds,
+                     WaveFile& outWave,
+                     QString& error,
+                     quint64 maxDecodedSamples = 0,
+                     qint64 timeStart = 0,
+                     qint64 timeEnd = std::numeric_limits<qint64>::max()) const;
+    RawBlockCompareResult compareRawBlocksWith(const WaveParser4Reader& other,
+                                               QString& error) const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> d;
 };

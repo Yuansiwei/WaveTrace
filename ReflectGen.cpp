@@ -910,6 +910,33 @@ namespace
         return out;
     }
 
+    class ScopedTokens
+    {
+    public:
+        ScopedTokens(CXTranslationUnit tu, CXSourceRange range)
+            : tu_(tu), tokens_(NULL), count_(0)
+        {
+            if (tu_) clang_tokenize(tu_, range, &tokens_, &count_);
+        }
+
+        ~ScopedTokens()
+        {
+            if (tokens_) clang_disposeTokens(tu_, tokens_, count_);
+        }
+
+        ScopedTokens(const ScopedTokens&) = delete;
+        ScopedTokens& operator=(const ScopedTokens&) = delete;
+
+        unsigned size() const { return count_; }
+        bool empty() const { return tokens_ == NULL || count_ == 0; }
+        CXToken operator[](unsigned i) const { return tokens_[i]; }
+
+    private:
+        CXTranslationUnit tu_;
+        CXToken* tokens_;
+        unsigned count_;
+    };
+
     std::string EscapeString(const std::string& s)
     {
         std::string out;
@@ -1075,16 +1102,12 @@ namespace
     {
         std::string out;
         if (!tu) return out;
-        CXSourceRange range = clang_getCursorExtent(cursor);
-        CXToken* tokens = NULL;
-        unsigned tokenCount = 0;
-        clang_tokenize(tu, range, &tokens, &tokenCount);
-        for (unsigned i = 0; i < tokenCount; ++i)
+        ScopedTokens tokens(tu, clang_getCursorExtent(cursor));
+        for (unsigned i = 0; i < tokens.size(); ++i)
         {
             if (!out.empty()) out += ' ';
             out += ToStdString(clang_getTokenSpelling(tu, tokens[i]));
         }
-        if (tokens != NULL) clang_disposeTokens(tu, tokens, tokenCount);
         return out;
     }
 
@@ -1128,12 +1151,10 @@ namespace
         if (matchedToken) matchedToken->clear();
         if (!tu) return false;
 
-        CXToken* tokens = NULL;
-        unsigned tokenCount = 0;
-        clang_tokenize(tu, range, &tokens, &tokenCount);
+        ScopedTokens tokens(tu, range);
 
         bool found = false;
-        for (unsigned i = 0; i < tokenCount; ++i)
+        for (unsigned i = 0; i < tokens.size(); ++i)
         {
             const CXTokenKind kind = clang_getTokenKind(tokens[i]);
 
@@ -1151,7 +1172,6 @@ namespace
             }
         }
 
-        if (tokens != NULL) clang_disposeTokens(tu, tokens, tokenCount);
         return found;
     }
 
@@ -2469,19 +2489,12 @@ namespace
         // TypedefDecl cursor.
         if (!tu) return true;
 
-        CXSourceRange range = clang_getCursorExtent(cursor);
-        CXToken* tokens = NULL;
-        unsigned tokenCount = 0;
-        clang_tokenize(tu, range, &tokens, &tokenCount);
-        if (!tokens || tokenCount == 0)
-        {
-            if (tokens) clang_disposeTokens(tu, tokens, tokenCount);
-            return true;
-        }
+        ScopedTokens tokens(tu, clang_getCursorExtent(cursor));
+        if (tokens.empty()) return true;
 
         bool sawKeyword = false;
         bool explicitTag = true;
-        for (unsigned i = 0; i < tokenCount; ++i)
+        for (unsigned i = 0; i < tokens.size(); ++i)
         {
             const std::string tok = ToStdString(clang_getTokenSpelling(tu, tokens[i]));
             if (!sawKeyword)
@@ -2509,7 +2522,6 @@ namespace
             break;
         }
 
-        clang_disposeTokens(tu, tokens, tokenCount);
         return explicitTag;
     }
 

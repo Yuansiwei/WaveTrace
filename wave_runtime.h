@@ -8268,16 +8268,22 @@ private:
         }
     }
 
-    NodeId add_dynamic_trace_target_object(const std::string& path,
+    template <typename HookReader>
+    NodeId add_runtime_typed_trace_object_(const std::string& path,
                                            NodeId parent_id,
-                                           const DynamicTraceTarget* target) {
-        if (!target) return 0;
-        const void* target_ptr = target->wave_trace_target_ptr();
-        const void* type_tag = target->wave_trace_target_type_tag();
-        if (!target_ptr || !type_tag) {
+                                           const char* source_label,
+                                           const char* pointer_label,
+                                           const void* object_ptr,
+                                           const void* type_tag,
+                                           std::uint32_t byte_width,
+                                           DynamicExpandFn fallback_expander,
+                                           HookReader hook_reader) {
+        if (!object_ptr || !type_tag) {
             if (options_.debug_log) {
-                debug_log_msg(std::string("dynamic target missing path=") + path +
-                              " target=" + detail::pointer_to_string(target_ptr) +
+                debug_log_msg(std::string(source_label ? source_label : "runtime source") +
+                              " missing path=" + path + " " +
+                              (pointer_label ? pointer_label : "object") + "=" +
+                              detail::pointer_to_string(object_ptr) +
                               " type_tag=" + detail::pointer_to_string(type_tag));
             }
             return 0;
@@ -8285,12 +8291,14 @@ private:
 
         DynamicExpandFn fn = find_dynamic_expander(type_tag);
         if (!fn) {
-            fn = target->wave_trace_dynamic_expander();
+            fn = fallback_expander;
         }
         if (!fn) {
             if (options_.debug_log) {
-                debug_log_msg(std::string("dynamic target unregistered path=") + path +
-                              " target=" + detail::pointer_to_string(target_ptr) +
+                debug_log_msg(std::string(source_label ? source_label : "runtime source") +
+                              " unregistered path=" + path + " " +
+                              (pointer_label ? pointer_label : "object") + "=" +
+                              detail::pointer_to_string(object_ptr) +
                               " type_tag=" + detail::pointer_to_string(type_tag));
             }
             return 0;
@@ -8298,9 +8306,9 @@ private:
 
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const std::uint32_t group_id = get_or_create_dirty_peek_group(
-            target_ptr,
+            object_ptr,
             type_tag,
-            target->wave_trace_target_byte_width());
+            byte_width);
 
         const std::uint32_t previous_group = active_dirty_peek_group_id_;
         const std::uint32_t previous_range = active_dirty_peek_range_id_;
@@ -8309,7 +8317,7 @@ private:
             active_dirty_peek_group_id_ = group_id;
             active_dirty_peek_range_id_ = kInvalidIndex;
         }
-        const NodeId result = fn(*this, path, parent_id, target_ptr);
+        const NodeId result = fn(*this, path, parent_id, object_ptr);
         const std::uint32_t end_new_range = static_cast<std::uint32_t>(dirty_peek_ranges_.size());
         active_dirty_peek_group_id_ = previous_group;
         active_dirty_peek_range_id_ = previous_range;
@@ -8320,7 +8328,7 @@ private:
         }
 
         if (first_new_range != end_new_range) {
-            WaveDirtyHook* hook = target->wave_trace_dirty_hook();
+            WaveDirtyHook* hook = hook_reader();
             bind_dirty_hook_to_group(hook, group_id);
             if (hook) {
                 mark_dirty_peek_ranges_hooked(group_id, first_new_range, end_new_range);
@@ -8329,65 +8337,40 @@ private:
         return result;
     }
 
+    NodeId add_dynamic_trace_target_object(const std::string& path,
+                                           NodeId parent_id,
+                                           const DynamicTraceTarget* target) {
+        if (!target) return 0;
+        return add_runtime_typed_trace_object_(
+            path,
+            parent_id,
+            "dynamic target",
+            "target",
+            target->wave_trace_target_ptr(),
+            target->wave_trace_target_type_tag(),
+            target->wave_trace_target_byte_width(),
+            target->wave_trace_dynamic_expander(),
+            [target]() -> WaveDirtyHook* {
+                return target->wave_trace_dirty_hook();
+            });
+    }
+
     NodeId add_peek_trace_source_object(const std::string& path,
                                         NodeId parent_id,
                                         const PeekTraceSource* source) {
         if (!source) return 0;
-        const void* value_ptr = source->wave_trace_peek_ptr();
-        const void* type_tag = source->wave_trace_peek_type_tag();
-        if (!value_ptr || !type_tag) {
-            if (options_.debug_log) {
-                debug_log_msg(std::string("peek source missing value path=") + path +
-                              " value=" + detail::pointer_to_string(value_ptr) +
-                              " type_tag=" + detail::pointer_to_string(type_tag));
-            }
-            return 0;
-        }
-
-        DynamicExpandFn fn = find_dynamic_expander(type_tag);
-        if (!fn) {
-            fn = source->wave_trace_peek_dynamic_expander();
-        }
-        if (!fn) {
-            if (options_.debug_log) {
-                debug_log_msg(std::string("peek source unregistered path=") + path +
-                              " value=" + detail::pointer_to_string(value_ptr) +
-                              " type_tag=" + detail::pointer_to_string(type_tag));
-            }
-            return 0;
-        }
-
-        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
-        const std::uint32_t group_id = get_or_create_dirty_peek_group(
-            value_ptr,
-            type_tag,
-            source->wave_trace_peek_byte_width());
-
-        const std::uint32_t previous_group = active_dirty_peek_group_id_;
-        const std::uint32_t previous_range = active_dirty_peek_range_id_;
-        const std::uint32_t first_new_range = static_cast<std::uint32_t>(dirty_peek_ranges_.size());
-        if (group_id != kInvalidIndex) {
-            active_dirty_peek_group_id_ = group_id;
-            active_dirty_peek_range_id_ = kInvalidIndex;
-        }
-        const NodeId result = fn(*this, path, parent_id, value_ptr);
-        const std::uint32_t end_new_range = static_cast<std::uint32_t>(dirty_peek_ranges_.size());
-        active_dirty_peek_group_id_ = previous_group;
-        active_dirty_peek_range_id_ = previous_range;
-
-        if (result == 0) {
-            rollback_topology_to(cp);
-            return 0;
-        }
-
-        if (first_new_range != end_new_range) {
-            WaveDirtyHook* hook = source->wave_trace_peek_dirty_hook();
-            bind_dirty_hook_to_group(hook, group_id);
-            if (hook) {
-                mark_dirty_peek_ranges_hooked(group_id, first_new_range, end_new_range);
-            }
-        }
-        return result;
+        return add_runtime_typed_trace_object_(
+            path,
+            parent_id,
+            "peek source",
+            "value",
+            source->wave_trace_peek_ptr(),
+            source->wave_trace_peek_type_tag(),
+            source->wave_trace_peek_byte_width(),
+            source->wave_trace_peek_dynamic_expander(),
+            [source]() -> WaveDirtyHook* {
+                return source->wave_trace_peek_dirty_hook();
+            });
     }
 
     template <typename IFace>

@@ -508,6 +508,83 @@ namespace {
         p.setRenderHint(QPainter::Antialiasing, oldAntialiasing);
     }
 
+    enum class DenseWaveBlockKind { Known, Z, Absent };
+
+    struct DenseWaveBlockSets {
+        QVector<QRect> knownMiniRects;
+        QVector<QRect> zMiniRects;
+        QVector<QRect> absentMiniRects;
+        QVector<int> knownBoundaryXs;
+        QVector<int> zBoundaryXs;
+        QVector<int> absentBoundaryXs;
+
+        void reserve(int expectedRects) {
+            const int capped = qMax(0, expectedRects);
+            knownMiniRects.reserve(capped);
+            zMiniRects.reserve(capped / 2 + 4);
+            absentMiniRects.reserve(capped / 2 + 4);
+            knownBoundaryXs.reserve(capped * 2);
+            zBoundaryXs.reserve(capped + 4);
+            absentBoundaryXs.reserve(capped + 4);
+        }
+
+        void addRect(const QRect& rect, DenseWaveBlockKind kind) {
+            QVector<QRect>& rects = (kind == DenseWaveBlockKind::Absent) ? absentMiniRects :
+                ((kind == DenseWaveBlockKind::Z) ? zMiniRects : knownMiniRects);
+            QVector<int>& boundaryXs = (kind == DenseWaveBlockKind::Absent) ? absentBoundaryXs :
+                ((kind == DenseWaveBlockKind::Z) ? zBoundaryXs : knownBoundaryXs);
+            rects.push_back(rect);
+            boundaryXs.push_back(rect.left());
+            boundaryXs.push_back(rect.right());
+        }
+    };
+
+    DenseWaveBlockKind denseBlockKindForBitState(QChar state) {
+        if (state == QLatin1Char('a')) return DenseWaveBlockKind::Absent;
+        if (state == QLatin1Char('z')) return DenseWaveBlockKind::Z;
+        return DenseWaveBlockKind::Known;
+    }
+
+    QColor denseBlockLineColor(DenseWaveBlockKind kind,
+                               const QColor& knownColor,
+                               const QColor& zColor,
+                               const QColor& absentColor) {
+        if (kind == DenseWaveBlockKind::Z) return zColor;
+        if (kind == DenseWaveBlockKind::Absent) return absentColor;
+        return knownColor;
+    }
+
+    QColor denseBitBlockFillColor(DenseWaveBlockKind kind,
+                                  const QColor& knownColor,
+                                  const QColor& zColor,
+                                  const QColor& absentColor) {
+        QColor fill = denseBlockLineColor(kind, knownColor, zColor, absentColor);
+        if (kind == DenseWaveBlockKind::Known) return fill;
+        fill.setAlpha(kind == DenseWaveBlockKind::Absent ? 80 : 95);
+        return fill;
+    }
+
+    void drawDenseWaveBlockSets(QPainter& p,
+                                const DenseWaveBlockSets& blocks,
+                                int yTop,
+                                int yBottom,
+                                const QColor& knownColor,
+                                const QColor& zColor,
+                                const QColor& absentColor) {
+        drawMergedDenseBusMiniRects(p, blocks.knownMiniRects, knownColor,
+                                    denseBitBlockFillColor(DenseWaveBlockKind::Known, knownColor, zColor, absentColor),
+                                    kWaveStrokeWidth);
+        drawMergedDenseBusMiniRects(p, blocks.zMiniRects, zColor,
+                                    denseBitBlockFillColor(DenseWaveBlockKind::Z, knownColor, zColor, absentColor),
+                                    kWaveStrokeWidth);
+        drawMergedDenseBusMiniRects(p, blocks.absentMiniRects, absentColor,
+                                    denseBitBlockFillColor(DenseWaveBlockKind::Absent, knownColor, zColor, absentColor),
+                                    kWaveStrokeWidth);
+        drawMergedBoundaryBlocks(p, blocks.knownBoundaryXs, yTop, yBottom, knownColor);
+        drawMergedBoundaryBlocks(p, blocks.zBoundaryXs, yTop, yBottom, zColor);
+        drawMergedBoundaryBlocks(p, blocks.absentBoundaryXs, yTop, yBottom, absentColor);
+    }
+
     QString normalizedTextValue(const QString& raw) {
         QString s = raw.trimmed();
         if (s.startsWith(QStringLiteral("0x"), Qt::CaseInsensitive)) return s.mid(2).toUpper();
@@ -1804,40 +1881,10 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     if (lastExclusive <= firstIdx) lastExclusive = qMin(lodSamples.size(), firstIdx + 1);
 
                     if (sig.kind == SignalKind::Bit) {
-                        enum class DenseBitBlockKind { Known, Z, Absent };
                         const int yBitTop = yHigh;
                         const int yBitBottom = yLow + 1;
-                        QVector<QRect> knownMiniRects;
-                        QVector<QRect> zMiniRects;
-                        QVector<QRect> absentMiniRects;
-                        QVector<int> knownBoundaryXs;
-                        QVector<int> zBoundaryXs;
-                        QVector<int> absentBoundaryXs;
-                        knownMiniRects.reserve(lastExclusive - firstIdx);
-                        zMiniRects.reserve((lastExclusive - firstIdx) / 2 + 4);
-                        absentMiniRects.reserve((lastExclusive - firstIdx) / 2 + 4);
-
-                        auto denseBitLineColor = [&](DenseBitBlockKind kind) {
-                            if (kind == DenseBitBlockKind::Z) return zColor;
-                            if (kind == DenseBitBlockKind::Absent) return absentColor;
-                            return isSelectedRow ? selectedKnownColor : waveGreen;
-                        };
-                        auto denseBitFillColor = [&](DenseBitBlockKind kind) {
-                            QColor fill = denseBitLineColor(kind);
-                            if (kind == DenseBitBlockKind::Known) return fill;
-                            fill.setAlpha(kind == DenseBitBlockKind::Absent ? 80 : (kind == DenseBitBlockKind::Z ? 95 : (isSelectedRow ? 118 : 105)));
-                            return fill;
-                        };
-                        auto addMiniRect = [&](const QRect& rect, DenseBitBlockKind kind) {
-                            QVector<QRect>& target = (kind == DenseBitBlockKind::Absent) ? absentMiniRects :
-                                ((kind == DenseBitBlockKind::Z) ? zMiniRects : knownMiniRects);
-                            target.push_back(rect);
-
-                            QVector<int>& boundaryTarget = (kind == DenseBitBlockKind::Absent) ? absentBoundaryXs :
-                                ((kind == DenseBitBlockKind::Z) ? zBoundaryXs : knownBoundaryXs);
-                            boundaryTarget.push_back(rect.left());
-                            boundaryTarget.push_back(rect.right());
-                        };
+                        DenseWaveBlockSets denseBlocks;
+                        denseBlocks.reserve(lastExclusive - firstIdx);
 
                         for (int i = firstIdx; i < lastExclusive; ++i) {
                             const WaveSample& sample = lodSamples.at(i);
@@ -1848,25 +1895,15 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                             if (segEnd <= segStart) continue;
 
                             const QChar state = classifyBitStateChar(sample);
-                            const DenseBitBlockKind kind = (state == QLatin1Char('a')) ? DenseBitBlockKind::Absent :
-                                ((state == QLatin1Char('z')) ? DenseBitBlockKind::Z : DenseBitBlockKind::Known);
+                            const DenseWaveBlockKind kind = denseBlockKindForBitState(state);
                             const int x1 = fastX(segStart);
                             const int x2 = qMax(x1 + 1, fastX(segEnd));
-                            addMiniRect(QRect(x1, yBitTop, x2 - x1, qMax(1, yBitBottom - yBitTop)), kind);
+                            denseBlocks.addRect(QRect(x1, yBitTop, x2 - x1, qMax(1, yBitBottom - yBitTop)), kind);
                         }
 
-                        drawMergedDenseBusMiniRects(p, knownMiniRects, denseBitLineColor(DenseBitBlockKind::Known),
-                                                    denseBitFillColor(DenseBitBlockKind::Known), kWaveStrokeWidth);
-                        drawMergedDenseBusMiniRects(p, zMiniRects, denseBitLineColor(DenseBitBlockKind::Z),
-                                                    denseBitFillColor(DenseBitBlockKind::Z), kWaveStrokeWidth);
-                        drawMergedDenseBusMiniRects(p, absentMiniRects, denseBitLineColor(DenseBitBlockKind::Absent),
-                                                    denseBitFillColor(DenseBitBlockKind::Absent), kWaveStrokeWidth);
-                        drawMergedBoundaryBlocks(p, knownBoundaryXs, yBitTop, yBitBottom,
-                                                 denseBitLineColor(DenseBitBlockKind::Known));
-                        drawMergedBoundaryBlocks(p, zBoundaryXs, yBitTop, yBitBottom,
-                                                 denseBitLineColor(DenseBitBlockKind::Z));
-                        drawMergedBoundaryBlocks(p, absentBoundaryXs, yBitTop, yBitBottom,
-                                                 denseBitLineColor(DenseBitBlockKind::Absent));
+                        drawDenseWaveBlockSets(p, denseBlocks, yBitTop, yBitBottom,
+                                               isSelectedRow ? selectedKnownColor : waveGreen,
+                                               zColor, absentColor);
                     } else {
                         const int yBusTop = yTop + 8;
                         const int yBusBottom = yTop + m_rowHeight - 8;
@@ -2182,41 +2219,14 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
             const int visibleCount = lastExclusive - firstIdx;
             const bool highDensity = visibleCount > qMax(4000, plotWidth * 8);
             if (highDensity) {
-                enum class DenseBitBlockKind { Known, Z, Absent };
                 const int yBitTop = yHigh;
                 const int yBitBottom = yLow + 1;
-                QVector<QRect> knownMiniRects;
-                QVector<QRect> zMiniRects;
-                QVector<QRect> absentMiniRects;
-                QVector<int> knownBoundaryXs;
-                QVector<int> zBoundaryXs;
-                QVector<int> absentBoundaryXs;
+                DenseWaveBlockSets denseBlocks;
                 QVector<int> sampled = collectBitAlternatingSampleIndicesForWindow(
                     sig, entry.signalIndex, m_viewStart, m_viewEnd, qMax(64, plotWidth * 3));
                 std::sort(sampled.begin(), sampled.end());
                 sampled.erase(std::unique(sampled.begin(), sampled.end()), sampled.end());
-
-                auto denseBitLineColor = [&](DenseBitBlockKind kind) {
-                    if (kind == DenseBitBlockKind::Z) return zColor;
-                    if (kind == DenseBitBlockKind::Absent) return absentColor;
-                    return isSelectedRow ? selectedKnownColor : waveGreen;
-                };
-                auto denseBitFillColor = [&](DenseBitBlockKind kind) {
-                    QColor fill = denseBitLineColor(kind);
-                    if (kind == DenseBitBlockKind::Known) return fill;
-                    fill.setAlpha(kind == DenseBitBlockKind::Absent ? 80 : (kind == DenseBitBlockKind::Z ? 95 : (isSelectedRow ? 118 : 105)));
-                    return fill;
-                };
-                auto addMiniRect = [&](const QRect& rect, DenseBitBlockKind kind) {
-                    QVector<QRect>& target = (kind == DenseBitBlockKind::Absent) ? absentMiniRects :
-                        ((kind == DenseBitBlockKind::Z) ? zMiniRects : knownMiniRects);
-                    target.push_back(rect);
-
-                    QVector<int>& boundaryTarget = (kind == DenseBitBlockKind::Absent) ? absentBoundaryXs :
-                        ((kind == DenseBitBlockKind::Z) ? zBoundaryXs : knownBoundaryXs);
-                    boundaryTarget.push_back(rect.left());
-                    boundaryTarget.push_back(rect.right());
-                };
+                denseBlocks.reserve(sampled.size());
 
                 for (int s = 0; s < sampled.size(); ++s) {
                     const int i = sampled.at(s);
@@ -2233,26 +2243,16 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     if (segEnd <= segStart) continue;
 
                     const QChar state = classifyBitStateChar(sample);
-                    const DenseBitBlockKind kind = (state == QLatin1Char('a')) ? DenseBitBlockKind::Absent :
-                        ((state == QLatin1Char('z')) ? DenseBitBlockKind::Z : DenseBitBlockKind::Known);
+                    const DenseWaveBlockKind kind = denseBlockKindForBitState(state);
                     const int x1 = fastX(segStart);
                     const int x2 = qMax(x1 + 1, fastX(segEnd));
                     const QRect rect(x1, yBitTop, x2 - x1, qMax(1, yBitBottom - yBitTop));
-                    addMiniRect(rect, kind);
+                    denseBlocks.addRect(rect, kind);
                 }
 
-                drawMergedDenseBusMiniRects(p, knownMiniRects, denseBitLineColor(DenseBitBlockKind::Known),
-                                            denseBitFillColor(DenseBitBlockKind::Known), kWaveStrokeWidth);
-                drawMergedDenseBusMiniRects(p, zMiniRects, denseBitLineColor(DenseBitBlockKind::Z),
-                                            denseBitFillColor(DenseBitBlockKind::Z), kWaveStrokeWidth);
-                drawMergedDenseBusMiniRects(p, absentMiniRects, denseBitLineColor(DenseBitBlockKind::Absent),
-                                            denseBitFillColor(DenseBitBlockKind::Absent), kWaveStrokeWidth);
-                drawMergedBoundaryBlocks(p, knownBoundaryXs, yBitTop, yBitBottom,
-                                         denseBitLineColor(DenseBitBlockKind::Known));
-                drawMergedBoundaryBlocks(p, zBoundaryXs, yBitTop, yBitBottom,
-                                         denseBitLineColor(DenseBitBlockKind::Z));
-                drawMergedBoundaryBlocks(p, absentBoundaryXs, yBitTop, yBitBottom,
-                                         denseBitLineColor(DenseBitBlockKind::Absent));
+                drawDenseWaveBlockSets(p, denseBlocks, yBitTop, yBitBottom,
+                                       isSelectedRow ? selectedKnownColor : waveGreen,
+                                       zColor, absentColor);
             } else {
                 std::vector<int> lowDiff(plotWidth + 1, 0);
                 std::vector<int> highDiff(plotWidth + 1, 0);

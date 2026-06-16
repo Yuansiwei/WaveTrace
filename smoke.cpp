@@ -81,12 +81,33 @@ int main(){
         return 2;
     }
 
+    PeekSmokeSource peek_hook_source;
+    if (!peek_hook_source.wave_trace_peek_dirty_hook() ||
+        peek_hook_source.wave_trace_peek_dirty_hook() != peek_hook_source.wave_dirty_hook()) {
+        std::cerr << "missing peek dirty hook\n";
+        return 3;
+    }
+
+    int peek_dirty_count = 0;
+    peek_hook_source.wave_dirty_hook()->bind(&peek_dirty_count, 42, &count_dirty_mark);
+    peek_hook_source.wave_dirty_hook()->mark_dirty();
+    if (peek_dirty_count != 1) {
+        std::cerr << "peek dirty hook did not fire\n";
+        return 4;
+    }
+    PeekSmokeSource copied_peek_source = peek_hook_source;
+    copied_peek_source.wave_dirty_hook()->mark_dirty();
+    if (peek_dirty_count != 1) {
+        std::cerr << "copied peek dirty hook kept binding\n";
+        return 5;
+    }
+
     DynamicSmokeTarget dynamic_target;
     dynamic_target.count = 3;
     if (!dynamic_target.wave_trace_dirty_hook() ||
         dynamic_target.wave_trace_dirty_hook() != dynamic_target.wave_dirty_hook()) {
         std::cerr << "missing dynamic dirty hook\n";
-        return 3;
+        return 6;
     }
 
     int dirty_count = 0;
@@ -94,13 +115,13 @@ int main(){
     dynamic_target.wave_dirty_hook()->mark_dirty();
     if (dirty_count != 1) {
         std::cerr << "dynamic dirty hook did not fire\n";
-        return 4;
+        return 7;
     }
     DynamicSmokeTarget copied_target = dynamic_target;
     copied_target.wave_dirty_hook()->mark_dirty();
     if (dirty_count != 1) {
         std::cerr << "copied dynamic dirty hook kept binding\n";
-        return 5;
+        return 8;
     }
 
     return 0;

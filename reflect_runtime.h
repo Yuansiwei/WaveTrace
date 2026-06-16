@@ -202,6 +202,18 @@ struct Serializer<T, typename std::enable_if<std::is_enum<T>::value>::type> {
     }
 };
 
+template <typename Range>
+void serialize_sequence(std::ostream& out, const Range& value, VisitSet& visited) {
+    out << "[";
+    bool first = true;
+    for (const auto& item : value) {
+        if (!first) out << ", ";
+        first = false;
+        serialize_value(out, item, visited);
+    }
+    out << "]";
+}
+
 inline void serialize_value(std::ostream& out, const std::string& value, VisitSet&) {
     write_escaped(out, value);
 }
@@ -258,22 +270,12 @@ void serialize_value(std::ostream& out, const std::weak_ptr<T>& ptr, VisitSet& v
 
 template <typename T, std::size_t N>
 void serialize_value(std::ostream& out, const std::array<T, N>& value, VisitSet& visited) {
-    out << "[";
-    for (std::size_t i = 0; i < N; ++i) {
-        if (i) out << ", ";
-        serialize_value(out, value[i], visited);
-    }
-    out << "]";
+    serialize_sequence(out, value, visited);
 }
 
 template <typename T>
 void serialize_value(std::ostream& out, const std::vector<T>& value, VisitSet& visited) {
-    out << "[";
-    for (std::size_t i = 0; i < value.size(); ++i) {
-        if (i) out << ", ";
-        serialize_value(out, value[i], visited);
-    }
-    out << "]";
+    serialize_sequence(out, value, visited);
 }
 
 template <typename A, typename B>

@@ -11,6 +11,10 @@
 
 class QLabel;
 class QDialog;
+class QDragEnterEvent;
+class QDragMoveEvent;
+class QDropEvent;
+class QEvent;
 class QLineEdit;
 class QPushButton;
 class QIcon;
@@ -31,6 +35,19 @@ public:
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override;
     bool openWaveFilePath(const QString& path, bool showError = true);
+    bool compareWaveFilePaths(const QString& leftPath,
+                              const QString& rightPath,
+                              bool showProgress = true,
+                              bool showMessages = true,
+                              QString* errorMessage = nullptr,
+                              qint64* elapsedMs = nullptr,
+                              int* resultSignalCount = nullptr);
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override;
+    void dragEnterEvent(QDragEnterEvent* event) override;
+    void dragMoveEvent(QDragMoveEvent* event) override;
+    void dropEvent(QDropEvent* event) override;
 
 private:
     void openWaveFile();
@@ -132,6 +149,7 @@ private:
     void clampWindowToAvailableScreen();
     void refreshActiveValueLabels();
     void scheduleRefreshActiveValueLabels(int delayMs = 35);
+    bool handleWaveFileDropEvent(QEvent* event);
 
     void insertSignalIntoTree(const QString& fullName, int signalIndex);
     bool canDeferSamplesWithLod(const WaveSignal& sig) const;

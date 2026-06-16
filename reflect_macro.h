@@ -152,6 +152,10 @@ template <typename DerivedT, typename ValueT>
 struct PeekTraceSourceFor : PeekTraceSource {
     typedef ValueT wave_trace_peek_value_type;
 
+protected:
+    mutable WaveDirtyHook peek_trace_dirty_hook_;
+
+public:
     const void* wave_trace_peek_ptr() const override {
         const DerivedT* self = static_cast<const DerivedT*>(this);
         const ValueT* value = const_cast<DerivedT*>(self)->peek();
@@ -168,6 +172,14 @@ struct PeekTraceSourceFor : PeekTraceSource {
 
     DynamicExpandFn wave_trace_peek_dynamic_expander() const override {
         return &dynamic_expand_bridge<ValueT>;
+    }
+
+    WaveDirtyHook* wave_trace_peek_dirty_hook() const override {
+        return wave_dirty_hook();
+    }
+
+    WaveDirtyHook* wave_dirty_hook() const {
+        return &peek_trace_dirty_hook_;
     }
 };
 
