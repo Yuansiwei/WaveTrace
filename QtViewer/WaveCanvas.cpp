@@ -289,16 +289,24 @@ namespace {
 #endif
     }
 
-    static inline int mouseEventXCompat(const QMouseEvent* event) {
-        return mouseEventPosCompat(event).x();
+    static inline QPointF mouseEventPosFCompat(const QMouseEvent* event) {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+        return event->position();
+#else
+        return event->pos();
+#endif
     }
 
-    static inline int mouseEventYCompat(const QMouseEvent* event) {
-        return mouseEventPosCompat(event).y();
+    static inline double mouseEventXCompat(const QMouseEvent* event) {
+        return mouseEventPosFCompat(event).x();
+    }
+
+    static inline double mouseEventYCompat(const QMouseEvent* event) {
+        return mouseEventPosFCompat(event).y();
     }
 
     static inline int wheelEventXCompat(const QWheelEvent* event) {
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
         return int(std::lround(event->position().x()));
 #else
         return event->pos().x();
@@ -709,7 +717,7 @@ namespace {
     }
 
     QString internalTimeText(qint64 value) {
-        return QString::number(value);
+        return waveFormatDisplayTime(value);
     }
 
     QString forceFloatingDecimalPoint(QString text) {
@@ -1426,8 +1434,9 @@ bool WaveCanvas::jumpToTime(qint64 internalTime) {
 qint64 WaveCanvas::xToTime(double x) const {
     const double usable = double(plotSpanPxForWidth(width(), m_padX));
     if (usable <= 1.0) return m_viewStart;
-    const double clamped = qBound<double>(m_padX, x, m_padX + usable);
-    const double ratio = (clamped - m_padX) / usable;
+    const double localX = qBound<double>(0.0, x - double(m_padX), usable);
+    const double centeredX = qBound<double>(0.0, localX + 0.5, usable);
+    const double ratio = centeredX / usable;
     return m_viewStart + static_cast<qint64>(std::llround(ratio * double(span())));
 }
 
@@ -1714,13 +1723,15 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
         return lo;
     };
 
-    const double first = qCeil(m_viewStart / step) * step;
-    for (double t = first; t <= m_viewEnd + 1e-9; t += step) {
-        const int x = fastX(static_cast<qint64>(std::llround(t)));
+    const qint64 tickStep = qMax<qint64>(1, static_cast<qint64>(std::llround(step)));
+    for (qint64 t = m_viewStart; t <= m_viewEnd;) {
+        const int x = fastX(t);
         p.setPen(QPen(QColor(255, 255, 255, 45), 1, Qt::DashLine));
         p.drawLine(x, 0, x, mainBottom);
         p.setPen(QColor("#D8E6F6"));
-        p.drawText(QPoint(x + 4, 26), internalTimeText(static_cast<qint64>(std::llround(t))));
+        p.drawText(QPoint(x + 4, 26), internalTimeText(t));
+        if (t > std::numeric_limits<qint64>::max() - tickStep) break;
+        t += tickStep;
     }
 
     const QColor waveGreen("#22C55E");
@@ -1922,7 +1933,8 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                         };
                         auto denseMiniFrameFillColor = [&](DenseMiniFrameKind kind) {
                             QColor fill = denseMiniFrameLineColor(kind);
-                            fill.setAlpha(kind == DenseMiniFrameKind::Absent ? 80 : (kind == DenseMiniFrameKind::Z ? 95 : (isSelectedRow ? 105 : 88)));
+                            if (kind == DenseMiniFrameKind::Known) return fill;
+                            fill.setAlpha(kind == DenseMiniFrameKind::Absent ? 80 : 95);
                             return fill;
                         };
                         auto sampleKind = [&](const WaveSample& sample) {
@@ -2117,7 +2129,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
             const int yBusBottom = yTop + m_rowHeight - 8;
             const int denseActivityMiniFrameMaxWidth = 6;
             const QColor lodActivityLineColor = isSelectedRow ? waveGreen.lighter(130) : waveGreen;
-            const QColor lodActivityFillColor = isSelectedRow ? QColor(68, 190, 118, 140) : QColor(34, 197, 94, 120);
+            const QColor lodActivityFillColor = lodActivityLineColor;
             QVector<QRect> lodActivityMiniRects;
             QVector<int> lodActivityBoundaryXs;
             auto addLodActivityBoundaryX = [&](int x) {
@@ -2490,7 +2502,8 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                 };
                 auto denseMiniFrameFillColor = [&](DenseMiniFrameKind kind) {
                     QColor fill = denseMiniFrameLineColor(kind);
-                    fill.setAlpha(kind == DenseMiniFrameKind::Absent ? 80 : (kind == DenseMiniFrameKind::Z ? 95 : (isSelectedRow ? 105 : 88)));
+                    if (kind == DenseMiniFrameKind::Known) return fill;
+                    fill.setAlpha(kind == DenseMiniFrameKind::Absent ? 80 : 95);
                     return fill;
                 };
                 auto addFrameBoundaryXs = [&](int leftX, int rightX, bool drawLeftEdge, bool drawRightEdge, DenseMiniFrameKind kind) {
@@ -2614,7 +2627,7 @@ void WaveCanvas::mousePressEvent(QMouseEvent* event) {
         m_pendingClickCtrlHeld = false;
         if (mouseEventYCompat(event) >= 0.0 && mouseEventYCompat(event) < m_timeHeaderHeight) {
             m_rulerSelecting = true;
-            m_rulerDragStartPos = mouseEventPosCompat(event);
+            m_rulerDragStartPos = mouseEventPosFCompat(event);
             m_rulerSelectAnchorTime = xToTime(mouseEventXCompat(event));
             m_rulerSelectCurrentTime = m_rulerSelectAnchorTime;
             m_rulerSelectionMoved = false;
@@ -2648,7 +2661,7 @@ void WaveCanvas::mousePressEvent(QMouseEvent* event) {
         }
 
         m_rulerSelecting = true;
-        m_rulerDragStartPos = mouseEventPosCompat(event);
+        m_rulerDragStartPos = mouseEventPosFCompat(event);
         m_rulerSelectAnchorTime = xToTime(mouseEventXCompat(event));
         m_rulerSelectCurrentTime = m_rulerSelectAnchorTime;
         m_rulerSelectionMoved = false;
@@ -2663,7 +2676,7 @@ void WaveCanvas::mousePressEvent(QMouseEvent* event) {
         if (mouseEventYCompat(event) >= m_timeHeaderHeight && !overviewRect().contains(mouseEventPosCompat(event))) {
             m_dragging = true;
             m_panDragMoved = false;
-            m_dragStartPos = mouseEventPosCompat(event);
+            m_dragStartPos = mouseEventPosFCompat(event);
             m_dragStartViewStart = m_viewStart;
             m_dragStartViewEnd = m_viewEnd;
             m_pendingClickRow = -1;
@@ -2712,7 +2725,7 @@ void WaveCanvas::mouseMoveEvent(QMouseEvent* event) {
     if (m_dragging) {
         const double usable = double(plotSpanPxForWidth(width(), m_padX));
         const double dx = mouseEventXCompat(event) - m_dragStartPos.x();
-        if (!m_panDragMoved && std::abs(dx) < 4) {
+        if (std::abs(dx) < 0.001) {
             event->accept();
             return;
         }
@@ -2771,14 +2784,17 @@ void WaveCanvas::mouseReleaseEvent(QMouseEvent* event) {
         m_panDragMoved = false;
         m_pendingClickRow = -1;
         m_pendingClickCtrlHeld = false;
+        Q_EMIT viewportChanged(m_viewStart, m_viewEnd);
         update();
         event->accept();
         return;
     }
 
+    const bool wasOverviewDragging = m_overviewDragging;
     m_dragging = false;
     m_panDragMoved = false;
     m_overviewDragging = false;
+    if (wasOverviewDragging) Q_EMIT viewportChanged(m_viewStart, m_viewEnd);
     QWidget::mouseReleaseEvent(event);
 }
 

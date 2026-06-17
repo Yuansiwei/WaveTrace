@@ -22,6 +22,7 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <utility>
 
 namespace reflect {
 
@@ -123,7 +124,7 @@ public:
     }
 
     DynamicExpandFn wave_trace_dynamic_expander() const override {
-        return &dynamic_expand_bridge<T>;
+        return NULL;
     }
 
     WaveDirtyHook* wave_trace_dirty_hook() const override {
@@ -171,7 +172,7 @@ public:
     }
 
     DynamicExpandFn wave_trace_peek_dynamic_expander() const override {
-        return &dynamic_expand_bridge<ValueT>;
+        return NULL;
     }
 
     WaveDirtyHook* wave_trace_peek_dirty_hook() const override {
@@ -216,6 +217,7 @@ namespace detail {
 struct UnionFieldTag {};
 
 struct UnionFieldBase {
+    UnionFieldBase() : ptr(nullptr) {}
     explicit UnionFieldBase(const void* p) : ptr(p) {}
     const void* ptr;
 };
@@ -286,6 +288,54 @@ template <typename T>
 struct is_wave_value : std::false_type {};
 
 template <typename T> struct is_wave_array : std::false_type {};
+
+template <typename PtrT> struct is_wave_ptr_storage : std::false_type {};
+
+template <typename PtrT> struct wave_ptr_storage_traits {
+    typedef void element_type;
+};
+
+template <typename T>
+struct is_wave_ptr_storage<T*> : std::integral_constant<bool,
+    !std::is_void<typename std::remove_cv<T>::type>::value &&
+    !std::is_array<typename std::remove_cv<T>::type>::value
+> {};
+
+template <typename T>
+struct wave_ptr_storage_traits<T*> {
+    typedef T element_type;
+    static element_type* get(T* p) noexcept { return p; }
+    static void reset(T*& p) noexcept { p = NULL; }
+    static void reset(T*& p, element_type* value) noexcept { p = value; }
+};
+
+template <typename T, typename D>
+struct is_wave_ptr_storage<std::unique_ptr<T, D> > : std::integral_constant<bool,
+    !std::is_void<typename std::remove_cv<T>::type>::value &&
+    !std::is_array<T>::value
+> {};
+
+template <typename T, typename D>
+struct wave_ptr_storage_traits<std::unique_ptr<T, D> > {
+    typedef T element_type;
+    static element_type* get(const std::unique_ptr<T, D>& p) noexcept { return p.get(); }
+    static void reset(std::unique_ptr<T, D>& p) noexcept { p.reset(); }
+};
+
+template <typename T>
+struct is_wave_ptr_storage<std::shared_ptr<T> > : std::integral_constant<bool,
+    !std::is_void<typename std::remove_cv<T>::type>::value &&
+    !std::is_array<T>::value
+> {};
+
+template <typename T>
+struct wave_ptr_storage_traits<std::shared_ptr<T> > {
+    typedef T element_type;
+    static element_type* get(const std::shared_ptr<T>& p) noexcept { return p.get(); }
+    static void reset(std::shared_ptr<T>& p) noexcept { p.reset(); }
+};
+
+template <typename T> struct is_wave_ptr : std::false_type {};
 
 } // namespace detail
 
@@ -407,6 +457,108 @@ WAVE_DEFINE_WAVEVALUE_ALIAS(WaveDouble, double);
 
 static_assert(sizeof(WaveValue<std::uint32_t>) == sizeof(std::uint32_t), "WaveValue size mismatch");
 static_assert(alignof(WaveValue<std::uint32_t>) == alignof(std::uint32_t), "WaveValue align mismatch");
+
+// WavePtr<PtrT> is a pointer-like wrapper whose tracing semantic is:
+// expand the single object currently referenced by the wrapped pointer.
+//
+// Supported PtrT forms:
+//   T*
+//   std::unique_ptr<T, D>
+//   std::shared_ptr<T>
+//
+// The pointee T does not need to inherit DirectReflectPointerTarget.  The
+// wrapper itself is the explicit opt-in marker.  Topology is still stable:
+// changing the pointer after topology preparation does not rebuild the tree.
+template <typename PtrT>
+class WavePtr {
+    static_assert(detail::is_wave_ptr_storage<PtrT>::value,
+                  "wave::WavePtr<PtrT> requires PtrT to be T*, std::unique_ptr<T, D>, or std::shared_ptr<T> for a non-array object type");
+
+public:
+    typedef PtrT pointer_type;
+    typedef typename detail::wave_ptr_storage_traits<PtrT>::element_type element_type;
+
+    WavePtr() noexcept : ptr_() {}
+    WavePtr(std::nullptr_t) noexcept : ptr_() {}
+    WavePtr(const WavePtr& other) = default;
+    WavePtr& operator=(const WavePtr& other) = default;
+    WavePtr(WavePtr&& other) noexcept : ptr_(std::move(other.ptr_)) {}
+    WavePtr& operator=(WavePtr&& other) noexcept {
+        ptr_ = std::move(other.ptr_);
+        return *this;
+    }
+
+    template <typename U = PtrT, typename std::enable_if<std::is_pointer<U>::value, int>::type = 0>
+    WavePtr(element_type* ptr) noexcept : ptr_(ptr) {}
+
+    template <typename U = PtrT, typename std::enable_if<std::is_pointer<U>::value, int>::type = 0>
+    WavePtr& operator=(element_type* ptr) noexcept {
+        detail::wave_ptr_storage_traits<PtrT>::reset(ptr_, ptr);
+        return *this;
+    }
+
+    template <typename U = PtrT, typename std::enable_if<!std::is_pointer<U>::value && std::is_copy_constructible<U>::value, int>::type = 0>
+    WavePtr(const U& ptr) : ptr_(ptr) {}
+
+    template <typename U = PtrT, typename std::enable_if<!std::is_pointer<U>::value && std::is_copy_assignable<U>::value, int>::type = 0>
+    WavePtr& operator=(const U& ptr) {
+        ptr_ = ptr;
+        return *this;
+    }
+
+    template <typename U = PtrT, typename std::enable_if<!std::is_pointer<U>::value, int>::type = 0>
+    WavePtr(PtrT&& ptr) noexcept : ptr_(std::move(ptr)) {}
+
+    template <typename U = PtrT, typename std::enable_if<!std::is_pointer<U>::value, int>::type = 0>
+    WavePtr& operator=(PtrT&& ptr) noexcept {
+        ptr_ = std::move(ptr);
+        return *this;
+    }
+
+    WavePtr& operator=(std::nullptr_t) noexcept {
+        detail::wave_ptr_storage_traits<PtrT>::reset(ptr_);
+        return *this;
+    }
+
+    element_type* get() const noexcept {
+        return detail::wave_ptr_storage_traits<PtrT>::get(ptr_);
+    }
+
+    element_type& operator*() const noexcept { return *get(); }
+    element_type* operator->() const noexcept { return get(); }
+    operator element_type*() const noexcept { return get(); }
+    explicit operator bool() const noexcept { return get() != NULL; }
+
+    void reset() noexcept {
+        detail::wave_ptr_storage_traits<PtrT>::reset(ptr_);
+    }
+
+    PtrT& storage() noexcept { return ptr_; }
+    const PtrT& storage() const noexcept { return ptr_; }
+
+    PtrT& raw_storage_unsafe_for_initialization_only() noexcept { return ptr_; }
+    const PtrT& raw_storage_unsafe_for_initialization_only() const noexcept { return ptr_; }
+
+private:
+    PtrT ptr_;
+};
+
+template <typename PtrT>
+struct detail::is_wave_ptr<WavePtr<PtrT> > : std::true_type {};
+
+template <typename WavePtrT>
+struct wave_ptr_traits;
+
+template <typename PtrT>
+struct wave_ptr_traits<WavePtr<PtrT> > {
+    typedef PtrT pointer_type;
+    typedef typename detail::wave_ptr_storage_traits<PtrT>::element_type element_type;
+};
+
+template <typename PtrT>
+WavePtr<typename std::decay<PtrT>::type> make_wave_ptr(PtrT&& ptr) {
+    return WavePtr<typename std::decay<PtrT>::type>(std::forward<PtrT>(ptr));
+}
 
 template <typename T, std::size_t N> class array;
 

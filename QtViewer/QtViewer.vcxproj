@@ -74,7 +74,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>Qt6EntryPoint.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(QtEntryPointLib);%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/MANIFESTINPUT:&quot;$(MSBuildProjectDirectory)\app.manifest&quot; %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
@@ -99,7 +99,7 @@
       <EnableUAC>false</EnableUAC>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalDependencies>Qt6EntryPoint.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(QtEntryPointLib);%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/MANIFESTINPUT:&quot;$(MSBuildProjectDirectory)\app.manifest&quot; %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
@@ -157,6 +157,18 @@
     <Exec Command="&quot;$(QtLocalBin)uic.exe&quot; &quot;$(MSBuildProjectDirectory)\QtSingalViewer.ui&quot; -o &quot;$(QtGeneratedDir)ui_QtSingalViewer.h&quot;" />
     <Exec Command="&quot;$(QtLocalBin)rcc.exe&quot; -name QtSingalViewer &quot;$(MSBuildProjectDirectory)\QtSingalViewer.qrc&quot; -o &quot;$(QtGeneratedDir)qrc_QtSingalViewer.cpp&quot;" />
     <Exec Command="&quot;$(QtLocalBin)rcc.exe&quot; -name resources &quot;$(MSBuildProjectDirectory)\resources.qrc&quot; -o &quot;$(QtGeneratedDir)qrc_resources.cpp&quot;" />
+  </Target>
+
+  <Target Name="DeployQtRuntime" AfterTargets="Build">
+    <MakeDir Directories="$(OutDir)platforms\" />
+    <Copy SourceFiles="$(QtLocalBin)Qt5Core.dll;$(QtLocalBin)Qt5Gui.dll;$(QtLocalBin)Qt5Widgets.dll"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(QtLocalBin)Qt5Core.dll')" />
+    <Copy SourceFiles="$(QtLocalPlugins)platforms\qwindows.dll"
+          DestinationFolder="$(OutDir)platforms\"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(QtLocalPlugins)platforms\qwindows.dll')" />
   </Target>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

@@ -4806,7 +4806,7 @@ private:
         std::ostringstream os;
         os << "\\\\.\\pipe\\WaveTraceWVZ4Writer_"
            << static_cast<unsigned long>(GetCurrentProcessId()) << "_"
-           << static_cast<unsigned long long>(GetTickCount64()) << "_"
+           << static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()) << "_"
            << reinterpret_cast<std::uintptr_t>(&os);
         return os.str();
     }
@@ -4859,7 +4859,7 @@ private:
     }
 
     bool connect_pipe(DWORD timeout_ms, std::string& error) {
-        const ULONGLONG start = GetTickCount64();
+        const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
         while (true) {
             pipe_ = CreateFileA(pipe_name_.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
                                 NULL, OPEN_EXISTING, 0, NULL);
@@ -4870,8 +4870,9 @@ private:
                 error = "WVZ4 writer helper exited before pipe connection";
                 return false;
             }
-            const ULONGLONG elapsed = GetTickCount64() - start;
-            if (elapsed >= timeout_ms) {
+            const unsigned long long elapsed_ms = static_cast<unsigned long long>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+            if (elapsed_ms >= static_cast<unsigned long long>(timeout_ms)) {
                 error = "timed out connecting to WVZ4 writer helper pipe";
                 return false;
             }

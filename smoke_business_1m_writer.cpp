@@ -12,6 +12,8 @@
 
 namespace {
 
+constexpr wvz4::u64 kWriterTicksPerBusinessCycle = 10;
+
 struct SignalMeta {
     wvz4::ValueType type = wvz4::ValueType::U64;
     wvz4::u32 bit_width = 64;
@@ -220,8 +222,10 @@ int main(int argc, char** argv) {
         std::cerr << "too many positional arguments\n";
         return 2;
     }
-    if (business_cycles == 0 || business_cycles > static_cast<wvz4::u64>((std::numeric_limits<wvz4::i64>::max)())) {
-        std::cerr << "cycle count must be in 1..INT64_MAX\n";
+    const wvz4::u64 max_writer_cycle = static_cast<wvz4::u64>((std::numeric_limits<wvz4::i64>::max)());
+    if (business_cycles == 0 || business_cycles > max_writer_cycle / kWriterTicksPerBusinessCycle) {
+        std::cerr << "cycle count must be in 1.." << (max_writer_cycle / kWriterTicksPerBusinessCycle)
+                  << " when scaled by writer ticks per business cycle\n";
         return 2;
     }
     if (signal_count_64 < 32u || signal_count_64 > 1000000u) {
@@ -275,7 +279,7 @@ int main(int argc, char** argv) {
         }
 
         wvz4::CycleSubmission submission;
-        submission.cycle = static_cast<wvz4::i64>(cycle);
+        submission.cycle = static_cast<wvz4::i64>(cycle * kWriterTicksPerBusinessCycle);
         submission.updates.reserve(static_cast<std::size_t>(rotating_update_count) + 24u);
 
         append_update_once(submission, seen_epoch, epoch, 1, metas, cycle);
@@ -321,6 +325,17 @@ int main(int argc, char** argv) {
         }
     }
 
+    const wvz4::u64 end_marker_cycle = business_cycles * kWriterTicksPerBusinessCycle - 1u;
+    wvz4::CycleSubmission end_marker;
+    end_marker.cycle = static_cast<wvz4::i64>(end_marker_cycle);
+    const bool submitted_end_marker = use_helper_process
+        ? helper_writer.submit_cycle(end_marker, error)
+        : writer.submit_cycle(end_marker, error);
+    if (!submitted_end_marker) {
+        std::cerr << "submit end marker failed at writer cycle " << end_marker_cycle << ": " << error << "\n";
+        return 3;
+    }
+
     const bool closed = use_helper_process ? helper_writer.close(error) : writer.close(error);
     if (!closed) {
         std::cerr << "close failed: " << error << "\n";
@@ -333,6 +348,7 @@ int main(int argc, char** argv) {
     std::cout << "path=" << output_path << "\n";
     std::cout << "writer_mode=" << (use_helper_process ? "helper" : "direct") << "\n";
     std::cout << "business_cycles=" << business_cycles << "\n";
+    std::cout << "writer_ticks_per_business_cycle=" << kWriterTicksPerBusinessCycle << "\n";
     std::cout << "signals=" << signal_count << "\n";
     std::cout << "rotating_updates_per_cycle=" << rotating_updates_per_cycle << "\n";
     std::cout << "lod_tables=" << (enable_lod_tables ? 1 : 0) << "\n";

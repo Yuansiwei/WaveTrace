@@ -5,6 +5,7 @@
 #include <QtGlobal>
 
 #include <cstring>
+#include <cmath>
 #include <limits>
 
 enum class SignalKind {
@@ -135,6 +136,49 @@ struct ActiveSignalRef {
 inline const QString& waveAbsentValue() {
     static const QString kValue = QStringLiteral("__WVZ_ABSENT__");
     return kValue;
+}
+
+inline constexpr qint64 kWaveViewerDisplayTicksPerCycle = 10;
+
+inline QString waveFormatDisplayTime(qint64 internalTime) {
+    qint64 decimalBase = kWaveViewerDisplayTicksPerCycle;
+    int decimals = 0;
+    while (decimalBase > 1 && decimalBase % 10 == 0) {
+        decimalBase /= 10;
+        ++decimals;
+    }
+
+    if (decimalBase != 1) {
+        QString text = QString::number(double(internalTime) / double(kWaveViewerDisplayTicksPerCycle), 'f', 6);
+        while (text.contains(QLatin1Char('.')) && text.endsWith(QLatin1Char('0'))) text.chop(1);
+        if (text.endsWith(QLatin1Char('.'))) text.chop(1);
+        return text;
+    }
+
+    const qint64 whole = internalTime / kWaveViewerDisplayTicksPerCycle;
+    qint64 rem = internalTime % kWaveViewerDisplayTicksPerCycle;
+    if (rem == 0) return QString::number(whole);
+    if (rem < 0) rem = -rem;
+
+    QString frac = QString::number(rem).rightJustified(decimals, QLatin1Char('0'));
+    while (frac.endsWith(QLatin1Char('0'))) frac.chop(1);
+    const QString wholeText = (internalTime < 0 && whole == 0) ? QStringLiteral("-0") : QString::number(whole);
+    return wholeText + QLatin1Char('.') + frac;
+}
+
+inline bool waveParseDisplayTime(const QString& text, qint64& internalTime) {
+    bool ok = false;
+    const double displayTime = text.trimmed().toDouble(&ok);
+    if (!ok || !std::isfinite(displayTime)) return false;
+
+    const double raw = displayTime * double(kWaveViewerDisplayTicksPerCycle);
+    if (raw < double(std::numeric_limits<qint64>::min()) ||
+        raw > double(std::numeric_limits<qint64>::max())) {
+        return false;
+    }
+
+    internalTime = static_cast<qint64>(std::llround(raw));
+    return true;
 }
 
 inline bool isWaveAbsentValue(const QString& value) {

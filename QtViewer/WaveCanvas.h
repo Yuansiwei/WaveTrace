@@ -3,6 +3,7 @@
 #include "WaveTypes.h"
 #include <QHash>
 #include <QList>
+#include <QPointF>
 #include <QSet>
 #include <QWidget>
 
@@ -31,6 +32,7 @@ public:
     qint64 viewEnd() const { return m_viewEnd; }
     qint64 fullStartTime() const;
     qint64 fullEndTime() const;
+    bool viewportDragActive() const { return m_dragging || m_overviewDragging; }
 
     QString formattedValueAtCursor(const ActiveSignalRef& entry) const;
     bool jumpToNearestChange(int signalIndex, bool forward);
@@ -66,7 +68,7 @@ private:
     qint64 m_hoverTime = -1;
 
     bool m_dragging = false;
-    QPoint m_dragStartPos;
+    QPointF m_dragStartPos;
     qint64 m_dragStartViewStart = 0;
     qint64 m_dragStartViewEnd = 100;
     bool m_panDragMoved = false;
@@ -75,7 +77,7 @@ private:
     double m_overviewDragOffset = 0.0;
 
     bool m_rulerSelecting = false;
-    QPoint m_rulerDragStartPos;
+    QPointF m_rulerDragStartPos;
     qint64 m_rulerSelectAnchorTime = 0;
     qint64 m_rulerSelectCurrentTime = 0;
     bool m_rulerSelectionMoved = false;

@@ -91,6 +91,7 @@ private:
         int signalIndex = -1;
         int sampleIndex = -1;
         qint64 time = -1;
+        qint64 duration = 0;
     };
 
     WaveFile m_wave;
@@ -154,6 +155,9 @@ private:
     void insertSignalIntoTree(const QString& fullName, int signalIndex);
     bool canDeferSamplesWithLod(const WaveSignal& sig) const;
     bool ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool allowLodDefer = true);
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+    bool ensureSignalSamplesLoaded(const QVector<int>& signalIndexes, bool allowLodDefer = true);
+#endif
     bool createDerivedSignal(const QString& name, const QString& expression, int widthOverride);
 
     void addSignalToActive(int signalIndex);

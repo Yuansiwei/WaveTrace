@@ -209,7 +209,11 @@ QStringList ActiveSignalListWidget::mimeTypes() const {
     return types;
 }
 
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 QMimeData* ActiveSignalListWidget::mimeData(const QList<QTreeWidgetItem*>& items) const {
+#else
+QMimeData* ActiveSignalListWidget::mimeData(const QList<QTreeWidgetItem*> items) const {
+#endif
     QMimeData* mime = QTreeWidget::mimeData(items);
     if (!mime) return nullptr;
 

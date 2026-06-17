@@ -28,7 +28,11 @@ Q_SIGNALS:
 
 protected:
     QStringList mimeTypes() const override;
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
     QMimeData* mimeData(const QList<QTreeWidgetItem*>& items) const override;
+#else
+    QMimeData* mimeData(const QList<QTreeWidgetItem*> items) const override;
+#endif
     Qt::DropActions supportedDropActions() const override;
 
     void keyPressEvent(QKeyEvent* event) override;

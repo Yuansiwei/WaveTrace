@@ -825,6 +825,22 @@ struct is_complete_type : std::false_type {};
 template <typename T>
 struct is_complete_type<T, decltype(void(sizeof(T)))> : std::true_type {};
 
+template <typename T>
+inline typename std::enable_if<
+    is_complete_type<typename remove_cvref<T>::type>::value,
+    std::string>::type
+type_name_or_incomplete() {
+    return typeid(typename remove_cvref<T>::type).name();
+}
+
+template <typename T>
+inline typename std::enable_if<
+    !is_complete_type<typename remove_cvref<T>::type>::value,
+    std::string>::type
+type_name_or_incomplete() {
+    return std::string("<incomplete>");
+}
+
 // Pointee marker detection.  The marker itself is declared in reflect_runtime.h
 // as wave::DirectReflectPointerTarget so business code can opt in by inheriting
 // from it.  We only evaluate std::is_base_of for complete non-void types; for
@@ -1684,7 +1700,8 @@ public:
                                         detail::is_unique_ptr_scalar<CleanT>::value ||
                                         detail::is_unique_ptr_array<CleanT>::value ||
                                         detail::is_shared_ptr<CleanT>::value ||
-                                        detail::is_weak_ptr<CleanT>::value;
+                                        detail::is_weak_ptr<CleanT>::value ||
+                                        detail::is_wave_ptr<CleanT>::value;
         watch.root_is_blacklisted_stl = detail::is_blacklisted_stl<CleanT>::value;
         watch.address = address;
         watch.key = ObjectKey(address, reflect::type_tag_of<CleanT>());
@@ -9464,6 +9481,12 @@ private:
 #endif
 
     template <typename T>
+    typename std::enable_if<detail::is_wave_ptr<T>::value, NodeId>::type
+    expand_field(const std::string& path, NodeId parent_id, const T* field_ptr) {
+        return expand_wave_ptr_field_impl<T>(path, parent_id, field_ptr);
+    }
+
+    template <typename T>
     typename std::enable_if<
         std::is_pointer<T>::value &&
         !std::is_same<typename detail::remove_cvref<T>::type, const char*>::value &&
@@ -9491,7 +9514,7 @@ private:
         if (options_.debug_log) {
             debug_log_msg(std::string("pointer array skipped path=") + path +
                           " reason=pointer-array-tracking-disabled" +
-                          " elem=" + typeid(Elem).name() +
+                          " elem=" + detail::type_name_or_incomplete<Elem>() +
                           " addr=" + detail::pointer_to_string(target));
         }
         return 0;
@@ -9575,6 +9598,36 @@ private:
                     getter_bit_offset_or_negative(meta...));
             });
         return keep_node_or_rollback(cp, node_id);
+    }
+
+    template <typename WavePtrT>
+    typename std::enable_if<detail::is_wave_ptr<WavePtrT>::value, NodeId>::type
+    expand_wave_ptr_field_impl(const std::string& path, NodeId parent_id, const WavePtrT* ptr) {
+        typedef typename wave_ptr_traits<WavePtrT>::element_type RawPointee;
+        typedef typename detail::remove_cvref<RawPointee>::type CleanPointee;
+        RawPointee* target = ptr ? ptr->get() : static_cast<RawPointee*>(NULL);
+        if (!target) {
+            if (options_.debug_log) debug_log_msg(std::string("wave_ptr null path=") + path);
+            return 0;
+        }
+        if (options_.debug_log) {
+            debug_log_msg(std::string("wave_ptr expand path=") + path +
+                          " type=" + detail::type_name_or_incomplete<CleanPointee>() +
+                          " addr=" + detail::pointer_to_string(detail::pointer_address(target)));
+        }
+        return expand_member_clean_dispatch<CleanPointee>(
+            path,
+            parent_id,
+            static_cast<const CleanPointee*>(target));
+    }
+
+    template <typename FieldT>
+    NodeId expand_member_clean_dispatch_selected(const std::string& path,
+                                                 NodeId parent_id,
+                                                 const FieldT* clean_ptr,
+                                                 std::integral_constant<int, 15>) {
+        if (options_.debug_log) debug_log_msg(std::string("member dispatch branch=wave_ptr path=") + path);
+        return expand_wave_ptr_field_impl<FieldT>(path, parent_id, clean_ptr);
     }
 
     template <typename FieldT>
@@ -9713,7 +9766,7 @@ private:
         }
         if (options_.debug_log) {
             debug_log_msg(std::string("pointer direct marker expand-once path=") + path +
-                          " type=" + typeid(CleanPointee).name() +
+                          " type=" + detail::type_name_or_incomplete<CleanPointee>() +
                           " addr=" + detail::pointer_to_string(target));
         }
         return expand_member_clean_dispatch<CleanPointee>(
@@ -9729,7 +9782,7 @@ private:
         if (options_.debug_log) {
             debug_log_msg(std::string("pointer skipped path=") + path +
                           " reason=pointee-not-DirectReflectPointerTarget" +
-                          " type=" + typeid(CleanPointee).name() +
+                          " type=" + detail::type_name_or_incomplete<CleanPointee>() +
                           " addr=" + detail::pointer_to_string(target));
         }
         return 0;
@@ -9763,7 +9816,7 @@ private:
         if (options_.debug_log) {
             debug_log_msg(std::string("pointer array skipped path=") + path +
                           " reason=pointer-array-tracking-disabled" +
-                          " elem=" + typeid(Elem).name() +
+                          " elem=" + detail::type_name_or_incomplete<Elem>() +
                           " addr=" + detail::pointer_to_string(target));
         }
         return 0;
@@ -9839,6 +9892,7 @@ private:
         enum {
             is_wave_array = detail::is_wave_array<FieldT>::value,
             is_wave_value = detail::is_wave_value<FieldT>::value,
+            is_wave_ptr = detail::is_wave_ptr<FieldT>::value,
             is_c_string = std::is_same<typename detail::remove_cvref<FieldT>::type, char*>::value ||
                           std::is_same<typename detail::remove_cvref<FieldT>::type, const char*>::value,
             is_pointer_or_smart = std::is_pointer<FieldT>::value ||
@@ -9858,7 +9912,8 @@ private:
 #else
             is_systemc_whitelist = false,
 #endif
-            value = detail::is_peek_trace_source<FieldT>::value ? 14 :
+            value = is_wave_ptr ? 15 :
+                    detail::is_peek_trace_source<FieldT>::value ? 14 :
                     is_wave_array ? 13 :
                     is_wave_value ? 12 :
                     is_c_string ? 11 :
@@ -9945,6 +10000,7 @@ private:
         !detail::is_unique_ptr_array<T>::value &&
         !detail::is_shared_ptr<T>::value &&
         !detail::is_weak_ptr<T>::value &&
+        !detail::is_wave_ptr<T>::value &&
         !detail::is_peek_trace_source<T>::value &&
         !detail::is_vsip_read_port<T>::value &&
         !detail::is_sc_in<T>::value &&
@@ -10017,6 +10073,7 @@ private:
                             !detail::is_unique_ptr_array<T>::value &&
                             !detail::is_shared_ptr<T>::value &&
                             !detail::is_weak_ptr<T>::value &&
+                            !detail::is_wave_ptr<T>::value &&
                             !detail::is_peek_trace_source<T>::value &&
                             !detail::is_vsip_read_port<T>::value &&
                             !detail::is_sc_in<T>::value &&

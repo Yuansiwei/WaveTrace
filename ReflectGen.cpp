@@ -64,6 +64,10 @@ namespace
     struct FieldInfo
     {
         std::string name;
+        // C++ expression path from the owning object to this field.  Normally it
+        // is identical to name.  For fields flattened out of a named anonymous
+        // union member, it is "unionMember.field".
+        std::string accessPath;
         // Original field type spelling, as emitted by libclang.
         std::string typeName;
         // Canonical field type spelling.  This lets root-class closure see through
@@ -214,6 +218,7 @@ namespace
         // CXTranslationUnit_KeepGoing. Pass --allow-errors only for emergency
         // debugging where partial generated reflection is explicitly acceptable.
         bool allowParseErrors = false;
+        bool suppressFunctionDiagnostics = true;
 
         // Optional heavy fallback for macro-heavy class declarations: run clang++ -E
         // to produce a fully macro-expanded temporary TU, parse it, and then mark
@@ -496,7 +501,7 @@ namespace
 
     CXChildVisitResult AstVisitor(CXCursor cursor, CXCursor, CXClientData clientData);
 
-    DiagnosticsSummary PrintDiagnostics(CXTranslationUnit tu);
+    DiagnosticsSummary PrintDiagnostics(CXTranslationUnit tu, const Options* opt = NULL);
 
     bool DiagnosticsAreAcceptableOrReport(const Options& opt, const DiagnosticsSummary& diag);
 
@@ -1928,6 +1933,7 @@ namespace
             << "    --clangxx <path_to_clang++.exe>\n"
             << "    --debug-ast    print per-cursor AST logs and verbose clang/probe args\n"
             << "    --allow-errors continue generation even if libclang reports error/fatal diagnostics\n"
+            << "    --show-function-diagnostics print function/default-argument redefinition diagnostics\n"
             << "    --no-expanded-friend-scan disable clang++ -E fallback friend detection\n"
             << "  This imports AdditionalIncludeDirectories, PreprocessorDefinitions,\n"
             << "  ForcedIncludeFiles and LanguageStandard as libclang arguments.\n"
@@ -2057,6 +2063,14 @@ namespace
             else if (a == "--allow-errors" || a == "--allow-parse-errors")
             {
                 opt.allowParseErrors = true;
+            }
+            else if (a == "--show-function-diagnostics" || a == "--show-function-errors")
+            {
+                opt.suppressFunctionDiagnostics = false;
+            }
+            else if (a == "--suppress-function-diagnostics" || a == "--suppress-function-errors")
+            {
+                opt.suppressFunctionDiagnostics = true;
             }
             else if (a == "--no-expanded-friend-scan")
             {
@@ -2250,6 +2264,64 @@ namespace
         // emitted as if they were normal obj->field members.
         return IsInsideUnionByParentChain(cursor, true) ||
             IsInsideUnionByParentChain(cursor, false);
+    }
+
+    CXCursor CursorDefinitionOrSelf(CXCursor cursor)
+    {
+        if (clang_Cursor_isNull(cursor)) return cursor;
+        CXCursor def = clang_getCursorDefinition(cursor);
+        return clang_Cursor_isNull(def) ? cursor : def;
+    }
+
+    bool FieldTypeDeclMatchesRecordCursor(CXCursor fieldCursor, CXCursor recordCursor)
+    {
+        if (clang_getCursorKind(fieldCursor) != CXCursor_FieldDecl ||
+            clang_Cursor_isNull(recordCursor))
+        {
+            return false;
+        }
+
+        CXType types[] = {
+            clang_getCursorType(fieldCursor),
+            clang_getCanonicalType(clang_getCursorType(fieldCursor))
+        };
+        const CXCursor recordDef = CursorDefinitionOrSelf(recordCursor);
+        for (std::size_t i = 0; i < sizeof(types) / sizeof(types[0]); ++i)
+        {
+            CXCursor decl = clang_getTypeDeclaration(types[i]);
+            if (clang_Cursor_isNull(decl)) continue;
+            decl = CursorDefinitionOrSelf(decl);
+            if (clang_equalCursors(decl, recordCursor) ||
+                clang_equalCursors(decl, recordDef))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::string FindNamedFieldForAnonymousUnion(CXCursor ownerRecordCursor, CXCursor unionCursor)
+    {
+        struct Payload
+        {
+            CXCursor unionCursor;
+            std::string name;
+        } payload{ unionCursor, std::string() };
+
+        clang_visitChildren(
+            ownerRecordCursor,
+            [](CXCursor child, CXCursor, CXClientData clientData) {
+                Payload* payload = static_cast<Payload*>(clientData);
+                if (clang_getCursorKind(child) != CXCursor_FieldDecl) return CXChildVisit_Continue;
+                const std::string name = ToStdString(clang_getCursorSpelling(child));
+                if (name.empty()) return CXChildVisit_Continue;
+                if (!FieldTypeDeclMatchesRecordCursor(child, payload->unionCursor)) return CXChildVisit_Continue;
+                payload->name = name;
+                return CXChildVisit_Break;
+            },
+            &payload);
+
+        return payload.name;
     }
 
     CXCursor FindEnclosingUnionCursor(CXCursor cursor)
@@ -2883,6 +2955,9 @@ namespace
             return;
         }
 
+        const std::string namedUnionField = FindNamedFieldForAnonymousUnion(ownerRecordCursor, unionCursor);
+        const std::string accessPrefix = namedUnionField.empty() ? std::string() : (namedUnionField + ".");
+
         const long long unionStorageBytes = clang_Type_getSizeOf(clang_getCursorType(unionCursor));
         if (unionStorageBytes <= 0)
         {
@@ -2900,7 +2975,8 @@ namespace
             CollectContext* ctx;
             bool* foundBody;
             long long unionStorageBytes;
-        } payload{ tu, ownerRecordCursor, &rec, ctx, foundBody, unionStorageBytes };
+            std::string accessPrefix;
+        } payload{ tu, ownerRecordCursor, &rec, ctx, foundBody, unionStorageBytes, accessPrefix };
 
         clang_visitChildren(
             unionCursor,
@@ -2912,18 +2988,20 @@ namespace
                 if (kind != CXCursor_FieldDecl) return CXChildVisit_Continue;
 
                 FieldInfo f;
-                f.name = ToStdString(clang_getCursorSpelling(child));
-                if (f.name.empty())
+                const std::string rawFieldName = ToStdString(clang_getCursorSpelling(child));
+                if (rawFieldName.empty())
                 {
                     if (ctx) ++ctx->fieldsSkippedEmptyName;
                     PrintCursorDebugLine("[field skipped]", child, "reason=anonymous-union-empty-name owner=[" + out->qualifiedName + "]");
                     return CXChildVisit_Continue;
                 }
+                f.name = payload->accessPrefix.empty() ? rawFieldName : (payload->accessPrefix + rawFieldName);
                 if (RecordHasCollectedFieldName(*out, f.name))
                 {
                     PrintCursorDebugLine("[field skipped]", child, "reason=anonymous-union-duplicate-injected-field owner=[" + out->qualifiedName + "] field=[" + f.name + "]");
                     return CXChildVisit_Continue;
                 }
+                f.accessPath = f.name;
 
                 CXType fieldType = clang_getCursorType(child);
                 f.typeName = ToStdString(clang_getTypeSpelling(fieldType));
@@ -3057,12 +3135,23 @@ namespace
                         PrintCursorDebugLine("[field skipped]", child, "reason=empty-name owner=[" + out->qualifiedName + "]");
                         return CXChildVisit_Continue;
                     }
+                    CXType fieldType = clang_getCursorType(child);
+                    CXCursor fieldTypeDecl = CursorDefinitionOrSelf(clang_getTypeDeclaration(fieldType));
+                    if (!clang_Cursor_isNull(fieldTypeDecl) &&
+                        clang_getCursorKind(fieldTypeDecl) == CXCursor_UnionDecl)
+                    {
+                        const std::string fieldUnionName = ToStdString(clang_getCursorSpelling(fieldTypeDecl));
+                        if (fieldUnionName.empty() || LooksLikeLibclangAnonymousName(fieldUnionName))
+                        {
+                            PrintCursorDebugLine("[field skipped]", child, "reason=named-anonymous-union-holder-expanded-as-prefixed-members owner=[" + out->qualifiedName + "] field=[" + f.name + "]");
+                            return CXChildVisit_Continue;
+                        }
+                    }
                     if (anonymousUnionInjectedField && RecordHasCollectedFieldName(*out, f.name))
                     {
                         PrintCursorDebugLine("[field skipped]", child, "reason=anonymous-union-duplicate-injected-field owner=[" + out->qualifiedName + "] field=[" + f.name + "]");
                         return CXChildVisit_Continue;
                     }
-                    CXType fieldType = clang_getCursorType(child);
                     f.typeName = ToStdString(clang_getTypeSpelling(fieldType));
                     f.canonicalTypeName = ToStdString(clang_getTypeSpelling(clang_getCanonicalType(fieldType)));
                     f.declQualifiedName = GetTypeDeclarationQualifiedName(fieldType);
@@ -3349,12 +3438,23 @@ namespace
                     f.name = ToStdString(clang_getCursorSpelling(child));
                     if (!f.name.empty())
                     {
+                        CXType fieldType = clang_getCursorType(child);
+                        CXCursor fieldTypeDecl = CursorDefinitionOrSelf(clang_getTypeDeclaration(fieldType));
+                        if (!clang_Cursor_isNull(fieldTypeDecl) &&
+                            clang_getCursorKind(fieldTypeDecl) == CXCursor_UnionDecl)
+                        {
+                            const std::string fieldUnionName = ToStdString(clang_getCursorSpelling(fieldTypeDecl));
+                            if (fieldUnionName.empty() || LooksLikeLibclangAnonymousName(fieldUnionName))
+                            {
+                                PrintCursorDebugLine("[field skipped]", child, "reason=named-anonymous-union-holder-expanded-as-prefixed-members owner=[" + out->qualifiedName + "] field=[" + f.name + "]");
+                                return CXChildVisit_Continue;
+                            }
+                        }
                         if (anonymousUnionInjectedField && RecordHasCollectedFieldName(*out, f.name))
                         {
                             PrintCursorDebugLine("[field skipped]", child, "reason=anonymous-union-duplicate-injected-field owner=[" + out->qualifiedName + "] field=[" + f.name + "]");
                             return CXChildVisit_Continue;
                         }
-                        CXType fieldType = clang_getCursorType(child);
                         f.typeName = ToStdString(clang_getTypeSpelling(fieldType));
                         f.canonicalTypeName = ToStdString(clang_getTypeSpelling(clang_getCanonicalType(fieldType)));
                         f.declQualifiedName = GetTypeDeclarationQualifiedName(fieldType);
@@ -3571,9 +3671,21 @@ namespace
         bool HasErrorOrFatal() const { return errors != 0 || fatals != 0; }
     };
 
-    DiagnosticsSummary PrintDiagnostics(CXTranslationUnit tu)
+    bool ShouldSuppressFunctionDiagnosticText(const std::string& text)
+    {
+        const std::string lower = ToLowerAscii(text);
+        return lower.find("redefinition of default argument") != std::string::npos ||
+            lower.find("redefinition of 'fl") != std::string::npos ||
+            lower.find("redefinition of \"fl") != std::string::npos ||
+            lower.find("redefinition of 'numberofone'") != std::string::npos ||
+            lower.find("overrides a member function but is not marked 'override'") != std::string::npos ||
+            lower.find("extra tokens at end of #include directive") != std::string::npos;
+    }
+
+    DiagnosticsSummary PrintDiagnostics(CXTranslationUnit tu, const Options* opt)
     {
         DiagnosticsSummary summary;
+        unsigned suppressed = 0;
         const unsigned diagCount = clang_getNumDiagnostics(tu);
         summary.total = diagCount;
         for (unsigned i = 0; i < diagCount; ++i)
@@ -3585,8 +3697,22 @@ namespace
             else if (sev == CXDiagnostic_Fatal) ++summary.fatals;
 
             CXString formatted = clang_formatDiagnostic(diag, clang_defaultDiagnosticDisplayOptions());
-            std::cerr << ToStdString(formatted) << "\n";
+            const std::string text = ToStdString(formatted);
+            if (opt && opt->allowParseErrors && opt->suppressFunctionDiagnostics && ShouldSuppressFunctionDiagnosticText(text))
+            {
+                ++suppressed;
+            }
+            else
+            {
+                std::cerr << text << "\n";
+            }
             clang_disposeDiagnostic(diag);
+        }
+        if (suppressed != 0)
+        {
+            std::cerr << "[diagnostics suppressed] function/default-argument/include-noise diagnostics hidden: "
+                << suppressed
+                << ". Pass --show-function-diagnostics to print them.\n";
         }
         return summary;
     }
@@ -4478,8 +4604,9 @@ namespace
             m.unionStorageBytes = f.unionStorageBytes;
             m.exprIsPointerAlready = false;
             m.asBoolStorage = !f.isBitField && IsBoolStorageTypedefSpelling(opt, f.typeName);
-            m.constExpr = constObjExpr + "->" + f.name;
-            m.mutExpr = mutObjExpr + "->" + f.name;
+            const std::string accessPath = f.accessPath.empty() ? f.name : f.accessPath;
+            m.constExpr = constObjExpr + "->" + accessPath;
+            m.mutExpr = mutObjExpr + "->" + accessPath;
             out.push_back(m);
             directNames.insert(m.displayName);
             if (gDebugAst)
@@ -6374,7 +6501,7 @@ namespace
             if (tu)
             {
                 std::cerr << "[diagnostics begin]\n";
-                PrintDiagnostics(tu);
+                PrintDiagnostics(tu, &opt);
                 std::cerr << "[diagnostics end]\n";
                 clang_disposeTranslationUnit(tu);
             }
@@ -6389,7 +6516,7 @@ namespace
             return false;
         }
 
-        const DiagnosticsSummary diag = PrintDiagnostics(tu);
+        const DiagnosticsSummary diag = PrintDiagnostics(tu, &opt);
         if (!DiagnosticsAreAcceptableOrReport(opt, diag))
         {
             clang_disposeTranslationUnit(tu);
@@ -6524,6 +6651,15 @@ namespace
         return true;
     }
 
+    bool IsWaveClosureTransparentWrapperType(const std::string& key)
+    {
+        // Wave runtime wrappers are infrastructure types, but some of them carry
+        // a business payload type that must remain reachable in root-class
+        // closure mode.  Do not emit the wrapper itself; recurse into template
+        // arguments instead.
+        return key == "wave::WavePtr" || key == "wave::array";
+    }
+
     std::string StripTypeForClosure(std::string s)
     {
         s = Trim(s);
@@ -6627,7 +6763,8 @@ namespace
         std::string cleaned = StripTypeForClosure(typeName);
         if (cleaned.empty()) return;
         const std::string topKey = TopLevelTypeKeyForClosure(cleaned);
-        if (IsBuiltinOrNonRecordLookupKey(topKey)) return;
+        const bool waveTransparentWrapper = IsWaveClosureTransparentWrapperType(topKey);
+        if (IsBuiltinOrNonRecordLookupKey(topKey) && !waveTransparentWrapper) return;
 
         // Full blacklist stop: std::vector/map/list/etc. are intentionally not
         // traversed, including their template arguments, because runtime treats
@@ -6636,8 +6773,11 @@ namespace
         if (IsStdClosureStopType(topKey)) return;
 
         // Direct business type / business template itself.
-        AddUniqueClosureCandidate(out, cleaned);
-        AddUniqueClosureCandidate(out, topKey);
+        if (!waveTransparentWrapper)
+        {
+            AddUniqueClosureCandidate(out, cleaned);
+            AddUniqueClosureCandidate(out, topKey);
+        }
 
         // Recurse into template arguments for business templates and supported
         // wrappers such as std::array/std::pair/smart_ptr/sc_vector/sc_in/vsipIN/vsiiIN.
@@ -7215,7 +7355,7 @@ namespace
             if (tu)
             {
                 std::cerr << "[expanded friend diagnostics begin]\n";
-                PrintDiagnostics(tu);
+                PrintDiagnostics(tu, &opt);
                 std::cerr << "[expanded friend diagnostics end]\n";
                 clang_disposeTranslationUnit(tu);
             }
@@ -7223,7 +7363,7 @@ namespace
             return false;
         }
 
-        const DiagnosticsSummary diag = PrintDiagnostics(tu);
+        const DiagnosticsSummary diag = PrintDiagnostics(tu, &opt);
         if (!DiagnosticsAreAcceptableOrReport(opt, diag))
         {
             std::cerr << "[expanded friend scan skipped] expanded TU diagnostics are not acceptable.\n";
@@ -7301,7 +7441,7 @@ namespace
             if (tu)
             {
                 std::cerr << "[diagnostics begin]\n";
-                PrintDiagnostics(tu);
+                PrintDiagnostics(tu, &opt);
                 std::cerr << "[diagnostics end]\n";
                 clang_disposeTranslationUnit(tu);
             }
@@ -7316,7 +7456,7 @@ namespace
             return false;
         }
 
-        const DiagnosticsSummary diag = PrintDiagnostics(tu);
+        const DiagnosticsSummary diag = PrintDiagnostics(tu, &opt);
         if (!DiagnosticsAreAcceptableOrReport(opt, diag))
         {
             clang_disposeTranslationUnit(tu);
@@ -7964,14 +8104,14 @@ namespace
                 << " (" << CxErrorName(err) << ")\n";
             if (tu)
             {
-                PrintDiagnostics(tu);
+                PrintDiagnostics(tu, &opt);
                 clang_disposeTranslationUnit(tu);
             }
             clang_disposeIndex(index);
             return;
         }
 
-        const DiagnosticsSummary diag = PrintDiagnostics(tu);
+        const DiagnosticsSummary diag = PrintDiagnostics(tu, &opt);
         if (!DiagnosticsAreAcceptableOrReport(opt, diag))
         {
             clang_disposeTranslationUnit(tu);

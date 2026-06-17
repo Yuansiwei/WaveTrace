@@ -52,21 +52,23 @@ public:
         std::size_t async_writer_queue_limit = 256;
         std::size_t async_writer_queue_bytes_limit = 256u * 1024u * 1024u;
 
-        // Crash/kill resistant helper mode. Enabled by default: the simulation
+        // Optional crash/kill resistant helper mode. Disabled by default because
+        // packaged CMake integration writes WVZ4 in-process and does not ship a
+        // writer helper executable.
+        //
+        // When enabled, the simulation
         // process sends layout/cycle frames to a separate writer process. The
         // helper owns the real WVZ4 Writer and finalizes the file if the parent
         // process exits, crashes, or is killed by VS Stop Debugging.
-        //
-        // Disable only for explicit scratch/perf runs where direct in-process
-        // writing is acceptable.
-        bool use_writer_process = true;
+        bool use_writer_process = false;
         std::string writer_process_exe_path;
         unsigned int writer_process_connect_timeout_ms = 10000;
 
         // WVZ4 v4 synthetic periodic clock. Enabled by default. The clock is
         // stored as CLKD(initial_value + period_ticks), not as ordinary WDAT
-        // transitions. Business-cycle samples are still mapped to
-        // cycle * clk_period_ticks so they align to clock edges.
+        // transitions. Business-cycle samples are always mapped to
+        // cycle * clk_period_ticks; disabling clock emission only hides the
+        // synthetic clk track, it does not change the writer time unit.
         bool emit_default_clk = true;
         std::string default_clk_name = "clk";
         bool clk_initial_value = false;
@@ -491,19 +493,11 @@ private:
     }
 
     bool map_business_cycle_to_writer_cycle(wave::Cycle cycle, wvz4::i64& out, std::string& error) const {
-        if (!cfg_.emit_default_clk) {
-            if (cycle > static_cast<wave::Cycle>(std::numeric_limits<wvz4::i64>::max())) {
-                error = "WVZ4 recorder end_cycle failed: cycle exceeds int64 range";
-                return false;
-            }
-            out = static_cast<wvz4::i64>(cycle);
-            return true;
-        }
         if (cfg_.clk_period_ticks == 0) {
             error = "WVZ4 recorder config error: clk_period_ticks must be positive";
             return false;
         }
-        if (cfg_.clk_fall_offset_ticks == 0) {
+        if (cfg_.emit_default_clk && cfg_.clk_fall_offset_ticks == 0) {
             error = "WVZ4 recorder config error: clk_fall_offset_ticks/toggle period must be positive";
             return false;
         }

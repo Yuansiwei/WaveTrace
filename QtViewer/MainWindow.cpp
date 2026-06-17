@@ -73,6 +73,7 @@
 #include <cmath>
 #include <future>
 #include <functional>
+#include <limits>
 #include <utility>
 #include <cstdlib>
 #include <cstdio>
@@ -2803,6 +2804,26 @@ private:
         return true;
     }
 
+    QString formatInternalDisplayTime(qint64 internalTime);
+
+    qint64 clampedValueFindSegmentDuration(qint64 segmentStart, qint64 segmentEnd, qint64 waveStart, qint64 waveEnd) {
+        if (waveEnd <= waveStart) return 0;
+        const qint64 clippedStart = std::max(waveStart, std::min(segmentStart, waveEnd));
+        const qint64 clippedEnd = std::max(waveStart, std::min(segmentEnd, waveEnd));
+        return clippedEnd > clippedStart ? (clippedEnd - clippedStart) : 0;
+    }
+
+    QString formatValueFindTimeShare(qint64 matchedDuration, qint64 totalDuration) {
+        if (totalDuration <= 0) return QStringLiteral("-");
+        matchedDuration = std::max<qint64>(0, std::min(matchedDuration, totalDuration));
+        const double percent = static_cast<double>(matchedDuration) * 100.0 / static_cast<double>(totalDuration);
+        const int decimals = (matchedDuration > 0 && percent < 0.01) ? 4 : 2;
+        return QStringLiteral("%1% (%2/%3)")
+            .arg(QString::number(percent, 'f', decimals))
+            .arg(formatInternalDisplayTime(matchedDuration))
+            .arg(formatInternalDisplayTime(totalDuration));
+    }
+
     QString stripDisplayRangeSuffix(QString name) {
         name = name.trimmed();
         if (!name.endsWith(QLatin1Char(']'))) return name;
@@ -3278,7 +3299,7 @@ private:
     }
 
     QString formatInternalDisplayTime(qint64 internalTime) {
-        return QString::number(internalTime);
+        return waveFormatDisplayTime(internalTime);
     }
 
     QColor iconColor(const QString& name) {
@@ -3701,6 +3722,10 @@ void MainWindow::buildUi() {
     m_metaLabel->setObjectName("metaLabel");
     m_metaLabel->setMinimumWidth(90);
 
+    m_windowLabel = new QLabel("-", topBarCard);
+    m_windowLabel->setObjectName("windowLabel");
+    m_windowLabel->setMinimumWidth(150);
+
     topBarLayout->addWidget(btnOpen);
     topBarLayout->addWidget(btnCompare);
     topBarLayout->addWidget(btnDerivedSignal);
@@ -3717,6 +3742,8 @@ void MainWindow::buildUi() {
     topBarLayout->addWidget(m_jumpTimeEdit);
     topBarLayout->addSpacing(8);
     topBarLayout->addWidget(m_metaLabel);
+    topBarLayout->addSpacing(8);
+    topBarLayout->addWidget(m_windowLabel);
     topBarLayout->addStretch(1);
     rightLayout->addWidget(topBarCard);
 
@@ -3860,7 +3887,7 @@ void MainWindow::applyTheme() {
             border: 1px solid #FFFFFF;
             border-radius: 10px;
         }
-        #metaLabel {
+        #metaLabel, #windowLabel {
             color: #3F4650;
             font-weight: 600;
             padding-left: 2px;
@@ -4139,12 +4166,9 @@ void MainWindow::applyWave(WaveFile&& wave) {
 }
 
 void MainWindow::updateMetaLabel() {
-    auto displayTimeText = [](qint64 internalTime) -> QString {
-        return QString::number(internalTime);
-    };
-
     const QString rangeText = QStringLiteral("%1 ~ %2")
-        .arg(displayTimeText(m_wave.meta.start), displayTimeText(m_wave.meta.end));
+        .arg(formatInternalDisplayTime(m_wave.meta.start),
+             formatInternalDisplayTime(m_wave.meta.end));
 
     if (m_metaLabel) {
         m_metaLabel->setText(rangeText);
@@ -4675,7 +4699,7 @@ void MainWindow::openValueFindDialog() {
     if (!m_valueFindDialog) {
         m_valueFindDialog = new QDialog(this);
         m_valueFindDialog->setWindowTitle(QStringLiteral("Find value"));
-        m_valueFindDialog->resize(560, 430);
+        m_valueFindDialog->resize(680, 430);
 
         auto* root = new QVBoxLayout(m_valueFindDialog);
         root->setContentsMargins(12, 12, 12, 12);
@@ -4696,10 +4720,11 @@ void MainWindow::openValueFindDialog() {
         root->addWidget(m_valueFindSummaryLabel);
 
         m_valueFindResults = new QTreeWidget(m_valueFindDialog);
-        m_valueFindResults->setColumnCount(3);
+        m_valueFindResults->setColumnCount(4);
         m_valueFindResults->setHeaderLabels(QStringList() << QStringLiteral("Signal")
                                                           << QStringLiteral("Count")
-                                                          << QStringLiteral("First time"));
+                                                          << QStringLiteral("First time")
+                                                          << QStringLiteral("Time %"));
         m_valueFindResults->setRootIsDecorated(false);
         m_valueFindResults->setSelectionMode(QAbstractItemView::SingleSelection);
         m_valueFindResults->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -4708,6 +4733,7 @@ void MainWindow::openValueFindDialog() {
         m_valueFindResults->header()->setSectionResizeMode(0, QHeaderView::Stretch);
         m_valueFindResults->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
         m_valueFindResults->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+        m_valueFindResults->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
         root->addWidget(m_valueFindResults, 1);
 
         auto* buttonRow = new QHBoxLayout();
@@ -4788,6 +4814,8 @@ void MainWindow::runValueFind() {
     m_valueFindSignalIndexes = signalIndexes;
     m_valueFindCurrentHit = -1;
 
+    const qint64 waveStart = m_wave.meta.start;
+    const qint64 waveEnd = m_wave.meta.end;
     int widthSkippedSignals = 0;
     for (int signalIndex : signalIndexes) {
         if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
@@ -4801,6 +4829,7 @@ void MainWindow::runValueFind() {
 
         const quint64 mask = waveBitMaskForWidth(sig.width);
         bool previousMatched = false;
+        int activeHitIndex = -1;
         for (int sampleIndex = 0; sampleIndex < sig.samples.size(); ++sampleIndex) {
             const WaveSample& sample = sig.samples.at(sampleIndex);
             bool matched = false;
@@ -4820,9 +4849,19 @@ void MainWindow::runValueFind() {
                 hit.signalIndex = signalIndex;
                 hit.sampleIndex = sampleIndex;
                 hit.time = sample.time;
+                activeHitIndex = m_valueFindHits.size();
                 m_valueFindHits.push_back(hit);
+            } else if (!matched && previousMatched && activeHitIndex >= 0) {
+                m_valueFindHits[activeHitIndex].duration =
+                    clampedValueFindSegmentDuration(m_valueFindHits.at(activeHitIndex).time, sample.time, waveStart, waveEnd);
+                activeHitIndex = -1;
             }
             previousMatched = matched;
+        }
+
+        if (previousMatched && activeHitIndex >= 0) {
+            m_valueFindHits[activeHitIndex].duration =
+                clampedValueFindSegmentDuration(m_valueFindHits.at(activeHitIndex).time, waveEnd, waveStart, waveEnd);
         }
     }
 
@@ -4858,12 +4897,15 @@ void MainWindow::rebuildValueFindResults() {
 
     QHash<int, int> countBySignal;
     QHash<int, int> firstHitBySignal;
+    QHash<int, qint64> durationBySignal;
     for (int i = 0; i < m_valueFindHits.size(); ++i) {
         const ValueFindHit& hit = m_valueFindHits.at(i);
         countBySignal[hit.signalIndex] = countBySignal.value(hit.signalIndex) + 1;
+        durationBySignal[hit.signalIndex] = durationBySignal.value(hit.signalIndex) + hit.duration;
         if (!firstHitBySignal.contains(hit.signalIndex)) firstHitBySignal.insert(hit.signalIndex, i);
     }
 
+    const qint64 totalDuration = std::max<qint64>(0, m_wave.meta.end - m_wave.meta.start);
     m_valueFindResults->clear();
     for (int signalIndex : m_valueFindSignalIndexes) {
         if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
@@ -4874,11 +4916,13 @@ void MainWindow::rebuildValueFindResults() {
         item->setText(0, signalDisplayName(signalIndex));
         item->setText(1, QString::number(count));
         item->setText(2, firstHit >= 0 ? formatInternalDisplayTime(m_valueFindHits.at(firstHit).time) : QStringLiteral("-"));
+        item->setText(3, formatValueFindTimeShare(durationBySignal.value(signalIndex, 0), totalDuration));
         item->setData(0, kValueFindRoleFirstHit, firstHit);
         item->setData(0, kValueFindRoleSignalIndex, signalIndex);
         if (count <= 0) {
             item->setForeground(1, QBrush(QColor("#AAB3BC")));
             item->setForeground(2, QBrush(QColor("#AAB3BC")));
+            item->setForeground(3, QBrush(QColor("#AAB3BC")));
         }
     }
 }
@@ -5001,12 +5045,8 @@ void MainWindow::jumpToTime() {
     const qint64 rangeStart = m_canvas->fullStartTime();
     const qint64 rangeEnd = m_canvas->fullEndTime();
 
-    auto displayTimeText = [](qint64 internalTime) -> QString {
-        return QString::number(internalTime);
-    };
-
-    const QString minText = displayTimeText(rangeStart);
-    const QString maxText = displayTimeText(rangeEnd);
+    const QString minText = formatInternalDisplayTime(rangeStart);
+    const QString maxText = formatInternalDisplayTime(rangeEnd);
     const QString rangeText = QStringLiteral("%1 ~ %2").arg(minText, maxText);
 
     if (rangeEnd < rangeStart) {
@@ -5026,7 +5066,8 @@ void MainWindow::jumpToTime() {
     }
 
     bool parsed = false;
-    const qint64 internalTime = input.toLongLong(&parsed, 10);
+    qint64 internalTime = 0;
+    parsed = waveParseDisplayTime(input, internalTime);
     if (!parsed) {
         QMessageBox::warning(this,
             QString::fromUtf8("时间格式不正确"),
@@ -5060,7 +5101,7 @@ void MainWindow::jumpToTime() {
     }
 
     if (m_jumpTimeEdit) {
-        m_jumpTimeEdit->setText(displayTimeText(internalTime));
+        m_jumpTimeEdit->setText(formatInternalDisplayTime(internalTime));
         m_jumpTimeEdit->selectAll();
     }
     refreshActiveValueLabels();
@@ -5652,6 +5693,12 @@ bool MainWindow::ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool
     return true;
 }
 
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+bool MainWindow::ensureSignalSamplesLoaded(const QVector<int>& signalIndexes, bool allowLodDefer) {
+    return ensureSignalSamplesLoaded(signalIndexes.toList(), allowLodDefer);
+}
+#endif
+
 void MainWindow::addSignalToActive(int signalIndex) {
     addSignalIndexesToActive(QList<int>() << signalIndex);
 }
@@ -5899,8 +5946,19 @@ void MainWindow::onCursorMoved(qint64) {
 void MainWindow::onHoverMoved(qint64) {
 }
 
-void MainWindow::onViewportChanged(qint64, qint64) {
+void MainWindow::onViewportChanged(qint64 start, qint64 end) {
+    if (m_windowLabel) {
+        const QString viewText = QStringLiteral("View %1 ~ %2")
+            .arg(formatInternalDisplayTime(start),
+                 formatInternalDisplayTime(end));
+        m_windowLabel->setText(viewText);
+        m_windowLabel->setToolTip(QStringLiteral("Viewport range: %1").arg(viewText));
+    }
     if (m_currentWaveSupportsOnDemand && m_activeList) {
+        if (m_canvas && m_canvas->viewportDragActive()) {
+            scheduleRefreshActiveValueLabels(100);
+            return;
+        }
         QList<int> needRawSignals;
         for (int i = 0; i < m_activeList->topLevelItemCount(); ++i) {
             QTreeWidgetItem* item = m_activeList->topLevelItem(i);

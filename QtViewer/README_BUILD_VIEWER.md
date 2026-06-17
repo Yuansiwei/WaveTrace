@@ -20,9 +20,11 @@ Run the Release build with Qt DLL/plugin paths configured:
 run_release.bat
 ```
 
-Local dependencies are copied into the project directory:
+Local dependencies are copied into the project directory. This package uses
+Qt 5.15.2 so the viewer can run on older Windows/Server systems where Qt 6.5
+fails to load `Qt6Gui.dll`.
 
-- `third_party/Qt/6.5.3/msvc2019_64`
+- `third_party/Qt/5.15.2/msvc2019_64`
 - `third_party/zstd-src/zstd-1.5.7`
 - `QtLocal.props`
 - `props/zstd_embed.props`
