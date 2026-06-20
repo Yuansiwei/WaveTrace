@@ -1615,6 +1615,7 @@ WaveLodLevel sliceLodLevelForSignal(const WaveLodLevel& source, const WaveSignal
     WaveLodLevel out;
     out.bucketCycles = source.bucketCycles;
     out.validRanges = source.validRanges;
+    out.loadedRanges = source.loadedRanges;
     out.samples.reserve(source.samples.size());
     for (const WaveSample& src : source.samples) {
         WaveSample sample = src;
@@ -3324,8 +3325,8 @@ void sortAndDedupLodSamples(QVector<QVector<WaveLodLevel>>& lodLevelsByStorageId
                 samples.resize(write);
             }
 
-            QVector<WaveLodValidRange>& ranges = levels[levelIndex].validRanges;
-            if (!ranges.isEmpty()) {
+            auto sortAndMergeRanges = [](QVector<WaveLodValidRange>& ranges) {
+                if (ranges.isEmpty()) return;
                 std::sort(ranges.begin(), ranges.end(), [](const WaveLodValidRange& a, const WaveLodValidRange& b) {
                     return a.start < b.start;
                 });
@@ -3341,7 +3342,10 @@ void sortAndDedupLodSamples(QVector<QVector<WaveLodLevel>>& lodLevelsByStorageId
                     }
                 }
                 ranges.resize(rangeWrite);
-            }
+            };
+
+            sortAndMergeRanges(levels[levelIndex].validRanges);
+            sortAndMergeRanges(levels[levelIndex].loadedRanges);
         }
     }
 }
@@ -3354,13 +3358,43 @@ bool decodeLodzChunksFromFooterIndex(QFile& file,
                                       bool allSelected,
                                       const QVector<int>& byteWidthByStorageId,
                                       QVector<QVector<WaveLodLevel>>& lodLevelsByStorageId,
+                                      qint64 windowStart,
+                                      qint64 windowEnd,
+                                      qint64 targetBucketCycles,
                                       QString& error) {
     if (formatVersion < kSupportedVersionV10 || lodChunks.isEmpty()) return true;
     if (selectedStorageIds.isEmpty() && !allSelected) return true;
+    const bool filterByTime = (windowEnd > windowStart) &&
+        (windowStart != 0 || windowEnd != std::numeric_limits<qint64>::max());
+    qint64 selectedBucketCycles = 0;
+    if (targetBucketCycles > 0) {
+        for (const LodChunkIndexRec& idx : lodChunks) {
+            if (idx.bucketCycles <= 0 || idx.bucketCycles > targetBucketCycles) continue;
+            if (filterByTime && (idx.end <= windowStart || idx.start >= windowEnd)) continue;
+            if (!allSelected && signalsPerChunk > 0 && !selectedStorageIds.isEmpty()) {
+                const u64 first64 = idx.signalChunkId * signalsPerChunk + 1ull;
+                if (first64 > u64(std::numeric_limits<int>::max())) continue;
+                const u64 maxCount = u64(std::numeric_limits<int>::max()) - first64 + 1ull;
+                const u64 count64 = qMin<u64>(signalsPerChunk, maxCount);
+                if (count64 == 0 ||
+                    !signalRangeIntersectsSelection(selectedStorageIds, false, int(first64), int(count64))) {
+                    continue;
+                }
+            }
+            selectedBucketCycles = qMax(selectedBucketCycles, idx.bucketCycles);
+        }
+        if (selectedBucketCycles <= 0) return true;
+    }
 
     const u64 fileSize64 = u64(file.size());
     for (int ci = 0; ci < lodChunks.size(); ++ci) {
         const LodChunkIndexRec& idx = lodChunks.at(ci);
+        if (filterByTime && (idx.end <= windowStart || idx.start >= windowEnd)) {
+            continue;
+        }
+        if (selectedBucketCycles > 0 && idx.bucketCycles < selectedBucketCycles) {
+            continue;
+        }
         if (!allSelected && signalsPerChunk > 0 && !selectedStorageIds.isEmpty()) {
             const u64 first64 = idx.signalChunkId * signalsPerChunk + 1ull;
             if (first64 > u64(std::numeric_limits<int>::max())) continue;
@@ -3514,6 +3548,12 @@ bool decodeLodzChunksFromFooterIndex(QFile& file,
             if (storageLevels.size() <= int(idx.levelIndex)) storageLevels.resize(int(idx.levelIndex) + 1);
             WaveLodLevel& level = storageLevels[int(idx.levelIndex)];
             level.bucketCycles = idx.bucketCycles;
+            if (idx.end > idx.start) {
+                WaveLodValidRange loadedRange;
+                loadedRange.start = idx.start;
+                loadedRange.end = idx.end;
+                level.loadedRanges.push_back(loadedRange);
+            }
             if (!validRanges.isEmpty()) {
                 level.validRanges.reserve(level.validRanges.size() + validRanges.size());
                 for (const WaveLodValidRange& range : validRanges) level.validRanges.push_back(range);
@@ -4523,7 +4563,9 @@ bool WaveParser4::loadFromFile(const QString& filePath,
                     return false;
                 }
                 const int idx = outputSignals.size();
-                outputSignals.push_back(makeWaveSignal(s, allSelectedSignalIds || selectedIds.contains(int(s.signalId))));
+                const bool rawSelected = options.loadRawSamples &&
+                    (allSelectedSignalIds || selectedIds.contains(int(s.signalId)));
+                outputSignals.push_back(makeWaveSignal(s, rawSelected));
                 directIntMapSet(outputIndexBySignalId, int(s.signalId), idx);
                 if (outputSignals.at(idx).samplesLoaded) {
                     const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
@@ -4538,16 +4580,18 @@ bool WaveParser4::loadFromFile(const QString& filePath,
                 if (!isVisibleSignal(s)) continue;
                 if (!allSelectedSignalIds && !selectedIds.contains(int(s.signalId))) continue;
                 const int idx = outputSignals.size();
-                outputSignals.push_back(makeWaveSignal(s, true));
+                outputSignals.push_back(makeWaveSignal(s, options.loadRawSamples));
                 directIntMapSet(outputIndexBySignalId, int(s.signalId), idx);
-                const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
-                directIntListMapAppend(outputIndexesByStorageId, storageId, idx);
+                if (options.loadRawSamples) {
+                    const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
+                    directIntListMapAppend(outputIndexesByStorageId, storageId, idx);
+                }
             }
         }
 
         samplesByOutputIndex.resize(outputSignals.size());
 
-        if (version >= kSupportedVersionV2 && version <= kSupportedVersionV12) {
+        if (options.loadRawSamples && version >= kSupportedVersionV2 && version <= kSupportedVersionV12) {
             if (!appendImplicitZeroSamplesForSelectedSignals(selectedIds, allSelectedSignalIds,
                                                              outputSignals, samplesByOutputIndex,
                                                              minTime, maxTime, error)) {
@@ -4614,7 +4658,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
                 break;
             }
 
-            if (selectedStorageIds.isEmpty() && !allSelectedStorageIds) {
+            if (!options.loadRawSamples || (selectedStorageIds.isEmpty() && !allSelectedStorageIds)) {
                 if (!skipSectionPayload(file, sh, error)) return false;
                 continue;
             }
@@ -4687,7 +4731,8 @@ bool WaveParser4::loadFromFile(const QString& filePath,
 
     if (!initializeOutput()) return false;
 
-    if (useFooterIndexedWdat && (allSelectedStorageIds || !selectedStorageIds.isEmpty())) {
+    if (options.loadRawSamples && useFooterIndexedWdat &&
+        (allSelectedStorageIds || !selectedStorageIds.isEmpty())) {
         if (!decodeWdatSectionsFromFooterIndex(file, footerBlocks, footerBlockIndexesByChunk,
                                                version, headerSignalsPerChunk,
                                                selectedStorageIds, allSelectedStorageIds,
@@ -4702,6 +4747,8 @@ bool WaveParser4::loadFromFile(const QString& filePath,
     if (!decodeLodzChunksFromFooterIndex(file, footerLodChunkIndex, version, headerSignalsPerChunk,
                                          lodSelectedStorageIds, allLodSelectedStorageIds,
                                          byteWidthByStorageId, footerLodLevelsByStorageId,
+                                         options.timeStart, options.timeEnd,
+                                         options.lodTargetBucketCycles,
                                          error)) {
         return false;
     }
@@ -4712,10 +4759,12 @@ bool WaveParser4::loadFromFile(const QString& filePath,
         maxTime = qMax(maxTime, b.end);
     }
 
-    appendClockSamplesForLoadedSignals(clocks, outputIndexBySignalId,
-                                       options.timeStart, options.timeEnd,
-                                       outputSignals, samplesByOutputIndex,
-                                       minTime, maxTime);
+    if (options.loadRawSamples) {
+        appendClockSamplesForLoadedSignals(clocks, outputIndexBySignalId,
+                                           options.timeStart, options.timeEnd,
+                                           outputSignals, samplesByOutputIndex,
+                                           minTime, maxTime);
+    }
 
     for (int i = 0; i < outputSignals.size(); ++i) {
         const int storageId = outputSignals.at(i).storageId > 0
@@ -4730,7 +4779,8 @@ bool WaveParser4::loadFromFile(const QString& filePath,
             }
         }
         outputSignals[i].samples = std::move(samplesByOutputIndex[i]);
-        if (allSelectedSignalIds || selectedIds.contains(outputSignals.at(i).signalId)) {
+        if (options.loadRawSamples &&
+            (allSelectedSignalIds || selectedIds.contains(outputSignals.at(i).signalId))) {
             outputSignals[i].samplesLoaded = true;
         }
     }

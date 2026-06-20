@@ -3,7 +3,11 @@
 
   <!-- Local Qt configuration.  This viewer uses Qt5 on older Windows targets. -->
   <PropertyGroup Label="UserMacros">
-    <QtLocalRoot>C:\Users\13611\source\repos\QtSingalViewer\third_party\Qt\5.15.2\msvc2019_64\</QtLocalRoot>
+    <QtLocalRoot Condition="'$(QtLocalRoot)'=='' and '$(QT5_ROOT)'!=''">$(QT5_ROOT)\</QtLocalRoot>
+    <QtLocalRoot Condition="'$(QtLocalRoot)'=='' and '$(QTDIR)'!='' and Exists('$(QTDIR)\lib\Qt5Core.lib')">$(QTDIR)\</QtLocalRoot>
+    <QtLocalRoot Condition="'$(QtLocalRoot)'=='' and Exists('C:\Qt\5.15.2\msvc2019_64\lib\Qt5Core.lib')">C:\Qt\5.15.2\msvc2019_64\</QtLocalRoot>
+    <QtLocalRoot Condition="'$(QtLocalRoot)'=='' and Exists('C:\Users\13611\source\repos\QtSingalViewer\third_party\Qt\5.15.2\msvc2019_64\lib\Qt5Core.lib')">C:\Users\13611\source\repos\QtSingalViewer\third_party\Qt\5.15.2\msvc2019_64\</QtLocalRoot>
+    <QtLocalRoot Condition="'$(QtLocalRoot)'==''">$(MSBuildThisFileDirectory)third_party\Qt\5.15.2\msvc2019_64\</QtLocalRoot>
     <QtLocalBin>$(QtLocalRoot)bin\</QtLocalBin>
     <QtLocalLib>$(QtLocalRoot)lib\</QtLocalLib>
     <QtLocalInclude>$(QtLocalRoot)include\</QtLocalInclude>
@@ -45,6 +49,18 @@
 
     <QtEntryPointLib Condition="'$(QtEntryPointLib)'=='' and '$(Configuration)'=='Debug' and Exists('$(QtLocalLib)qtmaind.lib')">qtmaind.lib</QtEntryPointLib>
     <QtEntryPointLib Condition="'$(QtEntryPointLib)'==''">qtmain.lib</QtEntryPointLib>
+
+    <QtCoreDll Condition="'$(QtCoreDll)'=='' and '$(Configuration)'=='Debug' and Exists('$(QtLocalBin)Qt5Cored.dll')">Qt5Cored.dll</QtCoreDll>
+    <QtCoreDll Condition="'$(QtCoreDll)'==''">Qt5Core.dll</QtCoreDll>
+
+    <QtGuiDll Condition="'$(QtGuiDll)'=='' and '$(Configuration)'=='Debug' and Exists('$(QtLocalBin)Qt5Guid.dll')">Qt5Guid.dll</QtGuiDll>
+    <QtGuiDll Condition="'$(QtGuiDll)'==''">Qt5Gui.dll</QtGuiDll>
+
+    <QtWidgetsDll Condition="'$(QtWidgetsDll)'=='' and '$(Configuration)'=='Debug' and Exists('$(QtLocalBin)Qt5Widgetsd.dll')">Qt5Widgetsd.dll</QtWidgetsDll>
+    <QtWidgetsDll Condition="'$(QtWidgetsDll)'==''">Qt5Widgets.dll</QtWidgetsDll>
+
+    <QtWindowsPlatformDll Condition="'$(QtWindowsPlatformDll)'=='' and '$(Configuration)'=='Debug' and Exists('$(QtLocalPlugins)platforms\qwindowsd.dll')">qwindowsd.dll</QtWindowsPlatformDll>
+    <QtWindowsPlatformDll Condition="'$(QtWindowsPlatformDll)'==''">qwindows.dll</QtWindowsPlatformDll>
   </PropertyGroup>
 
   <ItemDefinitionGroup>

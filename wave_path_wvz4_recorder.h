@@ -52,15 +52,11 @@ public:
         std::size_t async_writer_queue_limit = 256;
         std::size_t async_writer_queue_bytes_limit = 256u * 1024u * 1024u;
 
-        // Optional crash/kill resistant helper mode. Disabled by default because
-        // packaged CMake integration writes WVZ4 in-process and does not ship a
-        // writer helper executable.
-        //
-        // When enabled, the simulation
-        // process sends layout/cycle frames to a separate writer process. The
-        // helper owns the real WVZ4 Writer and finalizes the file if the parent
-        // process exits, crashes, or is killed by VS Stop Debugging.
-        bool use_writer_process = false;
+        // Crash/kill resistant helper mode. Enabled by default so a simulation
+        // process crash/kill still leaves a finalized WVZ4 up to the last
+        // complete cycle frame received by the helper. Set this to false only
+        // for deliberately in-process captures.
+        bool use_writer_process = true;
         std::string writer_process_exe_path;
         unsigned int writer_process_connect_timeout_ms = 10000;
 

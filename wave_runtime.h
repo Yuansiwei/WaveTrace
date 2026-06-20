@@ -4305,8 +4305,12 @@ private:
 
     void ensure_dirty_tls_capacity_for_current_thread() {
         ThreadTraceLocal& tls = current_thread_trace_local();
-        preserve_tls_dirty_before_owner_switch_(tls, this);
-        tls.attach(this, dirty_peek_groups_.size(), dirty_epoch_);
+        if (tls.owner != this) {
+            preserve_tls_dirty_before_owner_switch_(tls, this);
+            tls.attach(this, dirty_peek_groups_.size(), dirty_epoch_);
+        } else {
+            tls.ensure_capacity(dirty_peek_groups_.size());
+        }
     }
 
     bool try_ensure_dirty_tls_capacity_for_current_thread() noexcept {
@@ -4327,8 +4331,12 @@ private:
 
     void ensure_wave_value_tls_capacity_for_current_thread() {
         ThreadTraceLocal& tls = current_thread_trace_local();
-        preserve_tls_dirty_before_owner_switch_(tls, this);
-        tls.attach_wave_values(this, dirty_wave_value_groups_.size(), dirty_epoch_);
+        if (tls.owner != this) {
+            preserve_tls_dirty_before_owner_switch_(tls, this);
+            tls.attach_wave_values(this, dirty_wave_value_groups_.size(), dirty_epoch_);
+        } else {
+            tls.ensure_wave_value_capacity(dirty_wave_value_groups_.size());
+        }
     }
 
     bool try_ensure_wave_value_tls_capacity_for_current_thread() noexcept {
@@ -4348,8 +4356,12 @@ private:
 
     void ensure_wave_array_tls_capacity_for_current_thread() {
         ThreadTraceLocal& tls = current_thread_trace_local();
-        preserve_tls_dirty_before_owner_switch_(tls, this);
-        tls.attach_wave_arrays(this, dirty_wave_array_groups_.size(), dirty_epoch_);
+        if (tls.owner != this) {
+            preserve_tls_dirty_before_owner_switch_(tls, this);
+            tls.attach_wave_arrays(this, dirty_wave_array_groups_.size(), dirty_epoch_);
+        } else {
+            tls.ensure_wave_array_capacity(dirty_wave_array_groups_.size());
+        }
     }
 
     bool try_ensure_wave_array_tls_capacity_for_current_thread() noexcept {

@@ -124,7 +124,7 @@ public:
     }
 
     DynamicExpandFn wave_trace_dynamic_expander() const override {
-        return NULL;
+        return &dynamic_expand_bridge<T>;
     }
 
     WaveDirtyHook* wave_trace_dirty_hook() const override {
@@ -172,7 +172,7 @@ public:
     }
 
     DynamicExpandFn wave_trace_peek_dynamic_expander() const override {
-        return NULL;
+        return &dynamic_expand_bridge<ValueT>;
     }
 
     WaveDirtyHook* wave_trace_peek_dirty_hook() const override {

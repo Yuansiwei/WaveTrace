@@ -746,10 +746,6 @@ namespace {
         return text;
     }
 
-    int targetLodSamplesForPlotWidth(int plotWidth) {
-        return qMax(64, plotWidth / 2);
-    }
-
     int targetRawBusSamplesForPlotWidth(int plotWidth) {
         return qMax(64, plotWidth * 2);
     }
@@ -769,8 +765,27 @@ namespace {
         return windowStart + bucketCycles;
     }
 
-    QVector<WaveLodValidRange> effectiveLodValidRanges(const WaveLodLevel& level) {
-        if (!level.validRanges.isEmpty()) return level.validRanges;
+    QVector<WaveLodValidRange> intersectLodRanges(const QVector<WaveLodValidRange>& a,
+                                                  const QVector<WaveLodValidRange>& b) {
+        QVector<WaveLodValidRange> out;
+        int ai = 0;
+        int bi = 0;
+        while (ai < a.size() && bi < b.size()) {
+            const qint64 start = qMax(a.at(ai).start, b.at(bi).start);
+            const qint64 end = qMin(a.at(ai).end, b.at(bi).end);
+            if (end > start) {
+                WaveLodValidRange range;
+                range.start = start;
+                range.end = end;
+                out.push_back(range);
+            }
+            if (a.at(ai).end < b.at(bi).end) ++ai;
+            else ++bi;
+        }
+        return out;
+    }
+
+    QVector<WaveLodValidRange> inferredLodDataRanges(const WaveLodLevel& level) {
         QVector<WaveLodValidRange> ranges;
         const qint64 bucketCycles = qMax<qint64>(1, level.bucketCycles);
 
@@ -817,6 +832,15 @@ namespace {
         return ranges;
     }
 
+    QVector<WaveLodValidRange> effectiveLodValidRanges(const WaveLodLevel& level) {
+        if (level.validRanges.isEmpty() && level.loadedRanges.isEmpty()) {
+            return inferredLodDataRanges(level);
+        }
+        if (level.validRanges.isEmpty()) return level.loadedRanges;
+        if (level.loadedRanges.isEmpty()) return level.validRanges;
+        return intersectLodRanges(level.validRanges, level.loadedRanges);
+    }
+
     bool lodLevelIntersectsRange(const WaveLodLevel& level, qint64 start, qint64 end) {
         if (end <= start) return false;
         const QVector<WaveLodValidRange> ranges = effectiveLodValidRanges(level);
@@ -831,20 +855,17 @@ namespace {
                                                   qint64 spanValue, int plotWidth) {
         const double cyclesPerPixel = double(spanValue) / double(qMax(1, plotWidth));
         if (cyclesPerPixel < 128.0 || sig.lodLevels.isEmpty()) return nullptr;
-        const WaveLodLevel* first = nullptr;
         const WaveLodLevel* best = nullptr;
 
-        const int targetSamples = targetLodSamplesForPlotWidth(plotWidth);
-        const qint64 maxBucketCycles = qMax<qint64>(1, qint64(std::ceil(double(spanValue) / double(targetSamples))));
+        const qint64 maxBucketCycles = qMax<qint64>(1, qint64(std::floor(cyclesPerPixel)));
         for (int i = 0; i < sig.lodLevels.size(); ++i) {
             const WaveLodLevel& level = sig.lodLevels.at(i);
             if (level.bucketCycles <= 0 || (level.buckets.isEmpty() && level.samples.isEmpty())) continue;
             if (!lodLevelIntersectsRange(level, start, end)) continue;
-            if (!first) first = &level;
             if (level.bucketCycles <= maxBucketCycles) best = &level;
             else break;
         }
-        return best ? best : first;
+        return best;
     }
 
     int lowerSampleIndexForTime(const QVector<WaveSample>& samples, qint64 t) {
@@ -1713,6 +1734,16 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
     auto fastX = [&](qint64 t) -> int {
         return int(std::lround(fastXF(t)));
     };
+    auto pixelSpanForTimeRange = [&](qint64 start, qint64 end, bool forceVisible,
+                                     int& x1, int& x2) -> bool {
+        if (end <= start) return false;
+        x1 = qBound(plotLeft, fastX(start), plotRightBoundary);
+        x2 = qBound(plotLeft, fastX(end), plotRightBoundary);
+        if (forceVisible && x2 <= x1 && x1 < plotRightBoundary) {
+            x2 = x1 + 1;
+        }
+        return x2 > x1;
+    };
     auto lowerIndexForTime = [](const QVector<WaveSample>& samples, qint64 t) -> int {
         int lo = 0, hi = samples.size();
         while (lo < hi) {
@@ -2096,12 +2127,12 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
 
             auto drawBitMaskRange = [&](quint8 mask, qint64 start, qint64 end) {
                 if (end <= start || mask == 0u) return;
-                const int x1 = fastX(start);
-                const int x2 = fastX(end);
-                if (x2 <= x1) return;
+                int x1 = 0;
+                int x2 = 0;
+                if (!pixelSpanForTimeRange(start, end, true, x1, x2)) return;
                 const int right = x2 - 1;
                 auto drawMaskLine = [&](int y, const QColor& color) {
-                    if (right <= x1) return;
+                    if (right < x1) return;
                     validateBitHorizontalPrimitive("lod-bucket-mask", entry.signalIndex, absoluteRow,
                                                    x1, right, y, yHigh, yLow, yMid);
                     drawHorizontalPixelBlock(p, x1, right, y, color);
@@ -2137,9 +2168,9 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
             };
             auto drawBusStableRange = [&](quint64 rawBits, qint64 start, qint64 end) {
                 if (end <= start) return;
-                const int x1 = fastX(start);
-                const int x2 = fastX(end);
-                if (x2 <= x1) return;
+                int x1 = 0;
+                int x2 = 0;
+                if (!pixelSpanForTimeRange(start, end, false, x1, x2)) return;
                 drawBusRoundedFrame(p, QRect(x1, yBusTop, x2 - x1, qMax(1, yBusBottom - yBusTop)),
                                     lodActivityLineColor, kWaveStrokeWidth, Qt::NoBrush,
                                     start > m_viewStart, end < m_viewEnd);
@@ -2152,12 +2183,9 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
             };
             auto drawBusActivityRange = [&](const WaveLodBucket& bucket, qint64 start, qint64 end) {
                 if (end <= start) return;
-                const int x1 = fastX(start);
-                const int x2 = fastX(end);
-                if (x2 <= x1) {
-                    addLodActivityBoundaryX(x1);
-                    return;
-                }
+                int x1 = 0;
+                int x2 = 0;
+                if (!pixelSpanForTimeRange(start, end, true, x1, x2)) return;
                 if (x2 - x1 <= denseActivityMiniFrameMaxWidth) {
                     const QRect rect(x1, yBusTop, x2 - x1, qMax(1, yBusBottom - yBusTop));
                     lodActivityMiniRects.push_back(rect);
@@ -2361,15 +2389,17 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                                 continue;
                             }
                             if (style == Qt::SolidLine) {
+                                const int rightX = plotLeft + qMax(runStart, endX - 1);
                                 validateBitHorizontalPrimitive(context, entry.signalIndex, absoluteRow,
-                                                               plotLeft + runStart, plotLeft + qMax(runStart, endX),
+                                                               plotLeft + runStart, rightX,
                                                                y, yHigh, yLow, yMid);
-                                drawHorizontalPixelBlock(p, plotLeft + runStart, plotLeft + qMax(runStart, endX), y, color);
+                                drawHorizontalPixelBlock(p, plotLeft + runStart, rightX, y, color);
                             } else {
+                                const int rightX = plotLeft + qMax(runStart, endX - 1);
                                 validateBitHorizontalPrimitive(context, entry.signalIndex, absoluteRow,
-                                                               plotLeft + runStart, plotLeft + qMax(runStart, endX),
+                                                               plotLeft + runStart, rightX,
                                                                y, yHigh, yLow, yMid);
-                                p.drawLine(plotLeft + runStart, y, plotLeft + qMax(runStart, endX), y);
+                                p.drawLine(plotLeft + runStart, y, rightX, y);
                             }
                             runStart = -1;
                         }

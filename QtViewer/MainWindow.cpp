@@ -169,6 +169,114 @@ bool viewerDisableLodEnabled() {
     return enabled;
 }
 
+void compactLodRanges(QVector<WaveLodValidRange>& ranges) {
+    if (ranges.isEmpty()) return;
+    std::sort(ranges.begin(), ranges.end(), [](const WaveLodValidRange& a, const WaveLodValidRange& b) {
+        return a.start < b.start;
+    });
+    int write = 0;
+    for (int read = 0; read < ranges.size(); ++read) {
+        const WaveLodValidRange range = ranges.at(read);
+        if (range.end <= range.start) continue;
+        if (write > 0 && range.start <= ranges.at(write - 1).end) {
+            if (range.end > ranges[write - 1].end) ranges[write - 1].end = range.end;
+        } else {
+            if (write != read) ranges[write] = range;
+            ++write;
+        }
+    }
+    ranges.resize(write);
+}
+
+bool lodRangesCoverWindow(const QVector<WaveLodValidRange>& ranges, qint64 start, qint64 end) {
+    if (end <= start) return true;
+    if (ranges.isEmpty()) return true;
+    qint64 cursor = start;
+    for (const WaveLodValidRange& range : ranges) {
+        if (range.end <= cursor) continue;
+        if (range.start > cursor) return false;
+        cursor = qMax(cursor, range.end);
+        if (cursor >= end) return true;
+    }
+    return false;
+}
+
+bool lodLevelLoadedForWindow(const WaveLodLevel& level, qint64 start, qint64 end) {
+    if (level.bucketCycles <= 0 || (level.samples.isEmpty() && level.buckets.isEmpty())) return false;
+    return lodRangesCoverWindow(level.loadedRanges, start, end);
+}
+
+bool signalHasLoadedLodForWindow(const WaveSignal& sig,
+                                 qint64 start,
+                                 qint64 end,
+                                 int plotWidth) {
+    if (end <= start || sig.lodLevels.isEmpty()) return false;
+    const double cyclesPerPixel = double(end - start) / double(qMax(1, plotWidth));
+    if (cyclesPerPixel < 128.0) return false;
+    const qint64 maxBucketCycles = qMax<qint64>(1, qint64(std::floor(cyclesPerPixel)));
+    for (const WaveLodLevel& level : sig.lodLevels) {
+        if (level.bucketCycles <= 0) continue;
+        if (level.bucketCycles > maxBucketCycles) break;
+        if (lodLevelLoadedForWindow(level, start, end)) return true;
+    }
+    return false;
+}
+
+void compactLodSamples(QVector<WaveSample>& samples) {
+    if (samples.size() <= 1) return;
+    std::sort(samples.begin(), samples.end(), [](const WaveSample& a, const WaveSample& b) {
+        return a.time < b.time;
+    });
+    int write = 1;
+    for (int read = 1; read < samples.size(); ++read) {
+        if (samples.at(read).time == samples.at(write - 1).time) {
+            samples[write - 1] = samples.at(read);
+        } else {
+            if (write != read) samples[write] = samples.at(read);
+            ++write;
+        }
+    }
+    samples.resize(write);
+}
+
+void mergeLodLevel(WaveLodLevel& dst, WaveLodLevel&& src) {
+    if (src.bucketCycles <= 0) return;
+    if (dst.bucketCycles <= 0) dst.bucketCycles = src.bucketCycles;
+    if (dst.bucketCycles != src.bucketCycles) return;
+
+    dst.samples.reserve(dst.samples.size() + src.samples.size());
+    for (WaveSample& sample : src.samples) dst.samples.push_back(std::move(sample));
+    compactLodSamples(dst.samples);
+
+    dst.buckets.reserve(dst.buckets.size() + src.buckets.size());
+    for (WaveLodBucket& bucket : src.buckets) dst.buckets.push_back(std::move(bucket));
+    if (dst.buckets.size() > 1) {
+        std::sort(dst.buckets.begin(), dst.buckets.end(), [](const WaveLodBucket& a, const WaveLodBucket& b) {
+            if (a.start != b.start) return a.start < b.start;
+            return a.end < b.end;
+        });
+        int write = 1;
+        for (int read = 1; read < dst.buckets.size(); ++read) {
+            if (dst.buckets.at(read).start == dst.buckets.at(write - 1).start &&
+                dst.buckets.at(read).end == dst.buckets.at(write - 1).end) {
+                dst.buckets[write - 1] = dst.buckets.at(read);
+            } else {
+                if (write != read) dst.buckets[write] = dst.buckets.at(read);
+                ++write;
+            }
+        }
+        dst.buckets.resize(write);
+    }
+
+    dst.validRanges.reserve(dst.validRanges.size() + src.validRanges.size());
+    for (const WaveLodValidRange& range : src.validRanges) dst.validRanges.push_back(range);
+    compactLodRanges(dst.validRanges);
+
+    dst.loadedRanges.reserve(dst.loadedRanges.size() + src.loadedRanges.size());
+    for (const WaveLodValidRange& range : src.loadedRanges) dst.loadedRanges.push_back(range);
+    compactLodRanges(dst.loadedRanges);
+}
+
 void viewerPerfLog(const char* step, qint64 elapsedMs, int signalCount, int treeNodeCount, int activeRows = -1) {
     if (!viewerPerfLogEnabled()) return;
     std::fprintf(stderr,
@@ -4149,7 +4257,9 @@ void MainWindow::applyWave(WaveFile&& wave) {
                       m_wave.signalList.size(), m_wave.tree.nodesById.size(), m_activeList->topLevelItemCount());
     }
 
-    for (int i = 0; i < qMin(6, m_wave.signalList.size()); ++i) addSignalToActive(i);
+    QList<int> firstSignalIndexes;
+    for (int i = 0; i < qMin(6, m_wave.signalList.size()); ++i) firstSignalIndexes.push_back(i);
+    addSignalIndexesToActive(firstSignalIndexes);
     if (perf) {
         viewerPerfLog("apply.first_active", stepTimer.restart(),
                       m_wave.signalList.size(), m_wave.tree.nodesById.size(), m_activeList->topLevelItemCount());
@@ -4203,7 +4313,7 @@ bool MainWindow::openWaveFilePath(const QString& path, bool showError) {
         const bool rawOnly = viewerDisableLodEnabled();
         loadOptions.includeAllSignalDefinitions = true;
         loadOptions.autoLoadFirstSignalCount = rawOnly ? 6 : 0;
-        loadOptions.autoLoadFirstSignalLodCount = rawOnly ? 0 : 6;
+        loadOptions.autoLoadFirstSignalLodCount = 0;
         loadOptions.loadAllIfWindowEmpty = false;
         ok = WaveParser4::loadFromFile(path, wave, error, loadOptions);
     }
@@ -5604,11 +5714,85 @@ void MainWindow::setActiveItemFormat(QTreeWidgetItem* item, const QString& text)
 
 bool MainWindow::canDeferSamplesWithLod(const WaveSignal& sig) const {
     if (viewerDisableLodEnabled()) return false;
-    if (sig.lodLevels.isEmpty() || !m_canvas) return false;
+    if (!m_canvas) return false;
     const int plotWidth = qMax(1, m_canvas->width() - 20);
-    const qint64 span = qMax<qint64>(1, m_canvas->viewEnd() - m_canvas->viewStart());
-    const double cyclesPerPixel = double(span) / double(plotWidth);
-    return cyclesPerPixel >= 128.0;
+    return signalHasLoadedLodForWindow(sig, m_canvas->viewStart(), m_canvas->viewEnd(), plotWidth);
+}
+
+bool MainWindow::ensureSignalLodLoaded(const QList<int>& signalIndexes) {
+    if (viewerDisableLodEnabled()) return true;
+    if (!m_currentWaveFilePath.endsWith(".wvz4", Qt::CaseInsensitive)) return true;
+    if (signalIndexes.isEmpty()) return true;
+
+    const qint64 viewStart = m_canvas ? m_canvas->viewStart() : m_wave.meta.start;
+    const qint64 viewEnd = m_canvas ? m_canvas->viewEnd() : m_wave.meta.end;
+    const qint64 viewSpan = qMax<qint64>(1, viewEnd - viewStart);
+    const qint64 loadStart = (viewStart > std::numeric_limits<qint64>::min() + viewSpan)
+        ? qMax(m_wave.meta.start, viewStart - viewSpan)
+        : m_wave.meta.start;
+    const qint64 loadEnd = (viewEnd < std::numeric_limits<qint64>::max() - viewSpan)
+        ? qMin(m_wave.meta.end, viewEnd + viewSpan)
+        : m_wave.meta.end;
+    const int plotWidth = m_canvas ? qMax(1, m_canvas->width() - 20) : 1;
+    const double cyclesPerPixel = double(viewSpan) / double(plotWidth);
+    if (cyclesPerPixel < 128.0) return true;
+
+    QVector<int> signalIdsToLoad;
+    QSet<int> seenIds;
+    for (int signalIndex : signalIndexes) {
+        if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
+        const WaveSignal& sig = m_wave.signalList.at(signalIndex);
+        if (signalHasLoadedLodForWindow(sig, viewStart, viewEnd, plotWidth)) continue;
+        if (sig.samplesLoaded) continue;
+        if (sig.signalId <= 0) continue;
+        if (seenIds.contains(sig.signalId)) continue;
+        seenIds.insert(sig.signalId);
+        signalIdsToLoad.push_back(sig.signalId);
+    }
+    if (signalIdsToLoad.isEmpty()) return true;
+
+    WaveFile loadedWave;
+    QString error;
+    WaveParser4::LoadOptions loadOptions;
+    loadOptions.signalIds = signalIdsToLoad;
+    loadOptions.includeAllSignalDefinitions = false;
+    loadOptions.loadAllIfWindowEmpty = false;
+    loadOptions.loadRawSamples = false;
+    loadOptions.maxDecodedSamples = 0;
+    loadOptions.timeStart = loadStart;
+    loadOptions.timeEnd = qMax(loadStart + 1, loadEnd);
+    loadOptions.lodTargetBucketCycles = qMax<qint64>(1, qint64(std::floor(cyclesPerPixel)));
+    QElapsedTimer lodTimer;
+    if (viewerPerfLogEnabled()) lodTimer.start();
+    if (!WaveParser4::loadFromFile(m_currentWaveFilePath, loadedWave, error, loadOptions)) {
+        QMessageBox::warning(this,
+            QStringLiteral("Load LOD failed"),
+            error.isEmpty() ? QStringLiteral("Unable to load LOD for selected signals.") : error);
+        return false;
+    }
+    if (viewerPerfLogEnabled()) {
+        viewerPerfLog("lod.load", lodTimer.elapsed(),
+                      loadedWave.signalList.size(), loadedWave.tree.nodesById.size(),
+                      signalIdsToLoad.size());
+    }
+
+    for (WaveSignal& loadedSig : loadedWave.signalList) {
+        if (loadedSig.signalId < 0 || loadedSig.lodLevels.isEmpty()) continue;
+        int targetIndex = -1;
+        const int sid = loadedSig.signalId;
+        if (sid >= 0 && sid < m_signalIndexBySignalId.size()) {
+            targetIndex = m_signalIndexBySignalId.at(sid) - 1;
+        }
+        if (targetIndex < 0 || targetIndex >= m_wave.signalList.size()) continue;
+        QVector<WaveLodLevel>& targetLevels = m_wave.signalList[targetIndex].lodLevels;
+        if (targetLevels.size() < loadedSig.lodLevels.size()) targetLevels.resize(loadedSig.lodLevels.size());
+        for (int levelIndex = 0; levelIndex < loadedSig.lodLevels.size(); ++levelIndex) {
+            mergeLodLevel(targetLevels[levelIndex], std::move(loadedSig.lodLevels[levelIndex]));
+        }
+    }
+
+    if (m_canvas) m_canvas->update();
+    return true;
 }
 
 bool MainWindow::ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool allowLodDefer) {
@@ -5705,7 +5889,8 @@ void MainWindow::addSignalToActive(int signalIndex) {
 
 void MainWindow::addSignalIndexesToActive(const QList<int>& signalIndexes) {
     if (signalIndexes.isEmpty()) return;
-    if (!ensureSignalSamplesLoaded(signalIndexes, false)) return;
+    if (!ensureSignalLodLoaded(signalIndexes)) return;
+    if (!ensureSignalSamplesLoaded(signalIndexes, true)) return;
 
     QList<QTreeWidgetItem*> addedItems;
     addedItems.reserve(signalIndexes.size());
@@ -5959,10 +6144,21 @@ void MainWindow::onViewportChanged(qint64 start, qint64 end) {
             scheduleRefreshActiveValueLabels(100);
             return;
         }
-        QList<int> needRawSignals;
+        QList<int> activeSignalIndexes;
+        activeSignalIndexes.reserve(m_activeList->topLevelItemCount());
         for (int i = 0; i < m_activeList->topLevelItemCount(); ++i) {
             QTreeWidgetItem* item = m_activeList->topLevelItem(i);
             const int signalIndex = signalIndexFromActiveItem(item);
+            if (signalIndex >= 0 && signalIndex < m_wave.signalList.size()) {
+                activeSignalIndexes.push_back(signalIndex);
+            }
+        }
+        if (!activeSignalIndexes.isEmpty() && !ensureSignalLodLoaded(activeSignalIndexes)) {
+            scheduleRefreshActiveValueLabels(100);
+            return;
+        }
+        QList<int> needRawSignals;
+        for (int signalIndex : activeSignalIndexes) {
             if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
             const WaveSignal& sig = m_wave.signalList.at(signalIndex);
             if (sig.samplesLoaded) continue;

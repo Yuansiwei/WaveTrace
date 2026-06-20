@@ -60,6 +60,7 @@ struct WaveLodLevel {
     QVector<WaveLodBucket> buckets;
     QVector<WaveSample> samples;
     QVector<WaveLodValidRange> validRanges;
+    QVector<WaveLodValidRange> loadedRanges;
 };
 
 struct WaveDiffRegion {
@@ -138,7 +139,7 @@ inline const QString& waveAbsentValue() {
     return kValue;
 }
 
-inline constexpr qint64 kWaveViewerDisplayTicksPerCycle = 10;
+constexpr qint64 kWaveViewerDisplayTicksPerCycle = 10;
 
 inline QString waveFormatDisplayTime(qint64 internalTime) {
     qint64 decimalBase = kWaveViewerDisplayTicksPerCycle;

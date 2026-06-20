@@ -63,7 +63,7 @@
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
-      <LanguageStandard>stdcpp17</LanguageStandard>
+      <LanguageStandard>stdcpp14</LanguageStandard>
       <ExceptionHandling>Sync</ExceptionHandling>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
       <AdditionalIncludeDirectories>$(MSBuildProjectDirectory);$(QtGeneratedDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -85,7 +85,7 @@
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
-      <LanguageStandard>stdcpp17</LanguageStandard>
+      <LanguageStandard>stdcpp14</LanguageStandard>
       <ExceptionHandling>Sync</ExceptionHandling>
       <AdditionalIncludeDirectories>$(MSBuildProjectDirectory);$(QtGeneratedDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;_WINDOWS;NOMINMAX;_CRT_SECURE_NO_WARNINGS;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -161,14 +161,14 @@
 
   <Target Name="DeployQtRuntime" AfterTargets="Build">
     <MakeDir Directories="$(OutDir)platforms\" />
-    <Copy SourceFiles="$(QtLocalBin)Qt5Core.dll;$(QtLocalBin)Qt5Gui.dll;$(QtLocalBin)Qt5Widgets.dll"
+    <Copy SourceFiles="$(QtLocalBin)$(QtCoreDll);$(QtLocalBin)$(QtGuiDll);$(QtLocalBin)$(QtWidgetsDll)"
           DestinationFolder="$(OutDir)"
           SkipUnchangedFiles="true"
-          Condition="Exists('$(QtLocalBin)Qt5Core.dll')" />
-    <Copy SourceFiles="$(QtLocalPlugins)platforms\qwindows.dll"
+          Condition="Exists('$(QtLocalBin)$(QtCoreDll)')" />
+    <Copy SourceFiles="$(QtLocalPlugins)platforms\$(QtWindowsPlatformDll)"
           DestinationFolder="$(OutDir)platforms\"
           SkipUnchangedFiles="true"
-          Condition="Exists('$(QtLocalPlugins)platforms\qwindows.dll')" />
+          Condition="Exists('$(QtLocalPlugins)platforms\$(QtWindowsPlatformDll)')" />
   </Target>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

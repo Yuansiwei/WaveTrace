@@ -171,8 +171,9 @@ int main(int argc, char** argv) {
     wvz4::u64 signal_count_64 = 10000;
     wvz4::u64 rotating_updates_per_cycle = 1;
     wvz4::u64 progress_every = 100000;
-    bool use_helper_process = false;
+    bool use_helper_process = true;
     bool enable_lod_tables = true;
+    bool all_signals_every_cycle = false;
     std::string helper_exe_path;
 
     std::vector<std::string> positional;
@@ -180,10 +181,14 @@ int main(int argc, char** argv) {
         const std::string arg = argv[i] ? argv[i] : "";
         if (arg == "--helper") {
             use_helper_process = true;
+        } else if (arg == "--no-helper") {
+            use_helper_process = false;
         } else if (arg == "--no-lod") {
             enable_lod_tables = false;
         } else if (arg == "--lod") {
             enable_lod_tables = true;
+        } else if (arg == "--all-signals-every-cycle") {
+            all_signals_every_cycle = true;
         } else if (arg == "--helper-exe") {
             if (i + 1 >= argc) {
                 std::cerr << "--helper-exe requires a path\n";
@@ -198,7 +203,8 @@ int main(int argc, char** argv) {
         } else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "usage: smoke_business_1m_writer [out.wvz4] [cycles] [signals] [updates_per_cycle]"
-                << " [--helper] [--helper-exe path] [--progress cycles] [--no-lod|--lod]\n";
+                << " [--helper|--no-helper] [--helper-exe path] [--progress cycles] [--no-lod|--lod]"
+                << " [--all-signals-every-cycle]\n";
             return 0;
         } else {
             positional.push_back(arg);
@@ -228,11 +234,13 @@ int main(int argc, char** argv) {
                   << " when scaled by writer ticks per business cycle\n";
         return 2;
     }
-    if (signal_count_64 < 32u || signal_count_64 > 1000000u) {
-        std::cerr << "signal count must be in 32..1000000\n";
+    const wvz4::u64 min_signal_count = all_signals_every_cycle ? 1u : 32u;
+    if (signal_count_64 < min_signal_count || signal_count_64 > 1000000u) {
+        std::cerr << "signal count must be in " << min_signal_count << "..1000000\n";
         return 2;
     }
-    if (rotating_updates_per_cycle == 0 || rotating_updates_per_cycle > signal_count_64 - 6u) {
+    if (!all_signals_every_cycle &&
+        (rotating_updates_per_cycle == 0 || rotating_updates_per_cycle > signal_count_64 - 6u)) {
         std::cerr << "rotating updates per cycle must be in 1..signal_count-6\n";
         return 2;
     }
@@ -280,29 +288,41 @@ int main(int argc, char** argv) {
 
         wvz4::CycleSubmission submission;
         submission.cycle = static_cast<wvz4::i64>(cycle * kWriterTicksPerBusinessCycle);
-        submission.updates.reserve(static_cast<std::size_t>(rotating_update_count) + 24u);
+        submission.updates.reserve(all_signals_every_cycle
+            ? static_cast<std::size_t>(signal_count)
+            : static_cast<std::size_t>(rotating_update_count) + 24u);
 
-        append_update_once(submission, seen_epoch, epoch, 1, metas, cycle);
-        append_update_once(submission, seen_epoch, epoch, 2, metas, cycle);
-        if ((cycle % 4ull) == 0ull) append_update_once(submission, seen_epoch, epoch, 3, metas, cycle / 4ull);
-        if ((cycle % 8ull) == 0ull) append_update_once(submission, seen_epoch, epoch, 4, metas, mix64(cycle));
-        if ((cycle % 17ull) == 0ull) append_update_once(submission, seen_epoch, epoch, 5, metas, cycle / 17ull);
-        if ((cycle % 31ull) == 0ull) append_update_once(submission, seen_epoch, epoch, 6, metas, mix64(cycle ^ 0x31ull));
+        if (all_signals_every_cycle) {
+            for (wvz4::u32 signal_id = 1; signal_id <= signal_count; ++signal_id) {
+                wvz4::u64 value = (cycle << 20) ^ static_cast<wvz4::u64>(signal_id);
+                if (metas[signal_id].type == wvz4::ValueType::Bool) {
+                    value = cycle + signal_id;
+                }
+                append_update_once(submission, seen_epoch, epoch, signal_id, metas, value);
+            }
+        } else {
+            append_update_once(submission, seen_epoch, epoch, 1, metas, cycle);
+            append_update_once(submission, seen_epoch, epoch, 2, metas, cycle);
+            if ((cycle % 4ull) == 0ull) append_update_once(submission, seen_epoch, epoch, 3, metas, cycle / 4ull);
+            if ((cycle % 8ull) == 0ull) append_update_once(submission, seen_epoch, epoch, 4, metas, mix64(cycle));
+            if ((cycle % 17ull) == 0ull) append_update_once(submission, seen_epoch, epoch, 5, metas, cycle / 17ull);
+            if ((cycle % 31ull) == 0ull) append_update_once(submission, seen_epoch, epoch, 6, metas, mix64(cycle ^ 0x31ull));
 
-        const wvz4::u64 rotating_slots = signal_count_64 - 6u;
-        const wvz4::u64 rotating_base = (cycle * rotating_updates_per_cycle) % rotating_slots;
-        for (wvz4::u32 i = 0; i < rotating_update_count; ++i) {
-            const wvz4::u32 rotating = 7u + static_cast<wvz4::u32>((rotating_base + i) % rotating_slots);
-            append_update_once(submission, seen_epoch, epoch, rotating, metas,
-                               mix64((cycle << 12) ^ (static_cast<wvz4::u64>(i) << 32) ^ rotating));
-        }
+            const wvz4::u64 rotating_slots = signal_count_64 - 6u;
+            const wvz4::u64 rotating_base = (cycle * rotating_updates_per_cycle) % rotating_slots;
+            for (wvz4::u32 i = 0; i < rotating_update_count; ++i) {
+                const wvz4::u32 rotating = 7u + static_cast<wvz4::u32>((rotating_base + i) % rotating_slots);
+                append_update_once(submission, seen_epoch, epoch, rotating, metas,
+                                   mix64((cycle << 12) ^ (static_cast<wvz4::u64>(i) << 32) ^ rotating));
+            }
 
-        if ((cycle % 257ull) == 0ull) {
-            const wvz4::u32 base = 7u + static_cast<wvz4::u32>(
-                ((cycle / 257ull) * 23ull) % (signal_count - 22u));
-            for (wvz4::u32 i = 0; i < 16u; ++i) {
-                append_update_once(submission, seen_epoch, epoch, base + i, metas,
-                                   mix64(cycle ^ (static_cast<wvz4::u64>(base + i) << 24)));
+            if ((cycle % 257ull) == 0ull) {
+                const wvz4::u32 base = 7u + static_cast<wvz4::u32>(
+                    ((cycle / 257ull) * 23ull) % (signal_count - 22u));
+                for (wvz4::u32 i = 0; i < 16u; ++i) {
+                    append_update_once(submission, seen_epoch, epoch, base + i, metas,
+                                       mix64(cycle ^ (static_cast<wvz4::u64>(base + i) << 24)));
+                }
             }
         }
 
@@ -351,6 +371,7 @@ int main(int argc, char** argv) {
     std::cout << "writer_ticks_per_business_cycle=" << kWriterTicksPerBusinessCycle << "\n";
     std::cout << "signals=" << signal_count << "\n";
     std::cout << "rotating_updates_per_cycle=" << rotating_updates_per_cycle << "\n";
+    std::cout << "all_signals_every_cycle=" << (all_signals_every_cycle ? 1 : 0) << "\n";
     std::cout << "lod_tables=" << (enable_lod_tables ? 1 : 0) << "\n";
     std::cout << "submitted_updates=" << submitted_updates << "\n";
     std::cout << "elapsed_ms=" << elapsed_ms << "\n";

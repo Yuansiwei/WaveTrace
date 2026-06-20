@@ -31,9 +31,20 @@ public:
         // rows so wide views can defer raw sample loading.
         int autoLoadFirstSignalLodCount = -1;
 
+        // When positive, LODZ loading keeps the coarsest level whose bucket
+        // size is no larger than this many cycles, plus coarser fallback
+        // levels. 0 means load all available LOD levels for the selected
+        // signals and time range.
+        qint64 lodTargetBucketCycles = 0;
+
         // Safety guard for very large files. 0 means unlimited. The count is
         // checked while WDAT samples are materialized, before appending to memory.
         quint64 maxDecodedSamples = 0;
+
+        // When false, selected signal ids are used only to fetch LOD records.
+        // Raw WDAT samples are not decoded and returned signals stay
+        // samplesLoaded=false.
+        bool loadRawSamples = true;
 
         // New WVZ4 writer versions finalize files by writing FOOT and patching
         // footer_offset in the header. Keep this false in viewer paths so a
