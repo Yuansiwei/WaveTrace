@@ -183,7 +183,7 @@ namespace
         // batch roots / -o / --log-file / --whitelist-from-header, ReflectGen
         // automatically uses:
         //   <vcxproj_dir>/inc/aqcm.hpp
-        //   <vcxproj_dir>/generated_reflect
+        //   <vcxproj_dir>/WaveTracer/generated_reflect
         //   <output_dir>/reflectgen.log
         bool autoIncludeWhitelistHeader = false;
         bool autoExtraTargetListFile = false;
@@ -685,6 +685,11 @@ namespace
         const std::string& projectDir,
         const std::string& config,
         const std::string& platform);
+    std::string ExpandMsbuildMacrosForFile(std::string value,
+        const std::string& projectDir,
+        const std::string& thisFileDir,
+        const std::string& config,
+        const std::string& platform);
 
     bool ContainsUnexpandedMacro(const std::string& s);
 
@@ -711,19 +716,20 @@ namespace
     std::string MapLanguageStandardToClang(const std::string& value);
 
     void AddIncludeDirArg(std::vector<std::string>& args, std::string dir, const std::string& projectDir,
-        const std::string& config, const std::string& platform);
+        const std::string& config, const std::string& platform, const std::string& thisFileDir = std::string());
 
     void AddDefineArg(std::vector<std::string>& args, std::string def, const std::string& projectDir,
-        const std::string& config, const std::string& platform);
+        const std::string& config, const std::string& platform, const std::string& thisFileDir = std::string());
 
     void AddForcedIncludeArg(std::vector<std::string>& args, std::string file, const std::string& projectDir,
-        const std::string& config, const std::string& platform);
+        const std::string& config, const std::string& platform, const std::string& thisFileDir = std::string());
 
     void ParseAdditionalOptionsIntoArgs(std::vector<std::string>& args,
         const std::string& text,
         const std::string& projectDir,
         const std::string& config,
-        const std::string& platform);
+        const std::string& platform,
+        const std::string& thisFileDir = std::string());
 
     bool ApplyVcxprojSettings(Options& opt);
 
@@ -2129,7 +2135,7 @@ namespace
             }
             if (opt.batchDirs.empty() && opt.batchDirListFile.empty() && opt.includeWhitelistHeader.empty() && opt.vcxprojPath.empty()) return false;
             // outputHeader may be omitted for the common --vcxproj workflow;
-            // ApplyHardcodedProjectDefaults() will fill <vcxproj_dir>/generated_reflect.
+            // ApplyHardcodedProjectDefaults() will fill <vcxproj_dir>/WaveTracer/generated_reflect.
             if (opt.outputHeader.empty() && opt.vcxprojPath.empty()) return false;
             if (opt.aggregateHeader.empty()) opt.aggregateHeader = "project_reflect_auto.h";
         }
@@ -5331,6 +5337,100 @@ namespace
         return out;
     }
 
+    struct MsbuildXmlContext
+    {
+        std::string path;
+        std::string dir;
+        std::string xml;
+    };
+
+    bool MsbuildImportConditionMightApply(const std::string& startTag,
+        const std::string& config,
+        const std::string& platform)
+    {
+        const std::string cond = ToLowerAscii(ExtractXmlAttribute(startTag, "Condition"));
+        if (cond.empty()) return true;
+        const std::string cfg = ToLowerAscii(config);
+        const std::string plat = ToLowerAscii(platform);
+
+        if (!cfg.empty())
+        {
+            if (cond.find("debug") != std::string::npos && cfg.find("debug") == std::string::npos) return false;
+            if (cond.find("release") != std::string::npos && cfg.find("release") == std::string::npos) return false;
+        }
+        if (!plat.empty())
+        {
+            if (cond.find("win32") != std::string::npos && plat.find("win32") == std::string::npos) return false;
+            if (cond.find("x64") != std::string::npos && plat.find("x64") == std::string::npos) return false;
+        }
+        return true;
+    }
+
+    std::vector<std::string> ExtractMsbuildImportProjects(const std::string& xml,
+        const std::string& config,
+        const std::string& platform)
+    {
+        std::vector<std::string> out;
+        std::size_t pos = 0;
+        while ((pos = xml.find("<Import", pos)) != std::string::npos)
+        {
+            const std::size_t nameEnd = pos + 7;
+            if (nameEnd < xml.size())
+            {
+                const char c = xml[nameEnd];
+                if (!(std::isspace(static_cast<unsigned char>(c)) || c == '>' || c == '/'))
+                {
+                    pos = nameEnd;
+                    continue;
+                }
+            }
+            const std::size_t gt = xml.find('>', pos);
+            if (gt == std::string::npos) break;
+            const std::string startTag = xml.substr(pos, gt - pos + 1);
+            if (MsbuildImportConditionMightApply(startTag, config, platform))
+            {
+                const std::string project = ExtractXmlAttribute(startTag, "Project");
+                if (!project.empty()) out.push_back(project);
+            }
+            pos = gt + 1;
+        }
+        return out;
+    }
+
+    void CollectMsbuildXmlWithImports(const std::string& file,
+        const std::string& projectDir,
+        const std::string& config,
+        const std::string& platform,
+        std::set<std::string>& visited,
+        std::vector<MsbuildXmlContext>& out,
+        int depth = 0)
+    {
+        if (depth > 24) return;
+        std::string path = NormalizePathSlashes(ExpandEnvironmentVariablesInPath(StripOuterQuotes(file)));
+        if (!IsAbsolutePath(path)) path = JoinPath(projectDir, path);
+        path = CollapseDotDotPath(path);
+        const std::string key = ToLowerAscii(path);
+        if (visited.find(key) != visited.end()) return;
+        visited.insert(key);
+        if (!IsExistingRegularFile(path)) return;
+
+        const std::string xml = ReadWholeFileText(path);
+        if (xml.empty()) return;
+        const std::string thisDir = DirectoryName(path);
+        out.push_back(MsbuildXmlContext{ path, thisDir, xml });
+
+        const std::vector<std::string> imports = ExtractMsbuildImportProjects(xml, config, platform);
+        for (std::size_t i = 0; i < imports.size(); ++i)
+        {
+            std::string imported = StripOuterQuotes(ExpandMsbuildMacrosForFile(imports[i], projectDir, thisDir, config, platform));
+            if (imported.empty() || ContainsAnyUnexpandedVariable(imported)) continue;
+            imported = NormalizePathSlashes(imported);
+            if (!IsAbsolutePath(imported)) imported = JoinPath(thisDir, imported);
+            imported = CollapseDotDotPath(imported);
+            CollectMsbuildXmlWithImports(imported, projectDir, config, platform, visited, out, depth + 1);
+        }
+    }
+
     std::string EnsureTrailingSlash(std::string path)
     {
         path = NormalizePathSlashes(path);
@@ -5355,16 +5455,18 @@ namespace
         }
     }
 
-    std::string ExpandMsbuildMacros(std::string value,
+    std::string ExpandMsbuildMacrosForFile(std::string value,
         const std::string& projectDir,
+        const std::string& thisFileDir,
         const std::string& config,
         const std::string& platform)
     {
         const std::string projectDirSlash = EnsureTrailingSlash(projectDir);
         const std::string parentDirSlash = EnsureTrailingSlash(DirectoryName(projectDir));
+        const std::string thisFileDirSlash = EnsureTrailingSlash(thisFileDir.empty() ? projectDir : thisFileDir);
         ReplaceAll(value, "$(ProjectDir)", projectDirSlash);
         ReplaceAll(value, "$(MSBuildProjectDirectory)", NormalizePathSlashes(projectDir));
-        ReplaceAll(value, "$(MSBuildThisFileDirectory)", projectDirSlash);
+        ReplaceAll(value, "$(MSBuildThisFileDirectory)", thisFileDirSlash);
         ReplaceAll(value, "$(SolutionDir)", parentDirSlash);
         ReplaceAll(value, "$(Configuration)", config);
         ReplaceAll(value, "$(Platform)", platform);
@@ -5392,6 +5494,14 @@ namespace
         }
         value = ExpandEnvironmentVariablesInPath(value);
         return NormalizePathSlashes(value);
+    }
+
+    std::string ExpandMsbuildMacros(std::string value,
+        const std::string& projectDir,
+        const std::string& config,
+        const std::string& platform)
+    {
+        return ExpandMsbuildMacrosForFile(value, projectDir, projectDir, config, platform);
     }
 
     bool ContainsUnexpandedMacro(const std::string& s)
@@ -5586,9 +5696,9 @@ namespace
     }
 
     void AddIncludeDirArg(std::vector<std::string>& args, std::string dir, const std::string& projectDir,
-        const std::string& config, const std::string& platform)
+        const std::string& config, const std::string& platform, const std::string& thisFileDir)
     {
-        dir = StripOuterQuotes(ExpandMsbuildMacros(dir, projectDir, config, platform));
+        dir = StripOuterQuotes(ExpandMsbuildMacrosForFile(dir, projectDir, thisFileDir.empty() ? projectDir : thisFileDir, config, platform));
         if (dir.empty()) return;
         if (ContainsUnexpandedMacro(dir))
         {
@@ -5599,9 +5709,9 @@ namespace
     }
 
     void AddDefineArg(std::vector<std::string>& args, std::string def, const std::string& projectDir,
-        const std::string& config, const std::string& platform)
+        const std::string& config, const std::string& platform, const std::string& thisFileDir)
     {
-        def = StripOuterQuotes(ExpandMsbuildMacros(def, projectDir, config, platform));
+        def = StripOuterQuotes(ExpandMsbuildMacrosForFile(def, projectDir, thisFileDir.empty() ? projectDir : thisFileDir, config, platform));
         if (def.empty()) return;
         if (def.find("%(") != std::string::npos) return;
         if (ContainsUnexpandedMacro(def))
@@ -5613,9 +5723,9 @@ namespace
     }
 
     void AddForcedIncludeArg(std::vector<std::string>& args, std::string file, const std::string& projectDir,
-        const std::string& config, const std::string& platform)
+        const std::string& config, const std::string& platform, const std::string& thisFileDir)
     {
-        file = StripOuterQuotes(ExpandMsbuildMacros(file, projectDir, config, platform));
+        file = StripOuterQuotes(ExpandMsbuildMacrosForFile(file, projectDir, thisFileDir.empty() ? projectDir : thisFileDir, config, platform));
         if (file.empty()) return;
         if (ContainsUnexpandedMacro(file))
         {
@@ -5630,7 +5740,8 @@ namespace
         const std::string& text,
         const std::string& projectDir,
         const std::string& config,
-        const std::string& platform)
+        const std::string& platform,
+        const std::string& thisFileDir)
     {
         const std::vector<std::string> toks = TokenizeCommandLineLike(DecodeXmlEntities(text));
         for (std::size_t i = 0; i < toks.size(); ++i)
@@ -5639,27 +5750,27 @@ namespace
             if (t.empty() || t.find("%(") != std::string::npos) continue;
             if (t.compare(0, 2, "/I") == 0 && t.size() > 2)
             {
-                AddIncludeDirArg(args, t.substr(2), projectDir, config, platform);
+                AddIncludeDirArg(args, t.substr(2), projectDir, config, platform, thisFileDir);
             }
             else if ((t == "/I" || t == "-I") && i + 1 < toks.size())
             {
-                AddIncludeDirArg(args, toks[++i], projectDir, config, platform);
+                AddIncludeDirArg(args, toks[++i], projectDir, config, platform, thisFileDir);
             }
             else if (t.compare(0, 2, "/D") == 0 && t.size() > 2)
             {
-                AddDefineArg(args, t.substr(2), projectDir, config, platform);
+                AddDefineArg(args, t.substr(2), projectDir, config, platform, thisFileDir);
             }
             else if ((t == "/D" || t == "-D") && i + 1 < toks.size())
             {
-                AddDefineArg(args, toks[++i], projectDir, config, platform);
+                AddDefineArg(args, toks[++i], projectDir, config, platform, thisFileDir);
             }
             else if (t.compare(0, 3, "/FI") == 0 && t.size() > 3)
             {
-                AddForcedIncludeArg(args, t.substr(3), projectDir, config, platform);
+                AddForcedIncludeArg(args, t.substr(3), projectDir, config, platform, thisFileDir);
             }
             else if ((t == "/FI" || t == "-include") && i + 1 < toks.size())
             {
-                AddForcedIncludeArg(args, toks[++i], projectDir, config, platform);
+                AddForcedIncludeArg(args, toks[++i], projectDir, config, platform, thisFileDir);
             }
             else if (t.compare(0, 5, "/std:") == 0)
             {
@@ -5679,55 +5790,91 @@ namespace
         if (!opt.vcxprojPath.empty())
         {
             const std::string vcxproj = NormalizePathSlashes(ExpandEnvironmentVariablesInPath(opt.vcxprojPath));
-            const std::string xml = ReadWholeFileText(vcxproj);
-            if (xml.empty())
+            if (!IsExistingRegularFile(vcxproj))
             {
                 std::cerr << "Failed to read vcxproj: " << opt.vcxprojPath << "\n";
                 return false;
             }
             const std::string projectDir = DirectoryName(vcxproj);
-            const std::vector<std::string> itemGroups = ExtractMatchingBlocks(xml, "ItemDefinitionGroup", opt.configuration, opt.platform);
-            std::vector<std::string> blocks = itemGroups;
-            // Some minimal projects put ClCompile settings outside ItemDefinitionGroup.
-            // Only fall back to the whole file when no matching ItemDefinitionGroup exists;
-            // otherwise using the whole file would mix Debug/Release and x86/x64 settings.
-            if (blocks.empty()) blocks.push_back(xml);
-
-            for (std::size_t bi = 0; bi < blocks.size(); ++bi)
+            std::set<std::string> visitedMsbuildFiles;
+            std::vector<MsbuildXmlContext> msbuildFiles;
+            CollectMsbuildXmlWithImports(vcxproj, projectDir, opt.configuration, opt.platform, visitedMsbuildFiles, msbuildFiles);
+            if (msbuildFiles.empty())
             {
-                const std::string& block = blocks[bi];
-                const std::vector<std::string> incs = ExtractXmlTagValues(block, "AdditionalIncludeDirectories");
-                for (std::size_t i = 0; i < incs.size(); ++i)
+                std::cerr << "Failed to read vcxproj imports: " << opt.vcxprojPath << "\n";
+                return false;
+            }
+
+            if (opt.debugAst)
+            {
+                std::cerr << "[vcxproj] imported msbuild files: " << msbuildFiles.size() << "\n";
+                for (std::size_t i = 0; i < msbuildFiles.size(); ++i) std::cerr << "  " << msbuildFiles[i].path << "\n";
+            }
+
+            for (std::size_t fi = 0; fi < msbuildFiles.size(); ++fi)
+            {
+                const MsbuildXmlContext& ctx = msbuildFiles[fi];
+                const std::vector<std::string> propGroups = ExtractMatchingBlocks(ctx.xml, "PropertyGroup", opt.configuration, opt.platform);
+                for (std::size_t pi = 0; pi < propGroups.size(); ++pi)
                 {
-                    const std::vector<std::string> parts = SplitSemicolonList(incs[i]);
-                    for (std::size_t j = 0; j < parts.size(); ++j) AddIncludeDirArg(merged, parts[j], projectDir, opt.configuration, opt.platform);
+                    const std::vector<std::string> includePaths = ExtractXmlTagValues(propGroups[pi], "IncludePath");
+                    for (std::size_t i = 0; i < includePaths.size(); ++i)
+                    {
+                        const std::vector<std::string> parts = SplitSemicolonList(includePaths[i]);
+                        for (std::size_t j = 0; j < parts.size(); ++j) AddIncludeDirArg(merged, parts[j], projectDir, opt.configuration, opt.platform, ctx.dir);
+                    }
+
+                    const std::vector<std::string> nmakeIncludePaths = ExtractXmlTagValues(propGroups[pi], "NMakeIncludeSearchPath");
+                    for (std::size_t i = 0; i < nmakeIncludePaths.size(); ++i)
+                    {
+                        const std::vector<std::string> parts = SplitSemicolonList(nmakeIncludePaths[i]);
+                        for (std::size_t j = 0; j < parts.size(); ++j) AddIncludeDirArg(merged, parts[j], projectDir, opt.configuration, opt.platform, ctx.dir);
+                    }
                 }
 
-                const std::vector<std::string> defs = ExtractXmlTagValues(block, "PreprocessorDefinitions");
-                for (std::size_t i = 0; i < defs.size(); ++i)
-                {
-                    const std::vector<std::string> parts = SplitSemicolonList(defs[i]);
-                    for (std::size_t j = 0; j < parts.size(); ++j) AddDefineArg(merged, parts[j], projectDir, opt.configuration, opt.platform);
-                }
+                const std::vector<std::string> itemGroups = ExtractMatchingBlocks(ctx.xml, "ItemDefinitionGroup", opt.configuration, opt.platform);
+                std::vector<std::string> blocks = itemGroups;
+                // Some minimal projects put ClCompile settings outside ItemDefinitionGroup.
+                // Only fall back to the whole file when no matching ItemDefinitionGroup exists;
+                // otherwise using the whole file would mix Debug/Release and x86/x64 settings.
+                if (blocks.empty()) blocks.push_back(ctx.xml);
 
-                const std::vector<std::string> forced = ExtractXmlTagValues(block, "ForcedIncludeFiles");
-                for (std::size_t i = 0; i < forced.size(); ++i)
+                for (std::size_t bi = 0; bi < blocks.size(); ++bi)
                 {
-                    const std::vector<std::string> parts = SplitSemicolonList(forced[i]);
-                    for (std::size_t j = 0; j < parts.size(); ++j) AddForcedIncludeArg(merged, parts[j], projectDir, opt.configuration, opt.platform);
-                }
+                    const std::string& block = blocks[bi];
+                    const std::vector<std::string> incs = ExtractXmlTagValues(block, "AdditionalIncludeDirectories");
+                    for (std::size_t i = 0; i < incs.size(); ++i)
+                    {
+                        const std::vector<std::string> parts = SplitSemicolonList(incs[i]);
+                        for (std::size_t j = 0; j < parts.size(); ++j) AddIncludeDirArg(merged, parts[j], projectDir, opt.configuration, opt.platform, ctx.dir);
+                    }
 
-                const std::vector<std::string> standards = ExtractXmlTagValues(block, "LanguageStandard");
-                for (std::size_t i = 0; i < standards.size(); ++i)
-                {
-                    const std::string mapped = MapLanguageStandardToClang(standards[i]);
-                    if (!mapped.empty()) detectedStd = mapped;
-                }
+                    const std::vector<std::string> defs = ExtractXmlTagValues(block, "PreprocessorDefinitions");
+                    for (std::size_t i = 0; i < defs.size(); ++i)
+                    {
+                        const std::vector<std::string> parts = SplitSemicolonList(defs[i]);
+                        for (std::size_t j = 0; j < parts.size(); ++j) AddDefineArg(merged, parts[j], projectDir, opt.configuration, opt.platform, ctx.dir);
+                    }
 
-                const std::vector<std::string> extra = ExtractXmlTagValues(block, "AdditionalOptions");
-                for (std::size_t i = 0; i < extra.size(); ++i)
-                {
-                    ParseAdditionalOptionsIntoArgs(merged, extra[i], projectDir, opt.configuration, opt.platform);
+                    const std::vector<std::string> forced = ExtractXmlTagValues(block, "ForcedIncludeFiles");
+                    for (std::size_t i = 0; i < forced.size(); ++i)
+                    {
+                        const std::vector<std::string> parts = SplitSemicolonList(forced[i]);
+                        for (std::size_t j = 0; j < parts.size(); ++j) AddForcedIncludeArg(merged, parts[j], projectDir, opt.configuration, opt.platform, ctx.dir);
+                    }
+
+                    const std::vector<std::string> standards = ExtractXmlTagValues(block, "LanguageStandard");
+                    for (std::size_t i = 0; i < standards.size(); ++i)
+                    {
+                        const std::string mapped = MapLanguageStandardToClang(standards[i]);
+                        if (!mapped.empty()) detectedStd = mapped;
+                    }
+
+                    const std::vector<std::string> extra = ExtractXmlTagValues(block, "AdditionalOptions");
+                    for (std::size_t i = 0; i < extra.size(); ++i)
+                    {
+                        ParseAdditionalOptionsIntoArgs(merged, extra[i], projectDir, opt.configuration, opt.platform, ctx.dir);
+                    }
                 }
             }
         }
@@ -6050,6 +6197,11 @@ namespace
         {
             const std::string logPath = NormalizePathSlashes(MakeAbsoluteLexicalPath(ExpandEnvironmentVariablesInPath(StripOuterQuotes(opt.logFile))));
             if (!logPath.empty()) preservePaths.insert(CanonicalSourcePathKey(logPath));
+        }
+        if (!opt.extraTargetListFile.empty())
+        {
+            const std::string targetListPath = NormalizePathSlashes(MakeAbsoluteLexicalPath(ExpandEnvironmentVariablesInPath(StripOuterQuotes(opt.extraTargetListFile))));
+            if (!targetListPath.empty()) preservePaths.insert(CanonicalSourcePathKey(targetListPath));
         }
 
         if (!DirectoryExistsForDiagnostics(outputDir))
@@ -8343,6 +8495,57 @@ namespace
         std::size_t rootIndex;
     };
 
+    bool AllHeadersUnderRoot(const std::vector<std::string>& headers, const std::string& root)
+    {
+        if (headers.empty() || root.empty()) return false;
+        std::string candidate = NormalizePathSlashes(ExpandEnvironmentVariablesInPath(StripOuterQuotes(root)));
+        if (!IsAbsolutePath(candidate)) candidate = MakeAbsoluteLexicalPath(candidate);
+        candidate = NormalizePathSlashes(CollapseDotDotPath(candidate));
+        if (HasHeaderExtension(candidate) && IsExistingRegularFile(candidate)) candidate = DirectoryName(candidate);
+        if (candidate.empty() || IsRootLikePathForClear(candidate)) return false;
+
+        for (std::size_t i = 0; i < headers.size(); ++i)
+        {
+            if (!IsCanonicalAncestorOrSelf(candidate, headers[i])) return false;
+        }
+        return true;
+    }
+
+    std::string SelectExtraTargetSourceRoot(const Options& opt,
+        const std::vector<std::string>& headers,
+        const std::vector<std::string>& roots,
+        const std::string& fallbackRoot)
+    {
+        for (std::size_t i = 0; i < roots.size(); ++i)
+        {
+            if (AllHeadersUnderRoot(headers, roots[i]))
+            {
+                return NormalizePathSlashes(CollapseDotDotPath(MakeAbsoluteLexicalPath(roots[i])));
+            }
+        }
+
+        if (!opt.vcxprojPath.empty())
+        {
+            const std::string vcxproj = NormalizePathSlashes(CollapseDotDotPath(MakeAbsoluteLexicalPath(ExpandEnvironmentVariablesInPath(StripOuterQuotes(opt.vcxprojPath)))));
+            const std::string projectDir = DirectoryName(vcxproj);
+            if (AllHeadersUnderRoot(headers, projectDir)) return projectDir;
+        }
+
+        if (!headers.empty())
+        {
+            std::string common = DirectoryName(headers[0]);
+            while (!common.empty() && !AllHeadersUnderRoot(headers, common))
+            {
+                const std::string parent = DirectoryName(common);
+                if (parent == common) break;
+                common = parent;
+            }
+            if (!common.empty() && AllHeadersUnderRoot(headers, common)) return common;
+        }
+
+        return fallbackRoot;
+    }
+
     bool RunBatchMode(const Options& opt)
     {
         std::vector<std::string> roots = opt.batchDirs;
@@ -8387,6 +8590,7 @@ namespace
         if (!opt.extraTargetListFile.empty())
         {
             CollectHeaderFilesFromExtraTargetListFile(opt, extraTargetHeaders, extraTargetRoot);
+            extraTargetRoot = SelectExtraTargetSourceRoot(opt, extraTargetHeaders, roots, extraTargetRoot);
             for (std::size_t i = 0; i < extraTargetHeaders.size(); ++i)
             {
                 const std::string key = CanonicalSourcePathKey(extraTargetHeaders[i]);
@@ -8782,7 +8986,7 @@ namespace
 
         if (opt.outputHeader.empty() && !projectDir.empty())
         {
-            opt.outputHeader = NormalizePathSlashes(JoinPath(projectDir, "generated_reflect"));
+            opt.outputHeader = NormalizePathSlashes(JoinPath(JoinPath(projectDir, "WaveTracer"), "generated_reflect"));
             opt.autoOutputHeader = true;
         }
 
@@ -8813,7 +9017,7 @@ namespace
 
         if (opt.outputHeader.empty())
         {
-            std::cerr << "[hardcoded defaults failed] no output directory. Pass -o <generated_reflect_dir>.\n";
+            std::cerr << "[hardcoded defaults failed] no output directory. Pass -o <WaveTracer/generated_reflect dir>.\n";
             return false;
         }
 

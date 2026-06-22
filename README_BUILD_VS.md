@@ -1,69 +1,65 @@
-# Visual Studio build
+# WaveTrace Release Package Build Notes
 
-Open `WaveTrace.sln` in Visual Studio 2019/2022 and build `Release|x64`.
+The formal package is intended to be copied into a business tree and consumed as
+prebuilt tooling plus source headers. It does not require business CMake or
+Visual Studio projects to build WaveTrace tools.
 
-Projects:
+The zip top-level directory is `WaveTracer`.
 
-- `ReflectGen`: builds the current `ReflectGen.cpp` and uses local `third_party\llvm\llvm-local`.
-- `wvz4_writer_monitor`: builds the helper writer process used by `PathStableWvz4Recorder`.
-- `smoke*`: small compile/runtime checks for the reflection-waveform runtime and WVZ4 writer.
+Prebuilt tools and libraries:
 
-Dependency property sheets:
+- `tools\bin\wavetrace_reflectgen.exe`
+- `tools\bin\wvz4_writer_monitor.exe`
+- `tools\bin\libclang.dll` and its runtime DLLs
+- `tools\lib\zstd_release.lib`
+- `tools\lib\zstd_debug.lib`
+- `tools\lib\clang\22`
+- `third_party\zstd\include`
 
-- `props\llvm_local.props`: adds `third_party\llvm\llvm-local\include`, links `libclang.lib`, and copies `libclang.dll`.
-- `props\zstd_embed.props`: embeds zstd sources from `third_party\zstd-src\zstd-1.5.7`.
-- `props\wavetrace_app_common.props`: shared x64 output paths and C++ settings.
-- `props\wavetrace_reflectgen_reference.props`: adds an MSBuild `ProjectReference` to `ReflectGen` for apps whose build invokes the reflection generator.
-- `props\wvz4_writer_helper_reference.props`: adds an MSBuild `ProjectReference` to `wvz4_writer_monitor` for apps that use helper-process WVZ4 writing. This is an incremental build dependency only; it does not link the helper into the app.
+Property sheets:
 
-For a business executable that invokes ReflectGen and uses `PathStableWvz4Recorder`
-or `wvz4::WriterProcessClient`, import both dependency sheets after
-`props\wavetrace_app_common.props`:
+- `props\zstd_embed.props`: adds the minimal zstd include path and links the
+  prebuilt zstd static library. It does not compile zstd sources.
+- `props\wavetrace_reflectgen_reference.props`: runs the prebuilt ReflectGen
+  executable before C++ compilation, writes generated reflection headers under
+  `$(IntDir)\WaveTracer\generated_reflect`, and adds that directory to the
+  include path. It does not add a `ProjectReference`.
+- `props\wvz4_writer_helper_reference.props`: checks that the prebuilt writer
+  helper exists. It does not add a `ProjectReference`.
 
-```xml
-<Import Project="props\wavetrace_reflectgen_reference.props"
-        Condition="Exists('props\wavetrace_reflectgen_reference.props')" />
-<Import Project="props\wvz4_writer_helper_reference.props"
-        Condition="Exists('props\wvz4_writer_helper_reference.props')" />
+## CMake Integration
+
+When `ENABLE_WAVETRACE=ON`, the CMake integration uses the prebuilt tools from
+`tools\bin`. It does not call `add_executable()` for ReflectGen or the writer
+helper, and the zstd dependency is an `IMPORTED STATIC` library.
+
+Generated reflection files are written to:
+
+```text
+<business-build-dir>\WaveTracer\generated_reflect\project_reflect_auto.h
+<business-build-dir>\WaveTracer\generated_reflect\root_class_closure_reflect_auto.h
 ```
 
-MSBuild/Visual Studio will then build `ReflectGen.exe` and
-`wvz4_writer_monitor.exe` before the app when needed, and skip them when their
-inputs are already up to date. Avoid post-build `msbuild` commands for these
-tools; they bypass normal project dependency scheduling.
+The same directory also contains `reflectgen.log` and
+`wavetrace_reflect_targets.txt`.
 
-Command-line build from a VS developer prompt:
-
-```bat
-msbuild WaveTrace.sln /m /p:Configuration=Release /p:Platform=x64
-```
-
-## CMake tool integration
-
-The CMake integration builds ReflectGen from the current source through
-`cmake/wavetrace_reflectgen.cmake`; reflection custom commands depend on that
-target, so changing `ReflectGen.cpp` rebuilds the generator before regenerating
-headers.
-
-The helper process uses `cmake/wavetrace_writer_helper.cmake`. When
-`ENABLE_WAVETRACE=ON`, the cmodel templates call:
+For a final executable target in the same CMake project, call:
 
 ```cmake
 include("${WAVETRACE_ROOT}/cmake/wavetrace_writer_helper.cmake")
-wavetrace_target_needs_writer_helper(cmodel)
-```
-
-This adds a normal CMake target dependency on `wavetrace_writer_monitor`, so
-Ninja/MSBuild builds the helper before `cmodel` only when needed. Because
-`cmodel` is a static library, CMake cannot know the final simulator executable
-directory. For a final executable target in the same CMake project, call the
-same function on that executable too:
-
-```cmake
-add_executable(my_sim ...)
-target_link_libraries(my_sim PRIVATE cmodel)
 wavetrace_target_needs_writer_helper(my_sim)
 ```
 
-For executable targets, the function also copies `wvz4_writer_monitor.exe`
-beside the simulator after build, which matches the runtime helper lookup path.
+For executable targets, the function copies `wvz4_writer_monitor.exe` beside the
+simulator after build, matching the runtime helper lookup path.
+
+## Formal Package
+
+Use:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\package_wavetrace_release.ps1
+```
+
+The package script uses a whitelist. It deliberately excludes smoke/test
+projects, SystemC, the full zstd source tree, and the full LLVM tree.

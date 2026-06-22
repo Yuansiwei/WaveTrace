@@ -83,6 +83,7 @@ struct Top {
     DirectLeaf unique_target_seed;
     DirectLeaf shared_target_seed;
     DirectLeaf wave_raw_target;
+    DirectLeaf wave_raw_array_targets[2];
     DirectLeaf wave_shared_target_seed;
     PlainLeaf plain_target;
     DirectLeaf* direct_raw;
@@ -90,6 +91,7 @@ struct Top {
     std::shared_ptr<DirectLeaf> direct_shared;
     PlainLeaf* plain_ptr;
     wave::WavePtr<DirectLeaf*> wave_raw;
+    wave::WavePtr<DirectLeaf*> wave_raw_array;
     wave::WavePtr<std::shared_ptr<DirectLeaf> > wave_shared;
     MetricChannel peek;
     MetricChannel port_channel;
@@ -103,6 +105,7 @@ struct Top {
           unique_target_seed(20),
           shared_target_seed(30),
           wave_raw_target(40),
+          wave_raw_array_targets{ DirectLeaf(70), DirectLeaf(80) },
           wave_shared_target_seed(50),
           plain_target(60),
           direct_raw(&raw_target),
@@ -110,9 +113,11 @@ struct Top {
           direct_shared(new DirectLeaf(shared_target_seed)),
           plain_ptr(&plain_target),
           wave_raw(&wave_raw_target),
+          wave_raw_array(wave_raw_array_targets),
           wave_shared(std::shared_ptr<DirectLeaf>(new DirectLeaf(wave_shared_target_seed))),
           dirty_counter(0),
           flag_bool(0) {
+        wave_raw_array.declareSize(2);
         friend_box.set_secret(7);
         peek.value.count = 11;
         port_channel.value.count = 12;
@@ -191,6 +196,7 @@ template<> struct reflected_visitor<Top> {
         on_ptr("direct_shared", std::addressof(obj->direct_shared));
         on_ptr("plain_ptr", std::addressof(obj->plain_ptr));
         on_ptr("wave_raw", std::addressof(obj->wave_raw));
+        on_ptr("wave_raw_array", std::addressof(obj->wave_raw_array));
         on_ptr("wave_shared", std::addressof(obj->wave_shared));
         on_ptr("peek", std::addressof(obj->peek));
         on_ptr("port", std::addressof(obj->port));
@@ -280,6 +286,8 @@ int main() {
     opt.enable_wave_array_dirty = true;
     opt.enable_flat_leaf_fast_table = true;
 
+    wave::ensure_dynamic_type_registered<MetricValue>();
+
     wave::Tracer tracer(sink, opt);
     tracer.add_root("top", &top);
     tracer.sample(0);
@@ -291,6 +299,8 @@ int main() {
         "top.direct_unique.value",
         "top.direct_shared.value",
         "top.wave_raw.value",
+        "top.wave_raw_array.[0].value",
+        "top.wave_raw_array.[1].value",
         "top.wave_shared.value",
         "top.peek.count",
         "top.port.count",
@@ -317,6 +327,8 @@ int main() {
     if (!has_u64_event(sink, index, "top.direct_unique.value", 0, 20)) return fail("direct unique_ptr value missing");
     if (!has_u64_event(sink, index, "top.direct_shared.value", 0, 30)) return fail("direct shared_ptr value missing");
     if (!has_u64_event(sink, index, "top.wave_raw.value", 0, 40)) return fail("WavePtr raw value missing");
+    if (!has_u64_event(sink, index, "top.wave_raw_array.[0].value", 0, 70)) return fail("WavePtr raw array element 0 missing");
+    if (!has_u64_event(sink, index, "top.wave_raw_array.[1].value", 0, 80)) return fail("WavePtr raw array element 1 missing");
     if (!has_u64_event(sink, index, "top.wave_shared.value", 0, 50)) return fail("WavePtr shared value missing");
     if (!has_u64_event(sink, index, "top.peek.count", 0, 11)) return fail("peek initial value missing");
     if (!has_u64_event(sink, index, "top.port.count", 0, 12)) return fail("port-derived peek initial value missing");
@@ -345,6 +357,7 @@ int main() {
     top.slots[2].count = 55;
     top.flag_bool = 3;
     top.direct_raw->value = 99;
+    top.wave_raw_array_targets[1].value = 88;
     tracer.sample(3);
 
     if (!has_u64_event(sink, index, "top.peek.count", 3, 111)) return fail("dirty peek update missing");
@@ -353,6 +366,7 @@ int main() {
     if (!has_u64_event(sink, index, "top.slots.[2].count", 3, 55)) return fail("wave::array dirty update missing");
     if (!has_bool_event(sink, index, "top.flag_bool", 3, true)) return fail("bool storage update missing");
     if (!has_u64_event(sink, index, "top.direct_raw.value", 3, 99)) return fail("direct pointer update missing");
+    if (!has_u64_event(sink, index, "top.wave_raw_array.[1].value", 3, 88)) return fail("WavePtr raw array update missing");
 
     std::cout << "markers/pointer/dirty coverage passed: tracks="
               << sink.declarations.size()

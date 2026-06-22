@@ -9617,6 +9617,11 @@ private:
     expand_wave_ptr_field_impl(const std::string& path, NodeId parent_id, const WavePtrT* ptr) {
         typedef typename wave_ptr_traits<WavePtrT>::element_type RawPointee;
         typedef typename detail::remove_cvref<RawPointee>::type CleanPointee;
+        const std::size_t declared_count = ptr ? wave_ptr_traits<WavePtrT>::declared_size(*ptr) : 0;
+        if (declared_count == 0) {
+            if (options_.debug_log) debug_log_msg(std::string("wave_ptr empty declared size path=") + path);
+            return 0;
+        }
         RawPointee* target = ptr ? ptr->get() : static_cast<RawPointee*>(NULL);
         if (!target) {
             if (options_.debug_log) debug_log_msg(std::string("wave_ptr null path=") + path);
@@ -9625,12 +9630,37 @@ private:
         if (options_.debug_log) {
             debug_log_msg(std::string("wave_ptr expand path=") + path +
                           " type=" + detail::type_name_or_incomplete<CleanPointee>() +
+                          " declared_size=" + detail::to_string_unsigned(declared_count) +
                           " addr=" + detail::pointer_to_string(detail::pointer_address(target)));
         }
-        return expand_member_clean_dispatch<CleanPointee>(
-            path,
-            parent_id,
-            static_cast<const CleanPointee*>(target));
+        if (declared_count == 1) {
+            return expand_member_clean_dispatch<CleanPointee>(
+                path,
+                parent_id,
+                static_cast<const CleanPointee*>(target));
+        }
+
+        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
+        const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+
+        for (std::size_t i = 0; i < declared_count; ++i) {
+            const std::string child_path = detail::compose_index_child_path(path, i);
+            TopologyCheckpoint elem_cp = make_topology_checkpoint(node_id);
+            const CleanPointee* elem = static_cast<const CleanPointee*>(target + i);
+            const NodeId child_node = expand_member_clean_dispatch<CleanPointee>(
+                child_path,
+                node_id,
+                elem);
+            if (child_node == 0) {
+                rollback_topology_to(elem_cp);
+            }
+        }
+
+        return keep_node_or_rollback(cp, node_id);
     }
 
     template <typename FieldT>

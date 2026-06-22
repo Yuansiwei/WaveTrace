@@ -1,27 +1,25 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup Label="UserMacros">
-    <ZstdRoot>$(MSBuildThisFileDirectory)..\third_party\zstd-src\zstd-1.5.7</ZstdRoot>
+    <WaveTraceRoot Condition="'$(WaveTraceRoot)'==''">$(MSBuildThisFileDirectory)..</WaveTraceRoot>
+    <ZstdIncludeDir>$(WaveTraceRoot)\third_party\zstd\include</ZstdIncludeDir>
+    <ZstdLibDir>$(WaveTraceRoot)\tools\lib</ZstdLibDir>
+    <ZstdLib Condition="'$(Configuration)'=='Debug'">zstd_debug.lib</ZstdLib>
+    <ZstdLib Condition="'$(ZstdLib)'==''">zstd_release.lib</ZstdLib>
   </PropertyGroup>
 
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(ZstdRoot)\lib;$(ZstdRoot)\lib\common;$(ZstdRoot)\lib\compress;$(ZstdRoot)\lib\decompress;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ZstdIncludeDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(ZstdLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>$(ZstdLib);%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
   </ItemDefinitionGroup>
 
-  <ItemGroup>
-    <ClCompile Include="$(ZstdRoot)\lib\common\*.c">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <CompileAs>CompileAsC</CompileAs>
-    </ClCompile>
-    <ClCompile Include="$(ZstdRoot)\lib\compress\*.c">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <CompileAs>CompileAsC</CompileAs>
-    </ClCompile>
-    <ClCompile Include="$(ZstdRoot)\lib\decompress\*.c">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <CompileAs>CompileAsC</CompileAs>
-    </ClCompile>
-  </ItemGroup>
+  <Target Name="CheckWaveTraceZstdPrebuilt" BeforeTargets="ClCompile">
+    <Error Condition="!Exists('$(ZstdIncludeDir)\zstd.h')" Text="WaveTrace zstd.h not found: $(ZstdIncludeDir)\zstd.h" />
+    <Error Condition="!Exists('$(ZstdLibDir)\$(ZstdLib)')" Text="WaveTrace zstd library not found: $(ZstdLibDir)\$(ZstdLib)" />
+  </Target>
 </Project>

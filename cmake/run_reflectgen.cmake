@@ -72,6 +72,7 @@ elseif(DEFINED WAVETRACE_REFLECT_BATCH_DIR)
     message(STATUS "WaveTrace ReflectGen batch dir: ${WAVETRACE_REFLECT_BATCH_DIR}")
 endif()
 message(STATUS "WaveTrace ReflectGen output: ${WAVETRACE_REFLECT_OUTPUT_DIR}/${WAVETRACE_REFLECT_AGGREGATE_HEADER}")
+message(STATUS "WaveTrace ReflectGen log: ${WAVETRACE_REFLECT_LOG_FILE}")
 
 execute_process(
     COMMAND ${_cmd}

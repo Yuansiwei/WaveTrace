@@ -59,7 +59,7 @@ endif()
 set(DV_DUMP OFF)
 
 option(ENABLE_WAVETRACE "enable WaveTrace waveform tracing" ON)
-set(WAVETRACE_ROOT "${CMAKE_CURRENT_LIST_DIR}/WaveTrace" CACHE PATH "WaveTrace package root")
+set(WAVETRACE_ROOT "${CMAKE_CURRENT_LIST_DIR}/WaveTracer" CACHE PATH "WaveTrace package root")
 set(WAVETRACE_REFLECT_ROOT_CLASS "cmoTopLevel" CACHE STRING "WaveTrace reflection root class")
 if(WAVETRACE_REFLECT_ROOT_CLASS STREQUAL "cmTopLevel")
 	set(WAVETRACE_REFLECT_ROOT_CLASS "cmoTopLevel" CACHE STRING "WaveTrace reflection root class" FORCE)
@@ -73,6 +73,12 @@ if(ENABLE_WAVETRACE)
 	if(NOT EXISTS "${WAVETRACE_ROOT}/reflect_macro.h")
 		if(DEFINED ENV{WAVETRACE_ROOT} AND EXISTS "$ENV{WAVETRACE_ROOT}/reflect_macro.h")
 			set(WAVETRACE_ROOT "$ENV{WAVETRACE_ROOT}" CACHE PATH "WaveTrace package root" FORCE)
+		elseif(EXISTS "${CMAKE_CURRENT_LIST_DIR}/reflect_macro.h")
+			set(WAVETRACE_ROOT "${CMAKE_CURRENT_LIST_DIR}" CACHE PATH "WaveTrace package root" FORCE)
+		elseif(EXISTS "${CMAKE_CURRENT_LIST_DIR}/WaveTracer/reflect_macro.h")
+			set(WAVETRACE_ROOT "${CMAKE_CURRENT_LIST_DIR}/WaveTracer" CACHE PATH "WaveTrace package root" FORCE)
+		elseif(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../WaveTracer/reflect_macro.h")
+			set(WAVETRACE_ROOT "${CMAKE_CURRENT_LIST_DIR}/../WaveTracer" CACHE PATH "WaveTrace package root" FORCE)
 		elseif(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../WaveTrace/reflect_macro.h")
 			set(WAVETRACE_ROOT "${CMAKE_CURRENT_LIST_DIR}/../WaveTrace" CACHE PATH "WaveTrace package root" FORCE)
 		endif()
@@ -81,17 +87,19 @@ if(ENABLE_WAVETRACE)
 		message(FATAL_ERROR "ENABLE_WAVETRACE=ON but the WaveTrace package was not found. Put the WaveTrace package next to this CMake file, set WAVETRACE_ROOT, or set ENV{WAVETRACE_ROOT}. Current WAVETRACE_ROOT='${WAVETRACE_ROOT}'")
 	endif()
 
-	set(WAVETRACE_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/wavetrace_gen")
+	set(WAVETRACE_BUILD_TOP_DIR "${CMAKE_BINARY_DIR}/WaveTracer")
+	set(WAVETRACE_GEN_DIR "${WAVETRACE_BUILD_TOP_DIR}/generated_reflect")
 	set(WAVETRACE_TOOL_DIR "${WAVETRACE_ROOT}/tools/bin")
-	set(WAVETRACE_ZSTD_ROOT "${WAVETRACE_ROOT}/third_party/zstd-src/zstd-1.5.7")
+	set(WAVETRACE_ZSTD_INCLUDE_DIR "${WAVETRACE_ROOT}/third_party/zstd/include" CACHE PATH "Prebuilt zstd include directory")
 	set(WAVETRACE_CLANG_RESOURCE_DIR "${WAVETRACE_ROOT}/tools/lib/clang/22" CACHE PATH "Clang resource directory used by WaveTrace ReflectGen")
+	set(WAVETRACE_REFLECTGEN_EXE "${WAVETRACE_TOOL_DIR}/wavetrace_reflectgen.exe" CACHE FILEPATH "Prebuilt WaveTrace ReflectGen executable")
 	if(WIN32)
 		set(WAVETRACE_ZSTD_LIB_RELEASE "${WAVETRACE_ROOT}/tools/lib/zstd_release.lib" CACHE FILEPATH "Prebuilt static zstd Release library")
 		set(WAVETRACE_ZSTD_LIB_DEBUG "${WAVETRACE_ROOT}/tools/lib/zstd_debug.lib" CACHE FILEPATH "Prebuilt static zstd Debug library")
 	endif()
 
-	if(NOT EXISTS "${WAVETRACE_ZSTD_ROOT}/lib/zstd.h")
-		message(FATAL_ERROR "WaveTrace zstd header was not found under '${WAVETRACE_ZSTD_ROOT}/lib'")
+	if(NOT EXISTS "${WAVETRACE_ZSTD_INCLUDE_DIR}/zstd.h")
+		message(FATAL_ERROR "WaveTrace zstd header was not found under '${WAVETRACE_ZSTD_INCLUDE_DIR}'")
 	endif()
 	if(NOT EXISTS "${WAVETRACE_CLANG_RESOURCE_DIR}/include/stddef.h" AND EXISTS "${WAVETRACE_ROOT}/third_party/llvm/llvm-local/lib/clang/22/include/stddef.h")
 		set(WAVETRACE_CLANG_RESOURCE_DIR "${WAVETRACE_ROOT}/third_party/llvm/llvm-local/lib/clang/22" CACHE PATH "Clang resource directory used by WaveTrace ReflectGen" FORCE)
@@ -99,10 +107,10 @@ if(ENABLE_WAVETRACE)
 	if(NOT EXISTS "${WAVETRACE_CLANG_RESOURCE_DIR}/include/stddef.h")
 		message(FATAL_ERROR "WaveTrace clang resource directory was not found: '${WAVETRACE_CLANG_RESOURCE_DIR}'. Expected include/stddef.h under it.")
 	endif()
-	include("${WAVETRACE_ROOT}/cmake/wavetrace_reflectgen.cmake")
-	wavetrace_add_reflectgen()
-	set(WAVETRACE_REFLECTGEN_EXE "$<TARGET_FILE:wavetrace_reflectgen>")
-	set(WAVETRACE_REFLECTGEN_DEPENDS wavetrace_reflectgen)
+	if(NOT EXISTS "${WAVETRACE_REFLECTGEN_EXE}")
+		message(FATAL_ERROR "WaveTrace prebuilt ReflectGen executable was not found: '${WAVETRACE_REFLECTGEN_EXE}'")
+	endif()
+	set(WAVETRACE_REFLECTGEN_DEPENDS "${WAVETRACE_REFLECTGEN_EXE}")
 	if(WIN32)
 		if(NOT EXISTS "${WAVETRACE_ZSTD_LIB_RELEASE}")
 			message(FATAL_ERROR "WaveTrace prebuilt static zstd Release library was not found: '${WAVETRACE_ZSTD_LIB_RELEASE}'")
@@ -110,7 +118,16 @@ if(ENABLE_WAVETRACE)
 		if(NOT EXISTS "${WAVETRACE_ZSTD_LIB_DEBUG}")
 			message(FATAL_ERROR "WaveTrace prebuilt static zstd Debug library was not found: '${WAVETRACE_ZSTD_LIB_DEBUG}'")
 		endif()
+		if(NOT EXISTS "${WAVETRACE_TOOL_DIR}/libclang.dll")
+			message(FATAL_ERROR "WaveTrace ReflectGen runtime dependency was not found: '${WAVETRACE_TOOL_DIR}/libclang.dll'")
+		endif()
 	endif()
+endif()
+set(WAVETRACE_CMODEL_FORCE_INCLUDE_MSVC)
+set(WAVETRACE_CMODEL_FORCE_INCLUDE_CLANG)
+if(ENABLE_WAVETRACE)
+	set(WAVETRACE_CMODEL_FORCE_INCLUDE_MSVC "/FI${WAVETRACE_ROOT}/reflect_macro.h")
+	set(WAVETRACE_CMODEL_FORCE_INCLUDE_CLANG -include "${WAVETRACE_ROOT}/reflect_macro.h")
 endif()
 # Collect all source files
 set(ALL_SOURCES)
@@ -194,11 +211,12 @@ if(WIN32)
 	string(REPLACE "\\" "/" CMODEL_PATH "${AQARCH}/cmodel")
 	target_compile_options(cmodel PUBLIC -DAQ2_DMA=1 -DXAQ2=1 -DEMULATOR -DPATH_TO_CMODEL="${CMODEL_PATH}" $<$<CONFIG:DEBUG>:-DUSE_PRINTF> $<$<CONFIG:DEBUG>:-D_DEBUG> $<$<BOOL:${DV_DUMP}>:-DDV_DUMP=1> $<$<BOOL:${ISAMODEL}>:-DgcdMODELING_MODE=2>)
 	if (MSVC)
-		target_compile_options(cmodel PRIVATE /FI${AQARCH}/cmodel/inc/vsiPrecomp.h
+		target_compile_options(cmodel PRIVATE ${WAVETRACE_CMODEL_FORCE_INCLUDE_MSVC}
+											/FI${AQARCH}/cmodel/inc/vsiPrecomp.h
 											/vmg -Zm300 /bigobj -D_CRT_SECURE_NO_WARNINGS )
 		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP4")
 	else()
-		target_compile_options(cmodel PRIVATE -include ${AQARCH}/cmodel/inc/vsiPrecomp.h)
+		target_compile_options(cmodel PRIVATE ${WAVETRACE_CMODEL_FORCE_INCLUDE_CLANG} -include ${AQARCH}/cmodel/inc/vsiPrecomp.h)
 		#target_compile_options(cmodel PRIVATE -flto)
 		target_link_libraries(cmodel PRIVATE winpthread)
 	endif()
@@ -295,12 +313,13 @@ elseif(UNIX)
     -DvsidUSE_VSI_HEADERS=1)
 	target_compile_definitions(cmodel PRIVATE PATH_TO_CMODEL="${AQARCH}/cmodel")
 	if (MSVC)
-		target_compile_options(cmodel PRIVATE /FI${AQARCH}/cmodel/inc/vsiPrecomp.h
+		target_compile_options(cmodel PRIVATE ${WAVETRACE_CMODEL_FORCE_INCLUDE_MSVC}
+											/FI${AQARCH}/cmodel/inc/vsiPrecomp.h
 											/vmg -Zm300 /bigobj)
 		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-return-type -fPIC -g")
     else()
 		set_target_properties(cmodel PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON)
-        target_compile_options(cmodel PRIVATE -include ${AQARCH}/cmodel/inc/vsiPrecomp.h)
+        target_compile_options(cmodel PRIVATE ${WAVETRACE_CMODEL_FORCE_INCLUDE_CLANG} -include ${AQARCH}/cmodel/inc/vsiPrecomp.h)
 		if(DV_DUMP)
 			set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-return-type -fPIC -g")
 		endif()
@@ -353,6 +372,8 @@ if(ENABLE_WAVETRACE)
 		-I${WAVETRACE_ROOT}
 		-resource-dir=${WAVETRACE_CLANG_RESOURCE_DIR}
 		"-DANON(x)="
+		-include
+		${WAVETRACE_ROOT}/reflect_macro.h
 		-include
 		${AQARCH}/cmodel/inc/vsiPrecomp.h
 	)
@@ -471,7 +492,8 @@ if(ENABLE_WAVETRACE)
 	endforeach()
 	list(APPEND WAVETRACE_REFLECT_CLANG_ARGS ${WAVETRACE_REFLECT_EXTRA_CLANG_ARGS_LIST})
 
-	set(WAVETRACE_REFLECT_TARGET_LIST "${CMAKE_CURRENT_BINARY_DIR}/wavetrace_reflect_targets.txt")
+	file(MAKE_DIRECTORY "${WAVETRACE_GEN_DIR}")
+	set(WAVETRACE_REFLECT_TARGET_LIST "${WAVETRACE_GEN_DIR}/wavetrace_reflect_targets.txt")
 	file(WRITE "${WAVETRACE_REFLECT_TARGET_LIST}" "")
 	set(WAVETRACE_REFLECT_TARGET_HEADER_COUNT 0)
 	set(WAVETRACE_REFLECT_ENTRY_HEADERS)
@@ -525,6 +547,7 @@ if(ENABLE_WAVETRACE)
 
 	add_custom_command(
 		OUTPUT "${WAVETRACE_GEN_DIR}/project_reflect_auto.h"
+		BYPRODUCTS "${WAVETRACE_GEN_DIR}/root_class_closure_reflect_auto.h"
 		COMMAND ${CMAKE_COMMAND}
 			"-DWAVETRACE_REFLECTGEN_EXE=${WAVETRACE_REFLECTGEN_EXE}"
 			"-DWAVETRACE_REFLECT_BATCH_DIR=${WAVETRACE_REFLECT_BATCH_DIR}"
@@ -543,7 +566,7 @@ if(ENABLE_WAVETRACE)
 	target_include_directories(cmodel PUBLIC
 		"${WAVETRACE_ROOT}"
 		"${WAVETRACE_GEN_DIR}"
-		"${WAVETRACE_ZSTD_ROOT}/lib"
+		"${WAVETRACE_ZSTD_INCLUDE_DIR}"
 	)
 	target_compile_definitions(cmodel PUBLIC
 		WAVE_RUNTIME_AVAILABLE=1
@@ -556,7 +579,7 @@ if(ENABLE_WAVETRACE)
 			IMPORTED_LOCATION_RELEASE "${WAVETRACE_ZSTD_LIB_RELEASE}"
 			IMPORTED_LOCATION_RELWITHDEBINFO "${WAVETRACE_ZSTD_LIB_RELEASE}"
 			IMPORTED_LOCATION_MINSIZEREL "${WAVETRACE_ZSTD_LIB_RELEASE}"
-			INTERFACE_INCLUDE_DIRECTORIES "${WAVETRACE_ZSTD_ROOT}/lib"
+			INTERFACE_INCLUDE_DIRECTORIES "${WAVETRACE_ZSTD_INCLUDE_DIR}"
 		)
 		target_link_libraries(cmodel PUBLIC WaveTrace::zstd)
 	endif()
@@ -564,7 +587,10 @@ if(ENABLE_WAVETRACE)
 	wavetrace_target_needs_writer_helper(cmodel)
 	file(GLOB WAVETRACE_IDE_HEADERS CONFIGURE_DEPENDS "${WAVETRACE_ROOT}/*.h")
 	list(SORT WAVETRACE_IDE_HEADERS)
-	set(WAVETRACE_GENERATED_HEADERS "${WAVETRACE_GEN_DIR}/project_reflect_auto.h")
+	set(WAVETRACE_GENERATED_HEADERS
+		"${WAVETRACE_GEN_DIR}/project_reflect_auto.h"
+		"${WAVETRACE_GEN_DIR}/root_class_closure_reflect_auto.h"
+	)
 	if(WAVETRACE_IDE_HEADERS)
 		set_source_files_properties(${WAVETRACE_IDE_HEADERS} PROPERTIES HEADER_FILE_ONLY TRUE)
 		source_group("WaveTrace" FILES ${WAVETRACE_IDE_HEADERS})

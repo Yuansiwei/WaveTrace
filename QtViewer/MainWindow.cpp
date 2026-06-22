@@ -45,6 +45,7 @@
 #include <QSplitter>
 #include <QSpinBox>
 #include <QStringList>
+#include <QStatusBar>
 #include <QTreeView>
 #include <QTreeWidget>
 #include <QAbstractItemView>
@@ -1272,6 +1273,56 @@ bool loadWaveFileFullyForCompare(const QString& path, WaveFile& wave, QString& e
     return WaveParser::loadFromFile(path, wave, error);
 }
 
+struct CompareCycleRange {
+    qint64 start = 0;
+    qint64 end = 0;
+    bool hasCommonRange = false;
+};
+
+CompareCycleRange makeCommonCompareCycleRange(const WaveMeta& leftMeta, const WaveMeta& rightMeta) {
+    CompareCycleRange range;
+    range.start = qMax(leftMeta.start, rightMeta.start);
+    range.end = qMin(leftMeta.end, rightMeta.end);
+    range.hasCommonRange = range.end > range.start;
+    if (!range.hasCommonRange) {
+        range.end = range.start;
+    }
+    return range;
+}
+
+bool compareFileRangesDiffer(const WaveMeta& leftMeta, const WaveMeta& rightMeta) {
+    return leftMeta.start != rightMeta.start || leftMeta.end != rightMeta.end;
+}
+
+QString formatCycleRange(qint64 start, qint64 end) {
+    return QStringLiteral("%1~%2").arg(start).arg(end);
+}
+
+QString formatCompareRangeNote(const WaveMeta& leftMeta, const WaveMeta& rightMeta) {
+    const CompareCycleRange common = makeCommonCompareCycleRange(leftMeta, rightMeta);
+    QString note = QStringLiteral("Compared common cycle range %1. A range=%2, B range=%3.")
+        .arg(common.hasCommonRange
+             ? formatCycleRange(common.start, common.end)
+             : QStringLiteral("<empty>"))
+        .arg(formatCycleRange(leftMeta.start, leftMeta.end))
+        .arg(formatCycleRange(rightMeta.start, rightMeta.end));
+    if (compareFileRangesDiffer(leftMeta, rightMeta)) {
+        note += QStringLiteral(" File cycle ranges differ; the non-overlapping tail is not inserted into the diff tree.");
+    }
+    return note;
+}
+
+QString formatNoSignalDiffMessage(const WaveMeta& leftMeta, const WaveMeta& rightMeta) {
+    QString msg = QStringLiteral("No matching-path signal differs in the common cycle range.");
+    if (!makeCommonCompareCycleRange(leftMeta, rightMeta).hasCommonRange) {
+        msg += QStringLiteral(" No common cycle range to compare.");
+    }
+    if (compareFileRangesDiffer(leftMeta, rightMeta)) {
+        msg += QStringLiteral("\n") + formatCompareRangeNote(leftMeta, rightMeta);
+    }
+    return msg;
+}
+
 WaveSample makeAbsentCompareSample() {
     WaveSample s;
     s.time = 0;
@@ -1631,8 +1682,9 @@ bool buildComparedWaveFile(const QString& leftPath,
     outWave.meta.timescale = (leftWave.meta.timescale == rightWave.meta.timescale)
         ? leftWave.meta.timescale
         : QStringLiteral("cycle");
-    outWave.meta.start = qMin(leftWave.meta.start, rightWave.meta.start);
-    outWave.meta.end = qMax(qMax(leftWave.meta.end, rightWave.meta.end), outWave.meta.start + 1);
+    const CompareCycleRange compareRange = makeCommonCompareCycleRange(leftWave.meta, rightWave.meta);
+    outWave.meta.start = compareRange.start;
+    outWave.meta.end = qMax(compareRange.end, outWave.meta.start + 1);
 
     int commonPathCount = 0;
     int nextSignalId = 1;
@@ -1643,9 +1695,12 @@ bool buildComparedWaveFile(const QString& leftPath,
         ++commonPathCount;
         const WaveSignal& leftSig = leftWave.signalList.at(li);
         const WaveSignal& rightSig = rightWave.signalList.at(ri);
-        const QVector<WaveDiffRegion> diffRegions = computeSignalDiffRegions(leftSig, rightSig,
-                                                                               outWave.meta.start, outWave.meta.end,
-                                                                               leftWave.meta.end, rightWave.meta.end);
+        QVector<WaveDiffRegion> diffRegions;
+        if (compareRange.hasCommonRange) {
+            diffRegions = computeSignalDiffRegions(leftSig, rightSig,
+                                                   compareRange.start, compareRange.end,
+                                                   compareRange.end, compareRange.end);
+        }
         if (diffRegions.isEmpty()) continue;
 
         const QString leftName = comparedSideFullPath(path, QStringLiteral("A"));
@@ -1659,7 +1714,7 @@ bool buildComparedWaveFile(const QString& leftPath,
         return false;
     }
     if (outWave.signalList.isEmpty()) {
-        error = QString::fromUtf8("没有发现路径相同且任意 cycle 数据不同的信号。");
+        error = formatNoSignalDiffMessage(leftWave.meta, rightWave.meta);
         return false;
     }
     return true;
@@ -1721,8 +1776,9 @@ bool buildComparedWaveFileOptimized(const QString& leftPath,
     outWave.meta.timescale = (leftWave.meta.timescale == rightWave.meta.timescale)
         ? leftWave.meta.timescale
         : QStringLiteral("cycle");
-    outWave.meta.start = qMin(leftWave.meta.start, rightWave.meta.start);
-    outWave.meta.end = qMax(qMax(leftWave.meta.end, rightWave.meta.end), outWave.meta.start + 1);
+    const CompareCycleRange compareRange = makeCommonCompareCycleRange(leftWave.meta, rightWave.meta);
+    outWave.meta.start = compareRange.start;
+    outWave.meta.end = qMax(compareRange.end, outWave.meta.start + 1);
 
     std::vector<CompareSignalJob> jobs;
     jobs.reserve(std::size_t(leftPathOrder.size() + rightPathOrder.size()));
@@ -1775,14 +1831,16 @@ bool buildComparedWaveFileOptimized(const QString& leftPath,
                 if (jobIndex < 0 || jobIndex >= int(jobs.size())) break;
                 const CompareSignalJob& job = jobs[std::size_t(jobIndex)];
                 QVector<WaveDiffRegion> diffRegions;
-                if (job.leftIndex >= 0 && job.rightIndex >= 0) {
+                if (!compareRange.hasCommonRange) {
+                    diffRegions.clear();
+                } else if (job.leftIndex >= 0 && job.rightIndex >= 0) {
                     const WaveSignal& leftSig = leftWave.signalList.at(job.leftIndex);
                     const WaveSignal& rightSig = rightWave.signalList.at(job.rightIndex);
                     diffRegions = computeSignalDiffRegions(leftSig, rightSig,
-                                                           outWave.meta.start, outWave.meta.end,
-                                                           leftWave.meta.end, rightWave.meta.end);
+                                                           compareRange.start, compareRange.end,
+                                                           compareRange.end, compareRange.end);
                 } else {
-                    diffRegions = makeFullCompareDiffRegions(outWave.meta.start, outWave.meta.end);
+                    diffRegions = makeFullCompareDiffRegions(compareRange.start, compareRange.end);
                 }
                 if (progress) progress->completedJobs.fetch_add(1, std::memory_order_release);
                 if (diffRegions.isEmpty()) continue;
@@ -1808,7 +1866,7 @@ bool buildComparedWaveFileOptimized(const QString& leftPath,
     }
     if (diffSignalCount == 0) {
         if (commonPathCount > 0) {
-            error = QStringLiteral("No matching-path signal differs at any cycle.");
+            error = formatNoSignalDiffMessage(leftWave.meta, rightWave.meta);
         } else {
             error = QStringLiteral("No signal differences were found.");
         }
@@ -2019,8 +2077,9 @@ bool buildComparedWaveFileWvz4Streaming(const QString& leftPath,
     outWave.meta.timescale = (leftDirectory.meta.timescale == rightDirectory.meta.timescale)
         ? leftDirectory.meta.timescale
         : QStringLiteral("cycle");
-    outWave.meta.start = qMin(leftDirectory.meta.start, rightDirectory.meta.start);
-    outWave.meta.end = qMax(qMax(leftDirectory.meta.end, rightDirectory.meta.end), outWave.meta.start + 1);
+    const CompareCycleRange compareRange = makeCommonCompareCycleRange(leftDirectory.meta, rightDirectory.meta);
+    outWave.meta.start = compareRange.start;
+    outWave.meta.end = qMax(compareRange.end, outWave.meta.start + 1);
 
     if (progress) {
         progress->totalJobs.store(jobs.size(), std::memory_order_release);
@@ -2120,12 +2179,14 @@ bool buildComparedWaveFileWvz4Streaming(const QString& leftPath,
                 rightSig = &it.value();
             }
 
-            if (leftSig && rightSig) {
+            if (!compareRange.hasCommonRange) {
+                diffRegions.clear();
+            } else if (leftSig && rightSig) {
                 diffRegions = computeSignalDiffRegions(*leftSig, *rightSig,
-                                                       outWave.meta.start, outWave.meta.end,
-                                                       leftDirectory.meta.end, rightDirectory.meta.end);
+                                                       compareRange.start, compareRange.end,
+                                                       compareRange.end, compareRange.end);
             } else {
-                diffRegions = makeFullCompareDiffRegions(outWave.meta.start, outWave.meta.end);
+                diffRegions = makeFullCompareDiffRegions(compareRange.start, compareRange.end);
             }
 
             if (!diffRegions.isEmpty()) {
@@ -2156,7 +2217,7 @@ bool buildComparedWaveFileWvz4Streaming(const QString& leftPath,
     }
 
     if (outWave.signalList.isEmpty()) {
-        error = QStringLiteral("No matching-path signal differs at any cycle.");
+        error = formatNoSignalDiffMessage(leftDirectory.meta, rightDirectory.meta);
         if (viewerPerfLogEnabled()) {
             comparePerfLog("compare.streaming.total", totalTimer.elapsed(),
                            0, jobs.size(), leftDirectory.signalList.size(), rightDirectory.signalList.size(), 0);
@@ -4592,6 +4653,9 @@ bool MainWindow::compareWaveFilePaths(const QString& leftPath,
     m_currentWaveSupportsOnDemand = false;
     m_signalIndexBySignalId.clear();
     applyWave(std::move(comparedWave));
+    if (showMessages && compareFileRangesDiffer(leftWave.meta, rightWave.meta)) {
+        statusBar()->showMessage(formatCompareRangeNote(leftWave.meta, rightWave.meta), 15000);
+    }
 
     if (resultSignalCount) *resultSignalCount = comparedSignalCount;
     if (elapsedMs) *elapsedMs = totalTimer.elapsed();

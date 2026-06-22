@@ -143,7 +143,6 @@
     <None Include="QtSingalViewer.ui" />
     <None Include="QtSingalViewer.qrc" />
     <None Include="resources.qrc" />
-    <None Include="smoke_wvz4_parser.cpp" />
   </ItemGroup>
 
   <Target Name="GenerateQtSources" BeforeTargets="ClCompile">

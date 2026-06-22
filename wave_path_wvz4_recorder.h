@@ -655,6 +655,26 @@ private:
         }
     }
 
+    static bool is_strictly_increasing_ids(const std::vector<wvz4::u32>& ids) {
+        for (std::size_t i = 1; i < ids.size(); ++i) {
+            if (ids[i - 1u] >= ids[i]) return false;
+        }
+        return true;
+    }
+
+    static void make_sorted_unique_ids(const std::vector<wvz4::u32>& src,
+                                       std::vector<wvz4::u32>& scratch,
+                                       const std::vector<wvz4::u32>*& out) {
+        if (is_strictly_increasing_ids(src)) {
+            out = &src;
+            return;
+        }
+        scratch = src;
+        std::sort(scratch.begin(), scratch.end());
+        scratch.erase(std::unique(scratch.begin(), scratch.end()), scratch.end());
+        out = &scratch;
+    }
+
     bool build_layout(wvz4::Layout& layout, std::string& error) {
         error.clear();
         if (!last_error_.empty()) { error = last_error_; return false; }
@@ -664,16 +684,24 @@ private:
         if (declared_node_ids_.empty() && !cfg_.emit_default_clk) { error = "WVZ4 layout requires at least one node"; return false; }
         if (declared_track_ids_.empty() && !cfg_.emit_default_clk) { error = "WVZ4 layout requires at least one signal"; return false; }
 
-        std::vector<wvz4::u32> node_ids = declared_node_ids_;
-        std::sort(node_ids.begin(), node_ids.end());
-        node_ids.erase(std::unique(node_ids.begin(), node_ids.end()), node_ids.end());
-        std::vector<wvz4::u32> track_ids = declared_track_ids_;
-        std::sort(track_ids.begin(), track_ids.end());
-        track_ids.erase(std::unique(track_ids.begin(), track_ids.end()), track_ids.end());
+        std::vector<wvz4::u32> node_ids_scratch;
+        std::vector<wvz4::u32> track_ids_scratch;
+        const std::vector<wvz4::u32>* node_ids_ptr = NULL;
+        const std::vector<wvz4::u32>* track_ids_ptr = NULL;
+        make_sorted_unique_ids(declared_node_ids_, node_ids_scratch, node_ids_ptr);
+        make_sorted_unique_ids(declared_track_ids_, track_ids_scratch, track_ids_ptr);
+        const std::vector<wvz4::u32>& node_ids = *node_ids_ptr;
+        const std::vector<wvz4::u32>& track_ids = *track_ids_ptr;
 
         std::unordered_map<std::string, wvz4::u32> name_to_id;
-        name_to_id.reserve(node_ids.size());
-        std::vector<std::vector<wvz4::u32> > children(node_states_.size());
+        name_to_id.reserve(node_ids.size() + (cfg_.emit_default_clk ? 1u : 0u));
+        layout.names.reserve(node_ids.size() + (cfg_.emit_default_clk ? 1u : 0u));
+        layout.nodes.reserve(node_ids.size() + (cfg_.emit_default_clk ? 1u : 0u));
+        layout.signals.reserve(track_ids.size() + (cfg_.emit_default_clk ? 1u : 0u));
+
+        std::vector<wvz4::u32> first_child(node_states_.size(), 0);
+        std::vector<wvz4::u32> last_child(node_states_.size(), 0);
+        std::vector<wvz4::u32> next_sibling(node_states_.size(), 0);
         for (std::size_t i = 0; i < node_ids.size(); ++i) {
             const wvz4::u32 nid = node_ids[i];
             if (nid >= node_states_.size() || !node_states_[nid].declared) { error = "WVZ4 layout build found missing node"; return false; }
@@ -682,7 +710,12 @@ private:
                 if (ns.parent_id >= node_states_.size() || !node_states_[ns.parent_id].declared) {
                     error = "WVZ4 layout build found node with missing parent; "; error += debug_state_summary(); return false;
                 }
-                children[ns.parent_id].push_back(nid);
+                if (first_child[ns.parent_id] == 0) {
+                    first_child[ns.parent_id] = nid;
+                } else {
+                    next_sibling[last_child[ns.parent_id]] = nid;
+                }
+                last_child[ns.parent_id] = nid;
             }
             if (name_to_id.find(ns.name) == name_to_id.end()) {
                 const wvz4::u32 name_id = static_cast<wvz4::u32>(name_to_id.size() + 1u);
@@ -704,9 +737,6 @@ private:
                 layout.names.push_back(nr);
             }
         }
-        std::sort(layout.names.begin(), layout.names.end(), [](const wvz4::NameRecord& a, const wvz4::NameRecord& b) {
-            return a.name_id < b.name_id;
-        });
 
         wvz4::u32 default_clk_node_id = 0;
         if (cfg_.emit_default_clk) {
@@ -717,7 +747,18 @@ private:
             default_clk_node_id = node_ids.empty() ? 1u : (node_ids.back() + 1u);
         }
 
-        layout.nodes.reserve(node_ids.size() + (cfg_.emit_default_clk ? 1u : 0u));
+        for (std::size_t i = 0; i < node_ids.size(); ++i) {
+            const wvz4::u32 nid = node_ids[i];
+            const NodeState& ns = node_states_[nid];
+            wvz4::NodeRecord rec;
+            rec.node_id = ns.node_id;
+            rec.parent_id = ns.parent_id;
+            rec.name_id = name_to_id[ns.name];
+            rec.kind = ns.kind;
+            rec.first_child = first_child[nid];
+            rec.next_sibling = next_sibling[nid];
+            layout.nodes.push_back(rec);
+        }
         if (cfg_.emit_default_clk) {
             wvz4::NodeRecord clk_node;
             clk_node.node_id = default_clk_node_id;
@@ -728,26 +769,7 @@ private:
             clk_node.next_sibling = 0;
             layout.nodes.push_back(clk_node);
         }
-        for (std::size_t i = 0; i < node_ids.size(); ++i) {
-            const wvz4::u32 nid = node_ids[i];
-            const NodeState& ns = node_states_[nid];
-            wvz4::NodeRecord rec;
-            rec.node_id = ns.node_id;
-            rec.parent_id = ns.parent_id;
-            rec.name_id = name_to_id[ns.name];
-            rec.kind = ns.kind;
-            if (!children[nid].empty()) rec.first_child = children[nid][0];
-            rec.next_sibling = 0;
-            if (ns.parent_id != 0) {
-                const std::vector<wvz4::u32>& siblings = children[ns.parent_id];
-                for (std::size_t k = 0; k + 1 < siblings.size(); ++k) {
-                    if (siblings[k] == nid) { rec.next_sibling = siblings[k + 1]; break; }
-                }
-            }
-            layout.nodes.push_back(rec);
-        }
 
-        layout.signals.reserve(track_ids.size() + (cfg_.emit_default_clk ? 1u : 0u));
         if (cfg_.emit_default_clk) {
             wvz4::SignalDefinition clk_sig;
             clk_sig.signal_id = 1u;

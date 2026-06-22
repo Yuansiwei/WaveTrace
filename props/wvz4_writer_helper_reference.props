@@ -2,16 +2,10 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup>
     <WaveTraceRoot Condition="'$(WaveTraceRoot)'==''">$(MSBuildThisFileDirectory)..</WaveTraceRoot>
+    <WaveTraceWriterHelperExe>$(WaveTraceRoot)\tools\bin\wvz4_writer_monitor.exe</WaveTraceWriterHelperExe>
   </PropertyGroup>
 
-  <ItemGroup>
-    <ProjectReference Include="$(WaveTraceRoot)\wvz4_writer_monitor.vcxproj">
-      <Project>{6115E34A-A038-4D19-A1D2-A6768109A1A4}</Project>
-      <Name>wvz4_writer_monitor</Name>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-      <LinkLibraryDependencies>false</LinkLibraryDependencies>
-      <UseLibraryDependencyInputs>false</UseLibraryDependencyInputs>
-      <Private>false</Private>
-    </ProjectReference>
-  </ItemGroup>
+  <Target Name="CheckWaveTraceWriterHelperPrebuilt" BeforeTargets="Build">
+    <Error Condition="!Exists('$(WaveTraceWriterHelperExe)')" Text="WaveTrace writer helper executable not found: $(WaveTraceWriterHelperExe)" />
+  </Target>
 </Project>

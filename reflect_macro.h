@@ -124,7 +124,7 @@ public:
     }
 
     DynamicExpandFn wave_trace_dynamic_expander() const override {
-        return &dynamic_expand_bridge<T>;
+        return NULL;
     }
 
     WaveDirtyHook* wave_trace_dirty_hook() const override {
@@ -172,7 +172,7 @@ public:
     }
 
     DynamicExpandFn wave_trace_peek_dynamic_expander() const override {
-        return &dynamic_expand_bridge<ValueT>;
+        return NULL;
     }
 
     WaveDirtyHook* wave_trace_peek_dirty_hook() const override {
@@ -459,7 +459,9 @@ static_assert(sizeof(WaveValue<std::uint32_t>) == sizeof(std::uint32_t), "WaveVa
 static_assert(alignof(WaveValue<std::uint32_t>) == alignof(std::uint32_t), "WaveValue align mismatch");
 
 // WavePtr<PtrT> is a pointer-like wrapper whose tracing semantic is:
-// expand the single object currently referenced by the wrapped pointer.
+// expand the object(s) currently referenced by the wrapped pointer.  By default
+// it expands a single object; business code may call declareSize(n) before
+// tracing topology is prepared to expand ptr[0]..ptr[n-1].
 //
 // Supported PtrT forms:
 //   T*
@@ -468,7 +470,8 @@ static_assert(alignof(WaveValue<std::uint32_t>) == alignof(std::uint32_t), "Wave
 //
 // The pointee T does not need to inherit DirectReflectPointerTarget.  The
 // wrapper itself is the explicit opt-in marker.  Topology is still stable:
-// changing the pointer after topology preparation does not rebuild the tree.
+// changing the pointer or declared size after topology preparation does not
+// rebuild the tree.
 template <typename PtrT>
 class WavePtr {
     static_assert(detail::is_wave_ptr_storage<PtrT>::value,
@@ -478,18 +481,19 @@ public:
     typedef PtrT pointer_type;
     typedef typename detail::wave_ptr_storage_traits<PtrT>::element_type element_type;
 
-    WavePtr() noexcept : ptr_() {}
-    WavePtr(std::nullptr_t) noexcept : ptr_() {}
+    WavePtr() noexcept : ptr_(), declared_size_(1) {}
+    WavePtr(std::nullptr_t) noexcept : ptr_(), declared_size_(1) {}
     WavePtr(const WavePtr& other) = default;
     WavePtr& operator=(const WavePtr& other) = default;
-    WavePtr(WavePtr&& other) noexcept : ptr_(std::move(other.ptr_)) {}
+    WavePtr(WavePtr&& other) noexcept : ptr_(std::move(other.ptr_)), declared_size_(other.declared_size_) {}
     WavePtr& operator=(WavePtr&& other) noexcept {
         ptr_ = std::move(other.ptr_);
+        declared_size_ = other.declared_size_;
         return *this;
     }
 
     template <typename U = PtrT, typename std::enable_if<std::is_pointer<U>::value, int>::type = 0>
-    WavePtr(element_type* ptr) noexcept : ptr_(ptr) {}
+    WavePtr(element_type* ptr) noexcept : ptr_(ptr), declared_size_(1) {}
 
     template <typename U = PtrT, typename std::enable_if<std::is_pointer<U>::value, int>::type = 0>
     WavePtr& operator=(element_type* ptr) noexcept {
@@ -497,19 +501,29 @@ public:
         return *this;
     }
 
-    template <typename U = PtrT, typename std::enable_if<!std::is_pointer<U>::value && std::is_copy_constructible<U>::value, int>::type = 0>
-    WavePtr(const U& ptr) : ptr_(ptr) {}
+    template <typename U = PtrT, typename std::enable_if<
+        !std::is_pointer<PtrT>::value &&
+        !std::is_pointer<U>::value &&
+        std::is_constructible<PtrT, const U&>::value, int>::type = 0>
+    WavePtr(const U& ptr) : ptr_(ptr), declared_size_(1) {}
 
-    template <typename U = PtrT, typename std::enable_if<!std::is_pointer<U>::value && std::is_copy_assignable<U>::value, int>::type = 0>
+    template <typename U = PtrT, typename std::enable_if<
+        !std::is_pointer<PtrT>::value &&
+        !std::is_pointer<U>::value &&
+        std::is_assignable<PtrT&, const U&>::value, int>::type = 0>
     WavePtr& operator=(const U& ptr) {
         ptr_ = ptr;
         return *this;
     }
 
-    template <typename U = PtrT, typename std::enable_if<!std::is_pointer<U>::value, int>::type = 0>
-    WavePtr(PtrT&& ptr) noexcept : ptr_(std::move(ptr)) {}
+    template <typename U = PtrT, typename std::enable_if<
+        !std::is_pointer<U>::value &&
+        std::is_constructible<PtrT, PtrT&&>::value, int>::type = 0>
+    WavePtr(PtrT&& ptr) noexcept : ptr_(std::move(ptr)), declared_size_(1) {}
 
-    template <typename U = PtrT, typename std::enable_if<!std::is_pointer<U>::value, int>::type = 0>
+    template <typename U = PtrT, typename std::enable_if<
+        !std::is_pointer<U>::value &&
+        std::is_assignable<PtrT&, PtrT&&>::value, int>::type = 0>
     WavePtr& operator=(PtrT&& ptr) noexcept {
         ptr_ = std::move(ptr);
         return *this;
@@ -526,8 +540,17 @@ public:
 
     element_type& operator*() const noexcept { return *get(); }
     element_type* operator->() const noexcept { return get(); }
+    element_type& operator[](std::size_t index) const noexcept { return get()[index]; }
     operator element_type*() const noexcept { return get(); }
     explicit operator bool() const noexcept { return get() != NULL; }
+
+    WavePtr& declareSize(std::size_t count) noexcept {
+        declared_size_ = count;
+        return *this;
+    }
+
+    std::size_t declared_size() const noexcept { return declared_size_; }
+    std::size_t declaredSize() const noexcept { return declared_size_; }
 
     void reset() noexcept {
         detail::wave_ptr_storage_traits<PtrT>::reset(ptr_);
@@ -541,6 +564,7 @@ public:
 
 private:
     PtrT ptr_;
+    std::size_t declared_size_;
 };
 
 template <typename PtrT>
@@ -553,6 +577,7 @@ template <typename PtrT>
 struct wave_ptr_traits<WavePtr<PtrT> > {
     typedef PtrT pointer_type;
     typedef typename detail::wave_ptr_storage_traits<PtrT>::element_type element_type;
+    static std::size_t declared_size(const WavePtr<PtrT>& ptr) noexcept { return ptr.declared_size(); }
 };
 
 template <typename PtrT>

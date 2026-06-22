@@ -5,6 +5,7 @@
   <PropertyGroup Label="UserMacros">
     <QtLocalRoot Condition="'$(QtLocalRoot)'=='' and '$(QT5_ROOT)'!=''">$(QT5_ROOT)\</QtLocalRoot>
     <QtLocalRoot Condition="'$(QtLocalRoot)'=='' and '$(QTDIR)'!='' and Exists('$(QTDIR)\lib\Qt5Core.lib')">$(QTDIR)\</QtLocalRoot>
+    <QtLocalRoot Condition="'$(QtLocalRoot)'=='' and Exists('$(MSBuildThisFileDirectory)third_party\Qt\5.15.2\msvc2019_64\lib\Qt5Core.lib')">$(MSBuildThisFileDirectory)third_party\Qt\5.15.2\msvc2019_64\</QtLocalRoot>
     <QtLocalRoot Condition="'$(QtLocalRoot)'=='' and Exists('C:\Qt\5.15.2\msvc2019_64\lib\Qt5Core.lib')">C:\Qt\5.15.2\msvc2019_64\</QtLocalRoot>
     <QtLocalRoot Condition="'$(QtLocalRoot)'=='' and Exists('C:\Users\13611\source\repos\QtSingalViewer\third_party\Qt\5.15.2\msvc2019_64\lib\Qt5Core.lib')">C:\Users\13611\source\repos\QtSingalViewer\third_party\Qt\5.15.2\msvc2019_64\</QtLocalRoot>
     <QtLocalRoot Condition="'$(QtLocalRoot)'==''">$(MSBuildThisFileDirectory)third_party\Qt\5.15.2\msvc2019_64\</QtLocalRoot>

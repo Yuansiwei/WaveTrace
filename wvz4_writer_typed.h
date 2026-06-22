@@ -1678,24 +1678,63 @@ private:
         return write_section(raw_tag, raw_payload, error);
     }
 
+    static bool names_sorted_by_id(const std::vector<NameRecord>& records) {
+        for (std::size_t i = 1; i < records.size(); ++i) {
+            if (records[i - 1u].name_id > records[i].name_id) return false;
+        }
+        return true;
+    }
+
+    static bool nodes_sorted_by_id(const std::vector<NodeRecord>& records) {
+        for (std::size_t i = 1; i < records.size(); ++i) {
+            if (records[i - 1u].node_id > records[i].node_id) return false;
+        }
+        return true;
+    }
+
+    static bool signals_sorted_by_id(const std::vector<SignalDefinition>& records) {
+        for (std::size_t i = 1; i < records.size(); ++i) {
+            if (records[i - 1u].signal_id > records[i].signal_id) return false;
+        }
+        return true;
+    }
+
+    static bool clocks_sorted_by_id(const std::vector<ClockDefinition>& records) {
+        for (std::size_t i = 1; i < records.size(); ++i) {
+            if (records[i - 1u].signal_id > records[i].signal_id) return false;
+        }
+        return true;
+    }
+
     bool write_layout_sections(const Layout& layout, std::string& error) {
         std::vector<u8> payload;
         payload.reserve(layout.names.size() * 16);
         detail::append_varuint(payload, static_cast<u64>(layout.names.size()));
-        std::vector<NameRecord> names = layout.names;
-        std::sort(names.begin(), names.end(), [](const NameRecord& a, const NameRecord& b) { return a.name_id < b.name_id; });
-        for (std::size_t i = 0; i < names.size(); ++i) {
-            detail::append_varuint(payload, names[i].name_id);
-            detail::append_string(payload, names[i].name);
+        std::vector<NameRecord> sorted_names;
+        const std::vector<NameRecord>* names = &layout.names;
+        if (!names_sorted_by_id(layout.names)) {
+            sorted_names = layout.names;
+            std::sort(sorted_names.begin(), sorted_names.end(), [](const NameRecord& a, const NameRecord& b) { return a.name_id < b.name_id; });
+            names = &sorted_names;
+        }
+        for (std::size_t i = 0; i < names->size(); ++i) {
+            detail::append_varuint(payload, (*names)[i].name_id);
+            detail::append_string(payload, (*names)[i].name);
         }
         if (!write_layout_section("NAME", "NAMZ", payload, error)) return false;
 
         payload.clear();
+        payload.reserve(layout.nodes.size() * 20);
         detail::append_varuint(payload, static_cast<u64>(layout.nodes.size()));
-        std::vector<NodeRecord> nodes = layout.nodes;
-        std::sort(nodes.begin(), nodes.end(), [](const NodeRecord& a, const NodeRecord& b) { return a.node_id < b.node_id; });
-        for (std::size_t i = 0; i < nodes.size(); ++i) {
-            const NodeRecord& n = nodes[i];
+        std::vector<NodeRecord> sorted_nodes;
+        const std::vector<NodeRecord>* nodes = &layout.nodes;
+        if (!nodes_sorted_by_id(layout.nodes)) {
+            sorted_nodes = layout.nodes;
+            std::sort(sorted_nodes.begin(), sorted_nodes.end(), [](const NodeRecord& a, const NodeRecord& b) { return a.node_id < b.node_id; });
+            nodes = &sorted_nodes;
+        }
+        for (std::size_t i = 0; i < nodes->size(); ++i) {
+            const NodeRecord& n = (*nodes)[i];
             detail::append_varuint(payload, n.node_id);
             detail::append_varuint(payload, n.parent_id);
             detail::append_varuint(payload, n.name_id);
@@ -1706,11 +1745,17 @@ private:
         if (!write_layout_section("NODE", "NODZ", payload, error)) return false;
 
         payload.clear();
+        payload.reserve(layout.signals.size() * 20);
         detail::append_varuint(payload, static_cast<u64>(layout.signals.size()));
-        std::vector<SignalDefinition> sigs = layout.signals;
-        std::sort(sigs.begin(), sigs.end(), [](const SignalDefinition& a, const SignalDefinition& b) { return a.signal_id < b.signal_id; });
-        for (std::size_t i = 0; i < sigs.size(); ++i) {
-            const SignalDefinition& s = sigs[i];
+        std::vector<SignalDefinition> sorted_sigs;
+        const std::vector<SignalDefinition>* sigs = &layout.signals;
+        if (!signals_sorted_by_id(layout.signals)) {
+            sorted_sigs = layout.signals;
+            std::sort(sorted_sigs.begin(), sorted_sigs.end(), [](const SignalDefinition& a, const SignalDefinition& b) { return a.signal_id < b.signal_id; });
+            sigs = &sorted_sigs;
+        }
+        for (std::size_t i = 0; i < sigs->size(); ++i) {
+            const SignalDefinition& s = (*sigs)[i];
             detail::append_varuint(payload, s.signal_id);
             detail::append_varuint(payload, s.storage_id != 0 ? s.storage_id : s.signal_id);
             detail::append_varuint(payload, s.node_id);
@@ -1724,15 +1769,20 @@ private:
 
         payload.clear();
         detail::append_varuint(payload, static_cast<u64>(layout.clocks.size()));
-        std::vector<ClockDefinition> clocks = layout.clocks;
-        std::sort(clocks.begin(), clocks.end(), [](const ClockDefinition& a, const ClockDefinition& b) { return a.signal_id < b.signal_id; });
-        for (std::size_t i = 0; i < clocks.size(); ++i) {
-            const ClockDefinition& c = clocks[i];
+        std::vector<ClockDefinition> sorted_clocks;
+        const std::vector<ClockDefinition>* clocks = &layout.clocks;
+        if (!clocks_sorted_by_id(layout.clocks)) {
+            sorted_clocks = layout.clocks;
+            std::sort(sorted_clocks.begin(), sorted_clocks.end(), [](const ClockDefinition& a, const ClockDefinition& b) { return a.signal_id < b.signal_id; });
+            clocks = &sorted_clocks;
+        }
+        for (std::size_t i = 0; i < clocks->size(); ++i) {
+            const ClockDefinition& c = (*clocks)[i];
             detail::append_varuint(payload, c.signal_id);
             detail::append_u8(payload, c.initial_value ? 1u : 0u);
             detail::append_varuint(payload, c.period_ticks);
         }
-        stats_.clock_count = static_cast<u64>(clocks.size());
+        stats_.clock_count = static_cast<u64>(clocks->size());
         stats_.clock_section_payload_bytes = static_cast<u64>(payload.size());
         if (!layout.clocks.empty()) {
             if (!write_layout_section("CLKD", "CLKZ", payload, error)) return false;
