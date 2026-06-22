@@ -150,6 +150,8 @@ enum class Compression : u8 {
 struct NameRecord {
     u32 name_id = 0;       // positive, unique
     std::string name;      // segment name, e.g. "top", "gpu", "warp[3]"
+    u32 name_offset = 0;   // optional offset into Layout::name_blob
+    u32 name_size = 0;     // optional byte length in Layout::name_blob
 };
 
 struct NodeRecord {
@@ -184,11 +186,56 @@ struct ClockDefinition {
 };
 
 struct Layout {
+    // Optional contiguous storage for NameRecord strings.  When name_size is
+    // non-zero, NameRecord::name is intentionally empty and the writer reads the
+    // bytes from this arena.  This avoids millions of tiny std::string
+    // allocations in large stable-topology layouts.
+    std::string name_blob;
     std::vector<NameRecord> names;
     std::vector<NodeRecord> nodes;
     std::vector<SignalDefinition> signals;
     std::vector<ClockDefinition> clocks;
 };
+
+inline bool layout_name_uses_blob(const NameRecord& r) {
+    return r.name_size != 0;
+}
+
+inline bool layout_name_range_valid(const Layout& layout, const NameRecord& r) {
+    if (!layout_name_uses_blob(r)) return !r.name.empty();
+    const std::size_t off = static_cast<std::size_t>(r.name_offset);
+    const std::size_t len = static_cast<std::size_t>(r.name_size);
+    return len != 0 && off <= layout.name_blob.size() && len <= layout.name_blob.size() - off;
+}
+
+inline const char* layout_name_data(const Layout& layout, const NameRecord& r) {
+    return layout_name_uses_blob(r)
+        ? layout.name_blob.data() + static_cast<std::size_t>(r.name_offset)
+        : r.name.data();
+}
+
+inline std::size_t layout_name_size(const Layout&, const NameRecord& r) {
+    return layout_name_uses_blob(r)
+        ? static_cast<std::size_t>(r.name_size)
+        : r.name.size();
+}
+
+inline void add_layout_name_blob_record(Layout& layout, u32 name_id, const char* data, std::size_t size) {
+    NameRecord nr;
+    nr.name_id = name_id;
+    nr.name_offset = static_cast<u32>(layout.name_blob.size());
+    nr.name_size = static_cast<u32>(size);
+    if (size != 0) layout.name_blob.append(data, size);
+    layout.names.push_back(nr);
+}
+
+inline void add_layout_name_blob_ref_record(Layout& layout, u32 name_id, u32 offset, u32 size) {
+    NameRecord nr;
+    nr.name_id = name_id;
+    nr.name_offset = offset;
+    nr.name_size = size;
+    layout.names.push_back(nr);
+}
 
 struct WriterOptions {
     u64 target_block_span = 100000; // writer-cycle span; must be > 0
@@ -602,6 +649,11 @@ inline void append_string(std::vector<u8>& out, const std::string& s) {
     if (!s.empty()) append_bytes(out, s.data(), s.size());
 }
 
+inline void append_string_bytes(std::vector<u8>& out, const char* data, std::size_t size) {
+    append_varuint(out, static_cast<u64>(size));
+    if (size != 0) append_bytes(out, data, size);
+}
+
 inline bool write_all(std::ofstream& out, const void* data, std::size_t size) {
     if (size == 0) return true;
     out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
@@ -719,6 +771,11 @@ public:
     Writer& operator=(const Writer&) = delete;
 
     bool open(const std::string& path, const Layout& layout, const WriterOptions& options, std::string& error) {
+        Layout layout_copy = layout;
+        return open(path, std::move(layout_copy), options, error);
+    }
+
+    bool open(const std::string& path, Layout&& layout, const WriterOptions& options, std::string& error) {
         std::string close_error;
         if (!close(close_error)) {
             error = close_error.empty() ? "failed to close previous WVZ4 writer before reopen" : close_error;
@@ -743,7 +800,7 @@ public:
             error = "WVZ4 WriterOptions.signals_per_chunk must be > 0 when signal chunking is enabled";
             return false;
         }
-        if (!validate_and_prepare_layout(layout, error)) return false;
+        if (!validate_and_prepare_layout(std::move(layout), error)) return false;
 
         out_.open(path.c_str(), std::ios::binary | std::ios::trunc);
         if (!out_) {
@@ -1368,7 +1425,12 @@ private:
     }
 
     bool validate_and_prepare_layout(const Layout& layout, std::string& error) {
-        layout_ = layout;
+        Layout layout_copy = layout;
+        return validate_and_prepare_layout(std::move(layout_copy), error);
+    }
+
+    bool validate_and_prepare_layout(Layout&& layout, std::string& error) {
+        layout_ = std::move(layout);
         if (layout_.names.empty()) { error = "WVZ4 layout requires a non-empty NameTable"; return false; }
         if (layout_.nodes.empty()) { error = "WVZ4 layout requires a non-empty NodeTable"; return false; }
         if (layout_.signals.empty()) { error = "WVZ4 layout requires a non-empty SignalTable"; return false; }
@@ -1389,7 +1451,7 @@ private:
         for (std::size_t i = 0; i < layout_.names.size(); ++i) {
             const NameRecord& r = layout_.names[i];
             if (r.name_id == 0) { error = "NameRecord.name_id must be positive"; return false; }
-            if (r.name.empty()) { error = detail::make_error("NameRecord.name must not be empty for name_id: ", r.name_id); return false; }
+            if (!layout_name_range_valid(layout_, r)) { error = detail::make_error("NameRecord.name must not be empty or out of range for name_id: ", r.name_id); return false; }
             if (seen_names[r.name_id]) { error = detail::make_error("duplicate name_id: ", r.name_id); return false; }
             seen_names[r.name_id] = 1;
         }
@@ -1708,7 +1770,10 @@ private:
 
     bool write_layout_sections(const Layout& layout, std::string& error) {
         std::vector<u8> payload;
-        payload.reserve(layout.names.size() * 16);
+        const std::size_t name_bytes = layout.name_blob.empty()
+            ? 0u
+            : layout.name_blob.size();
+        payload.reserve(layout.names.size() * 8u + name_bytes + 16u);
         detail::append_varuint(payload, static_cast<u64>(layout.names.size()));
         std::vector<NameRecord> sorted_names;
         const std::vector<NameRecord>* names = &layout.names;
@@ -1718,8 +1783,9 @@ private:
             names = &sorted_names;
         }
         for (std::size_t i = 0; i < names->size(); ++i) {
-            detail::append_varuint(payload, (*names)[i].name_id);
-            detail::append_string(payload, (*names)[i].name);
+            const NameRecord& r = (*names)[i];
+            detail::append_varuint(payload, r.name_id);
+            detail::append_string_bytes(payload, layout_name_data(layout, r), layout_name_size(layout, r));
         }
         if (!write_layout_section("NAME", "NAMZ", payload, error)) return false;
 
@@ -4739,6 +4805,15 @@ public:
         pos_ += static_cast<std::size_t>(n);
         return true;
     }
+    bool read_string_view(const u8*& ptr, std::size_t& size) {
+        u64 n = 0;
+        if (!read_varuint(n)) return false;
+        if (n > data_.size() - pos_) return false;
+        ptr = n == 0 ? NULL : &data_[pos_];
+        size = static_cast<std::size_t>(n);
+        pos_ += size;
+        return true;
+    }
     bool read_bytes(u8* dst, std::size_t n) {
         if (n > data_.size() - pos_) return false;
         if (n != 0) std::memcpy(dst, &data_[pos_], n);
@@ -4752,6 +4827,7 @@ public:
         return true;
     }
     bool at_end() const { return pos_ == data_.size(); }
+    std::size_t remaining() const { return data_.size() - pos_; }
 private:
     const std::vector<u8>& data_;
     std::size_t pos_ = 0;
@@ -4804,10 +4880,16 @@ inline bool deserialize_options(PayloadReader& r, WriterOptions& o) {
 }
 
 inline void serialize_layout(std::vector<u8>& out, const Layout& l) {
+    out.reserve(out.size() +
+                l.names.size() * 8u +
+                l.nodes.size() * 20u +
+                l.signals.size() * 24u +
+                l.clocks.size() * 12u +
+                l.name_blob.size() + 16u);
     append_varuint(out, static_cast<u64>(l.names.size()));
     for (std::size_t i = 0; i < l.names.size(); ++i) {
         append_varuint(out, l.names[i].name_id);
-        append_string(out, l.names[i].name);
+        append_string_bytes(out, layout_name_data(l, l.names[i]), layout_name_size(l, l.names[i]));
     }
     append_varuint(out, static_cast<u64>(l.nodes.size()));
     for (std::size_t i = 0; i < l.nodes.size(); ++i) {
@@ -4843,12 +4925,52 @@ inline void serialize_layout(std::vector<u8>& out, const Layout& l) {
 inline bool deserialize_layout(PayloadReader& r, Layout& l) {
     u64 n = 0;
     if (!r.read_varuint(n)) return false;
-    l.names.clear(); l.names.reserve(static_cast<std::size_t>(n));
-    for (u64 i = 0; i < n; ++i) {
-        NameRecord rec; u64 tmp = 0;
-        if (!r.read_varuint(tmp)) return false; rec.name_id = static_cast<u32>(tmp);
-        if (!r.read_string(rec.name)) return false;
-        l.names.push_back(rec);
+    l.name_blob.clear();
+    l.names.clear();
+    if (n == 0) {
+        u8 version = 0;
+        if (!r.read_u8(version)) return false;
+        if (version != 2u) return false;
+        u64 name_count = 0;
+        u64 blob_size_u64 = 0;
+        if (!r.read_varuint(name_count)) return false;
+        if (!r.read_varuint(blob_size_u64)) return false;
+        if (blob_size_u64 > static_cast<u64>((std::numeric_limits<u32>::max)())) return false;
+        const std::size_t blob_size = static_cast<std::size_t>(blob_size_u64);
+        const u8* blob_data = NULL;
+        if (!r.read_bytes_ptr(blob_data, blob_size)) return false;
+        if (blob_size != 0) {
+            l.name_blob.assign(reinterpret_cast<const char*>(blob_data), blob_size);
+        }
+        l.names.reserve(static_cast<std::size_t>(name_count));
+        std::size_t name_offset = 0;
+        for (u64 i = 0; i < name_count; ++i) {
+            NameRecord rec; u64 tmp = 0;
+            if (!r.read_varuint(tmp)) return false; rec.name_id = static_cast<u32>(tmp);
+            if (!r.read_varuint(tmp)) return false; rec.name_size = static_cast<u32>(tmp);
+            if (name_offset > static_cast<std::size_t>((std::numeric_limits<u32>::max)())) return false;
+            rec.name_offset = static_cast<u32>(name_offset);
+            if (!layout_name_range_valid(l, rec)) return false;
+            name_offset += static_cast<std::size_t>(rec.name_size);
+            l.names.push_back(rec);
+        }
+        if (name_offset != l.name_blob.size()) return false;
+    } else {
+        l.names.reserve(static_cast<std::size_t>(n));
+        l.name_blob.reserve((std::min<std::size_t>)(r.remaining(), static_cast<std::size_t>((std::numeric_limits<u32>::max)())));
+        for (u64 i = 0; i < n; ++i) {
+            NameRecord rec; u64 tmp = 0;
+            if (!r.read_varuint(tmp)) return false; rec.name_id = static_cast<u32>(tmp);
+            const u8* name_data = NULL;
+            std::size_t name_size = 0;
+            if (!r.read_string_view(name_data, name_size)) return false;
+            if (name_size > static_cast<std::size_t>((std::numeric_limits<u32>::max)())) return false;
+            if (l.name_blob.size() > static_cast<std::size_t>((std::numeric_limits<u32>::max)()) - name_size) return false;
+            rec.name_offset = static_cast<u32>(l.name_blob.size());
+            rec.name_size = static_cast<u32>(name_size);
+            if (name_size != 0) l.name_blob.append(reinterpret_cast<const char*>(name_data), name_size);
+            l.names.push_back(rec);
+        }
     }
     if (!r.read_varuint(n)) return false;
     l.nodes.clear(); l.nodes.reserve(static_cast<std::size_t>(n));
@@ -5559,7 +5681,7 @@ public:
                         op_error = "WVZ4 writer helper received corrupt layout payload";
                     } else {
                         if (opt.enable_stats_log && opt.stats_log_path.empty()) opt.stats_log_path = output_path + ".log";
-                        ok = helper.open(output_path, layout, opt, op_error);
+                        ok = helper.open(output_path, std::move(layout), opt, op_error);
                         have_writer = ok;
                     }
                 }
@@ -5708,12 +5830,20 @@ private:
                   const Layout& layout,
                   const WriterOptions& options,
                   std::string& error) {
+            Layout layout_copy = layout;
+            return open(output_path, std::move(layout_copy), options, error);
+        }
+
+        bool open(const std::string& output_path,
+                  Layout&& layout,
+                  const WriterOptions& options,
+                  std::string& error) {
             error.clear();
             if (opened_) {
                 error = "WVZ4 writer helper queue already open";
                 return false;
             }
-            if (!writer_.open(output_path, layout, options, error)) return false;
+            if (!writer_.open(output_path, std::move(layout), options, error)) return false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 opened_ = true;

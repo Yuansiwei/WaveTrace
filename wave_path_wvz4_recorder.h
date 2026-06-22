@@ -168,7 +168,15 @@ public:
                                   cfg_.options,
                                   error,
                                   cfg_.writer_process_exe_path,
-                                  cfg_.writer_process_connect_timeout_ms)) return false;
+                                  cfg_.writer_process_connect_timeout_ms)) {
+            if (node_name_blob_.empty() && !layout.name_blob.empty()) {
+                if (cfg_.emit_default_clk && cfg_.default_clk_name.size() <= layout.name_blob.size()) {
+                    layout.name_blob.resize(layout.name_blob.size() - cfg_.default_clk_name.size());
+                }
+                node_name_blob_.swap(layout.name_blob);
+            }
+            return false;
+        }
         writer_opened_ = true;
         ensure_frame_work_capacity_prepared();
         return true;
@@ -254,8 +262,39 @@ public:
         st.declared = true;
         st.node_id = static_cast<wvz4::u32>(decl.node_id);
         st.parent_id = static_cast<wvz4::u32>(decl.parent_id);
-        st.name = decl.name;
+        if (decl.name.size() > static_cast<std::size_t>(std::numeric_limits<wvz4::u32>::max())) {
+            set_error("WVZ4 recorder on_node_declared failed: node name exceeds uint32 range");
+            return;
+        }
+        if (node_name_blob_.size() > static_cast<std::size_t>(std::numeric_limits<wvz4::u32>::max()) - decl.name.size()) {
+            set_error("WVZ4 recorder on_node_declared failed: node name arena exceeds uint32 range");
+            return;
+        }
+        st.name_offset = static_cast<wvz4::u32>(node_name_blob_.size());
+        st.name_size = static_cast<wvz4::u32>(decl.name.size());
+        node_name_blob_.append(decl.name.data(), decl.name.size());
         st.kind = map_node_kind(decl.kind);
+        st.first_child = 0;
+        st.last_child = 0;
+        st.next_sibling = 0;
+        if (st.parent_id != 0) {
+            if (st.parent_id < node_states_.size() &&
+                node_states_[static_cast<std::size_t>(st.parent_id)].declared &&
+                st.parent_id != st.node_id) {
+                NodeState& parent = node_states_[static_cast<std::size_t>(st.parent_id)];
+                if (parent.first_child == 0) {
+                    parent.first_child = st.node_id;
+                } else {
+                    node_states_[static_cast<std::size_t>(parent.last_child)].next_sibling = st.node_id;
+                }
+                parent.last_child = st.node_id;
+            } else {
+                node_child_links_valid_ = false;
+            }
+        }
+        if (!declared_node_ids_.empty() && declared_node_ids_.back() >= st.node_id) {
+            declared_node_ids_strictly_increasing_ = false;
+        }
         declared_node_ids_.push_back(st.node_id);
     }
 
@@ -299,6 +338,9 @@ public:
         st.value_type = map_value_type(decl.kind, st.bit_width);
         st.byte_width = byte_width_for_type(st.value_type);
         st.radix = default_radix(decl.kind);
+        if (!declared_track_ids_.empty() && declared_track_ids_.back() >= st.track_id) {
+            declared_track_ids_strictly_increasing_ = false;
+        }
         declared_track_ids_.push_back(st.track_id);
     }
 
@@ -331,8 +373,12 @@ private:
         bool declared = false;
         wvz4::u32 node_id = 0;
         wvz4::u32 parent_id = 0;
-        std::string name;
+        wvz4::u32 name_offset = 0;
+        wvz4::u32 name_size = 0;
         wvz4::NodeKind kind = wvz4::NodeKind::Object;
+        wvz4::u32 first_child = 0;
+        wvz4::u32 last_child = 0;
+        wvz4::u32 next_sibling = 0;
     };
 
     struct TrackState {
@@ -365,10 +411,14 @@ private:
     wvz4::WriterProcessClient process_writer_;
 
     std::vector<NodeState> node_states_;       // id-indexed, id 0 unused
+    std::string node_name_blob_;
     std::vector<TrackState> track_states_;     // track-id indexed
     std::vector<FrameSlot> frame_slots_;       // track-id indexed, touched slots cleared after each cycle
     std::vector<wvz4::u32> declared_node_ids_;
     std::vector<wvz4::u32> declared_track_ids_;
+    bool declared_node_ids_strictly_increasing_ = true;
+    bool declared_track_ids_strictly_increasing_ = true;
+    bool node_child_links_valid_ = true;
     std::vector<wave::TrackId> current_sample_ids_;
     wvz4::CycleSubmission submission_work_;
     wvz4::CycleSubmission clk_down_work_;
@@ -383,10 +433,14 @@ private:
         last_error_.clear();
         clear_frame_work();
         node_states_.clear();
+        node_name_blob_.clear();
         track_states_.clear();
         frame_slots_.clear();
         declared_node_ids_.clear();
         declared_track_ids_.clear();
+        declared_node_ids_strictly_increasing_ = true;
+        declared_track_ids_strictly_increasing_ = true;
+        node_child_links_valid_ = true;
         current_sample_ids_.clear();
         submission_work_ = wvz4::CycleSubmission();
         clk_down_work_ = wvz4::CycleSubmission();
@@ -405,7 +459,6 @@ private:
     void ensure_track_capacity(wave::TrackId id) {
         const std::size_t index = static_cast<std::size_t>(id);
         if (track_states_.size() <= index) track_states_.resize(index + 1);
-        if (frame_slots_.size() <= index) frame_slots_.resize(index + 1);
     }
 
     void ensure_frame_capacity(wave::TrackId id) {
@@ -654,17 +707,11 @@ private:
         }
     }
 
-    static bool is_strictly_increasing_ids(const std::vector<wvz4::u32>& ids) {
-        for (std::size_t i = 1; i < ids.size(); ++i) {
-            if (ids[i - 1u] >= ids[i]) return false;
-        }
-        return true;
-    }
-
     static void make_sorted_unique_ids(const std::vector<wvz4::u32>& src,
+                                       bool already_strictly_increasing,
                                        std::vector<wvz4::u32>& scratch,
                                        const std::vector<wvz4::u32>*& out) {
-        if (is_strictly_increasing_ids(src)) {
+        if (already_strictly_increasing) {
             out = &src;
             return;
         }
@@ -687,18 +734,54 @@ private:
         std::vector<wvz4::u32> track_ids_scratch;
         const std::vector<wvz4::u32>* node_ids_ptr = NULL;
         const std::vector<wvz4::u32>* track_ids_ptr = NULL;
-        make_sorted_unique_ids(declared_node_ids_, node_ids_scratch, node_ids_ptr);
-        make_sorted_unique_ids(declared_track_ids_, track_ids_scratch, track_ids_ptr);
+        make_sorted_unique_ids(declared_node_ids_,
+                               declared_node_ids_strictly_increasing_,
+                               node_ids_scratch,
+                               node_ids_ptr);
+        make_sorted_unique_ids(declared_track_ids_,
+                               declared_track_ids_strictly_increasing_,
+                               track_ids_scratch,
+                               track_ids_ptr);
         const std::vector<wvz4::u32>& node_ids = *node_ids_ptr;
         const std::vector<wvz4::u32>& track_ids = *track_ids_ptr;
 
+        struct NameBlobMoveGuard {
+            std::string& source;
+            std::string& target;
+            std::size_t source_size;
+            bool active;
+
+            NameBlobMoveGuard(std::string& source_blob, std::string& target_blob)
+                : source(source_blob),
+                  target(target_blob),
+                  source_size(target_blob.size()),
+                  active(true) {}
+
+            ~NameBlobMoveGuard() {
+                if (!active) return;
+                if (target.size() > source_size) target.resize(source_size);
+                source.swap(target);
+            }
+
+            void commit() { active = false; }
+        };
+
+        layout.name_blob.swap(node_name_blob_);
+        NameBlobMoveGuard name_blob_guard(node_name_blob_, layout.name_blob);
+        layout.name_blob.reserve(layout.name_blob.size() + (cfg_.emit_default_clk ? cfg_.default_clk_name.size() : 0u));
         layout.names.reserve(node_ids.size() + (cfg_.emit_default_clk ? 1u : 0u));
         layout.nodes.reserve(node_ids.size() + (cfg_.emit_default_clk ? 1u : 0u));
         layout.signals.reserve(track_ids.size() + (cfg_.emit_default_clk ? 1u : 0u));
 
-        std::vector<wvz4::u32> first_child(node_states_.size(), 0);
-        std::vector<wvz4::u32> last_child(node_states_.size(), 0);
-        std::vector<wvz4::u32> next_sibling(node_states_.size(), 0);
+        const bool use_cached_child_links = node_child_links_valid_;
+        std::vector<wvz4::u32> first_child;
+        std::vector<wvz4::u32> last_child;
+        std::vector<wvz4::u32> next_sibling;
+        if (!use_cached_child_links) {
+            first_child.assign(node_states_.size(), 0);
+            last_child.assign(node_states_.size(), 0);
+            next_sibling.assign(node_states_.size(), 0);
+        }
         for (std::size_t i = 0; i < node_ids.size(); ++i) {
             const wvz4::u32 nid = node_ids[i];
             if (nid >= node_states_.size() || !node_states_[nid].declared) { error = "WVZ4 layout build found missing node"; return false; }
@@ -707,17 +790,26 @@ private:
                 if (ns.parent_id >= node_states_.size() || !node_states_[ns.parent_id].declared) {
                     error = "WVZ4 layout build found node with missing parent; "; error += debug_state_summary(); return false;
                 }
-                if (first_child[ns.parent_id] == 0) {
-                    first_child[ns.parent_id] = nid;
-                } else {
-                    next_sibling[last_child[ns.parent_id]] = nid;
+                if (!use_cached_child_links) {
+                    if (first_child[ns.parent_id] == 0) {
+                        first_child[ns.parent_id] = nid;
+                    } else {
+                        next_sibling[last_child[ns.parent_id]] = nid;
+                    }
+                    last_child[ns.parent_id] = nid;
                 }
-                last_child[ns.parent_id] = nid;
             }
-            wvz4::NameRecord nr;
-            nr.name_id = nid;
-            nr.name = ns.name;
-            layout.names.push_back(nr);
+            const std::size_t name_offset = static_cast<std::size_t>(ns.name_offset);
+            const std::size_t name_size = static_cast<std::size_t>(ns.name_size);
+            if (name_offset > layout.name_blob.size() || name_size > layout.name_blob.size() - name_offset) {
+                error = "WVZ4 layout build found corrupt node name arena";
+                return false;
+            }
+            wvz4::add_layout_name_blob_ref_record(
+                layout,
+                nid,
+                ns.name_offset,
+                ns.name_size);
         }
 
         wvz4::u32 default_clk_node_id = 0;
@@ -728,10 +820,11 @@ private:
                 return false;
             }
             default_clk_node_id = node_ids.empty() ? 1u : (node_ids.back() + 1u);
-            wvz4::NameRecord nr;
-            nr.name_id = default_clk_node_id;
-            nr.name = cfg_.default_clk_name;
-            layout.names.push_back(nr);
+            wvz4::add_layout_name_blob_record(
+                layout,
+                default_clk_node_id,
+                cfg_.default_clk_name.data(),
+                cfg_.default_clk_name.size());
         }
 
         for (std::size_t i = 0; i < node_ids.size(); ++i) {
@@ -742,8 +835,8 @@ private:
             rec.parent_id = ns.parent_id;
             rec.name_id = ns.node_id;
             rec.kind = ns.kind;
-            rec.first_child = first_child[nid];
-            rec.next_sibling = next_sibling[nid];
+            rec.first_child = use_cached_child_links ? ns.first_child : first_child[nid];
+            rec.next_sibling = use_cached_child_links ? ns.next_sibling : next_sibling[nid];
             layout.nodes.push_back(rec);
         }
         if (cfg_.emit_default_clk) {
@@ -799,6 +892,7 @@ private:
             sig.storage_only = ts.storage_only;
             layout.signals.push_back(sig);
         }
+        name_blob_guard.commit();
         return true;
     }
 };

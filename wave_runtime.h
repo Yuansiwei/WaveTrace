@@ -272,6 +272,8 @@ struct BuildOptions {
     // when a debugging sink really needs a keep-alive event for every track.
     bool emit_only_on_change = true;
     bool emit_pointer_address_track = false;
+    bool enable_union_fields = false;
+    bool enable_bitfield_fields = false;
 
     // Stable-topology hot path: after prepare_topology() has created all scalar
     // tracks, build a flat leaf table once and sample that POD table instead of
@@ -350,7 +352,7 @@ struct BuildOptions {
     // One-shot topology diagnostic.  When enabled, the tracer dumps leaf
     // distribution after topology expansion is complete: flat poll leaves and
     // dirty-safe peek leaves are reported separately, grouped by node depth.
-    bool dump_leaf_distribution_after_topology = false;
+    bool dump_leaf_distribution_after_topology = true;
     std::string leaf_distribution_dump_path = "wave_leaf_distribution.txt";
     std::uint32_t leaf_distribution_top_n = 50;
     bool leaf_distribution_dirty_safe_only = true;
@@ -1635,6 +1637,7 @@ class Tracer {
 public:
     explicit Tracer(IWaveSink& sink, const BuildOptions& options = BuildOptions())
         : sink_(sink), options_(options), debug_log_event_count_(0),
+          trace_level_limit_enabled_(detail::wave_trace_level_limit().enabled),
           next_node_id_(1), next_track_id_(1), next_object_id_(1), next_watch_id_(1),
           nodes_exported_(false), nodes_(1), tracks_(1), track_runtime_(1), objects_(1), lazy_value_watches_(1), root_watches_(1),
           flat_leaf_fast_table_valid_(false), flat_leaf_fast_table_complete_(false) {
@@ -2138,6 +2141,7 @@ private:
     std::ofstream debug_log_stream_;
     std::ofstream parallel_flat_leaf_load_log_stream_;
     std::size_t debug_log_event_count_;
+    bool trace_level_limit_enabled_;
 
     NodeId next_node_id_;
     TrackId next_track_id_;
@@ -7381,6 +7385,36 @@ private:
         return 0;
     }
 
+    bool needs_full_topology_paths_() const {
+        return options_.debug_log ||
+               options_.debug_log_root_expand_stats ||
+               options_.emit_track_decl_path ||
+               trace_level_limit_enabled_;
+    }
+
+    std::string make_child_path_(const std::string& parent, const char* child) const {
+        return needs_full_topology_paths_()
+            ? detail::compose_child_path(parent, child ? child : "")
+            : std::string(child ? child : "");
+    }
+
+    std::string make_child_path_(const std::string& parent, const std::string& child) const {
+        return needs_full_topology_paths_()
+            ? detail::compose_child_path(parent, child)
+            : child;
+    }
+
+    std::string make_index_child_path_(const std::string& parent, std::size_t index) const {
+        if (needs_full_topology_paths_()) return detail::compose_index_child_path(parent, index);
+        const std::string idx = std::to_string(index);
+        std::string out;
+        out.reserve(idx.size() + 2u);
+        out.push_back('[');
+        out.append(idx);
+        out.push_back(']');
+        return out;
+    }
+
     void export_node_declarations_once() {
         if (nodes_exported_) return;
         std::size_t exported_count = 0;
@@ -7416,9 +7450,10 @@ private:
 
     NodeId create_node(NodeId parent_id, const std::string& path, NodeKind kind, ObjectId object_id) {
         const bool trace_level_allowed =
-            kind == NodeKind::Leaf
+            !trace_level_limit_enabled_ ||
+            (kind == NodeKind::Leaf
                 ? detail::wave_trace_leaf_path_allowed(path)
-                : detail::wave_trace_descend_path_allowed(path);
+                : detail::wave_trace_descend_path_allowed(path));
         if (!trace_level_allowed) {
             if (options_.debug_log) {
                 debug_log_msg(std::string("trace level skip node kind=") +
@@ -8554,8 +8589,10 @@ private:
     typename std::enable_if<!detail::is_std_string<T>::value, NodeId>::type
     add_leaf_signal(const std::string& path, NodeId parent_id, const T* ptr) {
         if (!ptr) return 0;
-        if (NodeId union_alias = add_union_alias_leaf_signal_<T>(path, parent_id, ptr)) {
-            return union_alias;
+        if (options_.enable_union_fields) {
+            if (NodeId union_alias = add_union_alias_leaf_signal_<T>(path, parent_id, ptr)) {
+                return union_alias;
+            }
         }
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const NodeId node_id = create_node(parent_id, path, NodeKind::Leaf, 0);
@@ -8908,6 +8945,7 @@ private:
     template <typename T>
     typename std::enable_if<detail::is_leaf_scalar<T>::value && !detail::is_std_string<T>::value, NodeId>::type
     add_union_alias_leaf_signal_(const std::string& path, NodeId parent_id, const T* ptr) {
+        if (!options_.enable_union_fields) return 0;
         typedef typename detail::remove_cvref<T>::type CleanT;
         const ScalarSampleKind sk = scalar_kind_for_type<CleanT>();
         const std::size_t memory_bytes = scalar_sample_kind_byte_width(sk);
@@ -8968,6 +9006,7 @@ private:
             union_storage_bytes > static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())) {
             return expand_member_ptr(path, parent_id, field_ptr);
         }
+        if (!options_.enable_union_fields) return 0;
 
         typedef typename detail::remove_cvref<UnionT>::type CleanUnionT;
         const void* union_base = explicit_union_base ? explicit_union_base : detail::pointer_address(union_obj);
@@ -8988,6 +9027,7 @@ private:
                                                       std::size_t union_storage_bytes,
                                                       const void* union_base = NULL) {
         if (union_storage_bytes != 0) {
+            if (!options_.enable_union_fields) return 0;
             return expand_union_member_ptr(path, parent_id, field_ptr, union_obj, union_storage_bytes, union_base);
         }
         return expand_member_ptr(path, parent_id, field_ptr);
@@ -8999,8 +9039,9 @@ private:
                                                NodeId parent_id,
                                                FieldValue field_value,
                                                const UnionT*,
-                                               std::size_t,
+                                               std::size_t union_storage_bytes,
                                                const void* = NULL) {
+        if (union_storage_bytes != 0 && !options_.enable_union_fields) return 0;
         return expand_member_ptr(path, parent_id, field_value);
     }
 
@@ -9036,6 +9077,10 @@ private:
                               T (*getter)(const Obj*),
                               std::uint32_t explicit_bit_width,
                               long long field_bit_offset) {
+        if (!options_.enable_bitfield_fields) {
+            if (options_.debug_log) debug_log_msg(std::string("bitfield skipped path=") + path);
+            return 0;
+        }
         if (!obj || !getter) return 0;
         if (!detail::wave_trace_leaf_path_allowed(path)) return 0;
         BitfieldStorageRange range;
@@ -9077,6 +9122,10 @@ private:
     template <typename Obj, typename T>
     typename std::enable_if<!detail::is_leaf_scalar<T>::value || detail::is_std_string<T>::value, NodeId>::type
     add_bitfield_range_signal(const std::string& path, NodeId parent_id, const Obj* obj, T (*getter)(const Obj*), std::uint32_t explicit_bit_width, long long) {
+        if (!options_.enable_bitfield_fields) {
+            if (options_.debug_log) debug_log_msg(std::string("bitfield skipped path=") + path);
+            return 0;
+        }
         return add_getter_signal<Obj, T>(path, parent_id, obj, getter, explicit_bit_width);
     }
 
@@ -9120,7 +9169,7 @@ private:
         const std::uint32_t prev_range = active_dirty_wave_array_range_id_;
 
         for (std::size_t i = 0; i < wave_array_traits<ArrT>::size; ++i) {
-            const std::string child_path = detail::compose_index_child_path(path, i);
+            const std::string child_path = make_index_child_path_(path, i);
             TopologyCheckpoint elem_cp = make_topology_checkpoint(node_id);
             const ElemT* elem = std::addressof((*ptr)[i]);
             if (options_.enable_wave_array_dirty) {
@@ -9165,7 +9214,7 @@ private:
             return 0;
         }
         for (std::size_t i = 0; i < N; ++i) {
-            expand_field(detail::compose_index_child_path(path, i), node_id, &((*ptr)[i]));
+            expand_field(make_index_child_path_(path, i), node_id, &((*ptr)[i]));
         }
         return keep_node_or_rollback(cp, node_id);
     }
@@ -9182,7 +9231,7 @@ private:
         }
         for (std::size_t i = 0; i < ptr->size(); ++i) {
             typedef typename detail::remove_cvref<decltype((*ptr)[i])>::type ElementT;
-            expand_field(detail::compose_index_child_path(path, i), node_id, &((*ptr)[i]));
+            expand_field(make_index_child_path_(path, i), node_id, &((*ptr)[i]));
         }
         return keep_node_or_rollback(cp, node_id);
     }
@@ -9197,8 +9246,8 @@ private:
             rollback_topology_to(cp);
             return 0;
         }
-        expand_field(detail::compose_child_path(path, "first"), node_id, &ptr->first);
-        expand_field(detail::compose_child_path(path, "second"), node_id, &ptr->second);
+        expand_field(make_child_path_(path, "first"), node_id, &ptr->first);
+        expand_field(make_child_path_(path, "second"), node_id, &ptr->second);
         return keep_node_or_rollback(cp, node_id);
     }
 
@@ -9450,7 +9499,7 @@ private:
         }
         typedef typename detail::remove_cvref<decltype((*ptr)[0])>::type ElementT;
         for (std::size_t i = 0; i < ptr->size(); ++i) {
-            expand_field(detail::compose_index_child_path(path, i), node_id, &((*ptr)[i]));
+            expand_field(make_index_child_path_(path, i), node_id, &((*ptr)[i]));
         }
         return keep_node_or_rollback(cp, node_id);
     }
@@ -9589,18 +9638,21 @@ private:
         detail::call_reflected_visit<FieldT>(
             ptr,
             [this, &path, node_id, ptr](const char* name, auto child_field_ptr, auto... meta) {
-                const std::string child_path = detail::compose_child_path(path, name);
                 const std::size_t union_bytes = union_field_storage_bytes_or_zero(meta...);
+                if (union_bytes != 0 && !options_.enable_union_fields) return;
+                const std::string child_path = make_child_path_(path, name);
                 const void* union_base = union_field_base_or_null(meta...);
                 expand_reflected_child_ptr_with_union_meta_(child_path, node_id, child_field_ptr, ptr, union_bytes, union_base);
             },
             [this, &path, node_id](const char* name, const auto&) {
-                const std::string bit_path = detail::compose_child_path(path, name);
+                if (!options_.enable_bitfield_fields) return;
+                const std::string bit_path = make_child_path_(path, name);
                 debug_log_unsupported_raw(bit_path, node_id, "bitfield/getter value not directly addressable", std::string(), "$bitfield_getter_missing");
             },
             [this, &path, node_id, ptr](const char* name, auto getter, auto... meta) {
+                if (!options_.enable_bitfield_fields) return;
                 typedef typename detail::remove_cvref<decltype(getter(ptr))>::type GetterValueT;
-                const std::string bit_path = detail::compose_child_path(path, name);
+                const std::string bit_path = make_child_path_(path, name);
                 add_bitfield_range_signal<FieldT, GetterValueT>(
                     bit_path,
                     node_id,
@@ -9648,7 +9700,7 @@ private:
         }
 
         for (std::size_t i = 0; i < declared_count; ++i) {
-            const std::string child_path = detail::compose_index_child_path(path, i);
+            const std::string child_path = make_index_child_path_(path, i);
             TopologyCheckpoint elem_cp = make_topology_checkpoint(node_id);
             const CleanPointee* elem = static_cast<const CleanPointee*>(target + i);
             const NodeId child_node = expand_member_clean_dispatch<CleanPointee>(
@@ -9756,7 +9808,7 @@ private:
         for (std::size_t i = 0; i < clean_ptr->size(); ++i) {
             typedef typename detail::remove_cvref<decltype((*clean_ptr)[i])>::type ElemT;
             expand_member_clean_dispatch<ElemT>(
-                detail::compose_index_child_path(path, i),
+                make_index_child_path_(path, i),
                 node_id,
                 static_cast<const ElemT*>(&((*clean_ptr)[i])));
         }
@@ -9779,11 +9831,11 @@ private:
         typedef typename detail::remove_cvref<decltype(clean_ptr->first)>::type FirstT;
         typedef typename detail::remove_cvref<decltype(clean_ptr->second)>::type SecondT;
         expand_member_clean_dispatch<FirstT>(
-            detail::compose_child_path(path, "first"),
+            make_child_path_(path, "first"),
             node_id,
             static_cast<const FirstT*>(&clean_ptr->first));
         expand_member_clean_dispatch<SecondT>(
-            detail::compose_child_path(path, "second"),
+            make_child_path_(path, "second"),
             node_id,
             static_cast<const SecondT*>(&clean_ptr->second));
         return keep_node_or_rollback(cp, node_id);
@@ -10080,18 +10132,21 @@ private:
         detail::call_reflected_visit<T>(
             ptr,
             [this, &path, node_id, ptr](const char* name, auto field_ptr, auto... meta) {
-                const std::string child_path = detail::compose_child_path(path, name);
                 const std::size_t union_bytes = union_field_storage_bytes_or_zero(meta...);
+                if (union_bytes != 0 && !options_.enable_union_fields) return;
+                const std::string child_path = make_child_path_(path, name);
                 const void* union_base = union_field_base_or_null(meta...);
                 expand_reflected_child_ptr_with_union_meta_(child_path, node_id, field_ptr, ptr, union_bytes, union_base);
             },
             [this, &path, node_id](const char* name, const auto&) {
-                const std::string bit_path = detail::compose_child_path(path, name);
+                if (!options_.enable_bitfield_fields) return;
+                const std::string bit_path = make_child_path_(path, name);
                 debug_log_unsupported_raw(bit_path, node_id, "bitfield/getter value not directly addressable", std::string(), "$bitfield_getter_missing");
             },
             [this, &path, node_id, ptr](const char* name, auto getter, auto... meta) {
+                if (!options_.enable_bitfield_fields) return;
                 typedef typename detail::remove_cvref<decltype(getter(ptr))>::type GetterValueT;
-                const std::string bit_path = detail::compose_child_path(path, name);
+                const std::string bit_path = make_child_path_(path, name);
                 add_bitfield_range_signal<T, GetterValueT>(
                     bit_path,
                     node_id,
