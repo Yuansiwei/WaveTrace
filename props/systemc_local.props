@@ -2,6 +2,7 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup Label="UserMacros">
     <SystemCRoot Condition="'$(SystemCRoot)'=='' and '$(SYSTEMC_HOME)'!=''">$(SYSTEMC_HOME)</SystemCRoot>
+    <SystemCRoot Condition="'$(SystemCRoot)'=='' and Exists('$(MSBuildThisFileDirectory)..\third_party\systemc-2.3.4\src\systemc')">$(MSBuildThisFileDirectory)..\third_party\systemc-2.3.4</SystemCRoot>
     <SystemCRoot Condition="'$(SystemCRoot)'=='' and Exists('C:\third_party\systemc-2.3.4\src\systemc')">C:\third_party\systemc-2.3.4</SystemCRoot>
     <SystemCInclude>$(SystemCRoot)\src</SystemCInclude>
     <SystemCLibDir>$(SystemCRoot)\msvc10\SystemC\x64\Release</SystemCLibDir>

@@ -15,7 +15,7 @@ template<> struct reflected_visitor<Top> {
 }
 int main(){
   Top top{0,0}; std::string err;
-  PathStableWvz4Recorder rec; PathStableWvz4Recorder::OpenConfig cfg; cfg.file_path="/tmp/tap_bool_storage.wvz4"; cfg.async_writer=false; cfg.emit_default_clk=false; cfg.options.compression=wvz4::Compression::None; cfg.options.enable_stats_log=false; cfg.options.target_block_span=10;
+  PathStableWvz4Recorder rec; PathStableWvz4Recorder::OpenConfig cfg; cfg.file_path="/tmp/tap_bool_storage.wvz4"; cfg.emit_default_clk=false; cfg.options.compression=wvz4::Compression::None; cfg.options.enable_stats_log=false; cfg.options.target_block_span=10;
   if(!rec.open(cfg,err)){std::cerr<<err<<"\n"; return 1;}
   wave::BuildOptions opt; opt.enable_flat_memory_block_precheck=true; opt.enable_flat_leaf_fast_table=true;
   wave::Tracer tracer(rec,opt); tracer.add_root("top", &top); wave::WaveTap tap(tracer,rec);

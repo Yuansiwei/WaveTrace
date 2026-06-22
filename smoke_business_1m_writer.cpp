@@ -1,6 +1,7 @@
 #include "wvz4_writer_typed.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <iomanip>
@@ -49,16 +50,42 @@ SignalMeta signal_meta_for(wvz4::u32 signal_id) {
     return meta;
 }
 
-wvz4::CycleValueUpdate make_typed_update(wvz4::u32 signal_id,
-                                         const SignalMeta& meta,
-                                         wvz4::u64 value) {
+std::size_t byte_width_for_meta(const SignalMeta& meta) {
+    switch (meta.type) {
+    case wvz4::ValueType::Bool:
+    case wvz4::ValueType::U8:
+        return 1;
+    case wvz4::ValueType::U16:
+        return 2;
+    case wvz4::ValueType::U32:
+        return 4;
+    default:
+        return 8;
+    }
+}
+
+bool append_typed_update(wvz4::CycleSubmission& submission,
+                         wvz4::u32 signal_id,
+                         const SignalMeta& meta,
+                         wvz4::u64 value) {
+    wvz4::u8 bytes[wvz4::kMaxScalarBytes] = {};
+    wvz4::u8 byte_count = 8;
     if (meta.type == wvz4::ValueType::Bool) {
-        return wvz4::CycleValueUpdate::make_bool(signal_id, (value & 1ull) != 0ull);
+        byte_count = 1;
+        bytes[0] = (value & 1ull) != 0ull ? 1u : 0u;
+    } else if (meta.type == wvz4::ValueType::U32) {
+        byte_count = 4;
+        const wvz4::u32 v = static_cast<wvz4::u32>(value);
+        for (wvz4::u8 i = 0; i < byte_count; ++i) {
+            bytes[i] = static_cast<wvz4::u8>((v >> (8u * i)) & 0xffu);
+        }
+    } else {
+        byte_count = 8;
+        for (wvz4::u8 i = 0; i < byte_count; ++i) {
+            bytes[i] = static_cast<wvz4::u8>((value >> (8u * i)) & 0xffu);
+        }
     }
-    if (meta.type == wvz4::ValueType::U32) {
-        return wvz4::CycleValueUpdate::make<wvz4::u32>(signal_id, static_cast<wvz4::u32>(value));
-    }
-    return wvz4::CycleValueUpdate::make<wvz4::u64>(signal_id, value);
+    return submission.append_grouped_raw(byte_count, signal_id, bytes);
 }
 
 wvz4::u64 mix64(wvz4::u64 x) {
@@ -79,8 +106,7 @@ bool append_update_once(wvz4::CycleSubmission& submission,
     if (signal_id == 0 || signal_id >= metas.size()) return false;
     if (seen_epoch[signal_id] == epoch) return true;
     seen_epoch[signal_id] = epoch;
-    submission.updates.push_back(make_typed_update(signal_id, metas[signal_id], value));
-    return true;
+    return append_typed_update(submission, signal_id, metas[signal_id], value);
 }
 
 wvz4::Layout make_business_layout(wvz4::u32 signal_count, std::vector<SignalMeta>& metas) {
@@ -171,7 +197,6 @@ int main(int argc, char** argv) {
     wvz4::u64 signal_count_64 = 10000;
     wvz4::u64 rotating_updates_per_cycle = 1;
     wvz4::u64 progress_every = 100000;
-    bool use_helper_process = true;
     bool enable_lod_tables = true;
     bool all_signals_every_cycle = false;
     std::string helper_exe_path;
@@ -180,9 +205,10 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i] ? argv[i] : "";
         if (arg == "--helper") {
-            use_helper_process = true;
+            // Helper mode is the only supported high-level writer path.
         } else if (arg == "--no-helper") {
-            use_helper_process = false;
+            std::cerr << "--no-helper is no longer supported; smoke writer always uses the anti-kill helper\n";
+            return 2;
         } else if (arg == "--no-lod") {
             enable_lod_tables = false;
         } else if (arg == "--lod") {
@@ -203,7 +229,7 @@ int main(int argc, char** argv) {
         } else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "usage: smoke_business_1m_writer [out.wvz4] [cycles] [signals] [updates_per_cycle]"
-                << " [--helper|--no-helper] [--helper-exe path] [--progress cycles] [--no-lod|--lod]"
+                << " [--helper-exe path] [--progress cycles] [--no-lod|--lod]"
                 << " [--all-signals-every-cycle]\n";
             return 0;
         } else {
@@ -263,15 +289,11 @@ int main(int argc, char** argv) {
     options.block_pipeline_queue_limit = 16;
     options.enable_lod_tables = enable_lod_tables;
 
-    wvz4::Writer writer;
     wvz4::WriterProcessClient helper_writer;
     std::string error;
 
     const auto start = std::chrono::steady_clock::now();
-    const bool opened = use_helper_process
-        ? helper_writer.open(output_path, layout, options, error, helper_exe_path)
-        : writer.open(output_path, layout, options, error);
-    if (!opened) {
+    if (!helper_writer.open(output_path, layout, options, error, helper_exe_path)) {
         std::cerr << "open failed: " << error << "\n";
         return 1;
     }
@@ -279,6 +301,19 @@ int main(int argc, char** argv) {
     std::vector<int> seen_epoch(signal_count + 1u, 0);
     wvz4::u64 submitted_updates = 0;
     int epoch = 1;
+    wvz4::CycleSubmission submission;
+    std::array<std::size_t, wvz4::kMaxScalarBytes + 1u> signal_count_by_width = {};
+    for (wvz4::u32 signal_id = 1; signal_id <= signal_count; ++signal_id) {
+        ++signal_count_by_width[byte_width_for_meta(metas[signal_id])];
+    }
+    const std::size_t sparse_reserve = static_cast<std::size_t>(
+        (std::min)(signal_count_64, rotating_updates_per_cycle + 24u));
+    for (std::size_t width = 1; width < submission.width_groups.size(); ++width) {
+        const std::size_t count = all_signals_every_cycle
+            ? signal_count_by_width[width]
+            : (std::min)(signal_count_by_width[width], sparse_reserve);
+        submission.width_groups[width].reserve(count, static_cast<wvz4::u8>(width));
+    }
 
     for (wvz4::u64 cycle = 0; cycle < business_cycles; ++cycle, ++epoch) {
         if (epoch == (std::numeric_limits<int>::max)()) {
@@ -286,11 +321,8 @@ int main(int argc, char** argv) {
             epoch = 1;
         }
 
-        wvz4::CycleSubmission submission;
+        submission.clear_updates();
         submission.cycle = static_cast<wvz4::i64>(cycle * kWriterTicksPerBusinessCycle);
-        submission.updates.reserve(all_signals_every_cycle
-            ? static_cast<std::size_t>(signal_count)
-            : static_cast<std::size_t>(rotating_update_count) + 24u);
 
         if (all_signals_every_cycle) {
             for (wvz4::u32 signal_id = 1; signal_id <= signal_count; ++signal_id) {
@@ -326,11 +358,8 @@ int main(int argc, char** argv) {
             }
         }
 
-        submitted_updates += submission.updates.size();
-        const bool submitted = use_helper_process
-            ? helper_writer.submit_cycle(submission, error)
-            : writer.submit_cycle(submission, error);
-        if (!submitted) {
+        submitted_updates += submission.total_update_count();
+        if (!helper_writer.submit_cycle(submission, error)) {
             std::cerr << "submit failed at cycle " << cycle << ": " << error << "\n";
             return 3;
         }
@@ -348,16 +377,12 @@ int main(int argc, char** argv) {
     const wvz4::u64 end_marker_cycle = business_cycles * kWriterTicksPerBusinessCycle - 1u;
     wvz4::CycleSubmission end_marker;
     end_marker.cycle = static_cast<wvz4::i64>(end_marker_cycle);
-    const bool submitted_end_marker = use_helper_process
-        ? helper_writer.submit_cycle(end_marker, error)
-        : writer.submit_cycle(end_marker, error);
-    if (!submitted_end_marker) {
+    if (!helper_writer.submit_cycle(end_marker, error)) {
         std::cerr << "submit end marker failed at writer cycle " << end_marker_cycle << ": " << error << "\n";
         return 3;
     }
 
-    const bool closed = use_helper_process ? helper_writer.close(error) : writer.close(error);
-    if (!closed) {
+    if (!helper_writer.close(error)) {
         std::cerr << "close failed: " << error << "\n";
         return 4;
     }
@@ -366,7 +391,7 @@ int main(int argc, char** argv) {
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
     std::cout << "path=" << output_path << "\n";
-    std::cout << "writer_mode=" << (use_helper_process ? "helper" : "direct") << "\n";
+    std::cout << "writer_mode=helper\n";
     std::cout << "business_cycles=" << business_cycles << "\n";
     std::cout << "writer_ticks_per_business_cycle=" << kWriterTicksPerBusinessCycle << "\n";
     std::cout << "signals=" << signal_count << "\n";

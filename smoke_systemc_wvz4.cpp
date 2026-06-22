@@ -187,7 +187,6 @@ int sc_main(int argc, char* argv[]) {
     PathStableWvz4Recorder recorder;
     PathStableWvz4Recorder::OpenConfig cfg;
     cfg.file_path = out_path;
-    cfg.async_writer = false;
     cfg.emit_default_clk = false;
     cfg.clk_period_ticks = 10;
     cfg.clk_fall_offset_ticks = 5;

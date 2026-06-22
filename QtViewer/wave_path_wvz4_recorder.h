@@ -48,19 +48,10 @@ public:
     struct OpenConfig {
         std::string file_path = "wave.wvz4";
         wvz4::WriterOptions options{};
-        bool async_writer = true;
-        std::size_t async_writer_queue_limit = 256;
-        std::size_t async_writer_queue_bytes_limit = 256u * 1024u * 1024u;
 
-        // Optional crash/kill resistant helper mode. Disabled by default because
-        // packaged CMake integration writes WVZ4 in-process and does not ship a
-        // writer helper executable.
-        //
-        // When enabled, the simulation
-        // process sends layout/cycle frames to a separate writer process. The
-        // helper owns the real WVZ4 Writer and finalizes the file if the parent
-        // process exits, crashes, or is killed by VS Stop Debugging.
-        bool use_writer_process = false;
+        // Crash/kill resistant helper process. The high-level recorder always
+        // uses this path so a simulation crash/kill can still leave a finalized
+        // WVZ4 up to the last complete cycle frame received by the helper.
         std::string writer_process_exe_path;
         unsigned int writer_process_connect_timeout_ms = 10000;
 
@@ -133,8 +124,7 @@ public:
            << " frame_slots=" << frame_slots_.size()
            << " pending_samples=" << current_sample_ids_.size()
            << " emit_default_clk=" << (cfg_.emit_default_clk ? 1 : 0)
-           << " async=" << (cfg_.async_writer ? 1 : 0)
-           << " writer_process=" << (cfg_.use_writer_process ? 1 : 0);
+           << " writer_process=1";
         if (!last_error_.empty()) os << " last_error='" << last_error_ << "'";
         return os.str();
     }
@@ -145,13 +135,7 @@ public:
         bool ok = true;
         std::string local_error;
         if (writer_opened_) {
-            if (cfg_.use_writer_process) {
-                if (!process_writer_.close(local_error)) ok = false;
-            } else if (cfg_.async_writer) {
-                if (!async_writer_.close(local_error)) ok = false;
-            } else {
-                if (!writer_.close(local_error)) ok = false;
-            }
+            if (!process_writer_.close(local_error)) ok = false;
         }
         reset_session_state();
         if (!ok) error = local_error.empty() ? "WVZ4 recorder close failed" : local_error;
@@ -180,18 +164,12 @@ public:
         }
         wvz4::Layout layout;
         if (!build_layout(layout, error)) return false;
-        if (cfg_.use_writer_process) {
-            if (!process_writer_.open(cfg_.file_path,
-                                      layout,
-                                      cfg_.options,
-                                      error,
-                                      cfg_.writer_process_exe_path,
-                                      cfg_.writer_process_connect_timeout_ms)) return false;
-        } else if (cfg_.async_writer) {
-            if (!async_writer_.open(cfg_.file_path, layout, cfg_.options, error, cfg_.async_writer_queue_limit, cfg_.async_writer_queue_bytes_limit)) return false;
-        } else {
-            if (!writer_.open(cfg_.file_path, layout, cfg_.options, error)) return false;
-        }
+        if (!process_writer_.open(cfg_.file_path,
+                                  layout,
+                                  cfg_.options,
+                                  error,
+                                  cfg_.writer_process_exe_path,
+                                  cfg_.writer_process_connect_timeout_ms)) return false;
         writer_opened_ = true;
         ensure_frame_work_capacity_prepared();
         return true;
@@ -394,8 +372,6 @@ private:
     wave::Cycle current_cycle_ = 0;
     std::string last_error_;
 
-    wvz4::Writer writer_;
-    wvz4::AsyncWriter async_writer_;
     wvz4::WriterProcessClient process_writer_;
 
     std::vector<NodeState> node_states_;       // id-indexed, id 0 unused
@@ -482,14 +458,7 @@ private:
     }
 
     bool submit_to_writer(const wvz4::CycleSubmission& submission, std::string& error) {
-        if (cfg_.use_writer_process) {
-            return process_writer_.submit_cycle(submission, error);
-        }
-        if (cfg_.async_writer) {
-            wvz4::CycleSubmission copy = submission;
-            return async_writer_.submit_cycle(std::move(copy), error);
-        }
-        return writer_.submit_cycle(submission, error);
+        return process_writer_.submit_cycle(submission, error);
     }
 
     bool map_business_cycle_to_writer_cycle(wave::Cycle cycle, wvz4::i64& out, std::string& error) const {

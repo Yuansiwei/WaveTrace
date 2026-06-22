@@ -3,13 +3,17 @@
 ## Problem
 Long runs could grow memory without bound when the sampling side was faster than writer/compression.
 
-Primary unbounded buffers:
-- `PathStableWvz4Recorder::OpenConfig::async_writer_queue_limit` defaulted to `0` (unlimited).
+Note: this entry describes the earlier in-process async-writer path. Current
+`PathStableWvz4Recorder` submissions always go through the anti-kill helper
+process; the low-level `AsyncWriter` remains only as writer infrastructure.
+
+Primary unbounded buffers at that time:
+- The recorder-side async submission queue defaulted to unlimited.
 - `wvz4::WriterOptions::block_pipeline_queue_limit` defaulted to `0` (unlimited).
 
 ## Changes
-- `async_writer_queue_limit` default is now `256` cycle submissions.
-- Added `async_writer_queue_bytes_limit`, default `256 MiB`, as an approximate byte cap.
+- The recorder-side async queue was capped at 256 cycle submissions.
+- A 256 MiB approximate queued-byte cap was added.
 - `AsyncWriter` now tracks queued approximate bytes and applies backpressure.
 - `block_pipeline_queue_limit` default is now `8` block jobs.
 - Oversized single cycle submissions are still allowed to make progress when the async queue is empty.

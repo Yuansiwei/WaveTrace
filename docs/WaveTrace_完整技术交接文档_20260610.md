@@ -686,7 +686,6 @@ std::string error;
 PathStableWvz4Recorder recorder;
 PathStableWvz4Recorder::OpenConfig cfg;
 cfg.file_path = "out.wvz4";
-cfg.use_writer_process = true;
 recorder.open(cfg, error);
 
 wave::BuildOptions opt;
@@ -740,4 +739,3 @@ recorder.close(error);
 8. 增加跨平台 helper 实现。
 9. 增加端到端 benchmark 报告自动生成。
 10. 把专利材料和工程实现解耦，用术语表把内部名映射成正式技术名。
-

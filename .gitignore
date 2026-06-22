@@ -17,6 +17,8 @@ build_vs/
 
 # Local run logs and generated diagnostics
 *.log
+*.wvz4
+WaveTrace_no_tests_logs_systemc_*.zip
 
 # Codex extraction/staging folders
 _codex_extract_*/

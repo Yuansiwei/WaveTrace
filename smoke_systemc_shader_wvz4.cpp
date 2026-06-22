@@ -255,18 +255,22 @@ int sc_main(int argc, char* argv[]) {
         argc >= 3 ? std::max(1, std::atoi(argv[2])) : 1024;
 
     bool enable_dirty_peek = true;
-    bool use_helper = true;
     bool debug_log = false;
     for (int i = 3; i < argc; ++i) {
         const std::string arg = argv[i] ? argv[i] : "";
         if (arg == "--poll-peek") enable_dirty_peek = false;
         else if (arg == "--dirty-peek") enable_dirty_peek = true;
-        else if (arg == "--direct-writer") use_helper = false;
-        else if (arg == "--helper") use_helper = true;
+        else if (arg == "--helper") {
+            // Helper mode is the only supported high-level writer path.
+        }
+        else if (arg == "--direct-writer") {
+            std::cerr << "--direct-writer is no longer supported; recorder always uses the anti-kill helper\n";
+            return 2;
+        }
         else if (arg == "--debug-log") debug_log = true;
         else if (arg == "--help" || arg == "-h") {
             std::cout << "usage: smoke_systemc_shader_wvz4 [out.wvz4] [cycles]"
-                      << " [--dirty-peek|--poll-peek] [--helper|--direct-writer] [--debug-log]\n";
+                      << " [--dirty-peek|--poll-peek] [--debug-log]\n";
             return 0;
         }
     }
@@ -281,8 +285,6 @@ int sc_main(int argc, char* argv[]) {
     PathStableWvz4Recorder recorder;
     PathStableWvz4Recorder::OpenConfig cfg;
     cfg.file_path = out_path;
-    cfg.use_writer_process = use_helper;
-    cfg.async_writer = false;
     cfg.emit_default_clk = false;
     cfg.clk_period_ticks = 10;
     cfg.clk_fall_offset_ticks = 5;
@@ -329,7 +331,7 @@ int sc_main(int argc, char* argv[]) {
     std::cout << "systemc_shader_wvz4_ok cycles=" << cycles
               << " file=" << out_path
               << " dirty_peek=" << (enable_dirty_peek ? 1 : 0)
-              << " writer_mode=" << (use_helper ? "helper" : "direct")
+              << " writer_mode=helper"
               << " shader_cycles=" << shader.cycle
               << " sim_time=" << sc_core::sc_time_stamp() << "\n";
     return 0;

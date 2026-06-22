@@ -32,20 +32,21 @@ writer.submit_cycle(submission, error);
 writer.close(error);
 ```
 
-`wvz4::AsyncWriter` also still works.
+The low-level `wvz4::Writer`/`wvz4::AsyncWriter` classes remain available for
+writer implementation tests, but `PathStableWvz4Recorder` always writes through
+the crash/kill resistant helper process.
 
 
 ## PathStableWvz4Recorder helper mode
 
-`PathStableWvz4Recorder` uses writer-helper mode by default so the waveform can
-survive simulation process crash/kill. The main process sends layout/cycle
+`PathStableWvz4Recorder` uses writer-helper mode so the waveform can survive
+simulation process crash/kill. The main process sends layout/cycle
 frames to `wvz4_writer_monitor.exe`; the helper process owns the real
 `wvz4::Writer` and writes the final `.wvz4` directly.
 
 ```cpp
 PathStableWvz4Recorder::OpenConfig cfg;
 cfg.file_path = "out.wvz4";
-cfg.use_writer_process = true; // default
 cfg.writer_process_exe_path = "wvz4_writer_monitor.exe"; // optional; auto-located when empty
 recorder.open(cfg, error);
 ```
@@ -165,7 +166,7 @@ for (wave::Cycle c = 0; c != end; ++c) {
 }
 ```
 
-`wave_path_wvz4_recorder.h` also reuses per-cycle `CycleSubmission` buffers instead of constructing fresh local submission vectors every cycle.  It reserves frame/submission capacity as tracks are declared.  Strict no-allocation runs should still prefer `OpenConfig::async_writer = false`, because the current async writer API copies each `CycleSubmission` into its queue.
+`wave_path_wvz4_recorder.h` also reuses per-cycle `CycleSubmission` buffers instead of constructing fresh local submission vectors every cycle.  It reserves frame/submission capacity as tracks are declared.  Submission is handed to the helper process immediately; low-level async-writer queue sizing is no longer part of the high-level recorder configuration.
 
 ## 2026-05-22 update: dirty `peek()` group sampling
 

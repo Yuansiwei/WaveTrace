@@ -17,6 +17,7 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <Import Project="props\wavetrace_app_common.props" Condition="Exists('props\wavetrace_app_common.props')" />
   <Import Project="props\zstd_embed.props" Condition="Exists('props\zstd_embed.props')" />
+  <Import Project="props\wvz4_writer_helper_reference.props" Condition="Exists('props\wvz4_writer_helper_reference.props')" />
   <ImportGroup Label="ExtensionSettings" />
   <ImportGroup Label="Shared" />
   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'"><Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" /></ImportGroup>

@@ -48,15 +48,10 @@ public:
     struct OpenConfig {
         std::string file_path = "wave.wvz4";
         wvz4::WriterOptions options{};
-        bool async_writer = true;
-        std::size_t async_writer_queue_limit = 256;
-        std::size_t async_writer_queue_bytes_limit = 256u * 1024u * 1024u;
 
-        // Crash/kill resistant helper mode. Enabled by default so a simulation
-        // process crash/kill still leaves a finalized WVZ4 up to the last
-        // complete cycle frame received by the helper. Set this to false only
-        // for deliberately in-process captures.
-        bool use_writer_process = true;
+        // Crash/kill resistant helper process. The high-level recorder always
+        // uses this path so a simulation crash/kill can still leave a finalized
+        // WVZ4 up to the last complete cycle frame received by the helper.
         std::string writer_process_exe_path;
         unsigned int writer_process_connect_timeout_ms = 10000;
 
@@ -129,8 +124,7 @@ public:
            << " frame_slots=" << frame_slots_.size()
            << " pending_samples=" << current_sample_ids_.size()
            << " emit_default_clk=" << (cfg_.emit_default_clk ? 1 : 0)
-           << " async=" << (cfg_.async_writer ? 1 : 0)
-           << " writer_process=" << (cfg_.use_writer_process ? 1 : 0);
+           << " writer_process=1";
         if (!last_error_.empty()) os << " last_error='" << last_error_ << "'";
         return os.str();
     }
@@ -141,13 +135,7 @@ public:
         bool ok = true;
         std::string local_error;
         if (writer_opened_) {
-            if (cfg_.use_writer_process) {
-                if (!process_writer_.close(local_error)) ok = false;
-            } else if (cfg_.async_writer) {
-                if (!async_writer_.close(local_error)) ok = false;
-            } else {
-                if (!writer_.close(local_error)) ok = false;
-            }
+            if (!process_writer_.close(local_error)) ok = false;
         }
         reset_session_state();
         if (!ok) error = local_error.empty() ? "WVZ4 recorder close failed" : local_error;
@@ -176,18 +164,12 @@ public:
         }
         wvz4::Layout layout;
         if (!build_layout(layout, error)) return false;
-        if (cfg_.use_writer_process) {
-            if (!process_writer_.open(cfg_.file_path,
-                                      layout,
-                                      cfg_.options,
-                                      error,
-                                      cfg_.writer_process_exe_path,
-                                      cfg_.writer_process_connect_timeout_ms)) return false;
-        } else if (cfg_.async_writer) {
-            if (!async_writer_.open(cfg_.file_path, layout, cfg_.options, error, cfg_.async_writer_queue_limit, cfg_.async_writer_queue_bytes_limit)) return false;
-        } else {
-            if (!writer_.open(cfg_.file_path, layout, cfg_.options, error)) return false;
-        }
+        if (!process_writer_.open(cfg_.file_path,
+                                  layout,
+                                  cfg_.options,
+                                  error,
+                                  cfg_.writer_process_exe_path,
+                                  cfg_.writer_process_connect_timeout_ms)) return false;
         writer_opened_ = true;
         ensure_frame_work_capacity_prepared();
         return true;
@@ -243,17 +225,9 @@ public:
         }
 
         submission_work_.cycle = writer_cycle;
-        submission_work_.updates.clear();
-        for (std::size_t i = 0; i < current_sample_ids_.size(); ++i) {
-            const wave::TrackId tid = current_sample_ids_[i];
-            if (tid >= frame_slots_.size()) continue;
-            const FrameSlot& slot = frame_slots_[static_cast<std::size_t>(tid)];
-            if (!slot.has_sample) continue;
-            submission_work_.updates.push_back(slot.update);
-        }
 
         bool ok = true;
-        if (!submission_work_.updates.empty()) {
+        if (!submission_work_.empty()) {
             ok = submit_to_writer(submission_work_, error);
         }
 
@@ -324,6 +298,7 @@ public:
         st.bit_offset = decl.bit_offset;
         st.storage_only = decl.storage_only;
         st.value_type = map_value_type(decl.kind, st.bit_width);
+        st.byte_width = byte_width_for_type(st.value_type);
         st.radix = default_radix(decl.kind);
         declared_track_ids_.push_back(st.track_id);
     }
@@ -347,10 +322,8 @@ public:
         ensure_frame_capacity(frame_id);
         FrameSlot& slot = frame_slots_[static_cast<std::size_t>(frame_id)];
         if (slot.has_sample) { set_error("WVZ4 recorder on_sample failed: duplicate storage sample in one cycle"); return; }
-        wvz4::CycleValueUpdate upd;
-        if (!make_update(st, ev, upd)) return;
+        if (!append_update(st, ev, submission_work_)) return;
         slot.has_sample = true;
-        slot.update = upd;
         current_sample_ids_.push_back(frame_id);
     }
 
@@ -372,6 +345,7 @@ private:
         wvz4::u32 node_id = 0;
         wave::ValueKind kind = wave::ValueKind::Unknown;
         wvz4::ValueType value_type = wvz4::ValueType::U64;
+        wvz4::u8 byte_width = 8;
         wvz4::u32 bit_width = 64;
         wvz4::u32 bit_offset = 0;
         wvz4::Radix radix = wvz4::Radix::Auto;
@@ -380,7 +354,6 @@ private:
 
     struct FrameSlot {
         bool has_sample = false;
-        wvz4::CycleValueUpdate update;
     };
 
     OpenConfig cfg_;
@@ -390,8 +363,6 @@ private:
     wave::Cycle current_cycle_ = 0;
     std::string last_error_;
 
-    wvz4::Writer writer_;
-    wvz4::AsyncWriter async_writer_;
     wvz4::WriterProcessClient process_writer_;
 
     std::vector<NodeState> node_states_;       // id-indexed, id 0 unused
@@ -445,26 +416,17 @@ private:
 
     void ensure_frame_work_capacity_prepared() {
         const std::size_t sample_capacity = frame_slots_.size();
-        const std::size_t update_capacity = sample_capacity + (cfg_.emit_default_clk ? 1u : 0u);
 
         // This must not run once per declared track. Exact reserve(track_count) on every
         // track declaration causes O(N^2) realloc/copy when large topologies are exported.
         // It is called at cycle entry / writer open and is a no-op after capacity is enough.
         if (frame_work_reserved_capacity_ >= sample_capacity &&
-            current_sample_ids_.capacity() >= sample_capacity &&
-            submission_work_.updates.capacity() >= update_capacity &&
-            (!cfg_.emit_default_clk || clk_down_work_.updates.capacity() >= 1u)) {
+            current_sample_ids_.capacity() >= sample_capacity) {
             return;
         }
 
         if (current_sample_ids_.capacity() < sample_capacity) {
             current_sample_ids_.reserve(sample_capacity);
-        }
-        if (submission_work_.updates.capacity() < update_capacity) {
-            submission_work_.updates.reserve(update_capacity);
-        }
-        if (cfg_.emit_default_clk && clk_down_work_.updates.capacity() < 1u) {
-            clk_down_work_.updates.reserve(1u);
         }
         frame_work_reserved_capacity_ = sample_capacity;
     }
@@ -475,17 +437,11 @@ private:
             if (index < frame_slots_.size()) frame_slots_[index].has_sample = false;
         }
         current_sample_ids_.clear();
+        submission_work_.clear_updates();
     }
 
     bool submit_to_writer(const wvz4::CycleSubmission& submission, std::string& error) {
-        if (cfg_.use_writer_process) {
-            return process_writer_.submit_cycle(submission, error);
-        }
-        if (cfg_.async_writer) {
-            wvz4::CycleSubmission copy = submission;
-            return async_writer_.submit_cycle(std::move(copy), error);
-        }
-        return writer_.submit_cycle(submission, error);
+        return process_writer_.submit_cycle(submission, error);
     }
 
     bool map_business_cycle_to_writer_cycle(wave::Cycle cycle, wvz4::i64& out, std::string& error) const {
@@ -579,9 +535,76 @@ private:
         }
     }
 
+    static void write_u64_le_bytes(wvz4::u8* out, std::uint64_t v, wvz4::u8 nbytes) {
+        for (wvz4::u8 i = 0; i < nbytes && i < wvz4::kMaxScalarBytes; ++i) {
+            out[i] = static_cast<wvz4::u8>((v >> (8u * i)) & 0xffu);
+        }
+    }
+
+    bool append_raw_update(wvz4::CycleSubmission& submission,
+                           wvz4::u32 signal_id,
+                           wvz4::u8 byte_count,
+                           const void* data) {
+        if (!submission.append_grouped_raw(byte_count, signal_id, data)) {
+            set_error("WVZ4 recorder append_update failed: invalid grouped update byte width");
+            return false;
+        }
+        return true;
+    }
+
+    bool append_u64_update(wvz4::CycleSubmission& submission,
+                           wvz4::u32 signal_id,
+                           std::uint64_t bits,
+                           wvz4::u8 byte_count) {
+        wvz4::u8 bytes[wvz4::kMaxScalarBytes] = {};
+        write_u64_le_bytes(bytes, bits, byte_count);
+        return append_raw_update(submission, signal_id, byte_count, bytes);
+    }
+
+    bool append_update(const TrackState& st, const wave::TrackEvent& ev, wvz4::CycleSubmission& submission) {
+        const wvz4::u32 signal_id = st.storage_signal_id != 0 ? st.storage_signal_id : st.signal_id;
+        const wvz4::u8 nbytes = st.byte_width;
+        switch (st.value_type) {
+        case wvz4::ValueType::Bool: {
+            const bool v = ev.has_bool ? ev.bool_value : (ev.has_u64 ? ev.u64_value != 0 : false);
+            const wvz4::u8 byte = v ? 1u : 0u;
+            return append_raw_update(submission, signal_id, 1, &byte);
+        }
+        case wvz4::ValueType::F32: {
+            if (ev.has_u64) return append_u64_update(submission, signal_id, ev.u64_value, 4);
+            const float f = static_cast<float>(ev.has_f64 ? ev.f64_value : 0.0);
+            return append_raw_update(submission, signal_id, 4, &f);
+        }
+        case wvz4::ValueType::F64: {
+            if (ev.has_u64) return append_u64_update(submission, signal_id, ev.u64_value, 8);
+            const double d = ev.has_f64 ? ev.f64_value : 0.0;
+            return append_raw_update(submission, signal_id, 8, &d);
+        }
+        case wvz4::ValueType::I8:
+        case wvz4::ValueType::I16:
+        case wvz4::ValueType::I32:
+        case wvz4::ValueType::I64: {
+            if (!ev.has_i64 && !ev.has_u64) { set_error("WVZ4 recorder append_update failed: missing integer payload"); return false; }
+            const std::uint64_t bits = ev.has_i64 ? static_cast<std::uint64_t>(ev.i64_value) : ev.u64_value;
+            return append_u64_update(submission, signal_id, bits, nbytes);
+        }
+        case wvz4::ValueType::U8:
+        case wvz4::ValueType::U16:
+        case wvz4::ValueType::U32:
+        case wvz4::ValueType::U64: {
+            if (!ev.has_u64 && !ev.has_i64) { set_error("WVZ4 recorder append_update failed: missing unsigned payload"); return false; }
+            const std::uint64_t bits = ev.has_u64 ? ev.u64_value : static_cast<std::uint64_t>(ev.i64_value);
+            return append_u64_update(submission, signal_id, bits, nbytes);
+        }
+        default:
+            set_error("WVZ4 recorder append_update failed: unsupported value type");
+            return false;
+        }
+    }
+
     bool make_update(const TrackState& st, const wave::TrackEvent& ev, wvz4::CycleValueUpdate& out) {
         out.signal_id = st.storage_signal_id != 0 ? st.storage_signal_id : st.signal_id;
-        const wvz4::u8 nbytes = byte_width_for_type(st.value_type);
+        const wvz4::u8 nbytes = st.byte_width;
         switch (st.value_type) {
         case wvz4::ValueType::Bool: {
             const bool v = ev.has_bool ? ev.bool_value : (ev.has_u64 ? ev.u64_value != 0 : false);

@@ -30,7 +30,6 @@ std::string error;
 PathStableWvz4Recorder recorder;
 PathStableWvz4Recorder::OpenConfig cfg;
 cfg.file_path = "out.wvz4";
-cfg.async_writer = true;
 cfg.clk_period_ticks = 10;
 cfg.clk_fall_offset_ticks = 5;
 

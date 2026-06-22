@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <atomic>
 #include <cerrno>
 #include <condition_variable>
 #include <chrono>
@@ -336,9 +337,90 @@ private:
     }
 };
 
+struct CycleValueWidthGroup {
+    std::vector<u32> signal_ids;
+    std::vector<u8> values;
+
+    void clear() {
+        signal_ids.clear();
+        values.clear();
+    }
+
+    std::size_t size() const {
+        return signal_ids.size();
+    }
+
+    bool empty() const {
+        return signal_ids.empty();
+    }
+
+    void reserve(std::size_t count, u8 byte_count) {
+        signal_ids.reserve(count);
+        values.reserve(count * static_cast<std::size_t>(byte_count));
+    }
+
+    bool append_raw(u32 signal_id, const void* data, u8 byte_count) {
+        if (byte_count > kMaxScalarBytes) return false;
+        signal_ids.push_back(signal_id);
+        if (byte_count != 0) {
+            if (data) {
+                const u8* bytes = static_cast<const u8*>(data);
+                values.insert(values.end(), bytes, bytes + byte_count);
+            } else {
+                values.insert(values.end(), byte_count, static_cast<u8>(0));
+            }
+        }
+        return true;
+    }
+
+    bool append_update(const CycleValueUpdate& update) {
+        return append_raw(update.signal_id, update.value.bytes.data(), update.value.byte_count);
+    }
+};
+
 struct CycleSubmission {
     i64 cycle = 0;
+    // Legacy per-update form. New hot paths should prefer width_groups so the
+    // byte width is stored once per group rather than once per changed signal.
     std::vector<CycleValueUpdate> updates;
+    std::array<CycleValueWidthGroup, kMaxScalarBytes + 1u> width_groups;
+
+    void clear_updates() {
+        updates.clear();
+        for (std::size_t i = 0; i < width_groups.size(); ++i) width_groups[i].clear();
+    }
+
+    std::size_t grouped_update_count() const {
+        std::size_t count = 0;
+        for (std::size_t i = 0; i < width_groups.size(); ++i) count += width_groups[i].size();
+        return count;
+    }
+
+    std::size_t total_update_count() const {
+        return updates.size() + grouped_update_count();
+    }
+
+    bool empty() const {
+        return updates.empty() && grouped_update_count() == 0;
+    }
+
+    bool append_grouped_raw(u8 byte_count, u32 signal_id, const void* data) {
+        if (byte_count > kMaxScalarBytes) return false;
+        return width_groups[byte_count].append_raw(signal_id, data, byte_count);
+    }
+
+    bool append_grouped_update(const CycleValueUpdate& update) {
+        return append_grouped_raw(update.value.byte_count, update.signal_id, update.value.bytes.data());
+    }
+
+    std::size_t estimate_heap_bytes() const noexcept {
+        std::size_t bytes = updates.size() * sizeof(CycleValueUpdate);
+        for (std::size_t i = 0; i < width_groups.size(); ++i) {
+            bytes += width_groups[i].signal_ids.size() * sizeof(u32);
+            bytes += width_groups[i].values.size();
+        }
+        return bytes;
+    }
 };
 
 namespace detail {
@@ -472,6 +554,13 @@ inline void append_u32(std::vector<u8>& out, u32 v) {
     out.push_back(static_cast<u8>((v >> 24) & 0xffu));
 }
 
+inline void append_u32_to_raw(u8* out, u32 v) {
+    out[0] = static_cast<u8>(v & 0xffu);
+    out[1] = static_cast<u8>((v >> 8) & 0xffu);
+    out[2] = static_cast<u8>((v >> 16) & 0xffu);
+    out[3] = static_cast<u8>((v >> 24) & 0xffu);
+}
+
 inline void append_u64(std::vector<u8>& out, u64 v) {
     for (int i = 0; i < 8; ++i) out.push_back(static_cast<u8>((v >> (8 * i)) & 0xffu));
 }
@@ -596,6 +685,25 @@ inline bool scalar_is_zero(const ScalarValue& v, u8 fixed_width) {
     return true;
 }
 
+inline bool scalar_raw_is_zero(const u8* bytes, u8 fixed_width) {
+    if (!bytes && fixed_width != 0) return false;
+    for (u8 i = 0; i < fixed_width; ++i) {
+        if (bytes[i] != 0) return false;
+    }
+    return true;
+}
+
+inline bool scalar_equal_raw(const ScalarValue& value, const u8* bytes, u8 fixed_width) {
+    if (value.byte_count != fixed_width) return false;
+    if (!bytes && fixed_width != 0) return false;
+    return std::memcmp(value.bytes.data(), bytes, fixed_width) == 0;
+}
+
+inline void scalar_assign_raw(ScalarValue& value, const u8* bytes, u8 fixed_width) {
+    value.byte_count = fixed_width;
+    if (fixed_width != 0) std::memcpy(value.bytes.data(), bytes, fixed_width);
+}
+
 inline std::string make_error(const char* prefix, u64 id) {
     return std::string(prefix) + std::to_string(id);
 }
@@ -681,35 +789,55 @@ public:
         // Validate the whole submission before mutating writer state. This avoids
         // partially applying early updates if a later update is malformed.
         update_state_scratch_.clear();
-        if (update_state_scratch_.capacity() < submission.updates.size()) {
-            update_state_scratch_.reserve(submission.updates.size());
+        const std::size_t update_count = submission.total_update_count();
+        if (update_state_scratch_.capacity() < update_count) {
+            update_state_scratch_.reserve(update_count);
         }
         ensure_update_seen_capacity();
         begin_update_seen_epoch();
-        for (std::size_t i = 0; i < submission.updates.size(); ++i) {
-            const CycleValueUpdate& upd = submission.updates[i];
-            if (upd.signal_id == 0 || upd.signal_id >= signal_states_.size()) {
-                error = detail::make_error("invalid signal_id in update: ", upd.signal_id);
+        auto validate_update = [&](u32 signal_id, u8 byte_count) -> bool {
+            if (signal_id == 0 || signal_id >= signal_states_.size()) {
+                error = detail::make_error("invalid signal_id in update: ", signal_id);
                 return false;
             }
-            if (mark_update_seen(upd.signal_id)) {
-                error = detail::make_error("duplicate signal_id in one CycleSubmission: ", upd.signal_id);
+            if (mark_update_seen(signal_id)) {
+                error = detail::make_error("duplicate signal_id in one CycleSubmission: ", signal_id);
                 return false;
             }
-            SignalState& st = signal_states_[upd.signal_id];
+            SignalState& st = signal_states_[signal_id];
             if (!st.valid) {
-                error = detail::make_error("update targets undefined signal_id: ", upd.signal_id);
+                error = detail::make_error("update targets undefined signal_id: ", signal_id);
                 return false;
             }
             if (st.is_periodic_clock) {
-                error = detail::make_error("update targets periodic clock signal_id stored by CLKD: ", upd.signal_id);
+                error = detail::make_error("update targets periodic clock signal_id stored by CLKD: ", signal_id);
                 return false;
             }
-            if (upd.value.byte_count != st.byte_width_bytes) {
-                error = detail::make_error("update byte width mismatch for signal_id: ", upd.signal_id);
+            if (byte_count != st.byte_width_bytes) {
+                error = detail::make_error("update byte width mismatch for signal_id: ", signal_id);
                 return false;
             }
             update_state_scratch_.push_back(&st);
+            return true;
+        };
+        for (std::size_t i = 0; i < submission.updates.size(); ++i) {
+            const CycleValueUpdate& upd = submission.updates[i];
+            if (!validate_update(upd.signal_id, upd.value.byte_count)) return false;
+        }
+        for (std::size_t width = 0; width < submission.width_groups.size(); ++width) {
+            const CycleValueWidthGroup& group = submission.width_groups[width];
+            const u8 byte_count = static_cast<u8>(width);
+            if (byte_count != 0 && group.values.size() != group.signal_ids.size() * static_cast<std::size_t>(byte_count)) {
+                error = "grouped update value byte count mismatch";
+                return false;
+            }
+            if (byte_count == 0 && !group.values.empty()) {
+                error = "zero-width grouped update must not carry value bytes";
+                return false;
+            }
+            for (std::size_t i = 0; i < group.signal_ids.size(); ++i) {
+                if (!validate_update(group.signal_ids[i], byte_count)) return false;
+            }
         }
 
         if (diag_block_end >= 0 && submission.cycle >= diag_block_end) {
@@ -720,27 +848,59 @@ public:
             writer_diag_log_("writer-submit-after-flush", &submission, diag_block_end);
         }
 
-        for (std::size_t i = 0; i < submission.updates.size(); ++i) {
-            const CycleValueUpdate& upd = submission.updates[i];
-            SignalState& st = *update_state_scratch_[i];
+        std::size_t scratch_index = 0;
+        auto apply_update = [&](u32 signal_id, const ScalarValue& value) {
+            SignalState& st = *update_state_scratch_[scratch_index++];
             if (!st.has_current && options_.implicit_zero_initial_values &&
-                detail::scalar_is_zero(upd.value, st.byte_width_bytes)) {
-                st.current = upd.value;
+                detail::scalar_is_zero(value, st.byte_width_bytes)) {
+                st.current = value;
                 st.has_current = true;
-                continue;
+                return;
             }
-            if (st.has_current && detail::scalar_equal(upd.value, st.current)) {
-                continue;
+            if (st.has_current && detail::scalar_equal(value, st.current)) {
+                return;
             }
             Transition tr;
             tr.cycle = submission.cycle;
-            tr.value = upd.value;
+            tr.value = value;
             st.transitions.push_back(tr);
-            update_lod_tables(upd.signal_id, submission.cycle, upd.value);
-            mark_current_block_shared_time(upd.signal_id, submission.cycle);
-            st.current = upd.value;
+            update_lod_tables(signal_id, submission.cycle, value);
+            mark_current_block_shared_time(signal_id, submission.cycle);
+            st.current = value;
             st.has_current = true;
             have_pending_content_ = true;
+        };
+        for (std::size_t i = 0; i < submission.updates.size(); ++i) {
+            const CycleValueUpdate& upd = submission.updates[i];
+            apply_update(upd.signal_id, upd.value);
+        }
+        for (std::size_t width = 0; width < submission.width_groups.size(); ++width) {
+            const CycleValueWidthGroup& group = submission.width_groups[width];
+            const u8 byte_count = static_cast<u8>(width);
+            for (std::size_t i = 0; i < group.signal_ids.size(); ++i) {
+                const u8* raw = byte_count == 0
+                    ? NULL
+                    : group.values.data() + i * static_cast<std::size_t>(byte_count);
+                SignalState& st = *update_state_scratch_[scratch_index++];
+                if (!st.has_current && options_.implicit_zero_initial_values &&
+                    detail::scalar_raw_is_zero(raw, st.byte_width_bytes)) {
+                    detail::scalar_assign_raw(st.current, raw, st.byte_width_bytes);
+                    st.has_current = true;
+                    continue;
+                }
+                if (st.has_current && detail::scalar_equal_raw(st.current, raw, st.byte_width_bytes)) {
+                    continue;
+                }
+                Transition tr;
+                tr.cycle = submission.cycle;
+                detail::scalar_assign_raw(tr.value, raw, st.byte_width_bytes);
+                st.transitions.push_back(tr);
+                update_lod_tables(group.signal_ids[i], submission.cycle, st.transitions.back().value);
+                mark_current_block_shared_time(group.signal_ids[i], submission.cycle);
+                st.current = st.transitions.back().value;
+                st.has_current = true;
+                have_pending_content_ = true;
+            }
         }
         current_cycle_ = submission.cycle;
         have_submitted_cycle_ = true;
@@ -3315,7 +3475,7 @@ private:
         if (writer_diag_log_lines_ >= 128u || detail::backlog_log_disabled()) return;
         ++writer_diag_log_lines_;
         const long long cycle = submission ? static_cast<long long>(submission->cycle) : static_cast<long long>(current_cycle_);
-        const std::size_t updates = submission ? submission->updates.size() : 0;
+        const std::size_t updates = submission ? submission->total_update_count() : 0;
         detail::backlog_log(
             "%s writer=%p opened=%d submit_count=%llu cycle=%lld updates=%zu current_cycle=%lld block_start=%llu block_end=%lld span=%llu pending=%d next_block=%llu max_signal=%u chunks=%zu bytes=%llu block_index=%zu pipeline=%d extra=%zu err=%s",
             tag,
@@ -4178,7 +4338,7 @@ private:
     void async_diag_log_locked_(const char* tag, const CycleSubmission* submission = NULL, std::size_t approx_bytes = 0) {
         if (diag_log_lines_ >= 128u || detail::backlog_log_disabled()) return;
         ++diag_log_lines_;
-        const std::size_t updates = submission ? submission->updates.size() : 0;
+        const std::size_t updates = submission ? submission->total_update_count() : 0;
         const long long cycle = submission ? static_cast<long long>(submission->cycle) : -1ll;
         const unsigned long long now_ms = detail::backlog_now_ms();
         const unsigned long long active_ms = worker_in_submit_ ? (now_ms - active_submit_start_ms_) : 0ull;
@@ -4231,7 +4391,7 @@ private:
     }
 
     static std::size_t estimate_submission_bytes(const CycleSubmission& submission) noexcept {
-        return sizeof(CycleSubmission) + submission.updates.size() * sizeof(CycleValueUpdate);
+        return sizeof(CycleSubmission) + submission.estimate_heap_bytes();
     }
 
     bool enqueue(CycleSubmission&& submission, std::string& error) {
@@ -4291,7 +4451,7 @@ private:
                 std::lock_guard<std::mutex> lock(mutex_);
                 worker_in_submit_ = true;
                 active_submit_cycle_ = item.submission.cycle;
-                active_submit_updates_ = item.submission.updates.size();
+                active_submit_updates_ = item.submission.total_update_count();
                 active_submit_approx_bytes_ = item.approx_bytes;
                 active_submit_start_ms_ = detail::backlog_now_ms();
                 if (queue_.size() >= next_queue_log_size_ / 2u || active_submit_updates_ > 100000u) {
@@ -4515,6 +4675,12 @@ public:
         pos_ += 8;
         return true;
     }
+    bool read_u64(u64& v) {
+        if (pos_ + 8 > data_.size()) return false;
+        v = load_u64_le(&data_[pos_]);
+        pos_ += 8;
+        return true;
+    }
     bool read_string(std::string& s) {
         u64 n = 0;
         if (!read_varuint(n)) return false;
@@ -4526,6 +4692,12 @@ public:
     bool read_bytes(u8* dst, std::size_t n) {
         if (n > data_.size() - pos_) return false;
         if (n != 0) std::memcpy(dst, &data_[pos_], n);
+        pos_ += n;
+        return true;
+    }
+    bool read_bytes_ptr(const u8*& ptr, std::size_t n) {
+        if (n > data_.size() - pos_) return false;
+        ptr = n == 0 ? NULL : &data_[pos_];
         pos_ += n;
         return true;
     }
@@ -4667,33 +4839,137 @@ inline bool deserialize_layout(PayloadReader& r, Layout& l) {
     return true;
 }
 
+inline std::size_t serializable_cycle_group_count(const CycleValueWidthGroup& group, u8 byte_count) {
+    if (byte_count == 0) return group.values.empty() ? group.signal_ids.size() : 0u;
+    return (std::min)(group.signal_ids.size(), group.values.size() / static_cast<std::size_t>(byte_count));
+}
+
 inline void serialize_cycle(std::vector<u8>& out, const CycleSubmission& s) {
+    static const std::size_t kCycleValueWidthCount = kMaxScalarBytes + 1u;
     append_i64(out, s.cycle);
-    append_varuint(out, static_cast<u64>(s.updates.size()));
+    append_u64(out, static_cast<u64>(s.total_update_count()));
+
+    std::array<u64, kCycleValueWidthCount> counts;
+    counts.fill(0);
+    for (std::size_t width = 0; width < s.width_groups.size(); ++width) {
+        counts[width] += static_cast<u64>(serializable_cycle_group_count(s.width_groups[width], static_cast<u8>(width)));
+    }
+    for (std::size_t i = 0; i < s.updates.size(); ++i) {
+        const u8 width = s.updates[i].value.byte_count;
+        if (width <= kMaxScalarBytes) ++counts[width];
+    }
+
+    u8 non_empty_groups = 0;
+    for (std::size_t width = 0; width < counts.size(); ++width) {
+        if (counts[width] != 0) ++non_empty_groups;
+    }
+    append_u8(out, non_empty_groups);
+
+    std::array<std::size_t, kCycleValueWidthCount> id_offsets;
+    std::array<std::size_t, kCycleValueWidthCount> value_offsets;
+    std::array<std::size_t, kCycleValueWidthCount> cursors;
+    id_offsets.fill(0);
+    value_offsets.fill(0);
+    cursors.fill(0);
+
+    for (std::size_t width = 0; width < counts.size(); ++width) {
+        const u64 count = counts[width];
+        if (count == 0) continue;
+        const std::size_t value_width = width;
+        append_u8(out, static_cast<u8>(width));
+        append_u64(out, count);
+
+        if (count > static_cast<u64>((std::numeric_limits<std::size_t>::max)() / sizeof(u32))) return;
+        const std::size_t count_size = static_cast<std::size_t>(count);
+        const std::size_t id_bytes = count_size * sizeof(u32);
+        const std::size_t value_bytes = count_size * value_width;
+        reserve_extra(out, id_bytes + value_bytes);
+
+        id_offsets[width] = out.size();
+        out.resize(out.size() + id_bytes);
+        value_offsets[width] = out.size();
+        out.resize(out.size() + value_bytes);
+    }
+
+    for (std::size_t width = 0; width < s.width_groups.size(); ++width) {
+        const CycleValueWidthGroup& group = s.width_groups[width];
+        const u8 byte_count = static_cast<u8>(width);
+        const std::size_t group_count = serializable_cycle_group_count(group, byte_count);
+        for (std::size_t i = 0; i < group_count; ++i) {
+            const std::size_t index = cursors[width]++;
+            append_u32_to_raw(out.data() + id_offsets[width] + index * sizeof(u32),
+                              group.signal_ids[i]);
+            if (byte_count != 0) {
+                std::memcpy(out.data() + value_offsets[width] + index * static_cast<std::size_t>(byte_count),
+                            group.values.data() + i * static_cast<std::size_t>(byte_count),
+                            byte_count);
+            }
+        }
+    }
+
     for (std::size_t i = 0; i < s.updates.size(); ++i) {
         const CycleValueUpdate& u = s.updates[i];
-        append_varuint(out, u.signal_id);
-        append_u8(out, u.value.byte_count);
-        out.insert(out.end(), u.value.bytes.begin(), u.value.bytes.begin() + u.value.byte_count);
+        const u8 width = u.value.byte_count;
+        if (width > kMaxScalarBytes || counts[width] == 0) continue;
+        const std::size_t index = cursors[width]++;
+        append_u32_to_raw(out.data() + id_offsets[width] + index * sizeof(u32),
+                          u.signal_id);
+        if (width != 0) {
+            std::memcpy(out.data() + value_offsets[width] + index * static_cast<std::size_t>(width),
+                        u.value.bytes.data(),
+                        width);
+        }
     }
 }
 
 inline bool deserialize_cycle(PayloadReader& r, CycleSubmission& s) {
     if (!r.read_i64(s.cycle)) return false;
-    u64 n = 0;
-    if (!r.read_varuint(n)) return false;
-    s.updates.clear(); s.updates.reserve(static_cast<std::size_t>(n));
-    for (u64 i = 0; i < n; ++i) {
-        CycleValueUpdate u; u64 sid = 0; u8 bc = 0;
-        if (!r.read_varuint(sid)) return false; u.signal_id = static_cast<u32>(sid);
-        if (!r.read_u8(bc)) return false;
-        if (bc > kMaxScalarBytes) return false;
-        u.value.byte_count = bc;
-        u.value.bytes.fill(0);
-        if (!r.read_bytes(u.value.bytes.data(), bc)) return false;
-        s.updates.push_back(u);
+    u64 total = 0;
+    if (!r.read_u64(total)) return false;
+    if (total > static_cast<u64>((std::numeric_limits<std::size_t>::max)())) return false;
+
+    u8 group_count = 0;
+    if (!r.read_u8(group_count)) return false;
+    if (group_count > kMaxScalarBytes + 1u) return false;
+
+    s.clear_updates();
+    std::array<bool, kMaxScalarBytes + 1u> seen_width;
+    seen_width.fill(false);
+
+    for (u8 group = 0; group < group_count; ++group) {
+        u8 width = 0;
+        u64 count64 = 0;
+        if (!r.read_u8(width)) return false;
+        if (width > kMaxScalarBytes) return false;
+        if (seen_width[width]) return false;
+        seen_width[width] = true;
+        if (!r.read_u64(count64)) return false;
+        if (count64 > static_cast<u64>((std::numeric_limits<std::size_t>::max)())) return false;
+        const std::size_t count = static_cast<std::size_t>(count64);
+        if (count > static_cast<std::size_t>(total) - s.total_update_count()) return false;
+        if (count > (std::numeric_limits<std::size_t>::max)() / sizeof(u32)) return false;
+        if (width != 0 && count > (std::numeric_limits<std::size_t>::max)() / width) return false;
+
+        const std::size_t id_bytes = count * sizeof(u32);
+        const std::size_t value_bytes = count * static_cast<std::size_t>(width);
+        const u8* ids = NULL;
+        const u8* values = NULL;
+        if (!r.read_bytes_ptr(ids, id_bytes)) return false;
+        if (!r.read_bytes_ptr(values, value_bytes)) return false;
+
+        CycleValueWidthGroup& out_group = s.width_groups[width];
+        const std::size_t old_size = out_group.signal_ids.size();
+        const std::size_t old_value_size = out_group.values.size();
+        out_group.signal_ids.resize(old_size + count);
+        out_group.values.resize(old_value_size + value_bytes);
+        for (std::size_t i = 0; i < count; ++i) {
+            out_group.signal_ids[old_size + i] = load_u32_le(ids + i * sizeof(u32));
+        }
+        if (value_bytes != 0) {
+            std::memcpy(out_group.values.data() + old_value_size, values, value_bytes);
+        }
     }
-    return true;
+    return s.total_update_count() == static_cast<std::size_t>(total);
 }
 
 static const u32 kIpcMagic = 0x34504957u;    // "WIP4" little-endian spelling.
@@ -4701,6 +4977,8 @@ static const u32 kIpcAckMagic = 0x34415057u; // "WPA4" little-endian spelling.
 static const std::size_t kIpcHeaderSize = 28;
 static const std::size_t kIpcAckHeaderSize = 24;
 static const u64 kMaxIpcPayloadBytes = 512ull * 1024ull * 1024ull;
+static const long kWriterProcessCycleCredits = 4096;
+static const std::size_t kWriterProcessQueueBytesLimit = 256u * 1024u * 1024u;
 } // namespace detail
 
 enum class WriterProcessFrameType : u32 {
@@ -4756,6 +5034,15 @@ public:
             cleanup_handles(true);
             return false;
         }
+        {
+            std::lock_guard<std::mutex> lock(ack_mutex_);
+            ack_error_.clear();
+            ack_failed_ = false;
+            ack_last_seq_ = seq_;
+        }
+        cycle_credits_.store(detail::kWriterProcessCycleCredits, std::memory_order_release);
+        closing_seq_.store(0, std::memory_order_release);
+        ack_thread_ = std::thread([this]() { this->ack_loop(); });
         opened_ = true;
         return true;
 #endif
@@ -4769,10 +5056,15 @@ public:
 #else
         error.clear();
         if (!opened_) { error = "WVZ4 WriterProcessClient is not open"; return false; }
+        if (!acquire_cycle_credit(error)) return false;
         std::vector<u8> payload;
         detail::serialize_cycle(payload, submission);
-        return send_frame(WriterProcessFrameType::Cycle, payload, error) &&
-               read_ack(seq_, error);
+        if (!send_frame(WriterProcessFrameType::Cycle, payload, error)) {
+            cycle_credits_.fetch_add(1, std::memory_order_release);
+            set_ack_error(error);
+            return false;
+        }
+        return true;
 #endif
     }
 
@@ -4787,12 +5079,18 @@ public:
         bool ok = true;
         std::string local_error;
         std::vector<u8> payload;
-        if (!send_frame(WriterProcessFrameType::Finalize, payload, local_error) ||
-            !read_ack(seq_, local_error)) {
+        u64 finalize_seq = 0;
+        bool cleanup_done = false;
+        if (!send_frame(WriterProcessFrameType::Finalize, payload, local_error, &finalize_seq)) {
             ok = false;
+            cleanup_handles(false);
+            cleanup_done = true;
         }
-        cleanup_handles(true);
+        if (ok && !wait_for_ack(finalize_seq, local_error)) ok = false;
+        if (ack_thread_.joinable()) ack_thread_.join();
+        if (!cleanup_done) cleanup_handles(true);
         opened_ = false;
+        closing_seq_.store(0, std::memory_order_release);
         if (!ok) error = local_error.empty() ? "WVZ4 writer helper close failed" : local_error;
         return ok;
 #else
@@ -4816,13 +5114,28 @@ private:
 
         std::vector<std::string> candidates;
         candidates.push_back("wvz4_writer_monitor.exe");
+#if defined(_DEBUG)
+        candidates.push_back(detail::join_path("build_vs\\wvz4_writer_monitor\\Debug", "wvz4_writer_monitor.exe"));
         candidates.push_back(detail::join_path("build_vs\\wvz4_writer_monitor\\Release", "wvz4_writer_monitor.exe"));
+#else
+        candidates.push_back(detail::join_path("build_vs\\wvz4_writer_monitor\\Release", "wvz4_writer_monitor.exe"));
+        candidates.push_back(detail::join_path("build_vs\\wvz4_writer_monitor\\Debug", "wvz4_writer_monitor.exe"));
+#endif
         const std::string exe_dir = detail::current_exe_dir();
         if (!exe_dir.empty()) {
             candidates.push_back(detail::join_path(exe_dir, "wvz4_writer_monitor.exe"));
-            candidates.push_back(detail::join_path(detail::join_path(detail::parent_dir(detail::parent_dir(exe_dir)),
-                                                                      "wvz4_writer_monitor\\Release"),
+            const std::string build_root = detail::parent_dir(detail::parent_dir(exe_dir));
+#if defined(_DEBUG)
+            candidates.push_back(detail::join_path(detail::join_path(build_root, "wvz4_writer_monitor\\Debug"),
                                                   "wvz4_writer_monitor.exe"));
+            candidates.push_back(detail::join_path(detail::join_path(build_root, "wvz4_writer_monitor\\Release"),
+                                                  "wvz4_writer_monitor.exe"));
+#else
+            candidates.push_back(detail::join_path(detail::join_path(build_root, "wvz4_writer_monitor\\Release"),
+                                                  "wvz4_writer_monitor.exe"));
+            candidates.push_back(detail::join_path(detail::join_path(build_root, "wvz4_writer_monitor\\Debug"),
+                                                  "wvz4_writer_monitor.exe"));
+#endif
         }
         for (std::size_t i = 0; i < candidates.size(); ++i) {
             if (detail::file_exists(candidates[i])) return candidates[i];
@@ -4859,11 +5172,21 @@ private:
     }
 
     bool connect_pipe(DWORD timeout_ms, std::string& error) {
+        if (!connect_one_pipe(pipe_name_, GENERIC_WRITE, timeout_ms, pipe_, error)) return false;
+        const std::string ack_pipe_name = pipe_name_ + "_ack";
+        if (!connect_one_pipe(ack_pipe_name, GENERIC_READ, timeout_ms, ack_pipe_, error)) return false;
+        return true;
+    }
+
+    bool connect_one_pipe(const std::string& name,
+                          DWORD access,
+                          DWORD timeout_ms,
+                          HANDLE& out,
+                          std::string& error) {
         const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
         while (true) {
-            pipe_ = CreateFileA(pipe_name_.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
-                                NULL, OPEN_EXISTING, 0, NULL);
-            if (pipe_ != INVALID_HANDLE_VALUE) return true;
+            out = CreateFileA(name.c_str(), access, 0, NULL, OPEN_EXISTING, 0, NULL);
+            if (out != INVALID_HANDLE_VALUE) return true;
 
             const DWORD code = GetLastError();
             if (pi_.hProcess && WaitForSingleObject(pi_.hProcess, 0) == WAIT_OBJECT_0) {
@@ -4884,14 +5207,30 @@ private:
         }
     }
 
-    bool send_frame(WriterProcessFrameType type, const std::vector<u8>& payload, std::string& error) {
+    bool send_frame(WriterProcessFrameType type,
+                    const std::vector<u8>& payload,
+                    std::string& error,
+                    u64* seq_out = NULL) {
+        std::lock_guard<std::mutex> lock(send_mutex_);
+        const u64 seq = ++seq_;
+        if (type == WriterProcessFrameType::Finalize) {
+            closing_seq_.store(seq, std::memory_order_release);
+        }
+        if (seq_out) *seq_out = seq;
+        return send_frame_locked(type, payload, seq, error);
+    }
+
+    bool send_frame_locked(WriterProcessFrameType type,
+                           const std::vector<u8>& payload,
+                           u64 seq,
+                           std::string& error) {
         if (pipe_ == INVALID_HANDLE_VALUE) { error = "WVZ4 writer helper pipe is not connected"; return false; }
         const u32 checksum = detail::fnv1a32(payload);
         std::vector<u8> header;
         header.reserve(detail::kIpcHeaderSize);
         detail::append_u32(header, detail::kIpcMagic);
         detail::append_u32(header, static_cast<u32>(type));
-        detail::append_u64(header, ++seq_);
+        detail::append_u64(header, seq);
         detail::append_u64(header, static_cast<u64>(payload.size()));
         detail::append_u32(header, checksum);
         if (!detail::write_all_handle(pipe_, header.data(), header.size(), error)) return false;
@@ -4899,44 +5238,140 @@ private:
         return true;
     }
 
-    bool read_ack(u64 expected_seq, std::string& error) {
+    bool read_ack_frame(u64& seq, bool& ok, std::string& message, std::string& error) {
+        seq = 0;
+        ok = false;
+        message.clear();
+        error.clear();
         u8 hdr[detail::kIpcAckHeaderSize];
         bool disconnected = false;
-        if (!detail::read_all_handle(pipe_, hdr, sizeof(hdr), disconnected, error)) {
+        if (!detail::read_all_handle(ack_pipe_, hdr, sizeof(hdr), disconnected, error)) {
             if (disconnected) error = "WVZ4 writer helper pipe disconnected before ack";
             return false;
         }
         const u32 magic = detail::load_u32_le(hdr + 0);
-        const u64 seq = detail::load_u64_le(hdr + 4);
-        const u32 ok = detail::load_u32_le(hdr + 12);
+        seq = detail::load_u64_le(hdr + 4);
+        const u32 ok_u = detail::load_u32_le(hdr + 12);
         const u32 message_size = detail::load_u32_le(hdr + 16);
         const u32 checksum = detail::load_u32_le(hdr + 20);
-        if (magic != detail::kIpcAckMagic || seq != expected_seq) {
+        if (magic != detail::kIpcAckMagic) {
             error = "WVZ4 writer helper returned an invalid ack";
             return false;
         }
-        std::vector<u8> message(message_size);
+        std::vector<u8> msg(message_size);
         if (message_size > 0 &&
-            !detail::read_all_handle(pipe_, message.data(), message.size(), disconnected, error)) {
+            !detail::read_all_handle(ack_pipe_, msg.data(), msg.size(), disconnected, error)) {
             if (disconnected) error = "WVZ4 writer helper pipe disconnected during ack";
             return false;
         }
-        if (detail::fnv1a32(message) != checksum) {
+        if (detail::fnv1a32(msg) != checksum) {
             error = "WVZ4 writer helper ack checksum mismatch";
             return false;
         }
-        if (ok == 0) {
-            error.assign(reinterpret_cast<const char*>(message.data()), message.size());
+        ok = (ok_u != 0);
+        message.assign(reinterpret_cast<const char*>(msg.data()), msg.size());
+        return true;
+    }
+
+    bool read_ack(u64 expected_seq, std::string& error) {
+        u64 seq = 0;
+        bool ok = false;
+        std::string message;
+        if (!read_ack_frame(seq, ok, message, error)) return false;
+        if (seq != expected_seq) {
+            error = "WVZ4 writer helper returned an invalid ack";
+            return false;
+        }
+        if (!ok) {
+            error = message;
             if (error.empty()) error = "WVZ4 writer helper reported failure";
             return false;
         }
         return true;
     }
 
+    void set_ack_error(const std::string& message) {
+        std::lock_guard<std::mutex> lock(ack_mutex_);
+        if (!ack_failed_) {
+            ack_failed_ = true;
+            ack_error_ = message.empty() ? "WVZ4 writer helper IPC failed" : message;
+        }
+        ack_cv_.notify_all();
+    }
+
+    bool acquire_cycle_credit(std::string& error) {
+        while (true) {
+            {
+                std::lock_guard<std::mutex> lock(ack_mutex_);
+                if (ack_failed_) {
+                    error = ack_error_;
+                    return false;
+                }
+            }
+            long credits = cycle_credits_.load(std::memory_order_acquire);
+            while (credits > 0) {
+                if (cycle_credits_.compare_exchange_weak(credits,
+                                                         credits - 1,
+                                                         std::memory_order_acq_rel,
+                                                         std::memory_order_acquire)) {
+                    return true;
+                }
+            }
+            std::unique_lock<std::mutex> lock(ack_mutex_);
+            if (ack_failed_) {
+                error = ack_error_;
+                return false;
+            }
+            ack_cv_.wait_for(lock, std::chrono::milliseconds(1));
+        }
+    }
+
+    bool wait_for_ack(u64 target_seq, std::string& error) {
+        std::unique_lock<std::mutex> lock(ack_mutex_);
+        ack_cv_.wait(lock, [this, target_seq]() {
+            return ack_failed_ || ack_last_seq_ >= target_seq;
+        });
+        if (ack_failed_ && ack_last_seq_ < target_seq) {
+            error = ack_error_;
+            return false;
+        }
+        return true;
+    }
+
+    void ack_loop() {
+        while (true) {
+            u64 seq = 0;
+            bool ok = false;
+            std::string message;
+            std::string error;
+            if (!read_ack_frame(seq, ok, message, error)) {
+                set_ack_error(error);
+                return;
+            }
+            const u64 final_seq = closing_seq_.load(std::memory_order_acquire);
+            {
+                std::lock_guard<std::mutex> lock(ack_mutex_);
+                if (seq > ack_last_seq_) ack_last_seq_ = seq;
+                if (!ok) {
+                    ack_failed_ = true;
+                    ack_error_ = message.empty() ? "WVZ4 writer helper reported failure" : message;
+                } else if (seq != final_seq) {
+                    cycle_credits_.fetch_add(1, std::memory_order_release);
+                }
+            }
+            ack_cv_.notify_all();
+            if (!ok || (final_seq != 0 && seq == final_seq)) return;
+        }
+    }
+
     void cleanup_handles(bool wait_for_process) {
         if (pipe_ != INVALID_HANDLE_VALUE) {
             CloseHandle(pipe_);
             pipe_ = INVALID_HANDLE_VALUE;
+        }
+        if (ack_pipe_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(ack_pipe_);
+            ack_pipe_ = INVALID_HANDLE_VALUE;
         }
         if (wait_for_process && pi_.hProcess) {
             WaitForSingleObject(pi_.hProcess, 5000);
@@ -4952,7 +5387,17 @@ private:
     }
 
     HANDLE pipe_ = INVALID_HANDLE_VALUE;
+    HANDLE ack_pipe_ = INVALID_HANDLE_VALUE;
     PROCESS_INFORMATION pi_ {};
+    std::thread ack_thread_;
+    std::mutex send_mutex_;
+    std::mutex ack_mutex_;
+    std::condition_variable ack_cv_;
+    std::atomic<long> cycle_credits_ {0};
+    std::atomic<u64> closing_seq_ {0};
+    u64 ack_last_seq_ = 0;
+    bool ack_failed_ = false;
+    std::string ack_error_;
 #endif
 
     bool opened_ = false;
@@ -4961,6 +5406,9 @@ private:
 };
 
 class WriterProcessServer {
+#if defined(_WIN32)
+    class HelperQueue;
+#endif
 public:
     static bool run(const std::string& pipe_name,
                     const std::string& output_path,
@@ -4986,36 +5434,41 @@ public:
             error = detail::win32_error_message("failed to create WVZ4 writer helper pipe");
             return false;
         }
+        const std::string ack_pipe_name = pipe_name + "_ack";
+        HANDLE ack_pipe = CreateNamedPipeA(ack_pipe_name.c_str(),
+                                           PIPE_ACCESS_DUPLEX,
+                                           PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
+                                           1,
+                                           1u << 20,
+                                           1u << 20,
+                                           0,
+                                           NULL);
+        if (ack_pipe == INVALID_HANDLE_VALUE) {
+            CloseHandle(pipe);
+            if (parent) CloseHandle(parent);
+            error = detail::win32_error_message("failed to create WVZ4 writer helper ack pipe");
+            return false;
+        }
 
-        bool connected = false;
-        while (!connected) {
-            if (ConnectNamedPipe(pipe, NULL)) {
-                connected = true;
-                break;
-            }
-            const DWORD code = GetLastError();
-            if (code == ERROR_PIPE_CONNECTED) {
-                connected = true;
-                break;
-            }
-            if (parent && WaitForSingleObject(parent, 0) == WAIT_OBJECT_0) {
-                CloseHandle(pipe);
-                CloseHandle(parent);
-                return true;
-            }
-            if (code != ERROR_PIPE_LISTENING && code != ERROR_NO_DATA) {
-                CloseHandle(pipe);
-                if (parent) CloseHandle(parent);
-                error = detail::win32_error_message("failed while waiting for WVZ4 writer helper pipe client", code);
-                return false;
-            }
-            Sleep(20);
+        if (!connect_pipe_client(pipe, parent, "WVZ4 writer helper data pipe", error)) {
+            CloseHandle(pipe);
+            CloseHandle(ack_pipe);
+            if (parent) CloseHandle(parent);
+            return error.empty();
+        }
+        if (!connect_pipe_client(ack_pipe, parent, "WVZ4 writer helper ack pipe", error)) {
+            CloseHandle(pipe);
+            CloseHandle(ack_pipe);
+            if (parent) CloseHandle(parent);
+            return error.empty();
         }
 
         DWORD mode = PIPE_READMODE_BYTE | PIPE_WAIT;
         SetNamedPipeHandleState(pipe, &mode, NULL, NULL);
+        SetNamedPipeHandleState(ack_pipe, &mode, NULL, NULL);
 
-        Writer writer;
+        std::mutex ack_mutex;
+        HelperQueue helper(ack_pipe, ack_mutex);
         bool have_writer = false;
         bool result = true;
         while (true) {
@@ -5027,7 +5480,7 @@ public:
                 if (disconnected) {
                     if (have_writer) {
                         std::string close_error;
-                        if (!writer.close(close_error)) {
+                        if (!helper.close(close_error)) {
                             error = close_error;
                             result = false;
                         }
@@ -5039,10 +5492,58 @@ public:
             }
 
             std::string op_error;
-            bool ok = handle_frame(type, payload, output_path, writer, have_writer, op_error);
-            if (!send_ack(pipe, seq, ok, op_error, error)) {
-                result = false;
-                break;
+            bool ok = true;
+            bool ack_now = true;
+            detail::PayloadReader r(payload);
+            if (type == WriterProcessFrameType::Layout) {
+                if (have_writer) {
+                    ok = false;
+                    op_error = "WVZ4 writer helper received duplicate layout";
+                } else {
+                    WriterOptions opt;
+                    Layout layout;
+                    if (!detail::deserialize_options(r, opt) ||
+                        !detail::deserialize_layout(r, layout) ||
+                        !r.at_end()) {
+                        ok = false;
+                        op_error = "WVZ4 writer helper received corrupt layout payload";
+                    } else {
+                        if (opt.enable_stats_log && opt.stats_log_path.empty()) opt.stats_log_path = output_path + ".log";
+                        ok = helper.open(output_path, layout, opt, op_error);
+                        have_writer = ok;
+                    }
+                }
+            } else if (type == WriterProcessFrameType::Cycle) {
+                ack_now = false;
+                if (!have_writer) {
+                    ok = false;
+                    op_error = "WVZ4 writer helper received cycle before layout";
+                    ack_now = true;
+                } else {
+                    CycleSubmission s;
+                    if (!detail::deserialize_cycle(r, s) || !r.at_end()) {
+                        ok = false;
+                        op_error = "WVZ4 writer helper received corrupt cycle payload";
+                        ack_now = true;
+                    } else {
+                        ok = helper.enqueue(seq, std::move(s), op_error);
+                        if (!ok) ack_now = true;
+                    }
+                }
+            } else if (type == WriterProcessFrameType::Finalize) {
+                ok = helper.close(op_error);
+                have_writer = false;
+            } else {
+                ok = false;
+                op_error = "WVZ4 writer helper received unknown IPC frame type";
+            }
+
+            if (ack_now) {
+                std::lock_guard<std::mutex> ack_lock(ack_mutex);
+                if (!send_ack(ack_pipe, seq, ok, op_error, error)) {
+                    result = false;
+                    break;
+                }
             }
             if (!ok) {
                 result = false;
@@ -5055,7 +5556,10 @@ public:
 
         FlushFileBuffers(pipe);
         DisconnectNamedPipe(pipe);
+        FlushFileBuffers(ack_pipe);
+        DisconnectNamedPipe(ack_pipe);
         CloseHandle(pipe);
+        CloseHandle(ack_pipe);
         if (parent) CloseHandle(parent);
         return result;
 #endif
@@ -5063,6 +5567,34 @@ public:
 
 private:
 #if defined(_WIN32)
+    static bool connect_pipe_client(HANDLE pipe,
+                                    HANDLE parent,
+                                    const char* label,
+                                    std::string& error) {
+        bool connected = false;
+        while (!connected) {
+            if (ConnectNamedPipe(pipe, NULL)) {
+                connected = true;
+                break;
+            }
+            const DWORD code = GetLastError();
+            if (code == ERROR_PIPE_CONNECTED) {
+                connected = true;
+                break;
+            }
+            if (parent && WaitForSingleObject(parent, 0) == WAIT_OBJECT_0) {
+                error.clear();
+                return false;
+            }
+            if (code != ERROR_PIPE_LISTENING && code != ERROR_NO_DATA) {
+                error = detail::win32_error_message(std::string("failed while waiting for ") + label, code);
+                return false;
+            }
+            Sleep(20);
+        }
+        return true;
+    }
+
     static bool read_frame(HANDLE pipe,
                            WriterProcessFrameType& type,
                            u64& seq,
@@ -5097,48 +5629,6 @@ private:
         return true;
     }
 
-    static bool handle_frame(WriterProcessFrameType type,
-                             const std::vector<u8>& payload,
-                             const std::string& output_path,
-                             Writer& writer,
-                             bool& have_writer,
-                             std::string& error) {
-        error.clear();
-        detail::PayloadReader r(payload);
-        if (type == WriterProcessFrameType::Layout) {
-            if (have_writer) { error = "WVZ4 writer helper received duplicate layout"; return false; }
-            WriterOptions opt;
-            Layout layout;
-            if (!detail::deserialize_options(r, opt) ||
-                !detail::deserialize_layout(r, layout) ||
-                !r.at_end()) {
-                error = "WVZ4 writer helper received corrupt layout payload";
-                return false;
-            }
-            if (opt.enable_stats_log && opt.stats_log_path.empty()) opt.stats_log_path = output_path + ".log";
-            if (!writer.open(output_path, layout, opt, error)) return false;
-            have_writer = true;
-            return true;
-        }
-        if (type == WriterProcessFrameType::Cycle) {
-            if (!have_writer) { error = "WVZ4 writer helper received cycle before layout"; return false; }
-            CycleSubmission s;
-            if (!detail::deserialize_cycle(r, s) || !r.at_end()) {
-                error = "WVZ4 writer helper received corrupt cycle payload";
-                return false;
-            }
-            return writer.submit_cycle(s, error);
-        }
-        if (type == WriterProcessFrameType::Finalize) {
-            if (!have_writer) return true;
-            if (!writer.close(error)) return false;
-            have_writer = false;
-            return true;
-        }
-        error = "WVZ4 writer helper received unknown IPC frame type";
-        return false;
-    }
-
     static bool send_ack(HANDLE pipe, u64 seq, bool ok, const std::string& message, std::string& error) {
         std::vector<u8> msg;
         if (!message.empty()) {
@@ -5155,6 +5645,182 @@ private:
         if (!msg.empty() && !detail::write_all_handle(pipe, msg.data(), msg.size(), error)) return false;
         return true;
     }
+
+    class HelperQueue {
+    public:
+        HelperQueue(HANDLE pipe, std::mutex& ack_mutex) : pipe_(pipe), ack_mutex_(&ack_mutex) {}
+        ~HelperQueue() { std::string ignored; close(ignored); }
+
+        HelperQueue(const HelperQueue&) = delete;
+        HelperQueue& operator=(const HelperQueue&) = delete;
+
+        bool open(const std::string& output_path,
+                  const Layout& layout,
+                  const WriterOptions& options,
+                  std::string& error) {
+            error.clear();
+            if (opened_) {
+                error = "WVZ4 writer helper queue already open";
+                return false;
+            }
+            if (!writer_.open(output_path, layout, options, error)) return false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                opened_ = true;
+                stopping_ = false;
+                error_.clear();
+                queue_.clear();
+                queued_bytes_ = 0;
+            }
+            worker_ = std::thread([this]() { this->worker_loop(); });
+            return true;
+        }
+
+        bool enqueue(u64 seq, CycleSubmission&& submission, std::string& error) {
+            error.clear();
+            const std::size_t approx_bytes = estimate_submission_bytes(submission);
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (!opened_) {
+                error = "WVZ4 writer helper queue is not open";
+                return false;
+            }
+            if (!error_.empty()) {
+                error = error_;
+                return false;
+            }
+            cv_space_.wait(lock, [this, approx_bytes]() {
+                if (stopping_ || !error_.empty()) return true;
+                const bool count_ok = queue_.size() < static_cast<std::size_t>(detail::kWriterProcessCycleCredits);
+                const bool bytes_ok = queued_bytes_ + approx_bytes <= detail::kWriterProcessQueueBytesLimit ||
+                                      queue_.empty();
+                return count_ok && bytes_ok;
+            });
+            if (!error_.empty()) {
+                error = error_;
+                return false;
+            }
+            if (stopping_) {
+                error = "WVZ4 writer helper queue is stopping";
+                return false;
+            }
+
+            QueueItem item;
+            item.seq = seq;
+            item.submission = std::move(submission);
+            item.approx_bytes = approx_bytes;
+            queued_bytes_ += approx_bytes;
+            queue_.push_back(std::move(item));
+            cv_not_empty_.notify_one();
+            return true;
+        }
+
+        bool close(std::string& error) {
+            error.clear();
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!opened_) return true;
+                stopping_ = true;
+                cv_not_empty_.notify_all();
+                cv_space_.notify_all();
+            }
+            if (worker_.joinable()) worker_.join();
+
+            bool ok = true;
+            std::string local_error;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!error_.empty()) {
+                    local_error = error_;
+                    ok = false;
+                }
+            }
+            if (!writer_.close(local_error)) ok = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                opened_ = false;
+                stopping_ = false;
+                queue_.clear();
+                queued_bytes_ = 0;
+            }
+            if (!ok) error = local_error.empty() ? "WVZ4 writer helper queue close failed" : local_error;
+            return ok;
+        }
+
+    private:
+        struct QueueItem {
+            u64 seq = 0;
+            CycleSubmission submission;
+            std::size_t approx_bytes = 0;
+        };
+
+        static std::size_t estimate_submission_bytes(const CycleSubmission& submission) noexcept {
+            return sizeof(CycleSubmission) + submission.estimate_heap_bytes();
+        }
+
+        void set_error_locked(const std::string& error) {
+            if (error_.empty()) error_ = error.empty() ? "WVZ4 writer helper queue failed" : error;
+            stopping_ = true;
+            queue_.clear();
+            queued_bytes_ = 0;
+            cv_space_.notify_all();
+            cv_not_empty_.notify_all();
+        }
+
+        void worker_loop() {
+            while (true) {
+                QueueItem item;
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    cv_not_empty_.wait(lock, [this]() { return stopping_ || !queue_.empty(); });
+                    if (queue_.empty()) {
+                        if (stopping_) return;
+                        continue;
+                    }
+                    item = std::move(queue_.front());
+                    queue_.pop_front();
+                    if (queued_bytes_ >= item.approx_bytes) queued_bytes_ -= item.approx_bytes;
+                    else queued_bytes_ = 0;
+                    cv_space_.notify_one();
+                }
+
+                std::string op_error;
+                const bool ok = writer_.submit_cycle(item.submission, op_error);
+                std::string ack_error;
+                {
+                    std::lock_guard<std::mutex> ack_lock(*ack_mutex_);
+                    if (!send_ack(pipe_, item.seq, ok, op_error, ack_error)) {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        set_error_locked(ack_error);
+                        return;
+                    }
+                }
+                if (!ack_error.empty()) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    set_error_locked(ack_error);
+                    return;
+                }
+                if (!ok) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    set_error_locked(op_error);
+                    return;
+                }
+            }
+        }
+
+        HANDLE pipe_ = INVALID_HANDLE_VALUE;
+        std::mutex* ack_mutex_ = NULL;
+        Writer writer_;
+        bool opened_ = false;
+        bool stopping_ = false;
+        std::size_t queued_bytes_ = 0;
+        std::string error_;
+        std::thread worker_;
+        std::mutex mutex_;
+        std::condition_variable cv_not_empty_;
+        std::condition_variable cv_space_;
+        std::deque<QueueItem> queue_;
+    };
+
 #endif
 };
 

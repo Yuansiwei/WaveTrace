@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <WaveTraceRoot Condition="'$(WaveTraceRoot)'==''">$(MSBuildThisFileDirectory)..</WaveTraceRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="$(WaveTraceRoot)\ReflectGen.vcxproj">
+      <Project>{7B4A9062-1A78-4C51-8E9F-5D47C0A8A1E1}</Project>
+      <Name>ReflectGen</Name>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+      <UseLibraryDependencyInputs>false</UseLibraryDependencyInputs>
+      <Private>false</Private>
+    </ProjectReference>
+  </ItemGroup>
+</Project>
