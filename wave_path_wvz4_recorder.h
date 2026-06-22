@@ -34,7 +34,6 @@
 #include <limits>
 #include <sstream>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 // Stable-topology WVZ4 recorder.
@@ -693,8 +692,6 @@ private:
         const std::vector<wvz4::u32>& node_ids = *node_ids_ptr;
         const std::vector<wvz4::u32>& track_ids = *track_ids_ptr;
 
-        std::unordered_map<std::string, wvz4::u32> name_to_id;
-        name_to_id.reserve(node_ids.size() + (cfg_.emit_default_clk ? 1u : 0u));
         layout.names.reserve(node_ids.size() + (cfg_.emit_default_clk ? 1u : 0u));
         layout.nodes.reserve(node_ids.size() + (cfg_.emit_default_clk ? 1u : 0u));
         layout.signals.reserve(track_ids.size() + (cfg_.emit_default_clk ? 1u : 0u));
@@ -717,34 +714,24 @@ private:
                 }
                 last_child[ns.parent_id] = nid;
             }
-            if (name_to_id.find(ns.name) == name_to_id.end()) {
-                const wvz4::u32 name_id = static_cast<wvz4::u32>(name_to_id.size() + 1u);
-                name_to_id[ns.name] = name_id;
-                wvz4::NameRecord nr;
-                nr.name_id = name_id;
-                nr.name = ns.name;
-                layout.names.push_back(nr);
-            }
-        }
-        if (cfg_.emit_default_clk) {
-            if (cfg_.default_clk_name.empty()) { error = "WVZ4 layout default clk name must not be empty"; return false; }
-            if (name_to_id.find(cfg_.default_clk_name) == name_to_id.end()) {
-                const wvz4::u32 name_id = static_cast<wvz4::u32>(name_to_id.size() + 1u);
-                name_to_id[cfg_.default_clk_name] = name_id;
-                wvz4::NameRecord nr;
-                nr.name_id = name_id;
-                nr.name = cfg_.default_clk_name;
-                layout.names.push_back(nr);
-            }
+            wvz4::NameRecord nr;
+            nr.name_id = nid;
+            nr.name = ns.name;
+            layout.names.push_back(nr);
         }
 
         wvz4::u32 default_clk_node_id = 0;
         if (cfg_.emit_default_clk) {
+            if (cfg_.default_clk_name.empty()) { error = "WVZ4 layout default clk name must not be empty"; return false; }
             if (!node_ids.empty() && node_ids.back() == std::numeric_limits<wvz4::u32>::max()) {
                 error = "WVZ4 layout cannot allocate default clk node_id: node_id range exhausted";
                 return false;
             }
             default_clk_node_id = node_ids.empty() ? 1u : (node_ids.back() + 1u);
+            wvz4::NameRecord nr;
+            nr.name_id = default_clk_node_id;
+            nr.name = cfg_.default_clk_name;
+            layout.names.push_back(nr);
         }
 
         for (std::size_t i = 0; i < node_ids.size(); ++i) {
@@ -753,7 +740,7 @@ private:
             wvz4::NodeRecord rec;
             rec.node_id = ns.node_id;
             rec.parent_id = ns.parent_id;
-            rec.name_id = name_to_id[ns.name];
+            rec.name_id = ns.node_id;
             rec.kind = ns.kind;
             rec.first_child = first_child[nid];
             rec.next_sibling = next_sibling[nid];
@@ -763,7 +750,7 @@ private:
             wvz4::NodeRecord clk_node;
             clk_node.node_id = default_clk_node_id;
             clk_node.parent_id = 0;
-            clk_node.name_id = name_to_id[cfg_.default_clk_name];
+            clk_node.name_id = default_clk_node_id;
             clk_node.kind = wvz4::NodeKind::SignalLeaf;
             clk_node.first_child = 0;
             clk_node.next_sibling = 0;
