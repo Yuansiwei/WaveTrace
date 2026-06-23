@@ -47,7 +47,6 @@ frames to `wvz4_writer_monitor.exe`; the helper process owns the real
 ```cpp
 PathStableWvz4Recorder::OpenConfig cfg;
 cfg.file_path = "out.wvz4";
-cfg.writer_process_exe_path = "wvz4_writer_monitor.exe"; // optional; auto-located when empty
 recorder.open(cfg, error);
 ```
 

@@ -2,7 +2,6 @@
 
 #include <chrono>
 #include <cstdlib>
-#include <fstream>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -17,25 +16,6 @@ bool parse_u64_arg(const char* text, std::uint64_t& out) {
     if (end == text || *end != '\0') return false;
     out = static_cast<std::uint64_t>(value);
     return true;
-}
-
-bool file_exists(const std::string& path) {
-    std::ifstream f(path.c_str(), std::ios::binary);
-    return f.good();
-}
-
-std::string choose_helper(const std::string& explicit_path) {
-    if (!explicit_path.empty()) return explicit_path;
-    const char* candidates[] = {
-        "tools\\bin\\wvz4_writer_monitor.exe",
-        "build_vs\\wvz4_writer_monitor\\Release\\wvz4_writer_monitor.exe",
-        "build_vs\\wvz4_writer_monitor\\Debug\\wvz4_writer_monitor.exe",
-        "wvz4_writer_monitor.exe"
-    };
-    for (std::size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
-        if (file_exists(candidates[i])) return candidates[i];
-    }
-    return std::string();
 }
 
 std::string signal_name(std::uint32_t index) {
@@ -75,19 +55,12 @@ void declare_flat_topology(PathStableWvz4Recorder& recorder, std::uint32_t signa
 int main(int argc, char** argv) {
     std::string output_path = "build_vs\\wvz4_recorder_1m_layout.wvz4";
     std::uint64_t signal_count_64 = 1000000ull;
-    std::string helper_exe;
 
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i] ? argv[i] : "";
-        if (arg == "--helper-exe") {
-            if (i + 1 >= argc) {
-                std::cerr << "--helper-exe requires a path\n";
-                return 2;
-            }
-            helper_exe = argv[++i];
-        } else if (arg == "--help" || arg == "-h") {
-            std::cout << "usage: smoke_wvz4_recorder_1m_layout [out.wvz4] [signals] [--helper-exe path]\n";
+        if (arg == "--help" || arg == "-h") {
+            std::cout << "usage: smoke_wvz4_recorder_1m_layout [out.wvz4] [signals]\n";
             return 0;
         } else {
             positional.push_back(arg);
@@ -117,13 +90,7 @@ int main(int argc, char** argv) {
     cfg.options.enable_stats_log = false;
     cfg.options.enable_lod_tables = false;
     cfg.options.target_block_span = 8192;
-    cfg.writer_process_exe_path = choose_helper(helper_exe);
     cfg.writer_process_connect_timeout_ms = 60000;
-
-    if (cfg.writer_process_exe_path.empty()) {
-        std::cerr << "failed to find wvz4_writer_monitor.exe\n";
-        return 2;
-    }
 
     std::string error;
     const auto start = std::chrono::steady_clock::now();
@@ -158,7 +125,7 @@ int main(int argc, char** argv) {
     std::cout << "signals=" << signal_count << "\n";
     std::cout << "nodes=" << declared_nodes << "\n";
     std::cout << "tracks=" << declared_tracks << "\n";
-    std::cout << "helper=" << cfg.writer_process_exe_path << "\n";
+    std::cout << "helper=auto\n";
     std::cout << "declare_ms=" << declare_ms << "\n";
     std::cout << "open_writer_ms=" << open_writer_ms << "\n";
     std::cout << "total_ms=" << total_ms << "\n";

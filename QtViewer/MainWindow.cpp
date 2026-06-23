@@ -122,6 +122,32 @@ constexpr int kCompareStreamingHugeFileSignalBatchSize = 2048;
 constexpr qint64 kCompareStreamingHugeFileThresholdBytes = 2ll * 1024ll * 1024ll * 1024ll;
 constexpr quint64 kCompareStreamingBatchSampleBudget = 6ull * 1000ull * 1000ull;
 
+QString compareSideSuffix(const QString& text) {
+    if ((text.endsWith(QStringLiteral("@A")) || text.endsWith(QStringLiteral("@B"))) && text.size() > 2) {
+        return text.right(2);
+    }
+    return QString();
+}
+
+QString stripCompareSideMarker(QString text) {
+    const QString suffix = compareSideSuffix(text);
+    if (!suffix.isEmpty()) {
+        text.chop(suffix.size());
+    } else if ((text.startsWith(QStringLiteral("A ")) || text.startsWith(QStringLiteral("B "))) && text.size() > 2) {
+        text = text.mid(2);
+    }
+    return text;
+}
+
+QString formatNameWidthBeforeCompareSuffix(QString name, int width) {
+    if (width <= 1) return name;
+    const QString suffix = compareSideSuffix(name);
+    if (!suffix.isEmpty()) name.chop(suffix.size());
+    QString out = QStringLiteral("%1[%2:0]").arg(name).arg(qMax(0, width - 1));
+    if (!suffix.isEmpty()) out += suffix;
+    return out;
+}
+
 bool isSupportedWaveFilePath(const QString& path) {
     if (path.isEmpty()) return false;
     const QFileInfo info(path);
@@ -1054,8 +1080,8 @@ struct SignalLogicTree {
         QString text = nodeNameString(nodeId);
         if (nodeId >= 0 && nodeId < nodes.size()) {
             const LogicTreeNode& node = nodes.at(nodeId);
-            if (node.signalIndex >= 0 && node.width > 1) {
-                text += QStringLiteral("[%1:0]").arg(node.width - 1);
+            if (node.signalIndex >= 0) {
+                text = formatNameWidthBeforeCompareSuffix(text, node.width);
             }
         }
         return text;
@@ -1073,15 +1099,12 @@ struct SignalLogicTree {
             return true;
         }
 
-        // Compare-mode leaves are named "A <signal>" / "B <signal>" so A/B
-        // pairs stay adjacent.  Still allow structural searches using the
-        // original signal segment, e.g. "top.data[7:0]".
-        if ((bareName.startsWith(QStringLiteral("A ")) || bareName.startsWith(QStringLiteral("B "))) && bareName.size() > 2) {
-            const QString strippedBare = bareName.mid(2);
-            QString strippedDisplay = displayName;
-            if (strippedDisplay.startsWith(QStringLiteral("A ")) || strippedDisplay.startsWith(QStringLiteral("B "))) {
-                strippedDisplay = strippedDisplay.mid(2);
-            }
+        // Compare-mode leaves are named "<signal>@A" / "<signal>@B".
+        // Also tolerate the older "A <signal>" / "B <signal>" spelling when
+        // searching by the original structural segment.
+        const QString strippedBare = stripCompareSideMarker(bareName);
+        if (strippedBare != bareName) {
+            const QString strippedDisplay = stripCompareSideMarker(displayName);
             return QString::compare(strippedDisplay, needle, Qt::CaseInsensitive) == 0 ||
                    QString::compare(strippedBare, needle, Qt::CaseInsensitive) == 0;
         }
@@ -1276,15 +1299,26 @@ bool loadWaveFileFullyForCompare(const QString& path, WaveFile& wave, QString& e
 struct CompareCycleRange {
     qint64 start = 0;
     qint64 end = 0;
-    bool hasCommonRange = false;
+    bool hasRange = false;
 };
 
-CompareCycleRange makeCommonCompareCycleRange(const WaveMeta& leftMeta, const WaveMeta& rightMeta) {
+CompareCycleRange makeMaxCompareCycleRange(const WaveMeta& leftMeta, const WaveMeta& rightMeta) {
+    CompareCycleRange range;
+    range.start = qMin(leftMeta.start, rightMeta.start);
+    range.end = qMax(leftMeta.end, rightMeta.end);
+    range.hasRange = range.end > range.start;
+    if (!range.hasRange) {
+        range.end = range.start;
+    }
+    return range;
+}
+
+CompareCycleRange makeOverlappedCompareCycleRange(const WaveMeta& leftMeta, const WaveMeta& rightMeta) {
     CompareCycleRange range;
     range.start = qMax(leftMeta.start, rightMeta.start);
     range.end = qMin(leftMeta.end, rightMeta.end);
-    range.hasCommonRange = range.end > range.start;
-    if (!range.hasCommonRange) {
+    range.hasRange = range.end > range.start;
+    if (!range.hasRange) {
         range.end = range.start;
     }
     return range;
@@ -1299,28 +1333,47 @@ QString formatCycleRange(qint64 start, qint64 end) {
 }
 
 QString formatCompareRangeNote(const WaveMeta& leftMeta, const WaveMeta& rightMeta) {
-    const CompareCycleRange common = makeCommonCompareCycleRange(leftMeta, rightMeta);
-    QString note = QStringLiteral("Compared common cycle range %1. A range=%2, B range=%3.")
-        .arg(common.hasCommonRange
-             ? formatCycleRange(common.start, common.end)
+    const CompareCycleRange range = makeMaxCompareCycleRange(leftMeta, rightMeta);
+    const CompareCycleRange overlap = makeOverlappedCompareCycleRange(leftMeta, rightMeta);
+    QString note = QStringLiteral("Compared max cycle range %1. A range=%2, B range=%3.")
+        .arg(range.hasRange
+             ? formatCycleRange(range.start, range.end)
              : QStringLiteral("<empty>"))
         .arg(formatCycleRange(leftMeta.start, leftMeta.end))
         .arg(formatCycleRange(rightMeta.start, rightMeta.end));
+    note += QStringLiteral(" Signal values are diffed only where both files have time coverage: %1.")
+        .arg(overlap.hasRange ? formatCycleRange(overlap.start, overlap.end) : QStringLiteral("<empty>"));
     if (compareFileRangesDiffer(leftMeta, rightMeta)) {
-        note += QStringLiteral(" File cycle ranges differ; the non-overlapping tail is not inserted into the diff tree.");
+        note += QStringLiteral(" File cycle ranges differ; matching signals are compared across the max range without inserting one-sided-only signals.");
     }
     return note;
 }
 
 QString formatNoSignalDiffMessage(const WaveMeta& leftMeta, const WaveMeta& rightMeta) {
-    QString msg = QStringLiteral("No matching-path signal differs in the common cycle range.");
-    if (!makeCommonCompareCycleRange(leftMeta, rightMeta).hasCommonRange) {
-        msg += QStringLiteral(" No common cycle range to compare.");
+    QString msg = QStringLiteral("No matching-path signal differs in the overlapped cycle range.");
+    if (!makeOverlappedCompareCycleRange(leftMeta, rightMeta).hasRange) {
+        msg += QStringLiteral(" No overlapped cycle range to compare.");
     }
     if (compareFileRangesDiffer(leftMeta, rightMeta)) {
         msg += QStringLiteral("\n") + formatCompareRangeNote(leftMeta, rightMeta);
     }
     return msg;
+}
+
+void initializeCompareMeta(WaveMeta& meta,
+                           const QString& leftPath,
+                           const WaveMeta& leftMeta,
+                           const QString& rightPath,
+                           const WaveMeta& rightMeta) {
+    meta.hasCompareSources = true;
+    meta.compareLeftPath = leftPath;
+    meta.compareLeftLabel = QFileInfo(leftPath).fileName();
+    meta.compareLeftStart = leftMeta.start;
+    meta.compareLeftEnd = leftMeta.end;
+    meta.compareRightPath = rightPath;
+    meta.compareRightLabel = QFileInfo(rightPath).fileName();
+    meta.compareRightStart = rightMeta.start;
+    meta.compareRightEnd = rightMeta.end;
 }
 
 WaveSample makeAbsentCompareSample() {
@@ -1599,21 +1652,26 @@ void hydrateSignalSamplesForCompare(WaveSignal& sig) {
 
 QString comparedSideFullPath(const QString& matchedPath, const QString& sidePrefix) {
     const int dot = matchedPath.lastIndexOf(QLatin1Char('.'));
-    if (dot < 0) return sidePrefix + QLatin1Char(' ') + matchedPath;
+    if (dot < 0) return matchedPath + QLatin1Char('@') + sidePrefix;
     const QString parent = matchedPath.left(dot);
     const QString leaf = matchedPath.mid(dot + 1);
-    return parent + QLatin1Char('.') + sidePrefix + QLatin1Char(' ') + leaf;
+    return parent + QLatin1Char('.') + leaf + QLatin1Char('@') + sidePrefix;
 }
 
 WaveSignal makeComparedSideSignal(const QString& fullName,
                                   const WaveSignal& src,
                                   int signalId,
-                                  const QVector<WaveDiffRegion>& diffRegions) {
+                                  const QVector<WaveDiffRegion>& diffRegions,
+                                  qint64 visibleStart,
+                                  qint64 visibleEnd) {
     WaveSignal out = src;
     out.signalId = signalId;
     out.name = fullName;
     out.samplesLoaded = true;
     out.diffRegions = diffRegions;
+    out.hasVisibleRange = true;
+    out.visibleStart = visibleStart;
+    out.visibleEnd = visibleEnd;
     hydrateSignalSamplesForCompare(out);
     return out;
 }
@@ -1682,9 +1740,11 @@ bool buildComparedWaveFile(const QString& leftPath,
     outWave.meta.timescale = (leftWave.meta.timescale == rightWave.meta.timescale)
         ? leftWave.meta.timescale
         : QStringLiteral("cycle");
-    const CompareCycleRange compareRange = makeCommonCompareCycleRange(leftWave.meta, rightWave.meta);
+    const CompareCycleRange compareRange = makeMaxCompareCycleRange(leftWave.meta, rightWave.meta);
+    const CompareCycleRange diffRange = makeOverlappedCompareCycleRange(leftWave.meta, rightWave.meta);
     outWave.meta.start = compareRange.start;
     outWave.meta.end = qMax(compareRange.end, outWave.meta.start + 1);
+    initializeCompareMeta(outWave.meta, leftPath, leftWave.meta, rightPath, rightWave.meta);
 
     int commonPathCount = 0;
     int nextSignalId = 1;
@@ -1696,17 +1756,19 @@ bool buildComparedWaveFile(const QString& leftPath,
         const WaveSignal& leftSig = leftWave.signalList.at(li);
         const WaveSignal& rightSig = rightWave.signalList.at(ri);
         QVector<WaveDiffRegion> diffRegions;
-        if (compareRange.hasCommonRange) {
+        if (diffRange.hasRange) {
             diffRegions = computeSignalDiffRegions(leftSig, rightSig,
-                                                   compareRange.start, compareRange.end,
-                                                   compareRange.end, compareRange.end);
+                                                   diffRange.start, diffRange.end,
+                                                   diffRange.end, diffRange.end);
         }
         if (diffRegions.isEmpty()) continue;
 
         const QString leftName = comparedSideFullPath(path, QStringLiteral("A"));
         const QString rightName = comparedSideFullPath(path, QStringLiteral("B"));
-        outWave.signalList.push_back(makeComparedSideSignal(leftName, leftSig, nextSignalId++, diffRegions));
-        outWave.signalList.push_back(makeComparedSideSignal(rightName, rightSig, nextSignalId++, diffRegions));
+        outWave.signalList.push_back(makeComparedSideSignal(leftName, leftSig, nextSignalId++, diffRegions,
+                                                            leftWave.meta.start, leftWave.meta.end));
+        outWave.signalList.push_back(makeComparedSideSignal(rightName, rightSig, nextSignalId++, diffRegions,
+                                                            rightWave.meta.start, rightWave.meta.end));
     }
 
     if (commonPathCount == 0) {
@@ -1776,37 +1838,29 @@ bool buildComparedWaveFileOptimized(const QString& leftPath,
     outWave.meta.timescale = (leftWave.meta.timescale == rightWave.meta.timescale)
         ? leftWave.meta.timescale
         : QStringLiteral("cycle");
-    const CompareCycleRange compareRange = makeCommonCompareCycleRange(leftWave.meta, rightWave.meta);
+    const CompareCycleRange compareRange = makeMaxCompareCycleRange(leftWave.meta, rightWave.meta);
+    const CompareCycleRange diffRange = makeOverlappedCompareCycleRange(leftWave.meta, rightWave.meta);
     outWave.meta.start = compareRange.start;
     outWave.meta.end = qMax(compareRange.end, outWave.meta.start + 1);
+    initializeCompareMeta(outWave.meta, leftPath, leftWave.meta, rightPath, rightWave.meta);
 
     std::vector<CompareSignalJob> jobs;
-    jobs.reserve(std::size_t(leftPathOrder.size() + rightPathOrder.size()));
+    jobs.reserve(std::size_t(qMin(leftPathOrder.size(), rightPathOrder.size())));
     int commonPathCount = 0;
     for (const QString& path : leftPathOrder) {
         const int li = leftByPath.value(path, -1);
         const int ri = rightByPath.value(path, -1);
-        if (li < 0) continue;
-        if (ri >= 0) ++commonPathCount;
+        if (li < 0 || ri < 0) continue;
+        ++commonPathCount;
         CompareSignalJob job;
         job.path = path;
         job.leftIndex = li;
         job.rightIndex = ri;
         jobs.push_back(std::move(job));
     }
-    for (const QString& path : rightPathOrder) {
-        if (leftByPath.contains(path)) continue;
-        const int ri = rightByPath.value(path, -1);
-        if (ri < 0) continue;
-        CompareSignalJob job;
-        job.path = path;
-        job.leftIndex = -1;
-        job.rightIndex = ri;
-        jobs.push_back(std::move(job));
-    }
 
     if (jobs.empty()) {
-        error = QStringLiteral("The two files have no signals to compare.");
+        error = QStringLiteral("The two files have no matching-path signals to compare.");
         return false;
     }
     if (progress) {
@@ -1831,16 +1885,14 @@ bool buildComparedWaveFileOptimized(const QString& leftPath,
                 if (jobIndex < 0 || jobIndex >= int(jobs.size())) break;
                 const CompareSignalJob& job = jobs[std::size_t(jobIndex)];
                 QVector<WaveDiffRegion> diffRegions;
-                if (!compareRange.hasCommonRange) {
+                if (!diffRange.hasRange) {
                     diffRegions.clear();
-                } else if (job.leftIndex >= 0 && job.rightIndex >= 0) {
+                } else {
                     const WaveSignal& leftSig = leftWave.signalList.at(job.leftIndex);
                     const WaveSignal& rightSig = rightWave.signalList.at(job.rightIndex);
                     diffRegions = computeSignalDiffRegions(leftSig, rightSig,
-                                                           compareRange.start, compareRange.end,
-                                                           compareRange.end, compareRange.end);
-                } else {
-                    diffRegions = makeFullCompareDiffRegions(compareRange.start, compareRange.end);
+                                                           diffRange.start, diffRange.end,
+                                                           diffRange.end, diffRange.end);
                 }
                 if (progress) progress->completedJobs.fetch_add(1, std::memory_order_release);
                 if (diffRegions.isEmpty()) continue;
@@ -1880,22 +1932,12 @@ bool buildComparedWaveFileOptimized(const QString& leftPath,
         if (result.diffRegions.isEmpty()) continue;
         const QString leftName = comparedSideFullPath(jobs[i].path, QStringLiteral("A"));
         const QString rightName = comparedSideFullPath(jobs[i].path, QStringLiteral("B"));
-        if (result.leftIndex >= 0 && result.rightIndex >= 0) {
-            const WaveSignal& leftSig = leftWave.signalList.at(result.leftIndex);
-            const WaveSignal& rightSig = rightWave.signalList.at(result.rightIndex);
-            outWave.signalList.push_back(makeComparedSideSignal(leftName, leftSig, nextSignalId++, result.diffRegions));
-            outWave.signalList.push_back(makeComparedSideSignal(rightName, rightSig, nextSignalId++, result.diffRegions));
-        } else if (result.leftIndex >= 0) {
-            const WaveSignal& leftSig = leftWave.signalList.at(result.leftIndex);
-            outWave.signalList.push_back(makeComparedSideSignal(leftName, leftSig, nextSignalId++, result.diffRegions));
-            outWave.signalList.push_back(makeAbsentComparedSideSignal(rightName, leftSig, nextSignalId++,
-                                                                      outWave.meta.start, result.diffRegions));
-        } else if (result.rightIndex >= 0) {
-            const WaveSignal& rightSig = rightWave.signalList.at(result.rightIndex);
-            outWave.signalList.push_back(makeAbsentComparedSideSignal(leftName, rightSig, nextSignalId++,
-                                                                      outWave.meta.start, result.diffRegions));
-            outWave.signalList.push_back(makeComparedSideSignal(rightName, rightSig, nextSignalId++, result.diffRegions));
-        }
+        const WaveSignal& leftSig = leftWave.signalList.at(result.leftIndex);
+        const WaveSignal& rightSig = rightWave.signalList.at(result.rightIndex);
+        outWave.signalList.push_back(makeComparedSideSignal(leftName, leftSig, nextSignalId++, result.diffRegions,
+                                                            leftWave.meta.start, leftWave.meta.end));
+        outWave.signalList.push_back(makeComparedSideSignal(rightName, rightSig, nextSignalId++, result.diffRegions,
+                                                            rightWave.meta.start, rightWave.meta.end));
     }
     return true;
 }
@@ -2013,23 +2055,14 @@ bool buildComparedWaveFileWvz4Streaming(const QString& leftPath,
     }
 
     QVector<CompareSignalJob> jobs;
-    jobs.reserve(leftPathOrder.size() + rightPathOrder.size());
+    jobs.reserve(qMin(leftPathOrder.size(), rightPathOrder.size()));
     for (const QString& path : leftPathOrder) {
         const int li = leftByPath.value(path, -1);
-        if (li < 0) continue;
+        const int ri = rightByPath.value(path, -1);
+        if (li < 0 || ri < 0) continue;
         CompareSignalJob job;
         job.path = path;
         job.leftIndex = li;
-        job.rightIndex = rightByPath.value(path, -1);
-        jobs.push_back(job);
-    }
-    for (const QString& path : rightPathOrder) {
-        if (leftByPath.contains(path)) continue;
-        const int ri = rightByPath.value(path, -1);
-        if (ri < 0) continue;
-        CompareSignalJob job;
-        job.path = path;
-        job.leftIndex = -1;
         job.rightIndex = ri;
         jobs.push_back(job);
     }
@@ -2039,7 +2072,7 @@ bool buildComparedWaveFileWvz4Streaming(const QString& leftPath,
     }
 
     if (jobs.isEmpty()) {
-        error = QStringLiteral("The two WVZ4 files have no signals to compare.");
+        error = QStringLiteral("The two WVZ4 files have no matching-path signals to compare.");
         return false;
     }
 
@@ -2059,7 +2092,8 @@ bool buildComparedWaveFileWvz4Streaming(const QString& leftPath,
                            rightDirectory.signalList.size(),
                            int(rawCompare));
         }
-        if (rawCompare == WaveParser4Reader::RawBlockCompareResult::Equal) {
+        if (rawCompare == WaveParser4Reader::RawBlockCompareResult::Equal &&
+            !compareFileRangesDiffer(leftDirectory.meta, rightDirectory.meta)) {
             error = QStringLiteral("No matching-path signal differs at any cycle.");
             if (viewerPerfLogEnabled()) {
                 comparePerfLog("compare.streaming.total", totalTimer.elapsed(),
@@ -2077,9 +2111,11 @@ bool buildComparedWaveFileWvz4Streaming(const QString& leftPath,
     outWave.meta.timescale = (leftDirectory.meta.timescale == rightDirectory.meta.timescale)
         ? leftDirectory.meta.timescale
         : QStringLiteral("cycle");
-    const CompareCycleRange compareRange = makeCommonCompareCycleRange(leftDirectory.meta, rightDirectory.meta);
+    const CompareCycleRange compareRange = makeMaxCompareCycleRange(leftDirectory.meta, rightDirectory.meta);
+    const CompareCycleRange diffRange = makeOverlappedCompareCycleRange(leftDirectory.meta, rightDirectory.meta);
     outWave.meta.start = compareRange.start;
     outWave.meta.end = qMax(compareRange.end, outWave.meta.start + 1);
+    initializeCompareMeta(outWave.meta, leftPath, leftDirectory.meta, rightPath, rightDirectory.meta);
 
     if (progress) {
         progress->totalJobs.store(jobs.size(), std::memory_order_release);
@@ -2179,31 +2215,21 @@ bool buildComparedWaveFileWvz4Streaming(const QString& leftPath,
                 rightSig = &it.value();
             }
 
-            if (!compareRange.hasCommonRange) {
+            if (!diffRange.hasRange) {
                 diffRegions.clear();
-            } else if (leftSig && rightSig) {
-                diffRegions = computeSignalDiffRegions(*leftSig, *rightSig,
-                                                       compareRange.start, compareRange.end,
-                                                       compareRange.end, compareRange.end);
             } else {
-                diffRegions = makeFullCompareDiffRegions(compareRange.start, compareRange.end);
+                diffRegions = computeSignalDiffRegions(*leftSig, *rightSig,
+                                                       diffRange.start, diffRange.end,
+                                                       diffRange.end, diffRange.end);
             }
 
             if (!diffRegions.isEmpty()) {
                 const QString leftName = comparedSideFullPath(job.path, QStringLiteral("A"));
                 const QString rightName = comparedSideFullPath(job.path, QStringLiteral("B"));
-                if (leftSig && rightSig) {
-                    outWave.signalList.push_back(makeComparedSideSignal(leftName, *leftSig, nextSignalId++, diffRegions));
-                    outWave.signalList.push_back(makeComparedSideSignal(rightName, *rightSig, nextSignalId++, diffRegions));
-                } else if (leftSig) {
-                    outWave.signalList.push_back(makeComparedSideSignal(leftName, *leftSig, nextSignalId++, diffRegions));
-                    outWave.signalList.push_back(makeAbsentComparedSideSignal(rightName, *leftSig, nextSignalId++,
-                                                                              outWave.meta.start, diffRegions));
-                } else if (rightSig) {
-                    outWave.signalList.push_back(makeAbsentComparedSideSignal(leftName, *rightSig, nextSignalId++,
-                                                                              outWave.meta.start, diffRegions));
-                    outWave.signalList.push_back(makeComparedSideSignal(rightName, *rightSig, nextSignalId++, diffRegions));
-                }
+                outWave.signalList.push_back(makeComparedSideSignal(leftName, *leftSig, nextSignalId++, diffRegions,
+                                                                    leftDirectory.meta.start, leftDirectory.meta.end));
+                outWave.signalList.push_back(makeComparedSideSignal(rightName, *rightSig, nextSignalId++, diffRegions,
+                                                                    rightDirectory.meta.start, rightDirectory.meta.end));
                 if (progress) progress->outputSignalPairs.fetch_add(1, std::memory_order_relaxed);
                 ++batchOutputPairs;
             }
@@ -2423,8 +2449,8 @@ public:
 
         if (role == Qt::DisplayRole) {
             QString text = m_tree->nodeNameString(nodeId);
-            if (node.signalIndex >= 0 && node.width > 1) {
-                text += QStringLiteral("[%1:0]").arg(node.width - 1);
+            if (node.signalIndex >= 0) {
+                text = formatNameWidthBeforeCompareSuffix(text, node.width);
             }
             return text;
         }
@@ -2660,6 +2686,16 @@ protected:
             return;
         }
 
+        if (event && event->button() == Qt::LeftButton && m_suppressTextEditUntilRelease) {
+            m_suppressTextEditUntilRelease = false;
+            m_pressIndex = QModelIndex();
+            m_pressPos = QPoint();
+            m_pressOnDisclosure = false;
+            m_pressWasSelected = false;
+            QTreeView::mouseReleaseEvent(event);
+            return;
+        }
+
         const QModelIndex pressIndex = m_pressIndex;
         const QPoint pressPos = m_pressPos;
         const bool pressWasSelected = m_pressWasSelected;
@@ -2679,8 +2715,7 @@ protected:
     }
 
     void mouseDoubleClickEvent(QMouseEvent* event) override {
-        m_lastTextClickNodeId = -1;
-        m_lastTextClickMs = 0;
+        m_suppressTextEditUntilRelease = true;
         QTreeView::mouseDoubleClickEvent(event);
     }
 
@@ -2756,26 +2791,7 @@ protected:
 private:
     void maybeOpenTextEditorBySlowSecondClick(const QModelIndex& index, bool pressWasSelected) {
         if (!index.isValid() || index.column() != 0) return;
-        if (!pressWasSelected) {
-            rememberTextClick(index);
-            return;
-        }
-        const int nodeId = index.data(kTreeRoleNodeId).toInt();
-        const qint64 now = QDateTime::currentMSecsSinceEpoch();
-        const qint64 elapsed = (nodeId == m_lastTextClickNodeId) ? (now - m_lastTextClickMs) : 0;
-        const int fastDoubleClickMs = QApplication::doubleClickInterval();
-        if (nodeId == m_lastTextClickNodeId && elapsed > fastDoubleClickMs && elapsed < 2000) {
-            edit(index);
-            m_lastTextClickNodeId = -1;
-            m_lastTextClickMs = 0;
-            return;
-        }
-        rememberTextClick(index);
-    }
-
-    void rememberTextClick(const QModelIndex& index) {
-        m_lastTextClickNodeId = index.isValid() ? index.data(kTreeRoleNodeId).toInt() : -1;
-        m_lastTextClickMs = QDateTime::currentMSecsSinceEpoch();
+        if (pressWasSelected) edit(index);
     }
 
     QRect disclosureRectForIndex(const QModelIndex& index) const {
@@ -2867,8 +2883,7 @@ private:
     QPoint m_pressPos;
     bool m_pressOnDisclosure = false;
     bool m_pressWasSelected = false;
-    int m_lastTextClickNodeId = -1;
-    qint64 m_lastTextClickMs = 0;
+    bool m_suppressTextEditUntilRelease = false;
 };
 
     ValueRadix textToFormat(const QString& s) {
@@ -2995,12 +3010,14 @@ private:
 
     QString stripDisplayRangeSuffix(QString name) {
         name = name.trimmed();
-        if (!name.endsWith(QLatin1Char(']'))) return name;
+        const QString suffix = compareSideSuffix(name);
+        if (!suffix.isEmpty()) name.chop(suffix.size());
+        if (!name.endsWith(QLatin1Char(']'))) return name + suffix;
         const int open = name.lastIndexOf(QLatin1Char('['));
-        if (open <= 0) return name;
+        if (open <= 0) return name + suffix;
 
         const QString body = name.mid(open + 1, name.size() - open - 2).trimmed();
-        if (body.isEmpty()) return name;
+        if (body.isEmpty()) return name + suffix;
         bool ok = true;
         bool sawDigit = false;
         for (int i = 0; i < body.size(); ++i) {
@@ -3013,7 +3030,8 @@ private:
             ok = false;
             break;
         }
-        return (ok && sawDigit) ? name.left(open).trimmed() : name;
+        if (!(ok && sawDigit)) return name + suffix;
+        return name.left(open).trimmed() + suffix;
     }
 
     int literalWidthForValue(quint64 value) {
@@ -4170,13 +4188,11 @@ QString MainWindow::formatNameWithRange(int signalIndex) const {
 
     const WaveSignal& sig = m_wave.signalList.at(signalIndex);
     const QString name = signalDisplayName(signalIndex);
-    if (sig.width <= 1) return name;
-    return QString("%1[%2:0]").arg(name).arg(qMax(0, sig.width - 1));
+    return formatNameWidthBeforeCompareSuffix(name, sig.width);
 }
 
 QString MainWindow::formatNameWithRange(const WaveSignal& sig) const {
-    if (sig.width <= 1) return sig.name;
-    return QString("%1[%2:0]").arg(sig.name).arg(qMax(0, sig.width - 1));
+    return formatNameWidthBeforeCompareSuffix(sig.name, sig.width);
 }
 
 WaveFile MainWindow::materializeWaveSignalNames(const WaveFile& src) const {
@@ -4340,6 +4356,26 @@ void MainWindow::updateMetaLabel() {
     const QString rangeText = QStringLiteral("%1 ~ %2")
         .arg(formatInternalDisplayTime(m_wave.meta.start),
              formatInternalDisplayTime(m_wave.meta.end));
+    auto displayRangeText = [](qint64 start, qint64 end) {
+        return QStringLiteral("%1 ~ %2")
+            .arg(formatInternalDisplayTime(start),
+                 formatInternalDisplayTime(end));
+    };
+
+    QString title = QStringLiteral("Wave Viewer - Qt/C++");
+    if (m_wave.meta.hasCompareSources) {
+        title += QStringLiteral(" - %1 [%2] vs %3 [%4]")
+            .arg(m_wave.meta.compareLeftLabel,
+                 displayRangeText(m_wave.meta.compareLeftStart, m_wave.meta.compareLeftEnd),
+                 m_wave.meta.compareRightLabel,
+                 displayRangeText(m_wave.meta.compareRightStart, m_wave.meta.compareRightEnd));
+    } else if (!m_currentWaveFilePath.isEmpty()) {
+        title += QStringLiteral(" - %1 [%2]")
+            .arg(QFileInfo(m_currentWaveFilePath).fileName(), rangeText);
+    } else if (!m_wave.meta.title.isEmpty()) {
+        title += QStringLiteral(" - %1 [%2]").arg(m_wave.meta.title, rangeText);
+    }
+    setWindowTitle(title);
 
     if (m_metaLabel) {
         m_metaLabel->setText(rangeText);
@@ -5733,8 +5769,14 @@ void MainWindow::onTreeSearchTextChanged(const QString& text) {
 void MainWindow::onTreeIndexDoubleClicked(const QModelIndex& index) {
     if (!index.isValid()) return;
     const QVariant data = index.data(kTreeRoleSignalIndex);
-    if (!data.isValid()) return;
-    addSignalToActive(data.toInt());
+    if (data.isValid()) {
+        addSignalToActive(data.toInt());
+        return;
+    }
+    if (m_tree && m_treeModel && m_treeModel->hasChildren(index)) {
+        m_tree->setExpanded(index, !m_tree->isExpanded(index));
+        m_tree->viewport()->update();
+    }
 }
 
 

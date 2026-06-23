@@ -897,11 +897,14 @@ public:
             }
         }
 
-        if (diag_block_end >= 0 && submission.cycle >= diag_block_end) {
+        const i64 flush_cycle = (update_count == 0 && submission.cycle > 0)
+            ? (submission.cycle - 1)
+            : submission.cycle;
+        if (diag_block_end >= 0 && flush_cycle >= diag_block_end) {
             writer_diag_log_("writer-submit-before-flush", &submission, diag_block_end);
         }
-        if (!flush_until(submission.cycle, error)) return false;
-        if (diag_block_end >= 0 && submission.cycle >= diag_block_end) {
+        if (!flush_until(flush_cycle, error)) return false;
+        if (diag_block_end >= 0 && flush_cycle >= diag_block_end) {
             writer_diag_log_("writer-submit-after-flush", &submission, diag_block_end);
         }
 
@@ -961,6 +964,7 @@ public:
         }
         current_cycle_ = submission.cycle;
         have_submitted_cycle_ = true;
+        last_submission_empty_ = (update_count == 0);
         return true;
     }
 
@@ -970,8 +974,16 @@ public:
 
         bool ok = true;
         std::string local_error;
-        if (have_pending_content_) {
-            if (!commit_block(current_cycle_ + 1, local_error)) ok = false;
+        if (have_submitted_cycle_) {
+            if (current_cycle_ == std::numeric_limits<i64>::max()) {
+                local_error = "WVZ4 writer close failed: final cycle exceeds int64 range";
+                ok = false;
+            } else {
+                const i64 final_cycle = last_submission_empty_ ? current_cycle_ : (current_cycle_ + 1);
+                if (have_pending_content_ || static_cast<u64>(final_cycle) > current_block_start_) {
+                    if (!commit_block(final_cycle, local_error)) ok = false;
+                }
+            }
         }
         if (!stop_block_pipeline(local_error)) ok = false;
         if (ok && !write_footer_and_patch_header(local_error)) ok = false;
@@ -1934,6 +1946,17 @@ private:
             job.signal_chunk_id = chunk;
             job.first_signal_id = first_signal;
             job.signal_count = count;
+            build_block_payload(job);
+            jobs.push_back(std::move(job));
+        }
+        if (jobs.empty() && max_signal_id_ > 0) {
+            BlockJob job;
+            job.block_id = next_block_id_++;
+            job.start_cycle = block_index_.empty() ? 0 : static_cast<i64>(current_block_start_);
+            job.end_cycle = end_cycle;
+            job.signal_chunk_id = 0;
+            job.first_signal_id = 1;
+            job.signal_count = std::min<u32>(spc, max_signal_id_);
             build_block_payload(job);
             jobs.push_back(std::move(job));
         }
@@ -3449,6 +3472,15 @@ private:
     void build_block_payload(BlockJob& job) const {
         const std::vector<u64>* shared_times = shared_times_for_job(job);
         const bool default_delta = options_.enable_delta_time_encoding;
+        if (!signal_chunk_has_content(job.first_signal_id, job.signal_count)) {
+            std::vector<u8> best;
+            TileStats best_stats;
+            best.reserve(32);
+            build_block_payload_sparse(job, default_delta, false, NULL, best, best_stats);
+            job.raw_payload.swap(best);
+            job.stats = best_stats;
+            return;
+        }
 
         PayloadBuildMode best_mode = PayloadBuildMode::DenseDefault;
         std::size_t best_size = estimate_block_payload_dense_size(job, default_delta, false, NULL);
@@ -4296,6 +4328,7 @@ private:
         current_block_start_ = 0;
         current_cycle_ = 0;
         have_submitted_cycle_ = false;
+        last_submission_empty_ = false;
         next_block_id_ = 0;
         footer_offset_ = 0;
         update_state_scratch_.clear();
@@ -4344,6 +4377,7 @@ private:
     u64 current_block_start_ = 0;
     i64 current_cycle_ = 0;
     bool have_submitted_cycle_ = false;
+    bool last_submission_empty_ = false;
     u64 next_block_id_ = 0;
     u64 footer_offset_ = 0;
     PipelineState pipeline_;
@@ -5285,6 +5319,12 @@ private:
         if (!explicit_path.empty() && detail::file_exists(explicit_path)) return explicit_path;
 
         std::vector<std::string> candidates;
+        const std::string source_dir = detail::parent_dir(std::string(__FILE__));
+        if (!source_dir.empty()) {
+            candidates.push_back(detail::join_path(
+                detail::join_path(detail::join_path(source_dir, "tools"), "bin"),
+                "wvz4_writer_monitor.exe"));
+        }
         candidates.push_back("wvz4_writer_monitor.exe");
 #if defined(_DEBUG)
         candidates.push_back(detail::join_path("build_vs\\wvz4_writer_monitor\\Debug", "wvz4_writer_monitor.exe"));

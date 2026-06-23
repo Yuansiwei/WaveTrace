@@ -50,9 +50,9 @@ public:
         wvz4::WriterOptions options{};
 
         // Crash/kill resistant helper process. The high-level recorder always
-        // uses this path so a simulation crash/kill can still leave a finalized
-        // WVZ4 up to the last complete cycle frame received by the helper.
-        std::string writer_process_exe_path;
+        // uses the helper next to this WaveTracer source tree
+        // (tools/bin/wvz4_writer_monitor.exe) so business config does not need
+        // to provide a process path.
         unsigned int writer_process_connect_timeout_ms = 10000;
 
         // WVZ4 v4 synthetic periodic clock. Enabled by default. The clock is
@@ -135,6 +135,19 @@ public:
         bool ok = true;
         std::string local_error;
         if (writer_opened_) {
+            if (have_completed_cycle_ && last_completed_cycle_ == std::numeric_limits<wave::Cycle>::max()) {
+                local_error = "WVZ4 recorder close failed: final business cycle exceeds range";
+                ok = false;
+            } else if (have_completed_cycle_) {
+                wvz4::i64 final_cycle = 0;
+                if (!map_business_cycle_to_writer_cycle(last_completed_cycle_ + 1u, final_cycle, local_error)) {
+                    ok = false;
+                } else {
+                    wvz4::CycleSubmission final_marker;
+                    final_marker.cycle = final_cycle;
+                    if (!submit_to_writer(final_marker, local_error)) ok = false;
+                }
+            }
             if (!process_writer_.close(local_error)) ok = false;
         }
         reset_session_state();
@@ -168,7 +181,7 @@ public:
                                   layout,
                                   cfg_.options,
                                   error,
-                                  cfg_.writer_process_exe_path,
+                                  std::string(),
                                   cfg_.writer_process_connect_timeout_ms)) return false;
         writer_opened_ = true;
         ensure_frame_work_capacity_prepared();
@@ -234,9 +247,10 @@ public:
             submission_work_.updates.push_back(slot.update);
         }
 
-        bool ok = true;
-        if (!submission_work_.updates.empty()) {
-            ok = submit_to_writer(submission_work_, error);
+        const bool ok = submit_to_writer(submission_work_, error);
+        if (ok) {
+            last_completed_cycle_ = cycle;
+            have_completed_cycle_ = true;
         }
 
         clear_frame_work();
@@ -370,6 +384,8 @@ private:
     bool writer_opened_ = false;
     bool cycle_open_ = false;
     wave::Cycle current_cycle_ = 0;
+    wave::Cycle last_completed_cycle_ = 0;
+    bool have_completed_cycle_ = false;
     std::string last_error_;
 
     wvz4::WriterProcessClient process_writer_;
@@ -390,6 +406,8 @@ private:
         writer_opened_ = false;
         cycle_open_ = false;
         current_cycle_ = 0;
+        last_completed_cycle_ = 0;
+        have_completed_cycle_ = false;
         last_error_.clear();
         clear_frame_work();
         node_states_.clear();

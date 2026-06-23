@@ -374,7 +374,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    const wvz4::u64 end_marker_cycle = business_cycles * kWriterTicksPerBusinessCycle - 1u;
+    const wvz4::u64 end_marker_cycle = business_cycles * kWriterTicksPerBusinessCycle;
     wvz4::CycleSubmission end_marker;
     end_marker.cycle = static_cast<wvz4::i64>(end_marker_cycle);
     if (!helper_writer.submit_cycle(end_marker, error)) {

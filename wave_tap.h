@@ -19,6 +19,8 @@
 // cycle 0.
 //
 // WaveTap has no SystemC dependency and does not derive from sc_module.
+// If <systemc.h> is available, this header also provides SystemCStartSampler,
+// a tiny sc_module callback wrapper that samples once in start_of_simulation().
 
 #if defined(min)
 #pragma push_macro("min")
@@ -33,6 +35,16 @@
 
 #include "wave_path_wvz4_recorder.h"
 
+#if defined(__has_include)
+#if __has_include(<systemc.h>)
+#include <systemc.h>
+#define WAVE_TAP_HAS_SYSTEMC_ 1
+#endif
+#endif
+
+#if defined(WAVE_TAP_HAS_SYSTEMC_)
+#include <iostream>
+#endif
 #include <sstream>
 #include <string>
 
@@ -256,6 +268,27 @@ private:
     std::string last_error_;
 };
 
+#if defined(WAVE_TAP_HAS_SYSTEMC_)
+class SystemCStartSampler : public sc_core::sc_module {
+public:
+    SC_HAS_PROCESS(SystemCStartSampler);
+
+    SystemCStartSampler(sc_core::sc_module_name name, WaveTap& tap)
+        : sc_core::sc_module(name), tap_(&tap) {}
+
+    void start_of_simulation() override {
+        if (!tap_) return;
+        if (!tap_->sample_one_cycle()) {
+            std::cerr << "[wave] start_of_simulation sample failed: "
+                      << tap_->last_error() << "\n";
+        }
+    }
+
+private:
+    WaveTap* tap_;
+};
+#endif
+
 } // namespace wave
 
 #if defined(WAVE_TAP_RESTORE_MAX_MACRO_)
@@ -265,4 +298,8 @@ private:
 #if defined(WAVE_TAP_RESTORE_MIN_MACRO_)
 #pragma pop_macro("min")
 #undef WAVE_TAP_RESTORE_MIN_MACRO_
+#endif
+
+#if defined(WAVE_TAP_HAS_SYSTEMC_)
+#undef WAVE_TAP_HAS_SYSTEMC_
 #endif

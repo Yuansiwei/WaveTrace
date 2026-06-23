@@ -315,7 +315,7 @@ namespace {
 
     QRectF busRoundedFrameRect(const QRect& rect) {
         QRectF r(rect);
-        r.adjust(0.5, 0.5, -0.5, -0.5);
+        r.adjust(0.5, 0.5, 0.5, -0.5);
         if (r.width() < 1.0) r.setWidth(1.0);
         if (r.height() < 1.0) r.setHeight(1.0);
         return r;
@@ -1548,6 +1548,7 @@ int WaveCanvas::lastSampleIndexAtOrBefore(const WaveSignal& sig, int signalIndex
 WaveSample WaveCanvas::rawValueAtTime(int signalIndex, qint64 t) const {
     if (!m_wave || signalIndex < 0 || signalIndex >= m_wave->signalList.size()) { WaveSample s; s.isAbsent = true; s.value = waveAbsentValue(); return s; }
     const WaveSignal& sig = m_wave->signalList.at(signalIndex);
+    if (sig.hasVisibleRange && (t < sig.visibleStart || t >= sig.visibleEnd)) { WaveSample s; s.isAbsent = true; s.value = waveAbsentValue(); return s; }
     if (sig.samples.isEmpty()) { WaveSample s; s.isAbsent = true; s.value = waveAbsentValue(); return s; }
     if (t < sig.samples.first().time) { WaveSample s; s.isAbsent = true; s.value = waveAbsentValue(); return s; }
     const int idx = lastSampleIndexAtOrBefore(sig, signalIndex, t);
@@ -1786,6 +1787,9 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
         const int yHigh = yTop + 6;
         const int yLow = yTop + m_rowHeight - 6;
         const int yMid = yTop + m_rowHeight / 2;
+        const qint64 rowViewStart = sig.hasVisibleRange ? qMax(m_viewStart, sig.visibleStart) : m_viewStart;
+        const qint64 rowViewEnd = sig.hasVisibleRange ? qMin(m_viewEnd, sig.visibleEnd) : m_viewEnd;
+        const bool rowHasVisibleTime = rowViewEnd > rowViewStart;
 
         p.fillRect(QRect(0, yTop, width(), m_rowHeight), (absoluteRow % 2 == 0) ? QColor("#000000") : QColor("#080808"));
         const bool isSelectedRow = m_selectedEntryIndexes.contains(absoluteRow) || (absoluteRow == m_selectedEntryIndex);
@@ -1802,12 +1806,12 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
             const QColor diffFill = isSelectedRow ? QColor(255, 64, 64, 82) : QColor(255, 48, 48, 70);
             p.setPen(Qt::NoPen);
             p.setBrush(diffFill);
-            const int firstDiff = lowerDiffRegionByEnd(sig.diffRegions, m_viewStart);
+            const int firstDiff = lowerDiffRegionByEnd(sig.diffRegions, rowViewStart);
             for (int d = firstDiff; d < sig.diffRegions.size(); ++d) {
                 const WaveDiffRegion& region = sig.diffRegions.at(d);
-                if (region.start >= m_viewEnd) break;
-                const qint64 clippedStart = qMax(region.start, m_viewStart);
-                const qint64 clippedEnd = qMin(region.end, m_viewEnd);
+                if (region.start >= rowViewEnd) break;
+                const qint64 clippedStart = qMax(region.start, rowViewStart);
+                const qint64 clippedEnd = qMin(region.end, rowViewEnd);
                 if (clippedEnd <= clippedStart) continue;
                 const int x1 = fastX(clippedStart);
                 const int x2 = qMax(x1 + 1, fastX(clippedEnd));
@@ -1818,13 +1822,14 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
 
         p.setPen(QColor("#1A1A1A"));
         p.drawLine(0, yTop + m_rowHeight, width(), yTop + m_rowHeight);
+        if (!rowHasVisibleTime) continue;
 
         const int plotRight = plotRightPixel;
         const int plotWidth = plotSpanPx;
         const bool preferRawSamples = viewerDisableLodEnabled() ||
             (sig.samplesLoaded && !sig.samples.isEmpty() &&
              sig.samples.size() <= qMax(2000, plotWidth * 8));
-        if (!preferRawSamples) if (const WaveLodLevel* lodLevel = chooseLodLevelForViewport(sig, m_viewStart, m_viewEnd, spanValue, plotWidth)) {
+        if (!preferRawSamples) if (const WaveLodLevel* lodLevel = chooseLodLevelForViewport(sig, rowViewStart, rowViewEnd, spanValue, plotWidth)) {
             int selectedLodIndex = -1;
             for (int levelIndex = 0; levelIndex < sig.lodLevels.size(); ++levelIndex) {
                 if (&sig.lodLevels.at(levelIndex) == lodLevel) {
@@ -1834,7 +1839,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
             }
             if (selectedLodIndex < 0) selectedLodIndex = 0;
             logLodUse("select", sig, entry.signalIndex, absoluteRow,
-                      m_viewStart, m_viewEnd, m_viewStart, m_viewEnd,
+                      m_viewStart, m_viewEnd, rowViewStart, rowViewEnd,
                       selectedLodIndex, *lodLevel);
 
             if (!lodLevel->samples.isEmpty()) {
@@ -1891,7 +1896,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                         const WaveSample sample = rawValueAtTime(entry.signalIndex, start);
                         drawBusRoundedFrame(p, QRect(x1, yBusTop, x2 - x1, qMax(1, yBusBottom - yBusTop)),
                                             color, kWaveStrokeWidth, Qt::NoBrush,
-                                            start > m_viewStart, end < m_viewEnd);
+                                            start > rowViewStart, end < rowViewEnd);
                         const QRect textRect(x1 + 6, yTop + 3, qMax(1, x2 - x1 - 12), m_rowHeight - 6);
                         if (textRect.width() > 48) {
                             p.setPen(waveGreenText);
@@ -1931,7 +1936,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                         for (int i = firstIdx; i < lastExclusive; ++i) {
                             const WaveSample& sample = lodSamples.at(i);
                             const qint64 t0 = sample.time;
-                            const qint64 t1 = (i + 1 < lodSamples.size()) ? lodSamples.at(i + 1).time : fullEnd();
+                            const qint64 t1 = (i + 1 < lodSamples.size()) ? lodSamples.at(i + 1).time : visibleEnd;
                             const qint64 segStart = qMax(t0, visibleStart);
                             const qint64 segEnd = qMin(t1, visibleEnd);
                             if (segEnd <= segStart) continue;
@@ -1981,7 +1986,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                             QVector<int>& boundaryTarget = (kind == DenseMiniFrameKind::Absent) ? absentBoundaryXs :
                                 ((kind == DenseMiniFrameKind::Z) ? zBoundaryXs : knownBoundaryXs);
                             boundaryTarget.push_back(rect.left());
-                            boundaryTarget.push_back(rect.right());
+                            boundaryTarget.push_back(rect.left() + rect.width());
                         };
                         auto addBoundaryX = [&](int x, DenseMiniFrameKind kind) {
                             QVector<int>& target = (kind == DenseMiniFrameKind::Absent) ? absentBoundaryXs :
@@ -1997,7 +2002,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                             const QColor color = denseMiniFrameLineColor(kind);
                             drawBusRoundedFrame(p, QRect(x1, yBusTop, x2 - x1, qMax(1, yBusBottom - yBusTop)),
                                                 color, penWidth, Qt::NoBrush,
-                                                start > m_viewStart, end < m_viewEnd);
+                                                start > visibleStart, end < visibleEnd);
                             if (kind != DenseMiniFrameKind::Absent) {
                                 const QRect textRect(x1 + 6, yTop + 3, qMax(1, x2 - x1 - 12), m_rowHeight - 6);
                                 if (textRect.width() > 48) {
@@ -2091,15 +2096,15 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
 
                 const QVector<WaveLodValidRange> validRanges = effectiveLodValidRanges(*lodLevel);
                 if (validRanges.isEmpty()) {
-                    drawLodSampleRange(*lodLevel, m_viewStart, m_viewEnd);
+                    drawLodSampleRange(*lodLevel, rowViewStart, rowViewEnd);
                     continue;
                 }
 
                 bool drewLodRange = false;
-                qint64 cursor = m_viewStart;
+                qint64 cursor = rowViewStart;
                 for (const WaveLodValidRange& range : validRanges) {
-                    const qint64 clippedStart = qMax(range.start, m_viewStart);
-                    const qint64 clippedEnd = qMin(range.end, m_viewEnd);
+                    const qint64 clippedStart = qMax(range.start, rowViewStart);
+                    const qint64 clippedEnd = qMin(range.end, rowViewEnd);
                     if (clippedEnd <= clippedStart) continue;
                     if (cursor < clippedStart) {
                         drawFallbackLodRange(cursor, clippedStart, selectedLodIndex + 1);
@@ -2108,22 +2113,22 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     cursor = qMax(cursor, clippedEnd);
                     drewLodRange = true;
                 }
-                if (cursor < m_viewEnd) {
-                    drawFallbackLodRange(cursor, m_viewEnd, selectedLodIndex + 1);
+                if (cursor < rowViewEnd) {
+                    drawFallbackLodRange(cursor, rowViewEnd, selectedLodIndex + 1);
                 }
                 if (!drewLodRange) {
-                    drawFallbackLodRange(m_viewStart, m_viewEnd, selectedLodIndex + 1);
+                    drawFallbackLodRange(rowViewStart, rowViewEnd, selectedLodIndex + 1);
                 }
                 continue;
             }
 
             const QVector<WaveLodBucket>& buckets = lodLevel->buckets;
             logLodUse("draw-buckets", sig, entry.signalIndex, absoluteRow,
-                      m_viewStart, m_viewEnd, m_viewStart, m_viewEnd,
+                      m_viewStart, m_viewEnd, rowViewStart, rowViewEnd,
                       selectedLodIndex, *lodLevel);
-            int lodIndex = lowerLodBucketByEnd(buckets, m_viewStart);
+            int lodIndex = lowerLodBucketByEnd(buckets, rowViewStart);
             quint64 currentRaw = (lodIndex > 0) ? buckets.at(lodIndex - 1).lastRawBits : 0ull;
-            qint64 cursor = m_viewStart;
+            qint64 cursor = rowViewStart;
 
             auto drawBitMaskRange = [&](quint8 mask, qint64 start, qint64 end) {
                 if (end <= start || mask == 0u) return;
@@ -2173,7 +2178,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                 if (!pixelSpanForTimeRange(start, end, false, x1, x2)) return;
                 drawBusRoundedFrame(p, QRect(x1, yBusTop, x2 - x1, qMax(1, yBusBottom - yBusTop)),
                                     lodActivityLineColor, kWaveStrokeWidth, Qt::NoBrush,
-                                    start > m_viewStart, end < m_viewEnd);
+                                    start > rowViewStart, end < rowViewEnd);
                 const QRect textRect(x1 + 6, yTop + 3, qMax(1, x2 - x1 - 12), m_rowHeight - 6);
                 if (textRect.width() > 48) {
                     p.setPen(waveGreenText);
@@ -2190,13 +2195,13 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     const QRect rect(x1, yBusTop, x2 - x1, qMax(1, yBusBottom - yBusTop));
                     lodActivityMiniRects.push_back(rect);
                     lodActivityBoundaryXs.push_back(rect.left());
-                    lodActivityBoundaryXs.push_back(rect.right());
+                    lodActivityBoundaryXs.push_back(rect.left() + rect.width());
                     return;
                 }
                 drawBusRoundedFrame(p, QRect(x1, yBusTop, x2 - x1, qMax(1, yBusBottom - yBusTop)),
                                     lodActivityLineColor,
                                     kWaveStrokeWidth, QBrush(lodActivityFillColor),
-                                    start > m_viewStart, end < m_viewEnd);
+                                    start > rowViewStart, end < rowViewEnd);
                 const QRect textRect(x1 + 4, yTop + 3, qMax(1, x2 - x1 - 8), m_rowHeight - 6);
                 if (textRect.width() > 76) {
                     const QString text = QStringLiteral("%1..%2")
@@ -2212,16 +2217,16 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                 else drawBusStableRange(rawBits, start, end);
             };
 
-            while (lodIndex < buckets.size() && cursor < m_viewEnd) {
+            while (lodIndex < buckets.size() && cursor < rowViewEnd) {
                 const WaveLodBucket& bucket = buckets.at(lodIndex);
-                if (bucket.start >= m_viewEnd) break;
+                if (bucket.start >= rowViewEnd) break;
                 if (bucket.start > cursor) {
-                    drawStableRange(currentRaw, cursor, qMin(bucket.start, m_viewEnd));
-                    cursor = qMin(bucket.start, m_viewEnd);
+                    drawStableRange(currentRaw, cursor, qMin(bucket.start, rowViewEnd));
+                    cursor = qMin(bucket.start, rowViewEnd);
                 }
                 if (bucket.end > cursor) {
-                    const qint64 segStart = qMax(cursor, qMax(bucket.start, m_viewStart));
-                    const qint64 segEnd = qMin(bucket.end, m_viewEnd);
+                    const qint64 segStart = qMax(cursor, qMax(bucket.start, rowViewStart));
+                    const qint64 segEnd = qMin(bucket.end, rowViewEnd);
                     if (segEnd > segStart) {
                         if (sig.kind == SignalKind::Bit) {
                             quint8 mask = bucket.stateMask;
@@ -2235,13 +2240,13 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                             else drawBusStableRange(bucket.lastRawBits, segStart, segEnd);
                         }
                     }
-                    cursor = qMax(cursor, qMin(bucket.end, m_viewEnd));
+                    cursor = qMax(cursor, qMin(bucket.end, rowViewEnd));
                 }
                 currentRaw = bucket.lastRawBits;
                 ++lodIndex;
             }
-            if (cursor < m_viewEnd) {
-                drawStableRange(currentRaw, cursor, m_viewEnd);
+            if (cursor < rowViewEnd) {
+                drawStableRange(currentRaw, cursor, rowViewEnd);
             }
             drawMergedDenseBusMiniRects(p, lodActivityMiniRects, lodActivityLineColor,
                                         lodActivityFillColor, kWaveStrokeWidth);
@@ -2251,8 +2256,8 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
 
         if (sig.samples.isEmpty()) continue;
 
-        const int firstIdx = qMax(0, lowerIndexForTime(sig.samples, m_viewStart) - 1);
-        int lastExclusive = lowerIndexForTime(sig.samples, m_viewEnd + 1);
+        const int firstIdx = qMax(0, lowerIndexForTime(sig.samples, rowViewStart) - 1);
+        int lastExclusive = lowerIndexForTime(sig.samples, rowViewEnd + 1);
         if (lastExclusive <= firstIdx) lastExclusive = qMin(sig.samples.size(), firstIdx + 1);
 
         if (sig.kind == SignalKind::Bit) {
@@ -2263,7 +2268,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                 const int yBitBottom = yLow + 1;
                 DenseWaveBlockSets denseBlocks;
                 QVector<int> sampled = collectBitAlternatingSampleIndicesForWindow(
-                    sig, entry.signalIndex, m_viewStart, m_viewEnd, qMax(64, plotWidth * 3));
+                    sig, entry.signalIndex, rowViewStart, rowViewEnd, qMax(64, plotWidth * 3));
                 std::sort(sampled.begin(), sampled.end());
                 sampled.erase(std::unique(sampled.begin(), sampled.end()), sampled.end());
                 denseBlocks.reserve(sampled.size());
@@ -2273,13 +2278,13 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     if (i < firstIdx || i >= lastExclusive) continue;
                     const WaveSample& sample = sig.samples.at(i);
                     const qint64 t0 = sample.time;
-                    qint64 t1 = m_viewEnd;
+                    qint64 t1 = rowViewEnd;
                     if (s + 1 < sampled.size()) t1 = sig.samples.at(sampled.at(s + 1)).time;
                     else if (i + 1 < sig.samples.size()) t1 = sig.samples.at(i + 1).time;
-                    else t1 = fullEnd();
+                    else t1 = rowViewEnd;
 
-                    const qint64 segStart = qMax(t0, m_viewStart);
-                    const qint64 segEnd = qMin(qMax(t1, t0 + 1), m_viewEnd);
+                    const qint64 segStart = qMax(t0, rowViewStart);
+                    const qint64 segEnd = qMin(qMax(t1, t0 + 1), rowViewEnd);
                     if (segEnd <= segStart) continue;
 
                     const QChar state = classifyBitStateChar(sample);
@@ -2328,9 +2333,9 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
 
                 for (int i = firstIdx; i < lastExclusive; ++i) {
                     const qint64 t0 = sig.samples.at(i).time;
-                    const qint64 t1 = (i + 1 < sig.samples.size()) ? sig.samples.at(i + 1).time : fullEnd();
-                    const qint64 segStart = qMax(t0, m_viewStart);
-                    const qint64 segEnd = qMin(t1, m_viewEnd);
+                    const qint64 t1 = (i + 1 < sig.samples.size()) ? sig.samples.at(i + 1).time : rowViewEnd;
+                    const qint64 segStart = qMax(t0, rowViewStart);
+                    const qint64 segEnd = qMin(t1, rowViewEnd);
                     if (segEnd <= segStart) continue;
 
                     const QChar state = classifyBitStateChar(sig.samples.at(i));
@@ -2345,7 +2350,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     else if (state == QLatin1Char('1')) markHorizontal(highDiff, x1, x2);
                     else markHorizontal(lowDiff, x1, x2);
 
-                    if (i > 0 && t0 >= m_viewStart && t0 <= m_viewEnd) {
+                    if (i > 0 && t0 >= rowViewStart && t0 <= rowViewEnd) {
                         const QChar prevState = classifyBitStateChar(sig.samples.at(i - 1));
                         const int py = bitYForState(prevState);
                         if (py != y || prevState != state) {
@@ -2389,13 +2394,13 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                                 continue;
                             }
                             if (style == Qt::SolidLine) {
-                                const int rightX = plotLeft + qMax(runStart, endX - 1);
+                                const int rightX = plotLeft + endX;
                                 validateBitHorizontalPrimitive(context, entry.signalIndex, absoluteRow,
                                                                plotLeft + runStart, rightX,
                                                                y, yHigh, yLow, yMid);
                                 drawHorizontalPixelBlock(p, plotLeft + runStart, rightX, y, color);
                             } else {
-                                const int rightX = plotLeft + qMax(runStart, endX - 1);
+                                const int rightX = plotLeft + endX;
                                 validateBitHorizontalPrimitive(context, entry.signalIndex, absoluteRow,
                                                                plotLeft + runStart, rightX,
                                                                y, yHigh, yLow, yMid);
@@ -2465,9 +2470,9 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
 
                 for (int i = firstIdx; i < lastExclusive; ++i) {
                     const qint64 t0 = sig.samples.at(i).time;
-                    const qint64 t1 = (i + 1 < sig.samples.size()) ? sig.samples.at(i + 1).time : fullEnd();
-                    const qint64 segStart = qMax(t0, m_viewStart);
-                    const qint64 segEnd = qMin(qMax(t1, t0 + 1), m_viewEnd);
+                    const qint64 t1 = (i + 1 < sig.samples.size()) ? sig.samples.at(i + 1).time : rowViewEnd;
+                    const qint64 segStart = qMax(t0, rowViewStart);
+                    const qint64 segEnd = qMin(qMax(t1, t0 + 1), rowViewEnd);
                     if (segEnd <= segStart) continue;
 
                     const WaveSample& curSample = sig.samples.at(i);
@@ -2477,7 +2482,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     const int x2 = fastX(segEnd);
                     if (x2 <= x1) continue;
                     const QRect frameRect(x1, yBusTop, x2 - x1, qMax(1, yBusBottom - yBusTop));
-                    const BusFrame frame{ frameRect, t0 > m_viewStart, t1 < m_viewEnd };
+                    const BusFrame frame{ frameRect, t0 > rowViewStart, t1 < rowViewEnd };
 
                     if (isAbsent) {
                         absentRects.push_back(frame);
@@ -2503,7 +2508,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
             }
             else {
                 const QVector<int> sampled = collectSampleIndicesForWindow(
-                    sig, entry.signalIndex, m_viewStart, m_viewEnd, targetRawBusSamplesForPlotWidth(plotWidth));
+                    sig, entry.signalIndex, rowViewStart, rowViewEnd, targetRawBusSamplesForPlotWidth(plotWidth));
                 QVector<BusFrame> knownFrames;
                 QVector<BusFrame> zFrames;
                 QVector<BusFrame> absentRects;
@@ -2551,21 +2556,21 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                 for (int s = 0; s < sampled.size(); ++s) {
                     const int i = sampled.at(s);
                     const qint64 t0 = sig.samples.at(i).time;
-                    qint64 t1 = m_viewEnd;
+                    qint64 t1 = rowViewEnd;
                     if (s + 1 < sampled.size()) t1 = sig.samples.at(sampled.at(s + 1)).time;
                     else if (i + 1 < sig.samples.size()) t1 = sig.samples.at(i + 1).time;
-                    else t1 = fullEnd();
-                    const qint64 segStart = qMax(t0, m_viewStart);
-                    const qint64 segEnd = qMin(qMax(t1, t0 + 1), m_viewEnd);
+                    else t1 = rowViewEnd;
+                    const qint64 segStart = qMax(t0, rowViewStart);
+                    const qint64 segEnd = qMin(qMax(t1, t0 + 1), rowViewEnd);
                     if (segEnd <= segStart) continue;
                     const int x1 = fastX(segStart);
                     const int x2 = fastX(segEnd);
                     const WaveSample& curSample = sig.samples.at(i);
                     const DenseMiniFrameKind kind = sampleIsAbsentState(curSample) ? DenseMiniFrameKind::Absent :
                         (sampleContainsUnknownState(curSample) ? DenseMiniFrameKind::Z : DenseMiniFrameKind::Known);
-                    const bool drawLeftEdge = t0 > m_viewStart;
-                    const bool drawRightEdge = t1 < m_viewEnd;
-                    addFrameBoundaryXs(x1, qMax(x1, x2 - 1), drawLeftEdge, drawRightEdge, kind);
+                    const bool drawLeftEdge = t0 > rowViewStart;
+                    const bool drawRightEdge = t1 < rowViewEnd;
+                    addFrameBoundaryXs(x1, qMax(x1, x2), drawLeftEdge, drawRightEdge, kind);
                     if (x2 <= x1) continue;
                     const QRect frameRect(x1, yBusTop, x2 - x1, qMax(1, yBusBottom - yBusTop));
                     const BusFrame frame{ frameRect, drawLeftEdge, drawRightEdge };

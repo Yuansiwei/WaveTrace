@@ -89,6 +89,11 @@ struct WaveSignal {
     // Optional compare-mode overlay. Each interval marks a time span where the
     // paired waveform has a different value. Empty means normal waveform mode.
     QVector<WaveDiffRegion> diffRegions;
+    // Optional render-only time window. Compare views use this to leave one
+    // side blank outside that file's own cycle range without inserting absent samples.
+    bool hasVisibleRange = false;
+    qint64 visibleStart = 0;
+    qint64 visibleEnd = 0;
     // Derived cache for fast navigation. Contains times where samples[i] differs from samples[i-1].
     QVector<qint64> changeTimes;
     bool changeTimesReady = false;
@@ -121,6 +126,15 @@ struct WaveMeta {
     QString timescale = "1ns";
     qint64 start = 0;
     qint64 end = 100;
+    bool hasCompareSources = false;
+    QString compareLeftLabel;
+    QString compareLeftPath;
+    qint64 compareLeftStart = 0;
+    qint64 compareLeftEnd = 0;
+    QString compareRightLabel;
+    QString compareRightPath;
+    qint64 compareRightStart = 0;
+    qint64 compareRightEnd = 0;
 };
 
 struct WaveFile {
