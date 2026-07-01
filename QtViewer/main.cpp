@@ -845,6 +845,204 @@ static int runLodVisualCompare(QApplication& app, const QStringList& args) {
     return 0;
 }
 
+static int runLodVisualCompareFiles(QApplication& app, const QStringList& args) {
+    if (args.size() < 5) {
+        return 2;
+    }
+
+    const QString rawPath = args.at(2);
+    const QString lodPath = args.at(3);
+    const QString outDirPath = args.at(4);
+    const int requestedSignals = (args.size() >= 6) ? qMax(1, args.at(5).toInt()) : 6;
+    const int steps = (args.size() >= 7) ? qMax(0, args.at(6).toInt()) : 10;
+    const int width = (args.size() >= 8) ? qMax(320, args.at(7).toInt()) : 1600;
+    const int rowHeight = 44;
+    const int height = (args.size() >= 9)
+        ? qMax(240, args.at(8).toInt())
+        : qMax(360, 92 + requestedSignals * rowHeight);
+    const quint64 maxDecodedSamples = (args.size() >= 10)
+        ? qMax<quint64>(0ull, args.at(9).toULongLong())
+        : 300ull * 1000ull * 1000ull;
+
+    QDir outDir(outDirPath);
+    if (!outDir.exists() && !QDir().mkpath(outDirPath)) {
+        return 3;
+    }
+
+    WaveFile rawWave;
+    WaveFile lodWave;
+    QString rawError;
+    QString lodError;
+    QElapsedTimer rawLoadTimer;
+    rawLoadTimer.start();
+    if (!loadWaveForCaptureTool(rawPath, rawWave, rawError, requestedSignals, maxDecodedSamples)) {
+        QFile errorFile(outDir.filePath(QStringLiteral("lod_visual_compare_files_error.txt")));
+        if (errorFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QTextStream stream(&errorFile);
+            stream << "raw load failed: " << rawError << "\n";
+        }
+        return 4;
+    }
+    const qint64 rawLoadMs = rawLoadTimer.elapsed();
+
+    QElapsedTimer lodLoadTimer;
+    lodLoadTimer.start();
+    if (!loadWaveForCaptureTool(lodPath, lodWave, lodError, requestedSignals, maxDecodedSamples)) {
+        QFile errorFile(outDir.filePath(QStringLiteral("lod_visual_compare_files_error.txt")));
+        if (errorFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QTextStream stream(&errorFile);
+            stream << "lod load failed: " << lodError << "\n";
+        }
+        return 5;
+    }
+    const qint64 lodLoadMs = lodLoadTimer.elapsed();
+
+    QVector<ActiveSignalRef> rawEntries;
+    QVector<ActiveSignalRef> lodEntries;
+    QStringList matchedNames;
+    for (int rawIndex = 0; rawIndex < rawWave.signalList.size() && rawEntries.size() < requestedSignals; ++rawIndex) {
+        const WaveSignal& rawSig = rawWave.signalList.at(rawIndex);
+        if (rawSig.samples.isEmpty() && rawSig.lodLevels.isEmpty()) continue;
+
+        const QString rawName = benchmarkSignalName(rawWave, rawIndex);
+        int lodIndex = -1;
+        for (int i = 0; i < lodWave.signalList.size(); ++i) {
+            const WaveSignal& candidate = lodWave.signalList.at(i);
+            if (candidate.samples.isEmpty() && candidate.lodLevels.isEmpty()) continue;
+            if (benchmarkSignalName(lodWave, i) == rawName) {
+                lodIndex = i;
+                break;
+            }
+        }
+        if (lodIndex < 0) continue;
+
+        ActiveSignalRef rawRef;
+        rawRef.signalIndex = rawIndex;
+        rawRef.format = rawSig.defaultRadix;
+        rawEntries.push_back(rawRef);
+
+        ActiveSignalRef lodRef;
+        lodRef.signalIndex = lodIndex;
+        lodRef.format = lodWave.signalList.at(lodIndex).defaultRadix;
+        lodEntries.push_back(lodRef);
+        matchedNames.push_back(rawName);
+    }
+
+    if (rawEntries.isEmpty()) {
+        QFile errorFile(outDir.filePath(QStringLiteral("lod_visual_compare_files_error.txt")));
+        if (errorFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QTextStream stream(&errorFile);
+            stream << "no matched drawable signals\n";
+        }
+        return 6;
+    }
+
+    WaveCanvas rawCanvas;
+    WaveCanvas lodCanvas;
+    rawCanvas.resize(width, height);
+    lodCanvas.resize(width, height);
+    rawCanvas.setWave(&rawWave);
+    lodCanvas.setWave(&lodWave);
+    rawCanvas.setVisibleEntries(rawEntries);
+    lodCanvas.setVisibleEntries(lodEntries);
+    rawCanvas.setVisibleEntryWindow(0, rawEntries.size());
+    lodCanvas.setVisibleEntryWindow(0, lodEntries.size());
+    rawCanvas.show();
+    lodCanvas.show();
+    processEventsFor(app, 80);
+
+    QFile csv(outDir.filePath(QStringLiteral("lod_visual_compare_files.csv")));
+    if (!csv.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        return 7;
+    }
+    QTextStream stream(&csv);
+    stream << "metric,value\n";
+    stream << "raw_file," << csvField(QFileInfo(rawPath).fileName()) << "\n";
+    stream << "lod_file," << csvField(QFileInfo(lodPath).fileName()) << "\n";
+    stream << "raw_file_bytes," << QFileInfo(rawPath).size() << "\n";
+    stream << "lod_file_bytes," << QFileInfo(lodPath).size() << "\n";
+    stream << "raw_load_ms," << rawLoadMs << "\n";
+    stream << "lod_load_ms," << lodLoadMs << "\n";
+    stream << "matched_visible_signals," << rawEntries.size() << "\n";
+    stream << "canvas_width," << width << "\n";
+    stream << "canvas_height," << height << "\n";
+    stream << "steps," << (steps + 1) << "\n\n";
+    stream << "matched_signal,name\n";
+    for (int i = 0; i < matchedNames.size(); ++i) {
+        stream << i << "," << csvField(matchedNames.at(i)) << "\n";
+    }
+    stream << "\n";
+    stream << "step,view_start,view_end,view_span,exact_diff_pixels,total_pixels,exact_diff_ratio,"
+           << "active_raw,active_lod,active_both,active_union,active_jaccard,"
+           << "active_only_raw,active_miss_ratio,active_only_lod,active_extra_ratio,avg_abs_rgb_delta,"
+           << "raw_image,lod_image,diff_image\n";
+
+    LodVisualCompareMetrics worst;
+    bool haveWorst = false;
+    QElapsedTimer renderTimer;
+    renderTimer.start();
+    for (int step = 0; step <= steps; ++step) {
+        processEventsFor(app, 40);
+        QImage rawImage = renderCanvasImage(rawCanvas);
+        QImage lodImage = renderCanvasImage(lodCanvas);
+        QImage diffImage;
+        const qint64 viewStart = rawCanvas.viewStart();
+        const qint64 viewEnd = rawCanvas.viewEnd();
+        LodVisualCompareMetrics metrics = compareRenderedImages(rawImage, lodImage, step, viewStart, viewEnd, &diffImage);
+
+        const QString rawName = QStringLiteral("raw_file_%1.png").arg(step, 2, 10, QLatin1Char('0'));
+        const QString lodName = QStringLiteral("lod_file_%1.png").arg(step, 2, 10, QLatin1Char('0'));
+        const QString diffName = QStringLiteral("diff_file_%1.png").arg(step, 2, 10, QLatin1Char('0'));
+        rawImage.save(outDir.filePath(rawName));
+        lodImage.save(outDir.filePath(lodName));
+        diffImage.save(outDir.filePath(diffName));
+
+        stream << metrics.step << ","
+               << metrics.viewStart << ","
+               << metrics.viewEnd << ","
+               << metrics.viewSpan << ","
+               << metrics.exactDifferentPixels << ","
+               << metrics.totalPixels << ","
+               << metrics.exactDiffRatio << ","
+               << metrics.activeRawPixels << ","
+               << metrics.activeLodPixels << ","
+               << metrics.activeBothPixels << ","
+               << metrics.activeUnionPixels << ","
+               << metrics.activeJaccard << ","
+               << metrics.activeOnlyRawPixels << ","
+               << metrics.activeMissRatio << ","
+               << metrics.activeOnlyLodPixels << ","
+               << metrics.activeExtraRatio << ","
+               << metrics.avgAbsRgbDelta << ","
+               << csvField(rawName) << ","
+               << csvField(lodName) << ","
+               << csvField(diffName) << "\n";
+
+        if (!haveWorst || metrics.activeJaccard < worst.activeJaccard) {
+            worst = metrics;
+            haveWorst = true;
+        }
+
+        if (step < steps) {
+            rawCanvas.zoomByFactor(0.70);
+            lodCanvas.zoomByFactor(0.70);
+            processEventsFor(app, 120);
+        }
+    }
+
+    stream << "\n";
+    stream << "summary_metric,value\n";
+    stream << "render_compare_ms," << renderTimer.elapsed() << "\n";
+    if (haveWorst) {
+        stream << "worst_step," << worst.step << "\n";
+        stream << "worst_active_jaccard," << worst.activeJaccard << "\n";
+        stream << "worst_active_miss_ratio," << worst.activeMissRatio << "\n";
+        stream << "worst_active_extra_ratio," << worst.activeExtraRatio << "\n";
+        stream << "worst_exact_diff_ratio," << worst.exactDiffRatio << "\n";
+    }
+    return 0;
+}
+
 static int runZoomCaptureSequence(QApplication& app, const QStringList& args) {
     if (args.size() < 4) {
         return 2;
@@ -949,6 +1147,11 @@ int main(int argc, char *argv[]) {
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--lod-visual-compare")) {
         qputenv("WV_VIEWER_STRICT_RENDER_CHECKS", QByteArray("1"));
         return runLodVisualCompare(a, args);
+    }
+
+    if (args.size() >= 2 && args.at(1) == QStringLiteral("--lod-visual-compare-files")) {
+        qputenv("WV_VIEWER_STRICT_RENDER_CHECKS", QByteArray("1"));
+        return runLodVisualCompareFiles(a, args);
     }
 
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--dump-signal-head")) {

@@ -2024,31 +2024,44 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                             addMiniRect(QRect(x1, yBusTop, x2 - x1, qMax(1, yBusBottom - yBusTop)), kind);
                         };
 
-                        WaveSample rawAnchorSample;
-                        const WaveSample* currentSample = nullptr;
-                        if (sig.samplesLoaded && !sig.samples.isEmpty()) {
-                            rawAnchorSample = rawValueAtTime(entry.signalIndex, visibleStart);
-                            if (!sampleIsAbsentState(rawAnchorSample)) currentSample = &rawAnchorSample;
-                        }
-                        qint64 cursor = visibleStart;
-                        for (int i = firstIdx; i < lastExclusive && cursor < visibleEnd; ++i) {
-                            const WaveSample& sample = lodSamples.at(i);
-                            const qint64 winStart = lodSampleWindowStart(sample.time, lodBucketCycles);
-                            const qint64 winEnd = lodSampleWindowEnd(winStart, lodBucketCycles);
-                            if (winEnd <= visibleStart) {
-                                currentSample = &sample;
-                                continue;
+                        const int lodVisibleCount = lastExclusive - firstIdx;
+                        const bool lodDenseByPixel = lodVisibleCount > qMax(1, plotWidth);
+                        if (!lodDenseByPixel) {
+                            for (int i = firstIdx; i < lastExclusive; ++i) {
+                                const WaveSample& sample = lodSamples.at(i);
+                                const qint64 t0 = sample.time;
+                                const qint64 t1 = (i + 1 < lodSamples.size()) ? lodSamples.at(i + 1).time : visibleEnd;
+                                const qint64 segStart = qMax(t0, visibleStart);
+                                const qint64 segEnd = qMin(qMax(t1, t0 + 1), visibleEnd);
+                                drawBusStableSampleRange(&sample, segStart, segEnd);
                             }
-                            if (winStart >= visibleEnd) break;
-                            const qint64 activeStart = qMax(winStart, visibleStart);
-                            const qint64 activeEnd = qMin(winEnd, visibleEnd);
-                            if (cursor < activeStart) drawBusStableSampleRange(currentSample, cursor, activeStart);
-                            const qint64 drawStart = qMax(activeStart, cursor);
-                            if (activeEnd > drawStart) drawBusActivityWindow(sample, drawStart, activeEnd);
-                            currentSample = &sample;
-                            cursor = qMax(cursor, activeEnd);
+                        } else {
+                            WaveSample rawAnchorSample;
+                            const WaveSample* currentSample = nullptr;
+                            if (sig.samplesLoaded && !sig.samples.isEmpty()) {
+                                rawAnchorSample = rawValueAtTime(entry.signalIndex, visibleStart);
+                                if (!sampleIsAbsentState(rawAnchorSample)) currentSample = &rawAnchorSample;
+                            }
+                            qint64 cursor = visibleStart;
+                            for (int i = firstIdx; i < lastExclusive && cursor < visibleEnd; ++i) {
+                                const WaveSample& sample = lodSamples.at(i);
+                                const qint64 winStart = lodSampleWindowStart(sample.time, lodBucketCycles);
+                                const qint64 winEnd = lodSampleWindowEnd(winStart, lodBucketCycles);
+                                if (winEnd <= visibleStart) {
+                                    currentSample = &sample;
+                                    continue;
+                                }
+                                if (winStart >= visibleEnd) break;
+                                const qint64 activeStart = qMax(winStart, visibleStart);
+                                const qint64 activeEnd = qMin(winEnd, visibleEnd);
+                                if (cursor < activeStart) drawBusStableSampleRange(currentSample, cursor, activeStart);
+                                const qint64 drawStart = qMax(activeStart, cursor);
+                                if (activeEnd > drawStart) drawBusActivityWindow(sample, drawStart, activeEnd);
+                                currentSample = &sample;
+                                cursor = qMax(cursor, activeEnd);
+                            }
+                            if (cursor < visibleEnd) drawBusStableSampleRange(currentSample, cursor, visibleEnd);
                         }
-                        if (cursor < visibleEnd) drawBusStableSampleRange(currentSample, cursor, visibleEnd);
                         drawMergedDenseBusMiniRects(p, knownMiniRects, denseMiniFrameLineColor(DenseMiniFrameKind::Known),
                                                     denseMiniFrameFillColor(DenseMiniFrameKind::Known), kWaveStrokeWidth);
                         drawMergedDenseBusMiniRects(p, zMiniRects, denseMiniFrameLineColor(DenseMiniFrameKind::Z),

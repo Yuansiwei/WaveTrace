@@ -22,6 +22,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <Profile Condition="'$(EnableVsProfile)'=='true'">true</Profile>
     </Link>
   </ItemDefinitionGroup>
 
@@ -42,6 +43,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <Profile Condition="'$(EnableVsProfile)'=='true'">true</Profile>
     </Link>
   </ItemDefinitionGroup>
 </Project>

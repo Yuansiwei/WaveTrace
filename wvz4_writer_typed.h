@@ -1182,6 +1182,9 @@ private:
         u64 raw_transition_count = 0;
         bool has_residual_pending = false;
         Transition residual_pending_transition;
+        i64 residual_pending_base_window_start = 0;
+        i64 residual_pending_base_window_end = 0;
+        i64 residual_pending_coarsest_window_end = 0;
         std::vector<LodLevelState> levels;
     };
 
@@ -1357,6 +1360,42 @@ private:
         return static_cast<i64>(ustart + span);
     }
 
+    static u64 residual_lod_fixed_span(std::size_t level) {
+        switch (level) {
+        case 0: return 10ull;
+        case 1: return 100ull;
+        case 2: return 1000ull;
+        case 3: return 10000ull;
+        case 4: return 100000ull;
+        case 5: return 1000000ull;
+        case 6: return 10000000ull;
+        default: return 0ull;
+        }
+    }
+
+    static i64 residual_lod_fixed_window_start(i64 cycle, std::size_t level) {
+        if (cycle <= 0) return 0;
+        const u64 ucycle = static_cast<u64>(cycle);
+        u64 start = 0;
+        switch (level) {
+        case 0: start = (ucycle / 10ull) * 10ull; break;
+        case 1: start = (ucycle / 100ull) * 100ull; break;
+        case 2: start = (ucycle / 1000ull) * 1000ull; break;
+        case 3: start = (ucycle / 10000ull) * 10000ull; break;
+        case 4: start = (ucycle / 100000ull) * 100000ull; break;
+        case 5: start = (ucycle / 1000000ull) * 1000000ull; break;
+        case 6: start = (ucycle / 10000000ull) * 10000000ull; break;
+        default: return 0;
+        }
+        const u64 imax = static_cast<u64>((std::numeric_limits<i64>::max)());
+        return static_cast<i64>((std::min)(start, imax));
+    }
+
+    static i64 residual_lod_fixed_window_end(i64 window_start, std::size_t level) {
+        const u64 span = residual_lod_fixed_span(level);
+        return lod_sampling_window_end(window_start, span);
+    }
+
     static void close_lod_valid_range(LodLevelState& lod_level) {
         if (!lod_level.has_open_valid_range) return;
         if (lod_level.open_valid_end > lod_level.open_valid_start) {
@@ -1482,6 +1521,40 @@ private:
         have_pending_content_ = true;
     }
 
+    void set_residual_lod_pending(LodStorageState& storage, const Transition& transition) {
+        const bool had_pending = storage.has_residual_pending;
+        storage.residual_pending_transition = transition;
+        storage.has_residual_pending = true;
+        if (storage.levels.empty()) {
+            storage.residual_pending_base_window_start = 0;
+            storage.residual_pending_base_window_end = 0;
+            storage.residual_pending_coarsest_window_end = 0;
+            return;
+        }
+
+        const LodLevelState& base = storage.levels.front();
+        if (!(had_pending &&
+              transition.cycle >= storage.residual_pending_base_window_start &&
+              transition.cycle < storage.residual_pending_base_window_end)) {
+            storage.residual_pending_base_window_start =
+                lod_sampling_window_start(transition.cycle, base.min_cycle_delta);
+            storage.residual_pending_base_window_end =
+                lod_sampling_window_end(storage.residual_pending_base_window_start, base.min_cycle_delta);
+        }
+
+        if (!(had_pending &&
+              transition.cycle >= 0 &&
+              transition.cycle < storage.residual_pending_coarsest_window_end)) {
+            const LodLevelState& coarsest = storage.levels.back();
+            const i64 coarsest_start = lod_sampling_window_start(transition.cycle, coarsest.min_cycle_delta);
+            storage.residual_pending_coarsest_window_end =
+                lod_sampling_window_end(coarsest_start, coarsest.min_cycle_delta);
+        }
+        if (storage.residual_pending_coarsest_window_end < next_residual_finalize_cycle_) {
+            next_residual_finalize_cycle_ = storage.residual_pending_coarsest_window_end;
+        }
+    }
+
     void place_residual_lod_transition(u32 storage_id,
                                        LodStorageState& storage,
                                        const Transition& transition,
@@ -1493,10 +1566,12 @@ private:
 
         if (next_transition == NULL) {
             for (std::size_t rev = storage.levels.size(); rev > 0; --rev) {
-                LodLevelState& lod_level = storage.levels[rev - 1u];
+                const std::size_t level = rev - 1u;
+                LodLevelState& lod_level = storage.levels[level];
                 if (lod_level.disabled || lod_level.min_cycle_delta == 0) continue;
-                const i64 window_start = lod_sampling_window_start(transition.cycle,
-                                                                   lod_level.min_cycle_delta);
+                const i64 window_start = residual_lod_fixed_span(level) == lod_level.min_cycle_delta
+                    ? residual_lod_fixed_window_start(transition.cycle, level)
+                    : lod_sampling_window_start(transition.cycle, lod_level.min_cycle_delta);
                 emit_residual_lod_transition(lod_level, transition, window_start);
                 return;
             }
@@ -1507,11 +1582,24 @@ private:
         LodLevelState* selected_level = NULL;
         i64 selected_window_start = 0;
         const i64 next_cycle = next_transition->cycle;
-        for (std::size_t level = 0; level < storage.levels.size(); ++level) {
+        std::size_t level_begin = 0;
+        LodLevelState& base_level = storage.levels.front();
+        if (!base_level.disabled && base_level.min_cycle_delta != 0) {
+            const i64 window_start = storage.residual_pending_base_window_start;
+            const i64 window_end = storage.residual_pending_base_window_end;
+            if (next_cycle >= window_start && next_cycle < window_end) {
+                append_residual_raw_transition(storage_id, transition);
+                return;
+            }
+            selected_level = &base_level;
+            selected_window_start = window_start;
+            level_begin = 1u;
+        }
+
+        for (std::size_t level = level_begin; level < storage.levels.size(); ++level) {
             LodLevelState& lod_level = storage.levels[level];
             if (lod_level.disabled || lod_level.min_cycle_delta == 0) continue;
-            const i64 window_start = lod_sampling_window_start(transition.cycle,
-                                                               lod_level.min_cycle_delta);
+            const i64 window_start = lod_sampling_window_start(transition.cycle, lod_level.min_cycle_delta);
             const i64 window_end = lod_sampling_window_end(window_start, lod_level.min_cycle_delta);
             const bool crosses_window = next_cycle < window_start || next_cycle >= window_end;
             if (!crosses_window) break;
@@ -1529,19 +1617,21 @@ private:
 
     void finalize_residual_lod_until(i64 cycle) {
         if (!residual_lod_enabled() || cycle < 0) return;
+        if (cycle < next_residual_finalize_cycle_) return;
+        i64 next_due = (std::numeric_limits<i64>::max)();
         for (std::size_t sid = 0; sid < lod_states_.size(); ++sid) {
             LodStorageState& storage = lod_states_[sid];
             if (!storage.valid || storage.levels.empty() || !storage.has_residual_pending) continue;
-            LodLevelState& coarsest = storage.levels.back();
-            const i64 window_start = lod_sampling_window_start(storage.residual_pending_transition.cycle,
-                                                               coarsest.min_cycle_delta);
-            const i64 window_end = lod_sampling_window_end(window_start, coarsest.min_cycle_delta);
+            const i64 window_end = storage.residual_pending_coarsest_window_end;
             if (window_end <= cycle) {
                 place_residual_lod_transition(static_cast<u32>(sid), storage,
                                               storage.residual_pending_transition, NULL);
                 storage.has_residual_pending = false;
+            } else if (window_end < next_due) {
+                next_due = window_end;
             }
         }
+        next_residual_finalize_cycle_ = next_due;
     }
 
     void flush_all_residual_lod_pending() {
@@ -1553,6 +1643,7 @@ private:
                                           storage.residual_pending_transition, NULL);
             storage.has_residual_pending = false;
         }
+        next_residual_finalize_cycle_ = (std::numeric_limits<i64>::max)();
     }
 
     void update_lod_tables(u32 storage_id, const Transition& transition) {
@@ -1561,7 +1652,7 @@ private:
         LodStorageState& storage = lod_states_[storage_id];
         if (!storage.valid || storage.byte_width == 0) return;
         ++storage.raw_transition_count;
-        initialize_lod_levels(storage);
+        if (storage.levels.empty()) initialize_lod_levels(storage);
         Transition tr = transition;
         tr.value.byte_count = storage.byte_width;
         if (residual_lod_enabled()) {
@@ -1569,8 +1660,7 @@ private:
                 place_residual_lod_transition(storage_id, storage,
                                               storage.residual_pending_transition, &tr);
             }
-            storage.residual_pending_transition = tr;
-            storage.has_residual_pending = true;
+            set_residual_lod_pending(storage, tr);
             return;
         }
         u64 source_record_count = storage.raw_transition_count;
@@ -2777,7 +2867,22 @@ private:
         u64 stride = 0;
     };
 
-    void append_value_full_record(const std::vector<Transition>& transitions,
+    struct TransitionSpan {
+        const std::vector<Transition>* source = NULL;
+        std::size_t begin = 0;
+        std::size_t end = 0;
+
+        TransitionSpan() {}
+        TransitionSpan(const std::vector<Transition>& src, std::size_t first, std::size_t last)
+            : source(&src), begin(first), end(last) {}
+
+        std::size_t size() const { return end > begin ? end - begin : 0u; }
+        bool empty() const { return size() == 0; }
+        const Transition& operator[](std::size_t index) const { return (*source)[begin + index]; }
+    };
+
+    template <typename TransitionSeq>
+    void append_value_full_record(const TransitionSeq& transitions,
                                   i64 start_cycle,
                                   u8 byte_width,
                                   bool use_shared_time,
@@ -2800,7 +2905,8 @@ private:
         }
     }
 
-    void append_value_full_stride_record(const std::vector<Transition>& transitions,
+    template <typename TransitionSeq>
+    void append_value_full_stride_record(const TransitionSeq& transitions,
                                          i64 start_cycle,
                                          u8 byte_width,
                                          u64 stride,
@@ -2821,7 +2927,8 @@ private:
         }
     }
 
-    void append_value_bool_toggle_record(const std::vector<Transition>& transitions,
+    template <typename TransitionSeq>
+    void append_value_bool_toggle_record(const TransitionSeq& transitions,
                                          i64 start_cycle,
                                          bool use_shared_time,
                                          const std::vector<u64>* shared_times,
@@ -2843,7 +2950,8 @@ private:
         }
     }
 
-    void append_value_bool_toggle_stride_record(const std::vector<Transition>& transitions,
+    template <typename TransitionSeq>
+    void append_value_bool_toggle_stride_record(const TransitionSeq& transitions,
                                                 i64 start_cycle,
                                                 u64 stride,
                                                 std::vector<u8>& out,
@@ -2861,7 +2969,8 @@ private:
         append_record_stride_time(out, first_rel, stride, cost);
     }
 
-    void append_value_byte_mask_record(const std::vector<Transition>& transitions,
+    template <typename TransitionSeq>
+    void append_value_byte_mask_record(const TransitionSeq& transitions,
                                        i64 start_cycle,
                                        u8 byte_width,
                                        bool use_shared_time,
@@ -2903,7 +3012,8 @@ private:
         }
     }
 
-    void append_value_byte_mask_stride_record(const std::vector<Transition>& transitions,
+    template <typename TransitionSeq>
+    void append_value_byte_mask_stride_record(const TransitionSeq& transitions,
                                               i64 start_cycle,
                                               u8 byte_width,
                                               u64 stride,
@@ -2941,7 +3051,8 @@ private:
         }
     }
 
-    void append_value_nibble_mask_record(const std::vector<Transition>& transitions,
+    template <typename TransitionSeq>
+    void append_value_nibble_mask_record(const TransitionSeq& transitions,
                                          i64 start_cycle,
                                          u8 byte_width,
                                          bool use_shared_time,
@@ -2993,7 +3104,8 @@ private:
         }
     }
 
-    void append_value_nibble_mask_stride_record(const std::vector<Transition>& transitions,
+    template <typename TransitionSeq>
+    void append_value_nibble_mask_stride_record(const TransitionSeq& transitions,
                                                 i64 start_cycle,
                                                 u8 byte_width,
                                                 u64 stride,
@@ -3039,7 +3151,8 @@ private:
         }
     }
 
-    SignalRecordChoice choose_value_record_codec_and_size(const std::vector<Transition>& transitions,
+    template <typename TransitionSeq>
+    SignalRecordChoice choose_value_record_codec_and_size(const TransitionSeq& transitions,
                                                           i64 start_cycle,
                                                           u8 byte_width,
                                                           ValueType value_type,
@@ -3197,7 +3310,76 @@ private:
         return choice;
     }
 
-    void append_value_best_record(const std::vector<Transition>& transitions,
+    template <typename TransitionSeq>
+    bool sampled_nibble_mask_likely_smaller(const TransitionSeq& transitions,
+                                            u8 byte_width) const {
+        if (!options_.enable_value_byte_mask_encoding || transitions.size() < 2 ||
+            byte_width <= 2 || byte_width > 4) return false;
+        const std::size_t sample_count = (std::min<std::size_t>)(transitions.size(), 32u);
+        const std::size_t full_value_bytes = sample_count * static_cast<std::size_t>(byte_width);
+        std::size_t nibble_mask_value_bytes =
+            static_cast<std::size_t>(byte_width) + (sample_count - 1u + 1u) / 2u;
+        std::array<u8, kMaxScalarBytes> prev = transitions[0].value.bytes;
+        for (std::size_t t = 1; t < sample_count; ++t) {
+            const Transition& tr = transitions[t];
+            for (u8 b = 0; b < byte_width; ++b) {
+                if (tr.value.bytes[b] != prev[b]) ++nibble_mask_value_bytes;
+                prev[b] = tr.value.bytes[b];
+            }
+            if (nibble_mask_value_bytes >= full_value_bytes) return false;
+        }
+        return nibble_mask_value_bytes < full_value_bytes;
+    }
+
+    template <typename TransitionSeq>
+    bool sampled_byte_mask_likely_smaller(const TransitionSeq& transitions,
+                                          u8 byte_width) const {
+        if (!options_.enable_value_byte_mask_encoding || transitions.size() < 2 ||
+            byte_width <= 4 || byte_width > kMaxScalarBytes) return false;
+        const std::size_t sample_count = (std::min<std::size_t>)(transitions.size(), 32u);
+        const std::size_t full_value_bytes = sample_count * static_cast<std::size_t>(byte_width);
+        std::size_t byte_mask_value_bytes = static_cast<std::size_t>(byte_width);
+        std::array<u8, kMaxScalarBytes> prev = transitions[0].value.bytes;
+        for (std::size_t t = 1; t < sample_count; ++t) {
+            const Transition& tr = transitions[t];
+            byte_mask_value_bytes += 1u;
+            for (u8 b = 0; b < byte_width; ++b) {
+                if (tr.value.bytes[b] != prev[b]) ++byte_mask_value_bytes;
+                prev[b] = tr.value.bytes[b];
+            }
+            if (byte_mask_value_bytes >= full_value_bytes) return false;
+        }
+        return byte_mask_value_bytes < full_value_bytes;
+    }
+
+    template <typename TransitionSeq>
+    void append_value_residual_fast_record(const TransitionSeq& transitions,
+                                           i64 start_cycle,
+                                           u8 byte_width,
+                                           ValueType value_type,
+                                           bool use_shared_time,
+                                           const std::vector<u64>* shared_times,
+                                           std::vector<u8>& out) const {
+        if (transitions.size() < 64u) {
+            append_value_best_record(transitions, start_cycle, byte_width,
+                                     value_type, use_shared_time, shared_times, out);
+            return;
+        }
+        detail::reserve_extra(out, 1u + detail::varuint_size(static_cast<u64>(transitions.size())));
+        if (sampled_nibble_mask_likely_smaller(transitions, byte_width)) {
+            append_value_nibble_mask_record(transitions, start_cycle, byte_width,
+                                            use_shared_time, shared_times, out, NULL);
+        } else if (sampled_byte_mask_likely_smaller(transitions, byte_width)) {
+            append_value_byte_mask_record(transitions, start_cycle, byte_width,
+                                          use_shared_time, shared_times, out, NULL);
+        } else {
+            append_value_full_record(transitions, start_cycle, byte_width,
+                                     use_shared_time, shared_times, out, NULL);
+        }
+    }
+
+    template <typename TransitionSeq>
+    void append_value_best_record(const TransitionSeq& transitions,
                                   i64 start_cycle,
                                   u8 byte_width,
                                   ValueType value_type,
@@ -4216,22 +4398,25 @@ private:
         return static_cast<bool>(log);
     }
 
-    std::vector<u8> build_lod_transition_payload(const std::vector<Transition>& transitions,
-                                                 std::size_t begin,
-                                                 std::size_t end,
-                                                 const LodStorageState& storage,
-                                                 u64& record_count) const {
-        std::vector<u8> out;
+    void build_lod_transition_payload(const std::vector<Transition>& transitions,
+                                      std::size_t begin,
+                                      std::size_t end,
+                                      const LodStorageState& storage,
+                                      std::vector<u8>& out,
+                                      u64& record_count) const {
+        out.clear();
         record_count = 0;
-        if (begin >= end || begin >= transitions.size()) return out;
+        if (begin >= end || begin >= transitions.size()) return;
         end = (std::min)(end, transitions.size());
-        std::vector<Transition> slice;
-        slice.reserve(end - begin);
-        for (std::size_t i = begin; i < end; ++i) slice.push_back(transitions[i]);
+        const TransitionSpan slice(transitions, begin, end);
         record_count = static_cast<u64>(slice.size());
-        append_value_best_record(slice, 0, storage.byte_width,
-                                 storage.value_type, false, NULL, out);
-        return out;
+        if (residual_lod_enabled()) {
+            append_value_residual_fast_record(slice, 0, storage.byte_width,
+                                              storage.value_type, false, NULL, out);
+        } else {
+            append_value_best_record(slice, 0, storage.byte_width,
+                                     storage.value_type, false, NULL, out);
+        }
     }
 
     std::vector<LodSelectedLevel> select_lod_levels_to_store(const LodStorageState& storage) const {
@@ -4305,19 +4490,19 @@ private:
         if (raw_payload.empty() || storage_count == 0 || record_count == 0) return true;
 
         Compression compression = Compression::None;
-        std::vector<u8> encoded = raw_payload;
+        const std::vector<u8>* encoded = &raw_payload;
+        std::vector<u8> compressed;
         if (options_.compression == Compression::Zstd) {
-            std::vector<u8> compressed;
             if (!compress_payload_zstd(raw_payload, compressed, error)) return false;
             if (!compressed.empty() && compressed.size() < raw_payload.size()) {
-                encoded.swap(compressed);
+                encoded = &compressed;
                 compression = Compression::Zstd;
             }
         }
 
         const u64 chunk_id = static_cast<u64>(lod_chunk_index_.size());
         std::vector<u8> section_payload;
-        section_payload.reserve(48 + encoded.size());
+        section_payload.reserve(48 + encoded->size());
         detail::append_varuint(section_payload, chunk_id);
         detail::append_varuint(section_payload, level_index);
         detail::append_varuint(section_payload, signal_chunk_id);
@@ -4325,8 +4510,8 @@ private:
         detail::append_i64(section_payload, end_cycle);
         detail::append_u8(section_payload, static_cast<u8>(compression));
         detail::append_varuint(section_payload, static_cast<u64>(raw_payload.size()));
-        detail::append_varuint(section_payload, static_cast<u64>(encoded.size()));
-        detail::append_vector_bytes(section_payload, encoded);
+        detail::append_varuint(section_payload, static_cast<u64>(encoded->size()));
+        detail::append_vector_bytes(section_payload, *encoded);
 
         const u64 offset = static_cast<u64>(out_.tellp());
         if (!write_section("LODZ", section_payload, error)) return false;
@@ -4412,6 +4597,8 @@ private:
                     refs.push_back(ref);
                 }
 
+                std::vector<u8> raw_payload;
+                std::vector<u8> stream_payload;
                 while (true) {
                     bool have_next = false;
                     i64 window_start = (std::numeric_limits<i64>::max)();
@@ -4443,27 +4630,27 @@ private:
                             ++refs[r].cursor;
                         }
                         u64 slice_count = 0;
-                        const std::vector<u8> stream_payload =
-                            build_lod_transition_payload(transitions, begin, refs[r].cursor, *refs[r].storage, slice_count);
+                        build_lod_transition_payload(transitions, begin, refs[r].cursor,
+                                                     *refs[r].storage, stream_payload, slice_count);
                         if (slice_count == 0 || stream_payload.empty()) continue;
 
-                        std::vector<LodValidRange> valid_ranges;
+                        u64 valid_range_count = 0;
                         for (std::size_t vr = 0; vr < refs[r].valid_ranges.size(); ++vr) {
                             const LodValidRange& src = refs[r].valid_ranges[vr];
                             if (src.end_cycle <= window_start || src.start_cycle >= window_end) continue;
-                            LodValidRange clipped;
-                            clipped.start_cycle = src.start_cycle;
-                            clipped.end_cycle = src.end_cycle;
-                            if (clipped.end_cycle > clipped.start_cycle) valid_ranges.push_back(clipped);
+                            if (src.end_cycle > src.start_cycle) ++valid_range_count;
                         }
-                        if (valid_ranges.empty()) continue;
+                        if (valid_range_count == 0) continue;
 
                         detail::append_varuint(records_payload, refs[r].storage_id);
                         detail::append_varuint(records_payload, refs[r].storage->byte_width);
-                        detail::append_varuint(records_payload, static_cast<u64>(valid_ranges.size()));
-                        for (std::size_t vr = 0; vr < valid_ranges.size(); ++vr) {
-                            detail::append_i64(records_payload, valid_ranges[vr].start_cycle);
-                            detail::append_i64(records_payload, valid_ranges[vr].end_cycle);
+                        detail::append_varuint(records_payload, valid_range_count);
+                        for (std::size_t vr = 0; vr < refs[r].valid_ranges.size(); ++vr) {
+                            const LodValidRange& src = refs[r].valid_ranges[vr];
+                            if (src.end_cycle <= window_start || src.start_cycle >= window_end) continue;
+                            if (src.end_cycle <= src.start_cycle) continue;
+                            detail::append_i64(records_payload, src.start_cycle);
+                            detail::append_i64(records_payload, src.end_cycle);
                         }
                         detail::append_varuint(records_payload, slice_count);
                         detail::append_varuint(records_payload, static_cast<u64>(stream_payload.size()));
@@ -4473,7 +4660,7 @@ private:
                     }
 
                     if (storage_count == 0 || record_count == 0) continue;
-                    std::vector<u8> raw_payload;
+                    raw_payload.clear();
                     detail::append_varuint(raw_payload, storage_count);
                     detail::append_vector_bytes(raw_payload, records_payload);
                     if (!write_lodz_section(static_cast<u32>(level), it->first, window_start, window_end,
@@ -4571,10 +4758,13 @@ private:
         last_submission_empty_ = false;
         next_block_id_ = 0;
         footer_offset_ = 0;
+        next_residual_finalize_cycle_ = (std::numeric_limits<i64>::max)();
         update_state_scratch_.clear();
         update_seen_stamp_.clear();
         update_seen_epoch_ = 1;
         stats_ = WriterStats();
+        writer_submit_count_ = 0;
+        writer_diag_log_lines_ = 0;
         reset_pipeline_storage();
     }
 
@@ -4620,6 +4810,7 @@ private:
     bool last_submission_empty_ = false;
     u64 next_block_id_ = 0;
     u64 footer_offset_ = 0;
+    i64 next_residual_finalize_cycle_ = (std::numeric_limits<i64>::max)();
     PipelineState pipeline_;
     std::vector<SignalState*> update_state_scratch_;
     std::vector<u32> update_seen_stamp_;
@@ -4803,13 +4994,13 @@ private:
             if (!error_.empty()) { error = error_; return false; }
             if (stop_) { error = "WVZ4 AsyncWriter is stopping"; return false; }
         }
-        QueueItem item;
+        queue_.emplace_back();
+        QueueItem& item = queue_.back();
         item.submission = std::move(submission);
         item.approx_bytes = approx_bytes;
         queued_bytes_ += approx_bytes;
-        queue_.push_back(std::move(item));
         ++enqueued_count_;
-        maybe_log_async_queue_locked_("async-enqueue", &queue_.back().submission, approx_bytes);
+        maybe_log_async_queue_locked_("async-enqueue", &item.submission, approx_bytes);
         cv_not_empty_.notify_one();
         return true;
     }
@@ -4820,8 +5011,8 @@ private:
             worker_started_ = true;
             async_diag_log_locked_("async-worker-start");
         }
+        QueueItem item;
         while (true) {
-            QueueItem item;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 cv_not_empty_.wait(lock, [this]() { return stop_ || !queue_.empty(); });
@@ -5561,20 +5752,6 @@ private:
         if (!explicit_path.empty() && detail::file_exists(explicit_path)) return explicit_path;
 
         std::vector<std::string> candidates;
-        const std::string source_dir = detail::parent_dir(std::string(__FILE__));
-        if (!source_dir.empty()) {
-            candidates.push_back(detail::join_path(
-                detail::join_path(detail::join_path(source_dir, "tools"), "bin"),
-                "wvz4_writer_monitor.exe"));
-        }
-        candidates.push_back("wvz4_writer_monitor.exe");
-#if defined(_DEBUG)
-        candidates.push_back(detail::join_path("build_vs\\wvz4_writer_monitor\\Debug", "wvz4_writer_monitor.exe"));
-        candidates.push_back(detail::join_path("build_vs\\wvz4_writer_monitor\\Release", "wvz4_writer_monitor.exe"));
-#else
-        candidates.push_back(detail::join_path("build_vs\\wvz4_writer_monitor\\Release", "wvz4_writer_monitor.exe"));
-        candidates.push_back(detail::join_path("build_vs\\wvz4_writer_monitor\\Debug", "wvz4_writer_monitor.exe"));
-#endif
         const std::string exe_dir = detail::current_exe_dir();
         if (!exe_dir.empty()) {
             candidates.push_back(detail::join_path(exe_dir, "wvz4_writer_monitor.exe"));
@@ -5591,6 +5768,20 @@ private:
                                                   "wvz4_writer_monitor.exe"));
 #endif
         }
+#if defined(_DEBUG)
+        candidates.push_back(detail::join_path("build_vs\\wvz4_writer_monitor\\Debug", "wvz4_writer_monitor.exe"));
+        candidates.push_back(detail::join_path("build_vs\\wvz4_writer_monitor\\Release", "wvz4_writer_monitor.exe"));
+#else
+        candidates.push_back(detail::join_path("build_vs\\wvz4_writer_monitor\\Release", "wvz4_writer_monitor.exe"));
+        candidates.push_back(detail::join_path("build_vs\\wvz4_writer_monitor\\Debug", "wvz4_writer_monitor.exe"));
+#endif
+        const std::string source_dir = detail::parent_dir(std::string(__FILE__));
+        if (!source_dir.empty()) {
+            candidates.push_back(detail::join_path(
+                detail::join_path(detail::join_path(source_dir, "tools"), "bin"),
+                "wvz4_writer_monitor.exe"));
+        }
+        candidates.push_back("wvz4_writer_monitor.exe");
         for (std::size_t i = 0; i < candidates.size(); ++i) {
             if (detail::file_exists(candidates[i])) return candidates[i];
         }
@@ -6166,12 +6357,12 @@ private:
                 return false;
             }
 
-            QueueItem item;
+            queue_.emplace_back();
+            QueueItem& item = queue_.back();
             item.seq = seq;
             item.submission = std::move(submission);
             item.approx_bytes = approx_bytes;
             queued_bytes_ += approx_bytes;
-            queue_.push_back(std::move(item));
             cv_not_empty_.notify_one();
             return true;
         }
@@ -6229,8 +6420,8 @@ private:
         }
 
         void worker_loop() {
+            QueueItem item;
             while (true) {
-                QueueItem item;
                 {
                     std::unique_lock<std::mutex> lock(mutex_);
                     cv_not_empty_.wait(lock, [this]() { return stopping_ || !queue_.empty(); });

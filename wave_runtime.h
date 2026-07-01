@@ -939,6 +939,21 @@ struct is_peek_trace_source_impl<T, true> : std::integral_constant<bool,
 template <typename T>
 struct is_peek_trace_source : is_peek_trace_source_impl<T> {};
 
+template <typename...>
+struct make_void {
+    typedef void type;
+};
+
+template <typename T, typename = void>
+struct peek_trace_source_value_type {
+    typedef void type;
+};
+
+template <typename T>
+struct peek_trace_source_value_type<T, typename make_void<typename remove_cvref<T>::type::wave_trace_peek_value_type>::type> {
+    typedef typename remove_cvref<T>::type::wave_trace_peek_value_type type;
+};
+
 // Exact VSIP project port wrappers are sc_port-like handles.  They are followed
 // to their bound interface object, and that object must explicitly opt in with
 // PeekTraceSource/PeekTraceSourceFor before peek() expansion is used.  Merely
@@ -8437,6 +8452,34 @@ private:
             });
     }
 
+    template <typename ValueT>
+    typename std::enable_if<!std::is_void<ValueT>::value, NodeId>::type
+    add_peek_trace_source_object_typed(const std::string& path,
+                                       NodeId parent_id,
+                                       const PeekTraceSource* source) {
+        if (!source) return 0;
+        return add_runtime_typed_trace_object_(
+            path,
+            parent_id,
+            "peek source",
+            "value",
+            source->wave_trace_peek_ptr(),
+            source->wave_trace_peek_type_tag(),
+            source->wave_trace_peek_byte_width(),
+            &dynamic_expand_bridge<ValueT>,
+            [source]() -> WaveDirtyHook* {
+                return source->wave_trace_peek_dirty_hook();
+            });
+    }
+
+    template <typename ValueT>
+    typename std::enable_if<std::is_void<ValueT>::value, NodeId>::type
+    add_peek_trace_source_object_typed(const std::string& path,
+                                       NodeId parent_id,
+                                       const PeekTraceSource* source) {
+        return add_peek_trace_source_object(path, parent_id, source);
+    }
+
     template <typename IFace>
     NodeId expand_dynamic_trace_interface_target(const std::string& path, NodeId parent_id, const IFace* iface) {
         if (!iface) return 0;
@@ -9451,7 +9494,9 @@ private:
     template <typename T>
     typename std::enable_if<detail::is_peek_trace_source<T>::value, NodeId>::type
     expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
-        return add_peek_trace_source_object(path, parent_id, static_cast<const PeekTraceSource*>(ptr));
+        typedef typename detail::peek_trace_source_value_type<T>::type PeekValueT;
+        return add_peek_trace_source_object_typed<PeekValueT>(
+            path, parent_id, static_cast<const PeekTraceSource*>(ptr));
     }
 
     template <typename T>

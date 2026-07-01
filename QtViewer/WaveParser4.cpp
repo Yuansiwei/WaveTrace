@@ -693,6 +693,7 @@ bool decodeSignalRecord(SpanReader& rr,
                         QVector<QVector<WaveSample>>& samplesByOutputIndex,
                         qint64 windowStart,
                         qint64 windowEnd,
+                        bool compactSamples,
                         QString& error);
 
 bool decodeLodTransitionStreamPayload(const char* payload,
@@ -719,7 +720,7 @@ bool decodeLodTransitionStreamPayload(const char* payload,
     if (!decodeSignalRecord(rr, true, true, false, sharedTimes,
                             0, std::numeric_limits<qint64>::max(),
                             byteWidth, outputIndexes, fakeSignals, decoded,
-                            0, std::numeric_limits<qint64>::max(), error)) {
+                            0, std::numeric_limits<qint64>::max(), false, error)) {
         if (error.isEmpty()) error = QStringLiteral("WVZ4 failed to decode LOD transition stream");
         return false;
     }
@@ -1626,7 +1627,11 @@ WaveLodLevel sliceLodLevelForSignal(const WaveLodLevel& source, const WaveSignal
         if (sample.rawFieldsReady && !sample.isZ && !sample.isAbsent) {
             sample.rawBits = sliceRawBitsForSignal(sample.rawBits, sig);
         }
-        appendCompactedSample(out.samples, std::move(sample));
+        if (!out.samples.isEmpty() && out.samples.last().time == sample.time) {
+            out.samples.last() = std::move(sample);
+        } else {
+            out.samples.push_back(std::move(sample));
+        }
     }
 
     out.buckets.reserve(source.buckets.size());
@@ -1654,6 +1659,7 @@ bool appendDecodedSample(int outputIndex,
                          qint64 sampleTime,
                          const QVector<WaveSignal>& outputSignals,
                          QVector<QVector<WaveSample>>& samplesByOutputIndex,
+                         bool compactSamples,
                          QString& error) {
     if (gDecodedSampleLimit != 0 && gDecodedSampleCount >= gDecodedSampleLimit) {
         error = QStringLiteral("WVZ4 decoded sample limit exceeded (%1). Narrow the selected signals/time range or use LOD.")
@@ -1675,7 +1681,14 @@ bool appendDecodedSample(int outputIndex,
     // WVZ4 stores fixed-width <=64-bit scalar values.  Do not materialize a
     // QString for every decoded sample; display code formats rawBits on demand.
     sample.value.clear();
-    appendCompactedSample(samplesByOutputIndex[outputIndex], std::move(sample));
+    if (compactSamples) {
+        appendCompactedSample(samplesByOutputIndex[outputIndex], std::move(sample));
+    } else if (!samplesByOutputIndex[outputIndex].isEmpty() &&
+               samplesByOutputIndex[outputIndex].last().time == sample.time) {
+        samplesByOutputIndex[outputIndex].last() = std::move(sample);
+    } else {
+        samplesByOutputIndex[outputIndex].push_back(std::move(sample));
+    }
     ++gDecodedSampleCount;
     return true;
 }
@@ -1686,10 +1699,11 @@ bool appendDecodedSampleToOutputs(const QVector<int>& outputIndexes,
                                   qint64 sampleTime,
                                   const QVector<WaveSignal>& outputSignals,
                                   QVector<QVector<WaveSample>>& samplesByOutputIndex,
+                                  bool compactSamples,
                                   QString& error) {
     for (int i = 0; i < outputIndexes.size(); ++i) {
         if (!appendDecodedSample(outputIndexes.at(i), valueBytes, byteCount, sampleTime,
-                                 outputSignals, samplesByOutputIndex, error)) {
+                                 outputSignals, samplesByOutputIndex, compactSamples, error)) {
             return false;
         }
     }
@@ -1760,7 +1774,7 @@ void appendClockSamplesForLoadedSignals(const QVector<ClockRec>& clocks,
             if (!sampleInWindow(t, windowStart, windowEnd)) return;
             char byte = value ? 1 : 0;
             QString ignored;
-            appendDecodedSample(outputIndex, &byte, 1, t, outputSignals, samplesByOutputIndex, ignored);
+            appendDecodedSample(outputIndex, &byte, 1, t, outputSignals, samplesByOutputIndex, true, ignored);
             minTime = qMin(minTime, t);
             maxTime = qMax(maxTime, t);
         };
@@ -1884,7 +1898,7 @@ bool decodeRawWaveBlockV1(const QByteArray& rawPayload,
             }
             if (!keep || !outputIndexes || outputIndexes->isEmpty() || !sampleInWindow(sampleTime, windowStart, windowEnd)) continue;
             if (!appendDecodedSampleToOutputs(*outputIndexes, valueBytes, int(byteCount), sampleTime,
-                                              outputSignals, samplesByOutputIndex, error)) return false;
+                                              outputSignals, samplesByOutputIndex, true, error)) return false;
         }
     }
 
@@ -2049,7 +2063,7 @@ bool decodeRawWaveBlockV2(const QByteArray& rawPayload,
             }
             if (!keep || !outputIndexes || outputIndexes->isEmpty() || !sampleInWindow(sampleTime, windowStart, windowEnd)) continue;
             if (!appendDecodedSampleToOutputs(*outputIndexes, valueBytes, byteWidth, sampleTime,
-                                              outputSignals, samplesByOutputIndex, error)) return false;
+                                              outputSignals, samplesByOutputIndex, true, error)) return false;
         }
     }
 
@@ -2169,10 +2183,11 @@ bool appendDecodedRecordValue(const QVector<int>& outputIndexes,
                               qint64 windowEnd,
                               const QVector<WaveSignal>& outputSignals,
                               QVector<QVector<WaveSample>>& samplesByOutputIndex,
+                              bool compactSamples,
                               QString& error) {
     if (!sampleInWindow(sampleTime, windowStart, windowEnd)) return true;
     return appendDecodedSampleToOutputs(outputIndexes, value, byteWidth, sampleTime,
-                                        outputSignals, samplesByOutputIndex, error);
+                                        outputSignals, samplesByOutputIndex, compactSamples, error);
 }
 
 bool decodeSignalRecord(SpanReader& rr,
@@ -2188,6 +2203,7 @@ bool decodeSignalRecord(SpanReader& rr,
                         QVector<QVector<WaveSample>>& samplesByOutputIndex,
                         qint64 windowStart,
                         qint64 windowEnd,
+                        bool compactSamples,
                         QString& error) {
     u8 codecByte = static_cast<u8>(ValueRecordCodec::FullValues);
     if (hasValueCodec && !rr.readU8(codecByte)) {
@@ -2224,7 +2240,7 @@ bool decodeSignalRecord(SpanReader& rr,
             if (!readRecordTime(sampleTime)) return false;
             if (!readFullValue(rr, value, byteWidth, error, "WDAT full-value record")) return false;
             if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime, windowStart, windowEnd,
-                                          outputSignals, samplesByOutputIndex, error)) return false;
+                                          outputSignals, samplesByOutputIndex, compactSamples, error)) return false;
         }
         return true;
     }
@@ -2240,7 +2256,7 @@ bool decodeSignalRecord(SpanReader& rr,
             if (!resolveStrideRecordTime(firstRel, stride, ti, blockStart, blockEnd, sampleTime, error, "WDAT full-stride record")) return false;
             if (!readFullValue(rr, value, byteWidth, error, "WDAT full-stride record")) return false;
             if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime, windowStart, windowEnd,
-                                          outputSignals, samplesByOutputIndex, error)) return false;
+                                          outputSignals, samplesByOutputIndex, compactSamples, error)) return false;
         }
         return true;
     }
@@ -2256,7 +2272,7 @@ bool decodeSignalRecord(SpanReader& rr,
             if (!readRecordTime(sampleTime)) return false;
             value[0] = (ti == 0) ? (initial ? 1 : 0) : (value[0] ? 0 : 1);
             if (!appendDecodedRecordValue(outputIndexes, value, 1, sampleTime, windowStart, windowEnd,
-                                          outputSignals, samplesByOutputIndex, error)) return false;
+                                          outputSignals, samplesByOutputIndex, compactSamples, error)) return false;
         }
         return true;
     }
@@ -2278,7 +2294,7 @@ bool decodeSignalRecord(SpanReader& rr,
             if (!resolveStrideRecordTime(firstRel, stride, ti, blockStart, blockEnd, sampleTime, error, "WDAT bool-toggle-stride record")) return false;
             value[0] = (ti == 0) ? (initial ? 1 : 0) : (value[0] ? 0 : 1);
             if (!appendDecodedRecordValue(outputIndexes, value, 1, sampleTime, windowStart, windowEnd,
-                                          outputSignals, samplesByOutputIndex, error)) return false;
+                                          outputSignals, samplesByOutputIndex, compactSamples, error)) return false;
         }
         return true;
     }
@@ -2288,7 +2304,7 @@ bool decodeSignalRecord(SpanReader& rr,
         if (!readRecordTime(sampleTime)) return false;
         if (!readFullValue(rr, value, byteWidth, error, "WDAT byte-mask record")) return false;
         if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime, windowStart, windowEnd,
-                                      outputSignals, samplesByOutputIndex, error)) return false;
+                                      outputSignals, samplesByOutputIndex, compactSamples, error)) return false;
         for (u64 ti = 1; ti < transitionCount; ++ti) {
             if (!readRecordTime(sampleTime)) return false;
             u8 mask = 0;
@@ -2298,7 +2314,7 @@ bool decodeSignalRecord(SpanReader& rr,
             }
             if (!applyChangedByteMask(rr, value, byteWidth, mask, error, "WDAT byte-mask record")) return false;
             if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime, windowStart, windowEnd,
-                                          outputSignals, samplesByOutputIndex, error)) return false;
+                                          outputSignals, samplesByOutputIndex, compactSamples, error)) return false;
         }
         return true;
     }
@@ -2313,7 +2329,7 @@ bool decodeSignalRecord(SpanReader& rr,
         if (!resolveStrideRecordTime(firstRel, stride, 0, blockStart, blockEnd, sampleTime, error, "WDAT byte-mask-stride record")) return false;
         if (!readFullValue(rr, value, byteWidth, error, "WDAT byte-mask-stride record")) return false;
         if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime, windowStart, windowEnd,
-                                      outputSignals, samplesByOutputIndex, error)) return false;
+                                      outputSignals, samplesByOutputIndex, compactSamples, error)) return false;
         for (u64 ti = 1; ti < transitionCount; ++ti) {
             u8 mask = 0;
             if (!rr.readU8(mask)) {
@@ -2323,7 +2339,7 @@ bool decodeSignalRecord(SpanReader& rr,
             if (!resolveStrideRecordTime(firstRel, stride, ti, blockStart, blockEnd, sampleTime, error, "WDAT byte-mask-stride record")) return false;
             if (!applyChangedByteMask(rr, value, byteWidth, mask, error, "WDAT byte-mask-stride record")) return false;
             if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime, windowStart, windowEnd,
-                                          outputSignals, samplesByOutputIndex, error)) return false;
+                                          outputSignals, samplesByOutputIndex, compactSamples, error)) return false;
         }
         return true;
     }
@@ -2333,7 +2349,7 @@ bool decodeSignalRecord(SpanReader& rr,
         if (!readRecordTime(sampleTime)) return false;
         if (!readFullValue(rr, value, byteWidth, error, "WDAT nibble-mask record")) return false;
         if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime, windowStart, windowEnd,
-                                      outputSignals, samplesByOutputIndex, error)) return false;
+                                      outputSignals, samplesByOutputIndex, compactSamples, error)) return false;
         for (u64 ti = 1; ti < transitionCount; ti += 2) {
             qint64 sampleTime0 = 0;
             if (!readRecordTime(sampleTime0)) return false;
@@ -2347,11 +2363,11 @@ bool decodeSignalRecord(SpanReader& rr,
             }
             if (!applyChangedByteMask(rr, value, byteWidth, static_cast<u8>(packedMask & 0x0f), error, "WDAT nibble-mask record")) return false;
             if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime0, windowStart, windowEnd,
-                                          outputSignals, samplesByOutputIndex, error)) return false;
+                                          outputSignals, samplesByOutputIndex, compactSamples, error)) return false;
             if (haveSecond) {
                 if (!applyChangedByteMask(rr, value, byteWidth, static_cast<u8>((packedMask >> 4) & 0x0f), error, "WDAT nibble-mask record")) return false;
                 if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime1, windowStart, windowEnd,
-                                              outputSignals, samplesByOutputIndex, error)) return false;
+                                              outputSignals, samplesByOutputIndex, compactSamples, error)) return false;
             } else if ((packedMask & 0xf0u) != 0) {
                 error = QStringLiteral("WVZ4 WDAT nibble-mask record has dangling high mask");
                 return false;
@@ -2370,7 +2386,7 @@ bool decodeSignalRecord(SpanReader& rr,
         if (!resolveStrideRecordTime(firstRel, stride, 0, blockStart, blockEnd, sampleTime, error, "WDAT nibble-mask-stride record")) return false;
         if (!readFullValue(rr, value, byteWidth, error, "WDAT nibble-mask-stride record")) return false;
         if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime, windowStart, windowEnd,
-                                      outputSignals, samplesByOutputIndex, error)) return false;
+                                      outputSignals, samplesByOutputIndex, compactSamples, error)) return false;
         for (u64 ti = 1; ti < transitionCount; ti += 2) {
             u8 packedMask = 0;
             if (!rr.readU8(packedMask)) {
@@ -2381,13 +2397,13 @@ bool decodeSignalRecord(SpanReader& rr,
             if (!resolveStrideRecordTime(firstRel, stride, ti, blockStart, blockEnd, sampleTime0, error, "WDAT nibble-mask-stride record")) return false;
             if (!applyChangedByteMask(rr, value, byteWidth, static_cast<u8>(packedMask & 0x0f), error, "WDAT nibble-mask-stride record")) return false;
             if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime0, windowStart, windowEnd,
-                                          outputSignals, samplesByOutputIndex, error)) return false;
+                                          outputSignals, samplesByOutputIndex, compactSamples, error)) return false;
             if (ti + 1 < transitionCount) {
                 qint64 sampleTime1 = 0;
                 if (!resolveStrideRecordTime(firstRel, stride, ti + 1, blockStart, blockEnd, sampleTime1, error, "WDAT nibble-mask-stride record")) return false;
                 if (!applyChangedByteMask(rr, value, byteWidth, static_cast<u8>((packedMask >> 4) & 0x0f), error, "WDAT nibble-mask-stride record")) return false;
                 if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime1, windowStart, windowEnd,
-                                              outputSignals, samplesByOutputIndex, error)) return false;
+                                              outputSignals, samplesByOutputIndex, compactSamples, error)) return false;
             } else if ((packedMask & 0xf0u) != 0) {
                 error = QStringLiteral("WVZ4 WDAT nibble-mask-stride record has dangling high mask");
                 return false;
@@ -2696,7 +2712,7 @@ bool decodeRawWaveTileV3(const QByteArray& rawPayload,
             SpanReader rr(recordsBlob + int(beginOff64), int(endOff64 - beginOff64));
             if (!decodeSignalRecord(rr, hasValueCodec, useDeltaTimes, useSharedTimeTable, sharedTimes,
                                     blockStart, blockEnd, byteWidth, *outputIndexes,
-                                    outputSignals, samplesByOutputIndex, windowStart, windowEnd, error)) {
+                                    outputSignals, samplesByOutputIndex, windowStart, windowEnd, true, error)) {
                 return false;
             }
             if (!rr.eof()) {
@@ -2732,7 +2748,7 @@ bool decodeRawWaveTileV3(const QByteArray& rawPayload,
         SpanReader rr(recordsBlob + int(beginOff64), int(endOff64 - beginOff64));
         if (!decodeSignalRecord(rr, hasValueCodec, useDeltaTimes, useSharedTimeTable, sharedTimes,
                                 blockStart, blockEnd, byteWidth, *outputIndexes,
-                                outputSignals, samplesByOutputIndex, windowStart, windowEnd, error)) {
+                                outputSignals, samplesByOutputIndex, windowStart, windowEnd, true, error)) {
             return false;
         }
 
@@ -3367,6 +3383,23 @@ void sortAndCompactWaveSamples(QVector<WaveSample>& samples) {
     samples = std::move(compacted);
 }
 
+void sortAndDedupWaveSamplesByTime(QVector<WaveSample>& samples) {
+    if (samples.size() <= 1) return;
+    std::stable_sort(samples.begin(), samples.end(), [](const WaveSample& a, const WaveSample& b) {
+        return a.time < b.time;
+    });
+    int write = 1;
+    for (int read = 1; read < samples.size(); ++read) {
+        if (samples.at(read).time == samples.at(write - 1).time) {
+            samples[write - 1] = samples.at(read);
+        } else {
+            if (write != read) samples[write] = samples.at(read);
+            ++write;
+        }
+    }
+    samples.resize(write);
+}
+
 QVector<WaveLodValidRange> normalizedLodRanges(QVector<WaveLodValidRange> ranges) {
     if (ranges.isEmpty()) return ranges;
     std::sort(ranges.begin(), ranges.end(), [](const WaveLodValidRange& a, const WaveLodValidRange& b) {
@@ -3465,7 +3498,7 @@ void appendResidualLodToRawSamples(const QVector<QVector<WaveLodLevel>>& lodLeve
             samples.reserve(samples.size() + sliced.samples.size());
             for (WaveSample& sample : sliced.samples) samples.push_back(std::move(sample));
         }
-        sortAndCompactWaveSamples(samples);
+        sortAndDedupWaveSamplesByTime(samples);
     }
 }
 
