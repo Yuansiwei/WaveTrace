@@ -61,14 +61,15 @@ using u64 = std::uint64_t;
 using u32 = std::uint32_t;
 using u8  = std::uint8_t;
 
-static const u32 kFormatVersion = 12;
+static const u32 kFormatVersion = 13;
 static const u8 kSignalFlagStorageOnly = 1u << 0;
 static const u32 kMaxScalarBytes = 8;
 static const u64 kLodBaseBucketCycles = 256;
+static const u64 kLodResidualBaseBucketCycles = 10;
+static const u64 kLodResidualLevelMultiplier = 10;
 static const u32 kLodLevelCount = 7;
 static const u64 kLodMinRawTransitionsForTable = 4096;
 static const u64 kLodMaxRecordsToSourceRatio = 5; // one LOD level may keep at most 20% of its source records.
-static const u64 kLodTimeChunkBuckets = 4096;
 
 // Raw WDAT payload encoding flags. The outer WDAT section and block index remain
 // unchanged; these flags describe the uncompressed raw_payload inside each block.
@@ -87,6 +88,7 @@ static const u64 kHeaderFeatureBoolToggleCodec   = 1ull << 3;
 static const u64 kHeaderFeatureByteMaskCodec     = 1ull << 4;
 static const u64 kHeaderFeatureNibbleMaskCodec   = 1ull << 5;
 static const u64 kHeaderFeatureLodTables         = 1ull << 6;
+static const u64 kHeaderFeatureResidualLodTables = 1ull << 7;
 
 enum class ValueRecordCodec : u8 {
     FullValues = 0,       // time + full fixed-width value for every transition
@@ -264,7 +266,7 @@ struct WriterOptions {
     // stores an offset table for all signals in that chunk so a reader can decode
     // one signal after decompressing only its tile.
     bool enable_signal_chunking = true;
-    u32 signals_per_chunk = 1024;
+    u32 signals_per_chunk = 32;
 
     // WVZ4 v4 compression candidates.  The writer builds dense/sparse tile
     // candidates and per-signal value-codec candidates, then keeps the smallest
@@ -288,6 +290,7 @@ struct WriterOptions {
     // summaries in memory until FOOT is written. Disable for very large writer
     // stress runs when first-open/on-demand parser behavior is the target.
     bool enable_lod_tables = true;
+    bool enable_residual_lod_tables = true;
 
     // Emit a sidecar text report at close. Empty path means <wvz4-file>.log.
     bool enable_stats_log = true;
@@ -900,10 +903,16 @@ public:
         const i64 flush_cycle = (update_count == 0 && submission.cycle > 0)
             ? (submission.cycle - 1)
             : submission.cycle;
+        if (residual_lod_enabled()) {
+            finalize_residual_lod_until(flush_cycle);
+        }
+        const i64 commit_flush_cycle = residual_lod_enabled()
+            ? subtract_cycle_lag(flush_cycle, residual_lod_commit_lag_cycles())
+            : flush_cycle;
         if (diag_block_end >= 0 && flush_cycle >= diag_block_end) {
             writer_diag_log_("writer-submit-before-flush", &submission, diag_block_end);
         }
-        if (!flush_until(flush_cycle, error)) return false;
+        if (!flush_until(commit_flush_cycle, error)) return false;
         if (diag_block_end >= 0 && flush_cycle >= diag_block_end) {
             writer_diag_log_("writer-submit-after-flush", &submission, diag_block_end);
         }
@@ -923,12 +932,16 @@ public:
             Transition tr;
             tr.cycle = submission.cycle;
             tr.value = value;
-            st.transitions.push_back(tr);
-            update_lod_tables(signal_id, submission.cycle, value);
-            mark_current_block_shared_time(signal_id, submission.cycle);
+            if (residual_lod_enabled()) {
+                update_lod_tables(signal_id, tr);
+            } else {
+                st.transitions.push_back(tr);
+                update_lod_tables(signal_id, tr);
+                mark_current_block_shared_time(signal_id, submission.cycle);
+                have_pending_content_ = true;
+            }
             st.current = value;
             st.has_current = true;
-            have_pending_content_ = true;
         };
         for (std::size_t i = 0; i < submission.updates.size(); ++i) {
             const CycleValueUpdate& upd = submission.updates[i];
@@ -954,12 +967,16 @@ public:
                 Transition tr;
                 tr.cycle = submission.cycle;
                 detail::scalar_assign_raw(tr.value, raw, st.byte_width_bytes);
-                st.transitions.push_back(tr);
-                update_lod_tables(group.signal_ids[i], submission.cycle, st.transitions.back().value);
-                mark_current_block_shared_time(group.signal_ids[i], submission.cycle);
-                st.current = st.transitions.back().value;
+                if (residual_lod_enabled()) {
+                    update_lod_tables(group.signal_ids[i], tr);
+                } else {
+                    st.transitions.push_back(tr);
+                    update_lod_tables(group.signal_ids[i], st.transitions.back());
+                    mark_current_block_shared_time(group.signal_ids[i], submission.cycle);
+                    have_pending_content_ = true;
+                }
+                st.current = tr.value;
                 st.has_current = true;
-                have_pending_content_ = true;
             }
         }
         current_cycle_ = submission.cycle;
@@ -980,6 +997,9 @@ public:
                 ok = false;
             } else {
                 const i64 final_cycle = last_submission_empty_ ? current_cycle_ : (current_cycle_ + 1);
+                if (residual_lod_enabled()) {
+                    flush_all_residual_lod_pending();
+                }
                 if (have_pending_content_ || static_cast<u64>(final_cycle) > current_block_start_) {
                     if (!commit_block(final_cycle, local_error)) ok = false;
                 }
@@ -1160,6 +1180,8 @@ private:
         u8 byte_width = 0;
         ValueType value_type = ValueType::U64;
         u64 raw_transition_count = 0;
+        bool has_residual_pending = false;
+        Transition residual_pending_transition;
         std::vector<LodLevelState> levels;
     };
 
@@ -1177,6 +1199,7 @@ private:
         u32 storage_id = 0;
         const LodStorageState* storage = NULL;
         const LodLevelState* lod_level = NULL;
+        const std::vector<Transition>* transition_source = NULL;
         std::vector<Transition> transitions;
         std::vector<LodValidRange> valid_ranges;
         std::size_t cursor = 0;
@@ -1251,14 +1274,31 @@ private:
         return v;
     }
 
+    bool residual_lod_enabled() const {
+        return options_.enable_lod_tables && options_.enable_residual_lod_tables;
+    }
+
+    u64 residual_lod_commit_lag_cycles() const {
+        if (!residual_lod_enabled() || lod_bucket_cycles_.empty()) return 0;
+        return lod_bucket_cycles_.front();
+    }
+
+    static i64 subtract_cycle_lag(i64 cycle, u64 lag) {
+        if (cycle <= 0 || lag == 0) return cycle;
+        const u64 ucycle = static_cast<u64>(cycle);
+        if (ucycle <= lag) return 0;
+        return static_cast<i64>(ucycle - lag);
+    }
+
     void initialize_lod_bucket_cycles() {
         lod_bucket_cycles_.clear();
         lod_bucket_cycles_.reserve(kLodLevelCount);
-        u64 bucket_cycles = kLodBaseBucketCycles;
+        u64 bucket_cycles = residual_lod_enabled() ? kLodResidualBaseBucketCycles : kLodBaseBucketCycles;
+        const u64 multiplier = residual_lod_enabled() ? kLodResidualLevelMultiplier : kLodMaxRecordsToSourceRatio;
         for (u32 i = 0; i < kLodLevelCount; ++i) {
             lod_bucket_cycles_.push_back(bucket_cycles);
-            if (bucket_cycles <= (std::numeric_limits<u64>::max)() / kLodMaxRecordsToSourceRatio) {
-                bucket_cycles *= kLodMaxRecordsToSourceRatio;
+            if (bucket_cycles <= (std::numeric_limits<u64>::max)() / multiplier) {
+                bucket_cycles *= multiplier;
             }
         }
     }
@@ -1412,17 +1452,127 @@ private:
         lod_level.pending_transition = transition;
     }
 
-    void update_lod_tables(u32 storage_id, i64 cycle, const ScalarValue& new_value) {
+    static void append_lod_transition_unbounded(LodLevelState& lod_level,
+                                                const Transition& transition) {
+        if (!lod_level.transitions.empty() &&
+            lod_level.transitions.back().cycle == transition.cycle) {
+            lod_level.transitions.back() = transition;
+            return;
+        }
+        lod_level.transitions.push_back(transition);
+    }
+
+    void emit_residual_lod_transition(LodLevelState& lod_level,
+                                      const Transition& transition,
+                                      i64 window_start) {
+        append_lod_transition_unbounded(lod_level, transition);
+        extend_lod_valid_range(lod_level, window_start);
+    }
+
+    void append_residual_raw_transition(u32 storage_id, const Transition& transition) {
+        if (storage_id == 0 || storage_id >= signal_states_.size()) return;
+        SignalState& st = signal_states_[storage_id];
+        if (!st.valid || st.is_periodic_clock) return;
+        if (!st.transitions.empty() && st.transitions.back().cycle == transition.cycle) {
+            st.transitions.back() = transition;
+        } else {
+            st.transitions.push_back(transition);
+        }
+        mark_current_block_shared_time(storage_id, transition.cycle);
+        have_pending_content_ = true;
+    }
+
+    void place_residual_lod_transition(u32 storage_id,
+                                       LodStorageState& storage,
+                                       const Transition& transition,
+                                       const Transition* next_transition) {
+        if (storage.levels.empty()) {
+            append_residual_raw_transition(storage_id, transition);
+            return;
+        }
+
+        if (next_transition == NULL) {
+            for (std::size_t rev = storage.levels.size(); rev > 0; --rev) {
+                LodLevelState& lod_level = storage.levels[rev - 1u];
+                if (lod_level.disabled || lod_level.min_cycle_delta == 0) continue;
+                const i64 window_start = lod_sampling_window_start(transition.cycle,
+                                                                   lod_level.min_cycle_delta);
+                emit_residual_lod_transition(lod_level, transition, window_start);
+                return;
+            }
+            append_residual_raw_transition(storage_id, transition);
+            return;
+        }
+
+        LodLevelState* selected_level = NULL;
+        i64 selected_window_start = 0;
+        const i64 next_cycle = next_transition->cycle;
+        for (std::size_t level = 0; level < storage.levels.size(); ++level) {
+            LodLevelState& lod_level = storage.levels[level];
+            if (lod_level.disabled || lod_level.min_cycle_delta == 0) continue;
+            const i64 window_start = lod_sampling_window_start(transition.cycle,
+                                                               lod_level.min_cycle_delta);
+            const i64 window_end = lod_sampling_window_end(window_start, lod_level.min_cycle_delta);
+            const bool crosses_window = next_cycle < window_start || next_cycle >= window_end;
+            if (!crosses_window) break;
+            selected_level = &lod_level;
+            selected_window_start = window_start;
+        }
+
+        if (selected_level != NULL) {
+            emit_residual_lod_transition(*selected_level, transition, selected_window_start);
+            return;
+        }
+
+        append_residual_raw_transition(storage_id, transition);
+    }
+
+    void finalize_residual_lod_until(i64 cycle) {
+        if (!residual_lod_enabled() || cycle < 0) return;
+        for (std::size_t sid = 0; sid < lod_states_.size(); ++sid) {
+            LodStorageState& storage = lod_states_[sid];
+            if (!storage.valid || storage.levels.empty() || !storage.has_residual_pending) continue;
+            LodLevelState& coarsest = storage.levels.back();
+            const i64 window_start = lod_sampling_window_start(storage.residual_pending_transition.cycle,
+                                                               coarsest.min_cycle_delta);
+            const i64 window_end = lod_sampling_window_end(window_start, coarsest.min_cycle_delta);
+            if (window_end <= cycle) {
+                place_residual_lod_transition(static_cast<u32>(sid), storage,
+                                              storage.residual_pending_transition, NULL);
+                storage.has_residual_pending = false;
+            }
+        }
+    }
+
+    void flush_all_residual_lod_pending() {
+        if (!residual_lod_enabled()) return;
+        for (std::size_t sid = 0; sid < lod_states_.size(); ++sid) {
+            LodStorageState& storage = lod_states_[sid];
+            if (!storage.valid || !storage.has_residual_pending) continue;
+            place_residual_lod_transition(static_cast<u32>(sid), storage,
+                                          storage.residual_pending_transition, NULL);
+            storage.has_residual_pending = false;
+        }
+    }
+
+    void update_lod_tables(u32 storage_id, const Transition& transition) {
         if (!options_.enable_lod_tables) return;
-        if (cycle < 0 || storage_id >= lod_states_.size()) return;
+        if (transition.cycle < 0 || storage_id >= lod_states_.size()) return;
         LodStorageState& storage = lod_states_[storage_id];
         if (!storage.valid || storage.byte_width == 0) return;
         ++storage.raw_transition_count;
         initialize_lod_levels(storage);
-        Transition tr;
-        tr.cycle = cycle;
-        tr.value = new_value;
+        Transition tr = transition;
         tr.value.byte_count = storage.byte_width;
+        if (residual_lod_enabled()) {
+            if (storage.has_residual_pending) {
+                place_residual_lod_transition(storage_id, storage,
+                                              storage.residual_pending_transition, &tr);
+            }
+            storage.residual_pending_transition = tr;
+            storage.has_residual_pending = true;
+            return;
+        }
         u64 source_record_count = storage.raw_transition_count;
         for (std::size_t level = 0; level < storage.levels.size(); ++level) {
             LodLevelState& lod_level = storage.levels[level];
@@ -1679,6 +1829,7 @@ private:
         if (options_.enable_value_byte_mask_encoding) feature_flags |= kHeaderFeatureByteMaskCodec;
         if (options_.enable_value_byte_mask_encoding) feature_flags |= kHeaderFeatureNibbleMaskCodec;
         if (options_.enable_lod_tables) feature_flags |= kHeaderFeatureLodTables;
+        if (residual_lod_enabled()) feature_flags |= kHeaderFeatureResidualLodTables;
         if (!detail::write_u64(out_, feature_flags)) { error = "failed to write WVZ4 feature flags"; return false; }
         if (!detail::write_u64(out_, 0)) { error = "failed to write WVZ4 reserved"; return false; }
         if (!detail::write_u32(out_, 0)) { error = "failed to write WVZ4 reserved"; return false; }
@@ -1892,6 +2043,7 @@ private:
                 if (!commit_block(end_cycle, error)) return false;
                 writer_diag_log_("writer-commit-end", NULL, end_cycle);
                 current_block_start_ = static_cast<u64>(end_cycle);
+                rebuild_current_block_shared_times_from_transitions();
                 continue;
             }
 
@@ -1902,11 +2054,51 @@ private:
             const u64 target = (static_cast<u64>(cycle) / span_u) * span_u;
             if (target < current_block_start_) return true; // defensive; cycle is monotonic.
             current_block_start_ = target;
+            rebuild_current_block_shared_times_from_transitions();
             return true;
         }
     }
 
+    struct DeferredSignalTransitions {
+        u32 signal_id = 0;
+        std::vector<Transition> transitions;
+    };
+
+    void defer_future_transitions(i64 end_cycle, std::vector<DeferredSignalTransitions>& deferred) {
+        deferred.clear();
+        for (std::size_t i = 0; i < signal_order_.size(); ++i) {
+            const u32 signal_id = signal_order_[i];
+            SignalState& st = signal_states_[signal_id];
+            if (st.transitions.empty()) continue;
+            std::vector<Transition>::iterator first_future =
+                std::lower_bound(st.transitions.begin(), st.transitions.end(), end_cycle,
+                    [](const Transition& tr, i64 cycle) { return tr.cycle < cycle; });
+            if (first_future == st.transitions.end()) continue;
+
+            DeferredSignalTransitions item;
+            item.signal_id = signal_id;
+            item.transitions.assign(first_future, st.transitions.end());
+            st.transitions.erase(first_future, st.transitions.end());
+            deferred.push_back(std::move(item));
+        }
+    }
+
+    void restore_deferred_transitions(std::vector<DeferredSignalTransitions>& deferred) {
+        for (std::size_t i = 0; i < deferred.size(); ++i) {
+            const u32 signal_id = deferred[i].signal_id;
+            if (signal_id == 0 || signal_id >= signal_states_.size()) continue;
+            SignalState& st = signal_states_[signal_id];
+            st.transitions.insert(st.transitions.end(),
+                                  deferred[i].transitions.begin(),
+                                  deferred[i].transitions.end());
+        }
+        deferred.clear();
+        have_pending_content_ = signal_states_have_pending_transitions();
+    }
+
     bool commit_block(i64 end_cycle, std::string& error) {
+        std::vector<DeferredSignalTransitions> deferred;
+        defer_future_transitions(end_cycle, deferred);
         if (!options_.enable_signal_chunking) {
             BlockJob job;
             job.block_id = next_block_id_++;
@@ -1923,11 +2115,12 @@ private:
                 committed = enqueue_block_job(std::move(job), error);
             } else {
                 EncodedBlock encoded = encode_block_job(job);
-                if (!encoded.error.empty()) { error = encoded.error; return false; }
+                if (!encoded.error.empty()) { error = encoded.error; restore_deferred_transitions(deferred); return false; }
                 committed = write_encoded_block(encoded, error);
             }
-            if (!committed) return false;
+            if (!committed) { restore_deferred_transitions(deferred); return false; }
             clear_committed_transitions();
+            restore_deferred_transitions(deferred);
             return true;
         }
 
@@ -1973,13 +2166,22 @@ private:
                 committed = enqueue_block_job(std::move(jobs[i]), error);
             } else {
                 EncodedBlock encoded = encode_block_job(jobs[i]);
-                if (!encoded.error.empty()) { error = encoded.error; return false; }
+                if (!encoded.error.empty()) { error = encoded.error; restore_deferred_transitions(deferred); return false; }
                 committed = write_encoded_block(encoded, error);
             }
-            if (!committed) return false;
+            if (!committed) { restore_deferred_transitions(deferred); return false; }
         }
         clear_committed_transitions();
+        restore_deferred_transitions(deferred);
         return true;
+    }
+
+    bool signal_states_have_pending_transitions() const {
+        for (std::size_t i = 0; i < signal_order_.size(); ++i) {
+            const SignalState& st = signal_states_[signal_order_[i]];
+            if (st.valid && !st.is_periodic_clock && !st.transitions.empty()) return true;
+        }
+        return false;
     }
 
     void clear_committed_transitions() {
@@ -1989,6 +2191,20 @@ private:
         }
         clear_current_block_shared_times();
         have_pending_content_ = false;
+    }
+
+    void rebuild_current_block_shared_times_from_transitions() {
+        clear_current_block_shared_times();
+        have_pending_content_ = false;
+        for (std::size_t i = 0; i < signal_order_.size(); ++i) {
+            const u32 signal_id = signal_order_[i];
+            const SignalState& st = signal_states_[signal_id];
+            if (!st.valid || st.is_periodic_clock || st.transitions.empty()) continue;
+            for (std::size_t t = 0; t < st.transitions.size(); ++t) {
+                mark_current_block_shared_time(signal_id, st.transitions[t].cycle);
+            }
+            have_pending_content_ = true;
+        }
     }
 
     u32 shared_time_chunk_id_for_signal(u32 signal_id) const {
@@ -2019,10 +2235,11 @@ private:
         }
         const u64 rel = static_cast<u64>(cycle - static_cast<i64>(current_block_start_));
         std::vector<u64>& times = current_block_shared_times_by_chunk_[chunk_id];
-        if (times.empty() || times.back() != rel) {
-            // submit_cycle() is strictly monotonic, so this vector is naturally
-            // sorted and unique for each chunk.
+        if (times.empty() || times.back() < rel) {
             times.push_back(rel);
+        } else if (times.back() != rel) {
+            std::vector<u64>::iterator it = std::lower_bound(times.begin(), times.end(), rel);
+            if (it == times.end() || *it != rel) times.insert(it, rel);
         }
     }
 
@@ -4017,8 +4234,23 @@ private:
         return out;
     }
 
-    static std::vector<LodSelectedLevel> select_lod_levels_to_store(const LodStorageState& storage) {
+    std::vector<LodSelectedLevel> select_lod_levels_to_store(const LodStorageState& storage) const {
         std::vector<LodSelectedLevel> selected;
+
+        if (residual_lod_enabled()) {
+            for (std::size_t level = 0; level < storage.levels.size(); ++level) {
+                const LodLevelState& lod_level = storage.levels[level];
+                if (lod_level.disabled) continue;
+                const u64 sampled_count = lod_level_materialized_count(lod_level);
+                if (sampled_count == 0) continue;
+                LodSelectedLevel s;
+                s.level = level;
+                s.source_record_count = storage.raw_transition_count;
+                selected.push_back(s);
+            }
+            return selected;
+        }
+
         if (storage.raw_transition_count < kLodMinRawTransitionsForTable) return selected;
 
         u64 previous_count = storage.raw_transition_count;
@@ -4038,12 +4270,13 @@ private:
         return selected;
     }
 
-    static u64 lod_time_chunk_span(u64 bucket_cycles) {
-        if (bucket_cycles == 0) return kLodTimeChunkBuckets;
-        if (bucket_cycles > (std::numeric_limits<u64>::max)() / kLodTimeChunkBuckets) {
+    u64 lod_time_chunk_span(u64 bucket_cycles) const {
+        const u64 raw_span = options_.target_block_span == 0 ? 1u : options_.target_block_span;
+        if (bucket_cycles == 0) return raw_span;
+        if (bucket_cycles > (std::numeric_limits<u64>::max)() / raw_span) {
             return (std::numeric_limits<u64>::max)();
         }
-        return bucket_cycles * kLodTimeChunkBuckets;
+        return bucket_cycles * raw_span;
     }
 
     static i64 lod_time_window_start(i64 cycle, u64 span) {
@@ -4158,18 +4391,23 @@ private:
                     const LodStorageState& storage = lod_states_[storage_id];
                     if (level >= storage.levels.size()) continue;
                     const LodLevelState& lod_level = storage.levels[level];
-                    if (lod_level.disabled || lod_level.transitions.empty()) continue;
-                    std::vector<Transition> materialized = materialize_lod_level_transitions(lod_level);
-                    if (static_cast<u64>(materialized.size()) >
-                        selected.source_record_count / kLodMaxRecordsToSourceRatio) {
-                        materialized.clear();
-                    }
-                    if (materialized.empty()) continue;
+                    if (lod_level.disabled || lod_level_materialized_count(lod_level) == 0) continue;
                     LodStorageLevelRef ref;
                     ref.storage_id = storage_id;
                     ref.storage = &storage;
                     ref.lod_level = &lod_level;
-                    ref.transitions.swap(materialized);
+                    if (residual_lod_enabled()) {
+                        if (lod_level.transitions.empty()) continue;
+                        ref.transition_source = &lod_level.transitions;
+                    } else {
+                        std::vector<Transition> materialized = materialize_lod_level_transitions(lod_level);
+                        if (static_cast<u64>(materialized.size()) >
+                            selected.source_record_count / kLodMaxRecordsToSourceRatio) {
+                            materialized.clear();
+                        }
+                        if (materialized.empty()) continue;
+                        ref.transitions.swap(materialized);
+                    }
                     ref.valid_ranges = materialize_lod_level_valid_ranges(lod_level);
                     refs.push_back(ref);
                 }
@@ -4178,7 +4416,8 @@ private:
                     bool have_next = false;
                     i64 window_start = (std::numeric_limits<i64>::max)();
                     for (std::size_t r = 0; r < refs.size(); ++r) {
-                        const std::vector<Transition>& transitions = refs[r].transitions;
+                        const std::vector<Transition>& transitions =
+                            refs[r].transition_source ? *refs[r].transition_source : refs[r].transitions;
                         if (refs[r].cursor >= transitions.size()) continue;
                         const i64 candidate = lod_time_window_start(transitions[refs[r].cursor].cycle, span);
                         if (!have_next || candidate < window_start) {
@@ -4193,7 +4432,8 @@ private:
                     u64 storage_count = 0;
                     u64 record_count = 0;
                     for (std::size_t r = 0; r < refs.size(); ++r) {
-                        const std::vector<Transition>& transitions = refs[r].transitions;
+                        const std::vector<Transition>& transitions =
+                            refs[r].transition_source ? *refs[r].transition_source : refs[r].transitions;
                         if (refs[r].cursor >= transitions.size()) continue;
                         if (lod_time_window_start(transitions[refs[r].cursor].cycle, span) != window_start) continue;
 
@@ -4884,6 +5124,7 @@ inline void serialize_options(std::vector<u8>& out, const WriterOptions& o) {
     append_u8(out, o.enable_value_byte_mask_encoding ? 1 : 0);
     append_u8(out, o.enable_stride_time_record_encoding ? 1 : 0);
     append_u8(out, o.enable_lod_tables ? 1 : 0);
+    append_u8(out, o.enable_residual_lod_tables ? 1 : 0);
     append_u8(out, o.enable_stats_log ? 1 : 0);
     append_string(out, o.stats_log_path);
     append_varuint(out, static_cast<u64>(o.transition_reserve_per_signal));
@@ -4907,6 +5148,7 @@ inline bool deserialize_options(PayloadReader& r, WriterOptions& o) {
     if (!r.read_u8(b)) return false; o.enable_value_byte_mask_encoding = (b != 0);
     if (!r.read_u8(b)) return false; o.enable_stride_time_record_encoding = (b != 0);
     if (!r.read_u8(b)) return false; o.enable_lod_tables = (b != 0);
+    if (!r.read_u8(b)) return false; o.enable_residual_lod_tables = (b != 0);
     if (!r.read_u8(b)) return false; o.enable_stats_log = (b != 0);
     if (!r.read_string(o.stats_log_path)) return false;
     if (!r.read_varuint(v)) return false; o.transition_reserve_per_signal = static_cast<std::size_t>(v);

@@ -85,7 +85,11 @@ static const u32 kSupportedVersionV9 = 9;
 static const u32 kSupportedVersionV10 = 10;
 static const u32 kSupportedVersionV11 = 11;
 static const u32 kSupportedVersionV12 = 12;
+static const u32 kSupportedVersionV13 = 13;
 static const u8 kSignalFlagStorageOnly = 1u << 0;
+
+static const u64 kHeaderFeatureLodTables = 1ull << 6;
+static const u64 kHeaderFeatureResidualLodTables = 1ull << 7;
 
 // WVZ4 v2 raw WDAT payload flags. These match wvz4_writer_typed.h.
 static const u64 kWdatDeltaTimes      = 1ull << 0;
@@ -2932,7 +2936,7 @@ bool decodeWdatSectionStreaming(QFile& file,
                                     byteWidthBySignalId, outputSignals, samplesByOutputIndex,
                                     windowStart, windowEnd, minTime, maxTime, error);
     }
-    if (formatVersion >= kSupportedVersionV3 && formatVersion <= kSupportedVersionV12) {
+    if (formatVersion >= kSupportedVersionV3 && formatVersion <= kSupportedVersionV13) {
         return decodeRawWaveTileV3(raw, formatVersion, blockId, start, end,
                                    signalChunkId, firstSignalId, signalCount,
                                    selectedIds, allSelected, outputIndexesByStorageId,
@@ -3350,6 +3354,121 @@ void sortAndDedupLodSamples(QVector<QVector<WaveLodLevel>>& lodLevelsByStorageId
     }
 }
 
+void sortAndCompactWaveSamples(QVector<WaveSample>& samples) {
+    if (samples.size() <= 1) return;
+    std::stable_sort(samples.begin(), samples.end(), [](const WaveSample& a, const WaveSample& b) {
+        return a.time < b.time;
+    });
+    QVector<WaveSample> compacted;
+    compacted.reserve(samples.size());
+    for (WaveSample& sample : samples) {
+        appendCompactedSample(compacted, std::move(sample));
+    }
+    samples = std::move(compacted);
+}
+
+QVector<WaveLodValidRange> normalizedLodRanges(QVector<WaveLodValidRange> ranges) {
+    if (ranges.isEmpty()) return ranges;
+    std::sort(ranges.begin(), ranges.end(), [](const WaveLodValidRange& a, const WaveLodValidRange& b) {
+        return a.start < b.start;
+    });
+    int write = 0;
+    for (int read = 0; read < ranges.size(); ++read) {
+        WaveLodValidRange range = ranges.at(read);
+        if (range.end <= range.start) continue;
+        if (write > 0 && range.start <= ranges.at(write - 1).end) {
+            if (range.end > ranges[write - 1].end) ranges[write - 1].end = range.end;
+        } else {
+            if (write != read) ranges[write] = range;
+            ++write;
+        }
+    }
+    ranges.resize(write);
+    return ranges;
+}
+
+QVector<WaveLodValidRange> intersectLodRangeSets(QVector<WaveLodValidRange> a,
+                                                 QVector<WaveLodValidRange> b) {
+    a = normalizedLodRanges(std::move(a));
+    b = normalizedLodRanges(std::move(b));
+    QVector<WaveLodValidRange> out;
+    int ai = 0;
+    int bi = 0;
+    while (ai < a.size() && bi < b.size()) {
+        const qint64 start = qMax(a.at(ai).start, b.at(bi).start);
+        const qint64 end = qMin(a.at(ai).end, b.at(bi).end);
+        if (end > start) {
+            WaveLodValidRange range;
+            range.start = start;
+            range.end = end;
+            out.push_back(range);
+        }
+        if (a.at(ai).end < b.at(bi).end) ++ai;
+        else ++bi;
+    }
+    return out;
+}
+
+QVector<WaveLodValidRange> unionLodRangeSets(QVector<WaveLodValidRange> a,
+                                             QVector<WaveLodValidRange> b) {
+    a = normalizedLodRanges(std::move(a));
+    b = normalizedLodRanges(std::move(b));
+    a.reserve(a.size() + b.size());
+    for (const WaveLodValidRange& range : b) a.push_back(range);
+    return normalizedLodRanges(std::move(a));
+}
+
+QVector<WaveLodValidRange> combineResidualCoverage(QVector<WaveLodValidRange> current,
+                                                   QVector<WaveLodValidRange> coarser) {
+    return unionLodRangeSets(std::move(current), std::move(coarser));
+}
+
+void makeResidualLodLevelsCumulative(QVector<QVector<WaveLodLevel>>& lodLevelsByStorageId) {
+    for (int storage = 0; storage < lodLevelsByStorageId.size(); ++storage) {
+        QVector<WaveLodLevel>& levels = lodLevelsByStorageId[storage];
+        QVector<WaveSample> coarserSamples;
+        QVector<WaveLodValidRange> coarserValidRanges;
+        QVector<WaveLodValidRange> coarserLoadedRanges;
+        for (int levelIndex = levels.size() - 1; levelIndex >= 0; --levelIndex) {
+            WaveLodLevel& level = levels[levelIndex];
+            QVector<WaveSample> mergedSamples;
+            mergedSamples.reserve(level.samples.size() + coarserSamples.size());
+            for (const WaveSample& sample : level.samples) mergedSamples.push_back(sample);
+            for (const WaveSample& sample : coarserSamples) mergedSamples.push_back(sample);
+            sortAndCompactWaveSamples(mergedSamples);
+            level.samples = std::move(mergedSamples);
+            level.validRanges = combineResidualCoverage(level.validRanges, coarserValidRanges);
+            level.loadedRanges = combineResidualCoverage(level.loadedRanges, coarserLoadedRanges);
+
+            coarserSamples = level.samples;
+            coarserValidRanges = level.validRanges;
+            coarserLoadedRanges = level.loadedRanges;
+        }
+    }
+}
+
+void appendResidualLodToRawSamples(const QVector<QVector<WaveLodLevel>>& lodLevelsByStorageId,
+                                   const QSet<int>& selectedSignalIds,
+                                   bool allSelectedSignalIds,
+                                   const QVector<WaveSignal>& outputSignals,
+                                   QVector<QVector<WaveSample>>& samplesByOutputIndex) {
+    for (int outputIndex = 0; outputIndex < outputSignals.size() && outputIndex < samplesByOutputIndex.size(); ++outputIndex) {
+        const WaveSignal& sig = outputSignals.at(outputIndex);
+        if (!allSelectedSignalIds && !selectedSignalIds.contains(sig.signalId)) continue;
+        const int storageId = sig.storageId > 0 ? sig.storageId : sig.signalId;
+        if (storageId <= 0 || storageId >= lodLevelsByStorageId.size()) continue;
+        QVector<WaveSample>& samples = samplesByOutputIndex[outputIndex];
+        const QVector<WaveLodLevel>& storageLevels = lodLevelsByStorageId.at(storageId);
+        for (const WaveLodLevel& storageLevel : storageLevels) {
+            if (storageLevel.samples.isEmpty()) continue;
+            WaveLodLevel sliced = sliceLodLevelForSignal(storageLevel, sig);
+            samples.reserve(samples.size() + sliced.samples.size());
+            for (WaveSample& sample : sliced.samples) samples.push_back(std::move(sample));
+        }
+        sortAndCompactWaveSamples(samples);
+    }
+}
+
 bool decodeLodzChunksFromFooterIndex(QFile& file,
                                       const QVector<LodChunkIndexRec>& lodChunks,
                                       u32 formatVersion,
@@ -3666,7 +3785,7 @@ bool decodeWdatSection(const QByteArray& payload,
                                     byteWidthBySignalId, outputSignals, samplesByOutputIndex,
                                     windowStart, windowEnd, minTime, maxTime, error);
     }
-    if (formatVersion >= kSupportedVersionV3 && formatVersion <= kSupportedVersionV12) {
+    if (formatVersion >= kSupportedVersionV3 && formatVersion <= kSupportedVersionV13) {
         return decodeRawWaveTileV3(raw, formatVersion, blockId, start, end,
                                    signalChunkId, firstSignalId, signalCount,
                                    selectedIds, allSelected, outputIndexesByStorageId,
@@ -3824,6 +3943,8 @@ struct WaveParser4Reader::Impl {
     u32 headerSize = 0;
     u64 footerOffset = 0;
     u64 signalsPerChunk = 0;
+    u64 headerFeatureFlags = 0;
+    bool residualLodTables = false;
 
     QVector<QString> namesById;
     QVector<NodeRec> nodesById;
@@ -3879,13 +4000,18 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
     next->headerSize = readU32LE(header.constData() + 12);
     next->footerOffset = readU64LE(header.constData() + 24);
     next->signalsPerChunk = readU64LE(header.constData() + 32);
+    next->headerFeatureFlags = readU64LE(header.constData() + 40);
+    next->residualLodTables = next->version >= kSupportedVersionV13 &&
+        ((next->headerFeatureFlags & kHeaderFeatureResidualLodTables) != 0) &&
+        ((next->headerFeatureFlags & kHeaderFeatureLodTables) != 0);
 
     if (next->version != kSupportedVersionV1 && next->version != kSupportedVersionV2 &&
         next->version != kSupportedVersionV3 && next->version != kSupportedVersionV4 &&
         next->version != kSupportedVersionV5 && next->version != kSupportedVersionV6 &&
         next->version != kSupportedVersionV7 && next->version != kSupportedVersionV8 &&
         next->version != kSupportedVersionV9 && next->version != kSupportedVersionV10 &&
-        next->version != kSupportedVersionV11 && next->version != kSupportedVersionV12) {
+        next->version != kSupportedVersionV11 && next->version != kSupportedVersionV12 &&
+        next->version != kSupportedVersionV13) {
         error = QStringLiteral("Unsupported WVZ4 version: %1").arg(next->version);
         return false;
     }
@@ -4137,7 +4263,7 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
     qint64 maxTime = 0;
 
     DecodedSampleBudgetScope decodedSampleBudget(maxDecodedSamples);
-    if (d->version >= kSupportedVersionV2 && d->version <= kSupportedVersionV12) {
+    if (d->version >= kSupportedVersionV2 && d->version <= kSupportedVersionV13) {
         const QSet<int> noFilteredSignalIds;
         if (!appendImplicitZeroSamplesForSelectedSignals(noFilteredSignalIds, true,
                                                          outputSignals, samplesByOutputIndex,
@@ -4166,6 +4292,24 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
                                                        error)) {
             return false;
         }
+    }
+
+    if (d->residualLodTables && !selectedStorageIds.isEmpty()) {
+        QFile file(d->filePath);
+        if (!file.open(QIODevice::ReadOnly)) {
+            error = QStringLiteral("Cannot open WVZ4 file: %1").arg(d->filePath);
+            return false;
+        }
+        QVector<QVector<WaveLodLevel>> residualLodLevelsByStorageId = d->footerLodLevelsByStorageId;
+        if (!decodeLodzChunksFromFooterIndex(file, d->footerLodChunkIndex, d->version, d->signalsPerChunk,
+                                             selectedStorageIds, false,
+                                             d->byteWidthByStorageId, residualLodLevelsByStorageId,
+                                             timeStart, timeEnd, 0,
+                                             error)) {
+            return false;
+        }
+        appendResidualLodToRawSamples(residualLodLevelsByStorageId, emittedSignalIds, false,
+                                      outputSignals, samplesByOutputIndex);
     }
 
     expandTimeRangeFromFooterBlocks(d->footerBlocks, minTime, maxTime);
@@ -4361,8 +4505,10 @@ bool WaveParser4::loadFromFile(const QString& filePath,
     const u64 footerOffset = readU64LE(header.constData() + 24);
     const u64 headerSignalsPerChunk = readU64LE(header.constData() + 32);
     const u64 headerFeatureFlags = readU64LE(header.constData() + 40);
+    const bool residualLodTables = version >= kSupportedVersionV13 &&
+        ((headerFeatureFlags & kHeaderFeatureResidualLodTables) != 0) &&
+        ((headerFeatureFlags & kHeaderFeatureLodTables) != 0);
     Q_UNUSED(blockSpan);
-    Q_UNUSED(headerFeatureFlags);
 
     // On-demand WVZ4 sample load only needs SIGT plus WDAT.  NAME/NODE/NAMZ/NODZ
     // and full child-chain validation were previously repeated on every click,
@@ -4374,7 +4520,8 @@ bool WaveParser4::loadFromFile(const QString& filePath,
         version != kSupportedVersionV5 && version != kSupportedVersionV6 &&
         version != kSupportedVersionV7 && version != kSupportedVersionV8 &&
         version != kSupportedVersionV9 && version != kSupportedVersionV10 &&
-        version != kSupportedVersionV11 && version != kSupportedVersionV12) {
+        version != kSupportedVersionV11 && version != kSupportedVersionV12 &&
+        version != kSupportedVersionV13) {
         error = QStringLiteral("不支持的 WVZ4 版本：%1").arg(version);
         return false;
     }
@@ -4591,7 +4738,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
 
         samplesByOutputIndex.resize(outputSignals.size());
 
-        if (options.loadRawSamples && version >= kSupportedVersionV2 && version <= kSupportedVersionV12) {
+        if (options.loadRawSamples && version >= kSupportedVersionV2 && version <= kSupportedVersionV13) {
             if (!appendImplicitZeroSamplesForSelectedSignals(selectedIds, allSelectedSignalIds,
                                                              outputSignals, samplesByOutputIndex,
                                                              minTime, maxTime, error)) {
@@ -4744,13 +4891,25 @@ bool WaveParser4::loadFromFile(const QString& filePath,
         }
     }
 
+    const qint64 lodDecodeTargetBucketCycles = (residualLodTables && options.loadRawSamples)
+        ? 0
+        : options.lodTargetBucketCycles;
     if (!decodeLodzChunksFromFooterIndex(file, footerLodChunkIndex, version, headerSignalsPerChunk,
                                          lodSelectedStorageIds, allLodSelectedStorageIds,
                                          byteWidthByStorageId, footerLodLevelsByStorageId,
                                          options.timeStart, options.timeEnd,
-                                         options.lodTargetBucketCycles,
+                                         lodDecodeTargetBucketCycles,
                                          error)) {
         return false;
+    }
+
+    if (residualLodTables && options.loadRawSamples) {
+        appendResidualLodToRawSamples(footerLodLevelsByStorageId, selectedIds, allSelectedSignalIds,
+                                      outputSignals, samplesByOutputIndex);
+    }
+
+    if (residualLodTables) {
+        makeResidualLodLevelsCumulative(footerLodLevelsByStorageId);
     }
 
     for (int i = 0; i < footerBlocks.size(); ++i) {

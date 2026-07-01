@@ -11,7 +11,7 @@ This package keeps the existing WVZ4 stable-topology writer features and adds tw
 wvz4::WriterOptions opt;
 opt.target_block_span = 100000;
 opt.enable_signal_chunking = true;
-opt.signals_per_chunk = 1024;
+opt.signals_per_chunk = 32;
 opt.enable_delta_time_encoding = true;
 opt.enable_shared_time_table = true;
 opt.implicit_zero_initial_values = true;

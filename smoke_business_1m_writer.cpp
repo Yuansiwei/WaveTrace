@@ -282,7 +282,7 @@ int main(int argc, char** argv) {
 
     wvz4::WriterOptions options;
     options.target_block_span = 8192;
-    options.signals_per_chunk = 256;
+    options.signals_per_chunk = 32;
     options.compression = wvz4::Compression::Zstd;
     options.zstd_level = 3;
     options.enable_stats_log = true;

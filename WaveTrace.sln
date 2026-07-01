@@ -32,6 +32,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_systemc_helper_credit
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_bitfield_track_writer", "smoke_bitfield_track_writer.vcxproj", "{73BBEB1D-0C0A-41E1-B0F7-3E7C6C654222}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_lod_residual_benchmark", "smoke_lod_residual_benchmark.vcxproj", "{A36E519B-235E-42D8-A904-33765E8E7C82}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -98,6 +100,10 @@ Global
 		{73BBEB1D-0C0A-41E1-B0F7-3E7C6C654222}.Debug|x64.Build.0 = Debug|x64
 		{73BBEB1D-0C0A-41E1-B0F7-3E7C6C654222}.Release|x64.ActiveCfg = Release|x64
 		{73BBEB1D-0C0A-41E1-B0F7-3E7C6C654222}.Release|x64.Build.0 = Release|x64
+		{A36E519B-235E-42D8-A904-33765E8E7C82}.Debug|x64.ActiveCfg = Debug|x64
+		{A36E519B-235E-42D8-A904-33765E8E7C82}.Debug|x64.Build.0 = Debug|x64
+		{A36E519B-235E-42D8-A904-33765E8E7C82}.Release|x64.ActiveCfg = Release|x64
+		{A36E519B-235E-42D8-A904-33765E8E7C82}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

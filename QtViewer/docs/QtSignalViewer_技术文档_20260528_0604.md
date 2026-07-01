@@ -165,7 +165,7 @@ parser 可以通过 header 中的 `footer_offset` 直接定位 FOOT，再用 FOO
 
 ### 5.2 signal chunking
 
-signal chunking 的目的不是减少总数据量，而是减少查看某个信号时需要读取和解压的无关数据。默认 `signals_per_chunk = 1024`。某个 signal 的 chunk 号为：
+signal chunking 的目的不是减少总数据量，而是减少查看某个信号时需要读取和解压的无关数据。默认 `signals_per_chunk = 32`。某个 signal 的 chunk 号为：
 
 ```text
 signal_chunk_id = (signal_id - 1) / signals_per_chunk

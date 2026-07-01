@@ -4,6 +4,8 @@ VisualStudioVersion = 16.0.28729.10
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "QtViewer", "QtViewer.vcxproj", "{A7D0809D-5DA4-4A10-9C1F-8C7C603808CE}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_wvz4_raw_compare", "smoke_wvz4_raw_compare.vcxproj", "{BB2D0C1C-8B28-4E43-85A7-82D8521FA4C6}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -14,6 +16,10 @@ Global
 		{A7D0809D-5DA4-4A10-9C1F-8C7C603808CE}.Debug|x64.Build.0 = Debug|x64
 		{A7D0809D-5DA4-4A10-9C1F-8C7C603808CE}.Release|x64.ActiveCfg = Release|x64
 		{A7D0809D-5DA4-4A10-9C1F-8C7C603808CE}.Release|x64.Build.0 = Release|x64
+		{BB2D0C1C-8B28-4E43-85A7-82D8521FA4C6}.Debug|x64.ActiveCfg = Debug|x64
+		{BB2D0C1C-8B28-4E43-85A7-82D8521FA4C6}.Debug|x64.Build.0 = Debug|x64
+		{BB2D0C1C-8B28-4E43-85A7-82D8521FA4C6}.Release|x64.ActiveCfg = Release|x64
+		{BB2D0C1C-8B28-4E43-85A7-82D8521FA4C6}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
