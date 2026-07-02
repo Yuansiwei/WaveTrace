@@ -242,7 +242,10 @@ struct WriterOptions {
     // summaries in memory until FOOT is written. Disable for very large writer
     // stress runs when first-open/on-demand parser behavior is the target.
     bool enable_lod_tables = true;
-    bool enable_residual_lod_tables = true;
+    // Experimental: residual LOD stores each transition in only one raw/LOD
+    // stream and asks the reader to merge them back. Keep the default on the
+    // mature independent LOD path where raw remains complete.
+    bool enable_residual_lod_tables = false;
 
     // Emit a sidecar text report at close. Empty path means <wvz4-file>.log.
     bool enable_stats_log = true;

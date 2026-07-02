@@ -41,6 +41,7 @@
 #include <QPixmap>
 #include <QPushButton>
 #include <QProgressDialog>
+#include <QRegularExpression>
 #include <QShortcut>
 #include <QSplitter>
 #include <QSpinBox>
@@ -233,6 +234,15 @@ bool lodLevelLoadedForWindow(const WaveLodLevel& level, qint64 start, qint64 end
     return lodRangesCoverWindow(level.loadedRanges, start, end);
 }
 
+bool lodRangesIntersectWindowOrEmpty(const QVector<WaveLodValidRange>& ranges, qint64 start, qint64 end) {
+    if (end <= start) return true;
+    if (ranges.isEmpty()) return true;
+    for (const WaveLodValidRange& range : ranges) {
+        if (range.end > start && range.start < end) return true;
+    }
+    return false;
+}
+
 bool signalHasLoadedLodForWindow(const WaveSignal& sig,
                                  qint64 start,
                                  qint64 end,
@@ -247,6 +257,71 @@ bool signalHasLoadedLodForWindow(const WaveSignal& sig,
         if (lodLevelLoadedForWindow(level, start, end)) return true;
     }
     return false;
+}
+
+qint64 lodSampleEventTimeInRange(const WaveLodLevel& level, qint64 start, qint64 end, bool firstEvent) {
+    if (end <= start || level.samples.isEmpty()) return -1;
+    if (!lodRangesIntersectWindowOrEmpty(level.loadedRanges, start, end)) return -1;
+    if (!lodRangesIntersectWindowOrEmpty(level.validRanges, start, end)) return -1;
+
+    auto lowerSample = [](const QVector<WaveSample>& samples, qint64 t) {
+        int lo = 0;
+        int hi = samples.size();
+        while (lo < hi) {
+            const int mid = lo + (hi - lo) / 2;
+            if (samples.at(mid).time < t) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    };
+
+    if (firstEvent) {
+        const int i = lowerSample(level.samples, start);
+        return (i < level.samples.size() && level.samples.at(i).time < end)
+            ? level.samples.at(i).time
+            : -1;
+    }
+
+    int i = lowerSample(level.samples, end) - 1;
+    if (i < 0 || i >= level.samples.size()) return -1;
+    const qint64 t = level.samples.at(i).time;
+    return t >= start ? t : -1;
+}
+
+qint64 signalLodEventTimeInRange(const WaveSignal& sig,
+                                 qint64 start,
+                                 qint64 end,
+                                 int plotWidth,
+                                 bool firstEvent) {
+    if (end <= start || sig.lodLevels.isEmpty()) return -1;
+    const double cyclesPerPixel = double(end - start) / double(qMax(1, plotWidth));
+    if (cyclesPerPixel < 128.0) return -1;
+    const qint64 maxBucketCycles = qMax<qint64>(1, qint64(std::floor(cyclesPerPixel)));
+
+    const WaveLodLevel* preferred = nullptr;
+    for (const WaveLodLevel& level : sig.lodLevels) {
+        if (level.bucketCycles <= 0) continue;
+        if (level.bucketCycles > maxBucketCycles) break;
+        if (level.samples.isEmpty()) continue;
+        if (!lodRangesIntersectWindowOrEmpty(level.loadedRanges, start, end)) continue;
+        if (!lodRangesIntersectWindowOrEmpty(level.validRanges, start, end)) continue;
+        preferred = &level;
+    }
+
+    if (preferred) {
+        const qint64 t = lodSampleEventTimeInRange(*preferred, start, end, firstEvent);
+        if (t >= 0) return t;
+    }
+
+    qint64 best = -1;
+    for (const WaveLodLevel& level : sig.lodLevels) {
+        if (level.bucketCycles <= 0) continue;
+        if (level.bucketCycles > maxBucketCycles) break;
+        const qint64 t = lodSampleEventTimeInRange(level, start, end, firstEvent);
+        if (t < 0) continue;
+        if (best < 0 || (firstEvent ? (t < best) : (t > best))) best = t;
+    }
+    return best;
 }
 
 void compactLodSamples(QVector<WaveSample>& samples) {
@@ -1087,15 +1162,15 @@ struct SignalLogicTree {
         return text;
     }
 
-    bool nodeNameContains(int nodeId, const QString& needle) const {
-        return nodeSearchNameString(nodeId).contains(needle, Qt::CaseInsensitive);
+    bool nodeNameContains(int nodeId, const QString& needle, Qt::CaseSensitivity caseSensitivity) const {
+        return nodeSearchNameString(nodeId).contains(needle, caseSensitivity);
     }
 
-    bool nodeNameEquals(int nodeId, const QString& needle) const {
+    bool nodeNameEquals(int nodeId, const QString& needle, Qt::CaseSensitivity caseSensitivity) const {
         const QString displayName = nodeSearchNameString(nodeId);
         const QString bareName = nodeNameString(nodeId);
-        if (QString::compare(displayName, needle, Qt::CaseInsensitive) == 0 ||
-            QString::compare(bareName, needle, Qt::CaseInsensitive) == 0) {
+        if (QString::compare(displayName, needle, caseSensitivity) == 0 ||
+            QString::compare(bareName, needle, caseSensitivity) == 0) {
             return true;
         }
 
@@ -1105,15 +1180,15 @@ struct SignalLogicTree {
         const QString strippedBare = stripCompareSideMarker(bareName);
         if (strippedBare != bareName) {
             const QString strippedDisplay = stripCompareSideMarker(displayName);
-            return QString::compare(strippedDisplay, needle, Qt::CaseInsensitive) == 0 ||
-                   QString::compare(strippedBare, needle, Qt::CaseInsensitive) == 0;
+            return QString::compare(strippedDisplay, needle, caseSensitivity) == 0 ||
+                   QString::compare(strippedBare, needle, caseSensitivity) == 0;
         }
         return false;
     }
 
-    bool directPathMatchesFrom(int nodeId, const QStringList& parts, int partIndex) const {
+    bool directPathMatchesFrom(int nodeId, const QStringList& parts, int partIndex, Qt::CaseSensitivity caseSensitivity) const {
         if (partIndex < 0 || partIndex >= parts.size()) return true;
-        if (!nodeNameEquals(nodeId, parts.at(partIndex))) return false;
+        if (!nodeNameEquals(nodeId, parts.at(partIndex), caseSensitivity)) return false;
         if (partIndex == parts.size() - 1) return true;
 
         const LogicChildList* list = childListForNode(nodeId);
@@ -1121,17 +1196,17 @@ struct SignalLogicTree {
 
         const QString& next = parts.at(partIndex + 1);
         for (int childNodeId : list->children) {
-            if (nodeNameEquals(childNodeId, next) &&
-                directPathMatchesFrom(childNodeId, parts, partIndex + 1)) {
+            if (nodeNameEquals(childNodeId, next, caseSensitivity) &&
+                directPathMatchesFrom(childNodeId, parts, partIndex + 1, caseSensitivity)) {
                 return true;
             }
         }
         return false;
     }
 
-    int directPathEndNodeFrom(int nodeId, const QStringList& parts, int partIndex) const {
+    int directPathEndNodeFrom(int nodeId, const QStringList& parts, int partIndex, Qt::CaseSensitivity caseSensitivity) const {
         if (partIndex < 0 || partIndex >= parts.size()) return -1;
-        if (!nodeNameEquals(nodeId, parts.at(partIndex))) return -1;
+        if (!nodeNameEquals(nodeId, parts.at(partIndex), caseSensitivity)) return -1;
         if (partIndex == parts.size() - 1) return nodeId;
 
         const LogicChildList* list = childListForNode(nodeId);
@@ -1139,19 +1214,44 @@ struct SignalLogicTree {
 
         const QString& next = parts.at(partIndex + 1);
         for (int childNodeId : list->children) {
-            if (!nodeNameEquals(childNodeId, next)) continue;
-            const int endNode = directPathEndNodeFrom(childNodeId, parts, partIndex + 1);
+            if (!nodeNameEquals(childNodeId, next, caseSensitivity)) continue;
+            const int endNode = directPathEndNodeFrom(childNodeId, parts, partIndex + 1, caseSensitivity);
             if (endNode >= 0) return endNode;
         }
         return -1;
     }
 
-    QVector<int> searchTreeQuery(const QString& query, int maxResults) const {
+    QVector<int> searchTreeQuery(const QString& query, int maxResults,
+                                 Qt::CaseSensitivity caseSensitivity,
+                                 bool regexMode) const {
         QVector<int> result;
         if (maxResults <= 0) return result;
 
         const QString trimmed = query.trimmed();
         if (trimmed.isEmpty()) return result;
+
+        if (regexMode) {
+            QRegularExpression::PatternOptions options = QRegularExpression::NoPatternOption;
+            if (caseSensitivity == Qt::CaseInsensitive) {
+                options |= QRegularExpression::CaseInsensitiveOption;
+            }
+            const QRegularExpression re(trimmed, options);
+            if (!re.isValid()) return result;
+
+            result.reserve(qMin(maxResults, 1024));
+            for (int nodeId = 0; nodeId < nodes.size(); ++nodeId) {
+                const QString displayName = nodeSearchNameString(nodeId);
+                const QString bareName = nodeNameString(nodeId);
+                const QString fullPath = fullPathForNodeId(nodeId);
+                if (re.match(displayName).hasMatch() ||
+                    re.match(bareName).hasMatch() ||
+                    re.match(fullPath).hasMatch()) {
+                    result.push_back(nodeId);
+                    if (result.size() >= maxResults) return result;
+                }
+            }
+            return result;
+        }
 
         const QStringList parts = splitSearchPath(trimmed);
         if (parts.isEmpty()) return result;
@@ -1163,7 +1263,7 @@ struct SignalLogicTree {
 
             // Single-segment search searches tree node names, not complete leaf paths.
             for (int nodeId = 0; nodeId < nodes.size(); ++nodeId) {
-                if (nodeNameContains(nodeId, part)) {
+                if (nodeNameContains(nodeId, part, caseSensitivity)) {
                     result.push_back(nodeId);
                     if (result.size() >= maxResults) return result;
                 }
@@ -1175,8 +1275,8 @@ struct SignalLogicTree {
         // "a.b" means a node named "a" with a direct child path segment "b".
         // It can match anywhere in the tree, e.g. top.x.a.b.y will match at a.b.
         for (int nodeId = 0; nodeId < nodes.size(); ++nodeId) {
-            if (!nodeNameEquals(nodeId, parts.first())) continue;
-            const int endNode = directPathEndNodeFrom(nodeId, parts, 0);
+            if (!nodeNameEquals(nodeId, parts.first(), caseSensitivity)) continue;
+            const int endNode = directPathEndNodeFrom(nodeId, parts, 0, caseSensitivity);
             if (endNode >= 0) {
                 result.push_back(endNode);
                 if (result.size() >= maxResults) return result;
@@ -2925,6 +3025,53 @@ private:
         return indexes;
     }
 
+    qint64 signalChangeTimeInRange(const WaveSignal& sig, qint64 start, qint64 end, bool firstEvent) {
+        if (end <= start) return -1;
+        if (sig.changeTimesReady) {
+            const QVector<qint64>& times = sig.changeTimes;
+            if (times.isEmpty()) return -1;
+            if (firstEvent) {
+                const auto it = std::lower_bound(times.constBegin(), times.constEnd(), start);
+                return (it != times.constEnd() && *it < end) ? *it : -1;
+            }
+            const auto it = std::lower_bound(times.constBegin(), times.constEnd(), end);
+            if (it == times.constBegin()) return -1;
+            const qint64 t = *(it - 1);
+            return t >= start ? t : -1;
+        }
+
+        if (sig.samples.size() < 2) return -1;
+        auto lowerSample = [](const QVector<WaveSample>& samples, qint64 t) {
+            int lo = 0;
+            int hi = samples.size();
+            while (lo < hi) {
+                const int mid = lo + (hi - lo) / 2;
+                if (samples.at(mid).time < t) lo = mid + 1;
+                else hi = mid;
+            }
+            return lo;
+        };
+
+        if (firstEvent) {
+            const int begin = qMax(1, lowerSample(sig.samples, start));
+            for (int i = begin; i < sig.samples.size(); ++i) {
+                const qint64 t = sig.samples.at(i).time;
+                if (t >= end) break;
+                if (!waveSamplesEquivalent(sig.samples.at(i), sig.samples.at(i - 1))) return t;
+            }
+            return -1;
+        }
+
+        int i = lowerSample(sig.samples, end) - 1;
+        i = qMin(i, sig.samples.size() - 1);
+        for (; i >= 1; --i) {
+            const qint64 t = sig.samples.at(i).time;
+            if (t < start) break;
+            if (!waveSamplesEquivalent(sig.samples.at(i), sig.samples.at(i - 1))) return t;
+        }
+        return -1;
+    }
+
     struct ParsedValueFindTarget {
         quint64 bits = 0;
         bool negativeDecimal = false;
@@ -3816,7 +3963,30 @@ void MainWindow::buildUi() {
 
     m_treeSearchEdit = new QLineEdit(leftPane);
     m_treeSearchEdit->setPlaceholderText(QString::fromUtf8("搜索层级名 / 信号名"));
-    leftLayout->addWidget(m_treeSearchEdit);
+    m_treeSearchEdit->setMinimumWidth(0);
+    auto* treeSearchRow = new QHBoxLayout();
+    treeSearchRow->setSpacing(4);
+    treeSearchRow->setContentsMargins(0, 0, 0, 0);
+    m_treeSearchCaseButton = new QPushButton(QStringLiteral("Aa"), leftPane);
+    m_treeSearchRegexButton = new QPushButton(QStringLiteral(".*"), leftPane);
+    auto setupSearchOptionButton = [](QPushButton* button, const QString& tip) {
+        button->setCheckable(true);
+        button->setObjectName(QStringLiteral("searchOptionButton"));
+        button->setFixedSize(34, 30);
+        button->setToolTip(tip);
+        button->setAccessibleName(tip);
+        button->setFocusPolicy(Qt::NoFocus);
+        QFont f = button->font();
+        f.setPointSizeF(9.2);
+        f.setBold(true);
+        button->setFont(f);
+    };
+    setupSearchOptionButton(m_treeSearchCaseButton, QStringLiteral("Match case"));
+    setupSearchOptionButton(m_treeSearchRegexButton, QStringLiteral("Use regular expression"));
+    treeSearchRow->addWidget(m_treeSearchEdit, 1);
+    treeSearchRow->addWidget(m_treeSearchCaseButton);
+    treeSearchRow->addWidget(m_treeSearchRegexButton);
+    leftLayout->addLayout(treeSearchRow);
 
     auto* signalTree = new SignalTreeView(leftPane);
     signalTree->setActiveRowsDroppedCallback([this](const QList<int>& rows) {
@@ -3966,8 +4136,26 @@ void MainWindow::buildUi() {
     derivedSignalShortcut->setContext(Qt::WindowShortcut);
     connect(derivedSignalShortcut, &QShortcut::activated, this, &MainWindow::openDerivedSignalDialog);
 
+    auto* jumpFirstSignalEventShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+[")), this);
+    jumpFirstSignalEventShortcut->setContext(Qt::WindowShortcut);
+    connect(jumpFirstSignalEventShortcut, &QShortcut::activated, this, [this]() {
+        jumpSelectedTreeSignalToViewportEvent(true);
+    });
+
+    auto* jumpLastSignalEventShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+]")), this);
+    jumpLastSignalEventShortcut->setContext(Qt::WindowShortcut);
+    connect(jumpLastSignalEventShortcut, &QShortcut::activated, this, [this]() {
+        jumpSelectedTreeSignalToViewportEvent(false);
+    });
+
     connect(m_tree, &QTreeView::doubleClicked, this, &MainWindow::onTreeIndexDoubleClicked);
     connect(m_treeSearchEdit, &QLineEdit::returnPressed, this, [this]() {
+        onTreeSearchTextChanged(m_treeSearchEdit ? m_treeSearchEdit->text() : QString());
+    });
+    connect(m_treeSearchCaseButton, &QPushButton::toggled, this, [this](bool) {
+        onTreeSearchTextChanged(m_treeSearchEdit ? m_treeSearchEdit->text() : QString());
+    });
+    connect(m_treeSearchRegexButton, &QPushButton::toggled, this, [this](bool) {
         onTreeSearchTextChanged(m_treeSearchEdit ? m_treeSearchEdit->text() : QString());
     });
 
@@ -4107,6 +4295,19 @@ void MainWindow::applyTheme() {
         }
         QPushButton:pressed {
             background: #DCDDDF;
+        }
+        QPushButton:checked {
+            background: #6D8FB2;
+            border-color: #DDEBFA;
+            color: #FFFFFF;
+        }
+        QPushButton#searchOptionButton {
+            padding: 0px;
+            min-width: 34px;
+            max-width: 34px;
+            min-height: 30px;
+            max-height: 30px;
+            border-radius: 10px;
         }
         QLineEdit {
             background: #57616B;
@@ -4903,6 +5104,118 @@ QList<int> MainWindow::selectedActiveSignalIndexesForJump() const {
 
 QList<int> MainWindow::selectedActiveSignalIndexesForFind() const {
     return selectedActiveSignalIndexesForJump();
+}
+
+QList<int> MainWindow::selectedTreeSignalIndexesForViewportJump() const {
+    QList<int> signalIndexes;
+    QSet<int> seen;
+    if (!m_tree || !m_treeModel || !m_signalTreeModel) return signalIndexes;
+
+    QModelIndexList picked;
+    if (m_tree->selectionModel()) {
+        picked = m_tree->selectionModel()->selectedRows(0);
+    }
+    if (picked.isEmpty() && m_tree->currentIndex().isValid()) {
+        picked.push_back(m_tree->currentIndex());
+    }
+
+    for (const QModelIndex& index : picked) {
+        const QVariant signalValue = index.data(kTreeRoleSignalIndex);
+        if (signalValue.isValid()) {
+            const int signalIndex = signalValue.toInt();
+            if (signalIndex >= 0 && signalIndex < m_wave.signalList.size() && !seen.contains(signalIndex)) {
+                seen.insert(signalIndex);
+                signalIndexes.push_back(signalIndex);
+            }
+            continue;
+        }
+
+        const QVariant nodeValue = index.data(kTreeRoleNodeId);
+        if (!nodeValue.isValid()) continue;
+        collectSignalIndexesFromLogicNode(nodeValue.toInt(), seen, signalIndexes);
+    }
+    return signalIndexes;
+}
+
+bool MainWindow::selectActiveSignalByIndex(int signalIndex) {
+    if (!m_activeList || signalIndex < 0) return false;
+    for (int row = 0; row < m_activeList->topLevelItemCount(); ++row) {
+        QTreeWidgetItem* item = m_activeList->topLevelItem(row);
+        if (!item || signalIndexFromActiveItem(item) != signalIndex) continue;
+        m_activeList->clearSelection();
+        item->setSelected(true);
+        m_activeList->setCurrentItem(item, 0, QItemSelectionModel::NoUpdate);
+        m_activeList->scrollToItem(item);
+        if (m_canvas) m_canvas->setSelectedEntryIndexes(selectedTopLevelIndexes(m_activeList));
+        return true;
+    }
+    return false;
+}
+
+void MainWindow::jumpSelectedTreeSignalToViewportEvent(bool firstEvent) {
+    if (!m_canvas || m_wave.signalList.isEmpty()) return;
+    const QList<int> signalIndexes = selectedTreeSignalIndexesForViewportJump();
+    if (signalIndexes.isEmpty()) return;
+    if (!ensureSignalLodLoaded(signalIndexes)) return;
+
+    const qint64 start = m_canvas->viewStart();
+    const qint64 end = m_canvas->viewEnd();
+    const int plotWidth = qMax(1, m_canvas->width() - 20);
+    qint64 targetTime = -1;
+    int targetSignalIndex = -1;
+    QList<int> rawFallbackIndexes;
+
+    for (int signalIndex : signalIndexes) {
+        if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
+        const WaveSignal& sig = m_wave.signalList.at(signalIndex);
+        qint64 t = -1;
+        if (waveSignalRawSamplesCoverRange(sig, start, end)) {
+            t = signalChangeTimeInRange(sig, start, end, firstEvent);
+        }
+        if (t < 0) {
+            t = signalLodEventTimeInRange(sig, start, end, plotWidth, firstEvent);
+        }
+        if (t < 0 && !waveSignalRawSamplesCoverRange(sig, start, end) &&
+            !canDeferSamplesWithLod(sig)) {
+            rawFallbackIndexes.push_back(signalIndex);
+        }
+        if (t < 0) continue;
+        if (targetTime < 0 ||
+            (firstEvent ? (t < targetTime) : (t > targetTime))) {
+            targetTime = t;
+            targetSignalIndex = signalIndex;
+        }
+    }
+
+    if (targetTime < 0 && !rawFallbackIndexes.isEmpty()) {
+        if (!ensureSignalSamplesLoaded(rawFallbackIndexes, false, true, true)) {
+            statusBar()->showMessage(QStringLiteral("Raw event scan is too large for this viewport; zoom out to use LOD or narrow the tree selection."), 2600);
+            return;
+        }
+        for (int signalIndex : rawFallbackIndexes) {
+            if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
+            const WaveSignal& sig = m_wave.signalList.at(signalIndex);
+            if (!waveSignalRawSamplesCoverRange(sig, start, end)) continue;
+            const qint64 t = signalChangeTimeInRange(sig, start, end, firstEvent);
+            if (t < 0) continue;
+            if (targetTime < 0 ||
+                (firstEvent ? (t < targetTime) : (t > targetTime))) {
+                targetTime = t;
+                targetSignalIndex = signalIndex;
+            }
+        }
+    }
+
+    if (targetTime < 0 || targetSignalIndex < 0) {
+        statusBar()->showMessage(QStringLiteral("No event in current viewport for selected signal."), 1800);
+        return;
+    }
+
+    if (!selectActiveSignalByIndex(targetSignalIndex)) {
+        addSignalToActive(targetSignalIndex);
+    }
+    m_canvas->setCursorTime(targetTime);
+    refreshActiveValueLabels();
 }
 
 void MainWindow::openValueFindDialog() {
@@ -5726,11 +6039,33 @@ void MainWindow::showTreeSearchResults(const QString& query) {
     if (q.isEmpty()) {
         model->clearSearch();
         m_tree->collapseAll();
+        if (m_treeSearchEdit) m_treeSearchEdit->setToolTip(QString());
         return;
     }
 
     const int maxResults = 5000;
-    const QVector<int> matchedNodeIds = m_signalTreeModel->searchTreeQuery(q, maxResults);
+    const Qt::CaseSensitivity caseSensitivity =
+        (m_treeSearchCaseButton && m_treeSearchCaseButton->isChecked())
+        ? Qt::CaseSensitive
+        : Qt::CaseInsensitive;
+    const bool regexMode = m_treeSearchRegexButton && m_treeSearchRegexButton->isChecked();
+    if (regexMode) {
+        QRegularExpression::PatternOptions options = QRegularExpression::NoPatternOption;
+        if (caseSensitivity == Qt::CaseInsensitive) {
+            options |= QRegularExpression::CaseInsensitiveOption;
+        }
+        const QRegularExpression re(q, options);
+        if (!re.isValid()) {
+            model->setSearchRoots(QVector<int>());
+            if (m_treeSearchEdit) m_treeSearchEdit->setToolTip(re.errorString());
+            return;
+        }
+    }
+    if (m_treeSearchEdit) m_treeSearchEdit->setToolTip(QString());
+
+    const QVector<int> matchedNodeIds = m_signalTreeModel->searchTreeQuery(q, maxResults,
+                                                                           caseSensitivity,
+                                                                           regexMode);
     model->setSearchRoots(matchedNodeIds);
 
     // In search mode keep the real tree skeleton.  Expand only ancestor paths
@@ -5901,9 +6236,23 @@ bool MainWindow::ensureSignalLodLoaded(const QList<int>& signalIndexes) {
     return true;
 }
 
-bool MainWindow::ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool allowLodDefer) {
+bool MainWindow::ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool allowLodDefer, bool viewportRaw, bool quiet) {
     if (!m_currentWaveSupportsOnDemand || m_currentWaveFilePath.isEmpty()) return true;
     if (signalIndexes.isEmpty()) return true;
+
+    if (allowLodDefer && !ensureSignalLodLoaded(signalIndexes)) return false;
+    const bool useViewportRawWindow = viewportRaw &&
+        m_currentWaveFilePath.endsWith(".wvz4", Qt::CaseInsensitive);
+
+    const qint64 viewStart = m_canvas ? m_canvas->viewStart() : m_wave.meta.start;
+    const qint64 viewEnd = m_canvas ? m_canvas->viewEnd() : m_wave.meta.end;
+    const qint64 viewSpan = qMax<qint64>(1, viewEnd - viewStart);
+    const qint64 rawLoadStart = (viewStart > std::numeric_limits<qint64>::min() + viewSpan)
+        ? qMax(m_wave.meta.start, viewStart - viewSpan)
+        : m_wave.meta.start;
+    const qint64 rawLoadEnd = (viewEnd < std::numeric_limits<qint64>::max() - viewSpan)
+        ? qMin(m_wave.meta.end, viewEnd + viewSpan)
+        : m_wave.meta.end;
 
     QVector<int> signalIdsToLoad;
     QSet<int> seenIds;
@@ -5913,6 +6262,7 @@ bool MainWindow::ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool
         if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
         const WaveSignal& sig = m_wave.signalList.at(signalIndex);
         if (sig.samplesLoaded) continue;
+        if (useViewportRawWindow && waveSignalRawSamplesCoverRange(sig, viewStart, viewEnd)) continue;
         if (allowLodDefer && canDeferSamplesWithLod(sig)) continue;
         if (sig.signalId < 0) continue;
         if (seenIds.contains(sig.signalId)) continue;
@@ -5932,6 +6282,10 @@ bool MainWindow::ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool
         loadOptions.includeAllSignalDefinitions = false;
         loadOptions.loadAllIfWindowEmpty = false;
         loadOptions.maxDecodedSamples = kViewerOnDemandSampleBudget;
+        if (useViewportRawWindow) {
+            loadOptions.timeStart = rawLoadStart;
+            loadOptions.timeEnd = qMax(rawLoadStart + 1, rawLoadEnd);
+        }
         loadOk = WaveParser4::loadFromFile(m_currentWaveFilePath, loadedWave, error, loadOptions);
     } else {
         WaveParser3::LoadOptions loadOptions;
@@ -5941,7 +6295,31 @@ bool MainWindow::ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool
         loadOk = WaveParser3::loadFromFile(m_currentWaveFilePath, loadedWave, error, loadOptions);
     }
 
+    if (!loadOk && allowLodDefer && isDecodedSampleBudgetError(error)) {
+        if (!ensureSignalLodLoaded(signalIndexes)) return false;
+        bool allCoveredByLod = true;
+        for (int signalIndex : validIndexes) {
+            if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
+            if (!canDeferSamplesWithLod(m_wave.signalList.at(signalIndex))) {
+                allCoveredByLod = false;
+                break;
+            }
+        }
+        if (allCoveredByLod) {
+            if (m_canvas) m_canvas->update();
+            return true;
+        }
+    }
+
     if (!loadOk) {
+        if (quiet) {
+            statusBar()->showMessage(
+                error.isEmpty()
+                    ? QStringLiteral("Unable to load selected signal samples.")
+                    : error,
+                2600);
+            return false;
+        }
         QMessageBox::warning(this,
             QString::fromUtf8("加载信号失败"),
             error.isEmpty() ? QString::fromUtf8("无法按需加载所选信号。") : error);
@@ -5961,7 +6339,14 @@ bool MainWindow::ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool
 
         WaveSignal& target = m_wave.signalList[targetIndex];
         target.samples = std::move(loadedSig.samples);
-        target.samplesLoaded = true;
+        target.samplesLoaded = !useViewportRawWindow;
+        target.rawLoadedRanges.clear();
+        if (useViewportRawWindow) {
+            WaveLodValidRange range;
+            range.start = rawLoadStart;
+            range.end = qMax(rawLoadStart + 1, rawLoadEnd);
+            target.rawLoadedRanges.push_back(range);
+        }
         target.supportsZState = loadedSig.supportsZState;
         target.defaultRadix = loadedSig.defaultRadix;
         rebuildWaveSignalDerivedCaches(target);
@@ -5974,7 +6359,14 @@ bool MainWindow::ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool
         WaveSignal& sig = m_wave.signalList[signalIndex];
         if (seenIds.contains(sig.signalId) && !returnedIds.contains(sig.signalId)) {
             sig.samples.clear();
-            sig.samplesLoaded = true;
+            sig.samplesLoaded = !useViewportRawWindow;
+            sig.rawLoadedRanges.clear();
+            if (useViewportRawWindow) {
+                WaveLodValidRange range;
+                range.start = rawLoadStart;
+                range.end = qMax(rawLoadStart + 1, rawLoadEnd);
+                sig.rawLoadedRanges.push_back(range);
+            }
             rebuildWaveSignalDerivedCaches(sig);
         }
     }
@@ -5984,8 +6376,8 @@ bool MainWindow::ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool
 }
 
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-bool MainWindow::ensureSignalSamplesLoaded(const QVector<int>& signalIndexes, bool allowLodDefer) {
-    return ensureSignalSamplesLoaded(signalIndexes.toList(), allowLodDefer);
+bool MainWindow::ensureSignalSamplesLoaded(const QVector<int>& signalIndexes, bool allowLodDefer, bool viewportRaw, bool quiet) {
+    return ensureSignalSamplesLoaded(signalIndexes.toList(), allowLodDefer, viewportRaw, quiet);
 }
 #endif
 
@@ -5996,7 +6388,7 @@ void MainWindow::addSignalToActive(int signalIndex) {
 void MainWindow::addSignalIndexesToActive(const QList<int>& signalIndexes) {
     if (signalIndexes.isEmpty()) return;
     if (!ensureSignalLodLoaded(signalIndexes)) return;
-    if (!ensureSignalSamplesLoaded(signalIndexes, true)) return;
+    if (!ensureSignalSamplesLoaded(signalIndexes, true, true)) return;
 
     QList<QTreeWidgetItem*> addedItems;
     addedItems.reserve(signalIndexes.size());
@@ -6271,7 +6663,7 @@ void MainWindow::onViewportChanged(qint64 start, qint64 end) {
             if (canDeferSamplesWithLod(sig)) continue;
             needRawSignals.push_back(signalIndex);
         }
-        if (!needRawSignals.isEmpty() && ensureSignalSamplesLoaded(needRawSignals, false)) {
+        if (!needRawSignals.isEmpty() && ensureSignalSamplesLoaded(needRawSignals, false, true)) {
             rebuildVisibleSignals();
         }
     }

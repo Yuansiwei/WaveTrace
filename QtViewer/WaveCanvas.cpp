@@ -1452,6 +1452,20 @@ bool WaveCanvas::jumpToTime(qint64 internalTime) {
     return true;
 }
 
+bool WaveCanvas::setCursorTime(qint64 internalTime) {
+    if (!m_wave) return false;
+
+    const qint64 fs = fullStart();
+    const qint64 fe = fullEnd();
+    if (fe < fs) return false;
+    if (internalTime < fs || internalTime > fe) return false;
+
+    m_cursorTime = internalTime;
+    Q_EMIT cursorMoved(m_cursorTime);
+    update();
+    return true;
+}
+
 qint64 WaveCanvas::xToTime(double x) const {
     const double usable = double(plotSpanPxForWidth(width(), m_padX));
     if (usable <= 1.0) return m_viewStart;
@@ -1826,8 +1840,9 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
 
         const int plotRight = plotRightPixel;
         const int plotWidth = plotSpanPx;
+        const bool rawSamplesCoverRow = waveSignalRawSamplesCoverRange(sig, rowViewStart, rowViewEnd);
         const bool preferRawSamples = viewerDisableLodEnabled() ||
-            (sig.samplesLoaded && !sig.samples.isEmpty() &&
+            (rawSamplesCoverRow && !sig.samples.isEmpty() &&
              sig.samples.size() <= qMax(2000, plotWidth * 8));
         if (!preferRawSamples) if (const WaveLodLevel* lodLevel = chooseLodLevelForViewport(sig, rowViewStart, rowViewEnd, spanValue, plotWidth)) {
             int selectedLodIndex = -1;
@@ -1851,7 +1866,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                 };
 
                 auto drawRawLastResortRange = [&](qint64 start, qint64 end) {
-                    if (!sig.samplesLoaded || sig.samples.isEmpty() || end <= start) return;
+                    if (!waveSignalRawSamplesCoverRange(sig, start, end) || sig.samples.isEmpty() || end <= start) return;
                     logLodRawFallback(sig, entry.signalIndex, absoluteRow,
                                       m_viewStart, m_viewEnd, start, end);
                     const int x1 = fastX(start);
@@ -2038,7 +2053,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                         } else {
                             WaveSample rawAnchorSample;
                             const WaveSample* currentSample = nullptr;
-                            if (sig.samplesLoaded && !sig.samples.isEmpty()) {
+                            if (waveSignalRawSamplesCoverRange(sig, visibleStart, visibleEnd) && !sig.samples.isEmpty()) {
                                 rawAnchorSample = rawValueAtTime(entry.signalIndex, visibleStart);
                                 if (!sampleIsAbsentState(rawAnchorSample)) currentSample = &rawAnchorSample;
                             }
@@ -2267,7 +2282,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
             continue;
         }
 
-        if (sig.samples.isEmpty()) continue;
+        if (sig.samples.isEmpty() || !rawSamplesCoverRow) continue;
 
         const int firstIdx = qMax(0, lowerIndexForTime(sig.samples, rowViewStart) - 1);
         int lastExclusive = lowerIndexForTime(sig.samples, rowViewEnd + 1);

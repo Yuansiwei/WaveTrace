@@ -282,6 +282,16 @@ struct BuildOptions {
     // legacy path rather than dropping samples.
     bool enable_flat_leaf_fast_table = true;
 
+    // Store repeated local node names once and let NodeDesc reference the shared
+    // id.  This is especially useful for large arrays of the same reflected type
+    // where every element has fields named "valid", "state", etc.
+    bool enable_node_name_interning = true;
+
+    // Reserve topology storage in bulk before expanding large WavePtr arrays.
+    // This keeps the semantic path unchanged while avoiding repeated vector and
+    // hash-table growth in the common "many objects of the same type" case.
+    bool enable_wave_ptr_array_batch_reserve = true;
+
 
     // Dirty-peek optimization.  When enabled, value sources that expose a
     // WaveDirtyHook can be removed from the per-cycle polling table.  write()
@@ -2168,6 +2178,7 @@ private:
     // lookup overhead after the reflection tree has been built.
     std::vector<NodeDesc> nodes_;
     std::deque<std::string> node_names_;
+    std::unordered_map<std::string, std::uint32_t> node_name_ids_;
     std::deque<std::string> node_debug_paths_;
     std::vector<TrackDesc> tracks_;
     std::deque<std::string> track_paths_;
@@ -6618,7 +6629,9 @@ private:
             bitfield_storage_created_keys_.pop_back();
         }
         nodes_.resize(cp.nodes_size);
-        node_names_.resize(cp.node_names_size);
+        // node_names_ is an intern table.  It is intentionally monotonic so
+        // rolled-back speculative nodes do not invalidate name ids held by
+        // surviving nodes or the name lookup table.
         node_debug_paths_.resize(cp.node_debug_paths_size);
         tracks_.resize(cp.tracks_size);
         track_paths_.resize(cp.track_paths_size);
@@ -7364,6 +7377,32 @@ private:
         return track_paths_[static_cast<std::size_t>(id)];
     }
 
+    static bool is_generated_index_node_name_(const std::string& name) {
+        return name.size() >= 3u && name.front() == '[' && name.back() == ']';
+    }
+
+    std::uint32_t append_node_name_(const std::string& name) {
+        const std::uint32_t id = static_cast<std::uint32_t>(node_names_.size());
+        node_names_.push_back(name);
+        return id;
+    }
+
+    std::uint32_t intern_node_name_(const std::string& name) {
+        if (!options_.enable_node_name_interning || is_generated_index_node_name_(name)) {
+            return append_node_name_(name);
+        }
+        std::unordered_map<std::string, std::uint32_t>::const_iterator it = node_name_ids_.find(name);
+        if (it != node_name_ids_.end()) return it->second;
+        const std::uint32_t id = append_node_name_(name);
+        node_name_ids_.insert(std::make_pair(name, id));
+        return id;
+    }
+
+    std::uint32_t node_name_id_for_path_(const std::string& path) {
+        if (!needs_full_topology_paths_()) return intern_node_name_(path);
+        return intern_node_name_(detail::path_last_segment(path));
+    }
+
     const std::string& runtime_last_value_ref(const TrackRuntimeState& state) const {
         const std::uint32_t id = state.last_value_id;
         if (id == kInvalidIndex || static_cast<std::size_t>(id) >= track_runtime_last_values_.size()) {
@@ -7488,8 +7527,7 @@ private:
         node.id = id;
         node.parent_id = parent_id;
         node.object_id = object_id;
-        node.name_id = static_cast<std::uint32_t>(node_names_.size());
-        node_names_.push_back(detail::path_last_segment(path));
+        node.name_id = node_name_id_for_path_(path);
         if (options_.debug_log) {
             node.debug_path_id = static_cast<std::uint32_t>(node_debug_paths_.size());
             node_debug_paths_.push_back(path);
@@ -8238,6 +8276,72 @@ private:
         }
         if (options_.root_expand_reserve_lazy_watches != 0) {
             lazy_value_watches_.reserve(lazy_value_watches_.size() + options_.root_expand_reserve_lazy_watches);
+        }
+    }
+
+    static std::size_t checked_append_reserve_target_(std::size_t current, std::size_t add) {
+        const std::size_t max_value = (std::numeric_limits<std::size_t>::max)();
+        if (add > max_value - current) return max_value;
+        return current + add;
+    }
+
+    static std::size_t checked_add_for_reserve_(std::size_t lhs, std::size_t rhs) {
+        const std::size_t max_value = (std::numeric_limits<std::size_t>::max)();
+        if (rhs > max_value - lhs) return max_value;
+        return lhs + rhs;
+    }
+
+    static std::size_t checked_mul_for_reserve_(std::size_t count, std::size_t per_item) {
+        const std::size_t max_value = (std::numeric_limits<std::size_t>::max)();
+        if (per_item != 0 && count > max_value / per_item) return max_value;
+        return count * per_item;
+    }
+
+    void reserve_topology_append_(std::size_t nodes,
+                                  std::size_t tracks,
+                                  std::size_t objects,
+                                  std::size_t storage_keys) {
+        if (nodes != 0) {
+            nodes_.reserve(checked_append_reserve_target_(nodes_.size(), nodes));
+        }
+        if (tracks != 0) {
+            const std::size_t track_target = checked_append_reserve_target_(tracks_.size(), tracks);
+            tracks_.reserve(track_target);
+            track_runtime_.reserve(track_target);
+            all_track_ids_.reserve(checked_append_reserve_target_(all_track_ids_.size(), tracks));
+            parallel_track_ids_.reserve(checked_append_reserve_target_(parallel_track_ids_.size(), tracks));
+            scalar_getter_storage_.reserve(checked_append_reserve_target_(scalar_getter_storage_.size(), tracks));
+        }
+        if (objects != 0) {
+            objects_.reserve(checked_append_reserve_target_(objects_.size(), objects));
+            object_id_by_key_.reserve(checked_append_reserve_target_(object_id_by_key_.size(), objects));
+        }
+        if (storage_keys != 0) {
+            bitfield_storage_created_keys_.reserve(
+                checked_append_reserve_target_(bitfield_storage_created_keys_.size(), storage_keys));
+            bitfield_storage_by_key_.reserve(
+                checked_append_reserve_target_(bitfield_storage_by_key_.size(), storage_keys));
+        }
+    }
+
+    template <typename Pointee>
+    void reserve_wave_ptr_array_expansion_(std::size_t declared_count) {
+        if (!options_.enable_wave_ptr_array_batch_reserve || declared_count < 2) return;
+        typedef typename detail::remove_cvref<Pointee>::type CleanPointee;
+        if (reflect::is_reflected<CleanPointee>::value) {
+            reserve_topology_append_(
+                checked_add_for_reserve_(checked_mul_for_reserve_(declared_count, 8u), 1u),
+                checked_mul_for_reserve_(declared_count, 8u),
+                checked_mul_for_reserve_(declared_count, 2u),
+                checked_mul_for_reserve_(declared_count, 2u));
+        } else if (detail::is_leaf_scalar<CleanPointee>::value) {
+            reserve_topology_append_(checked_add_for_reserve_(declared_count, 1u), declared_count, 0, 0);
+        } else {
+            reserve_topology_append_(
+                checked_add_for_reserve_(checked_mul_for_reserve_(declared_count, 2u), 1u),
+                checked_mul_for_reserve_(declared_count, 2u),
+                declared_count,
+                0);
         }
     }
 
@@ -9247,8 +9351,25 @@ private:
         return expand_wave_array_field_impl<T>(path, parent_id, ptr);
     }
 
-    template <typename T, std::size_t N>
-    NodeId expand_field(const std::string& path, NodeId parent_id, const T (*ptr)[N]) {
+    template <typename ElemT>
+    typename std::enable_if<
+        !std::is_array<typename detail::remove_cvref<ElemT>::type>::value,
+        NodeId>::type
+    expand_c_array_element_(const std::string& path, NodeId parent_id, const ElemT* elem) {
+        return expand_member_clean_dispatch<ElemT>(path, parent_id, elem);
+    }
+
+    template <typename ElemT>
+    typename std::enable_if<
+        std::is_array<typename detail::remove_cvref<ElemT>::type>::value,
+        NodeId>::type
+    expand_c_array_element_(const std::string& path, NodeId parent_id, const ElemT* elem) {
+        return expand_c_array_field_impl<typename detail::remove_cvref<ElemT>::type>(path, parent_id, elem);
+    }
+
+    template <typename ArrT>
+    NodeId expand_c_array_field_impl(const std::string& path, NodeId parent_id, const ArrT* ptr) {
+        static_assert(std::is_array<ArrT>::value, "expand_c_array_field_impl requires a C array type");
         if (!ptr) return 0;
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
@@ -9256,10 +9377,20 @@ private:
             rollback_topology_to(cp);
             return 0;
         }
-        for (std::size_t i = 0; i < N; ++i) {
-            expand_field(make_index_child_path_(path, i), node_id, &((*ptr)[i]));
+        typedef typename std::remove_extent<ArrT>::type ElemT;
+        for (std::size_t i = 0; i < std::extent<ArrT>::value; ++i) {
+            expand_c_array_element_<ElemT>(
+                make_index_child_path_(path, i),
+                node_id,
+                std::addressof((*ptr)[i]));
         }
         return keep_node_or_rollback(cp, node_id);
+    }
+
+    template <typename T, std::size_t N>
+    NodeId expand_field(const std::string& path, NodeId parent_id, const T (*ptr)[N]) {
+        typedef T ArrT[N];
+        return expand_c_array_field_impl<ArrT>(path, parent_id, ptr);
     }
 
     template <typename T>
@@ -9663,24 +9794,9 @@ private:
         return add_volatile_leaf_signal<RawFieldT>(path, parent_id, field_ptr);
     }
 
-    template <typename FieldT>
-    NodeId expand_reflected_field_direct(const std::string& path, NodeId parent_id, const FieldT* ptr) {
-        if (!ptr) return 0;
-        const ObjectKey key(detail::pointer_address(ptr), reflect::type_tag_of<FieldT>());
-        if (contains_expanding_key(expanding_, key)) {
-            debug_log_unsupported_type<FieldT>(path, parent_id, "recursive expansion cut", "$recursive_cut", ptr);
-            return 0;
-        }
-
-        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
-        const ObjectId object_id = ensure_object(key, typeid(FieldT).name());
-        const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, object_id);
-        if (node_id == 0) {
-            rollback_topology_to(cp);
-            return 0;
-        }
-        ExpandingGuard expanding_guard(expanding_, key);
-        detail::call_reflected_visit<FieldT>(
+    template <typename T>
+    void expand_reflected_children_uncached_(const std::string& path, NodeId node_id, const T* ptr) {
+        detail::call_reflected_visit<T>(
             ptr,
             [this, &path, node_id, ptr](const char* name, auto child_field_ptr, auto... meta) {
                 const std::size_t union_bytes = union_field_storage_bytes_or_zero(meta...);
@@ -9698,7 +9814,7 @@ private:
                 if (!options_.enable_bitfield_fields) return;
                 typedef typename detail::remove_cvref<decltype(getter(ptr))>::type GetterValueT;
                 const std::string bit_path = make_child_path_(path, name);
-                add_bitfield_range_signal<FieldT, GetterValueT>(
+                add_bitfield_range_signal<T, GetterValueT>(
                     bit_path,
                     node_id,
                     ptr,
@@ -9706,7 +9822,33 @@ private:
                     getter_bit_width_or_zero(meta...),
                     getter_bit_offset_or_negative(meta...));
             });
+    }
+
+    template <typename T>
+    NodeId expand_reflected_field_cached_or_direct_(const std::string& path, NodeId parent_id, const T* ptr) {
+        if (!ptr) return 0;
+        typedef typename detail::remove_cvref<T>::type CleanT;
+        const ObjectKey key(detail::pointer_address(ptr), reflect::type_tag_of<CleanT>());
+        if (contains_expanding_key(expanding_, key)) {
+            debug_log_unsupported_type<CleanT>(path, parent_id, "recursive expansion cut", "$recursive_cut", ptr);
+            return 0;
+        }
+
+        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
+        const ObjectId object_id = ensure_object(key, typeid(CleanT).name());
+        const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, object_id);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        ExpandingGuard expanding_guard(expanding_, key);
+        expand_reflected_children_uncached_<CleanT>(path, node_id, ptr);
         return keep_node_or_rollback(cp, node_id);
+    }
+
+    template <typename FieldT>
+    NodeId expand_reflected_field_direct(const std::string& path, NodeId parent_id, const FieldT* ptr) {
+        return expand_reflected_field_cached_or_direct_<FieldT>(path, parent_id, ptr);
     }
 
     template <typename WavePtrT>
@@ -9737,6 +9879,7 @@ private:
                 static_cast<const CleanPointee*>(target));
         }
 
+        reserve_wave_ptr_array_expansion_<CleanPointee>(declared_count);
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
         if (node_id == 0) {
@@ -10029,6 +10172,7 @@ private:
     template <typename FieldT>
     struct member_dispatch_category {
         enum {
+            is_c_array = std::is_array<FieldT>::value,
             is_wave_array = detail::is_wave_array<FieldT>::value,
             is_wave_value = detail::is_wave_value<FieldT>::value,
             is_wave_ptr = detail::is_wave_ptr<FieldT>::value,
@@ -10051,7 +10195,8 @@ private:
 #else
             is_systemc_whitelist = false,
 #endif
-            value = is_wave_ptr ? 15 :
+            value = is_c_array ? 16 :
+                    is_wave_ptr ? 15 :
                     detail::is_peek_trace_source<FieldT>::value ? 14 :
                     is_wave_array ? 13 :
                     is_wave_value ? 12 :
@@ -10068,6 +10213,15 @@ private:
                     0
         };
     };
+
+    template <typename FieldT>
+    NodeId expand_member_clean_dispatch_selected(const std::string& path,
+                                                 NodeId parent_id,
+                                                 const FieldT* clean_ptr,
+                                                 std::integral_constant<int, 16>) {
+        if (options_.debug_log) debug_log_msg(std::string("member dispatch branch=c_array path=") + path);
+        return expand_c_array_field_impl<FieldT>(path, parent_id, clean_ptr);
+    }
 
     template <typename FieldT>
     NodeId expand_member_clean_dispatch(const std::string& path, NodeId parent_id, const FieldT* clean_ptr) {
@@ -10159,53 +10313,13 @@ private:
     template <typename T>
     typename std::enable_if<reflect::is_reflected<T>::value && !detail::is_peek_trace_source<T>::value && !detail::is_vsip_read_port<T>::value && !detail::is_sc_namespace_blacklisted<T>::value, NodeId>::type
     expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
-        if (!ptr) return 0;
-        const ObjectKey key(detail::pointer_address(ptr), reflect::type_tag_of<T>());
-        if (contains_expanding_key(expanding_, key)) {
-            debug_log_unsupported_type<T>(path, parent_id, "recursive expansion cut", "$recursive_cut", ptr);
-            return 0;
-        }
-
-        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
-        const ObjectId object_id = ensure_object(key, typeid(T).name());
-        const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, object_id);
-        if (node_id == 0) {
-            rollback_topology_to(cp);
-            return 0;
-        }
-        ExpandingGuard expanding_guard(expanding_, key);
-        detail::call_reflected_visit<T>(
-            ptr,
-            [this, &path, node_id, ptr](const char* name, auto field_ptr, auto... meta) {
-                const std::size_t union_bytes = union_field_storage_bytes_or_zero(meta...);
-                if (union_bytes != 0 && !options_.enable_union_fields) return;
-                const std::string child_path = make_child_path_(path, name);
-                const void* union_base = union_field_base_or_null(meta...);
-                expand_reflected_child_ptr_with_union_meta_(child_path, node_id, field_ptr, ptr, union_bytes, union_base);
-            },
-            [this, &path, node_id](const char* name, const auto&) {
-                if (!options_.enable_bitfield_fields) return;
-                const std::string bit_path = make_child_path_(path, name);
-                debug_log_unsupported_raw(bit_path, node_id, "bitfield/getter value not directly addressable", std::string(), "$bitfield_getter_missing");
-            },
-            [this, &path, node_id, ptr](const char* name, auto getter, auto... meta) {
-                if (!options_.enable_bitfield_fields) return;
-                typedef typename detail::remove_cvref<decltype(getter(ptr))>::type GetterValueT;
-                const std::string bit_path = make_child_path_(path, name);
-                add_bitfield_range_signal<T, GetterValueT>(
-                    bit_path,
-                    node_id,
-                    ptr,
-                    getter,
-                    getter_bit_width_or_zero(meta...),
-                    getter_bit_offset_or_negative(meta...));
-            });
-        return keep_node_or_rollback(cp, node_id);
+        return expand_reflected_field_cached_or_direct_<T>(path, parent_id, ptr);
     }
 
     template <typename T>
     typename std::enable_if<!reflect::is_reflected<T>::value &&
                             !detail::is_leaf_scalar<T>::value &&
+                            !std::is_array<T>::value &&
                             !detail::is_std_array<T>::value &&
                             !detail::is_wave_array<T>::value &&
                             !detail::is_std_pair<T>::value &&

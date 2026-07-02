@@ -26,6 +26,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_systemc_shader_wvz4",
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_markers_pointer_dirty", "smoke_markers_pointer_dirty.vcxproj", "{6B90FE95-7B96-437E-886E-5430904B4D78}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_reflect_topology_cache_stress", "smoke_reflect_topology_cache_stress.vcxproj", "{F0DF53E0-5065-42B8-91B4-37B646709AA9}"
+EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_helper_kill_crash", "smoke_helper_kill_crash.vcxproj", "{530FDB76-B33F-4D40-80CD-E72A4F684560}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_systemc_helper_credit_perf", "smoke_systemc_helper_credit_perf.vcxproj", "{B9E62E79-D91C-4E51-9C0E-C2FE9CE63F03}"
@@ -88,6 +90,10 @@ Global
 		{6B90FE95-7B96-437E-886E-5430904B4D78}.Debug|x64.Build.0 = Debug|x64
 		{6B90FE95-7B96-437E-886E-5430904B4D78}.Release|x64.ActiveCfg = Release|x64
 		{6B90FE95-7B96-437E-886E-5430904B4D78}.Release|x64.Build.0 = Release|x64
+		{F0DF53E0-5065-42B8-91B4-37B646709AA9}.Debug|x64.ActiveCfg = Debug|x64
+		{F0DF53E0-5065-42B8-91B4-37B646709AA9}.Debug|x64.Build.0 = Debug|x64
+		{F0DF53E0-5065-42B8-91B4-37B646709AA9}.Release|x64.ActiveCfg = Release|x64
+		{F0DF53E0-5065-42B8-91B4-37B646709AA9}.Release|x64.Build.0 = Release|x64
 		{530FDB76-B33F-4D40-80CD-E72A4F684560}.Debug|x64.ActiveCfg = Debug|x64
 		{530FDB76-B33F-4D40-80CD-E72A4F684560}.Debug|x64.Build.0 = Debug|x64
 		{530FDB76-B33F-4D40-80CD-E72A4F684560}.Release|x64.ActiveCfg = Release|x64

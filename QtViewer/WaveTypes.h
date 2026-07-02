@@ -86,6 +86,10 @@ struct WaveSignal {
     // Legacy loaders default to true; WVZ3 selective loading sets false for directory-only signal entries.
     bool samplesLoaded = true;
     QVector<WaveSample> samples;
+    // WVZ4 on-demand display path may keep only the current raw viewport plus
+    // prefetch. samplesLoaded still means full-file coverage; this range list
+    // describes partial raw coverage when samplesLoaded is false.
+    QVector<WaveLodValidRange> rawLoadedRanges;
     // Optional compare-mode overlay. Each interval marks a time span where the
     // paired waveform has a different value. Empty means normal waveform mode.
     QVector<WaveDiffRegion> diffRegions;
@@ -101,6 +105,15 @@ struct WaveSignal {
     // decimated transition stream in FOOT; v10 stores chunked transition streams in LODZ.
     QVector<WaveLodLevel> lodLevels;
 };
+
+inline bool waveSignalRawSamplesCoverRange(const WaveSignal& sig, qint64 start, qint64 end) {
+    if (sig.samplesLoaded) return true;
+    if (end <= start) return true;
+    for (const WaveLodValidRange& range : sig.rawLoadedRanges) {
+        if (range.start <= start && range.end >= end) return true;
+    }
+    return false;
+}
 
 
 struct WaveTreeNode {

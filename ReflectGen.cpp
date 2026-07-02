@@ -1109,6 +1109,14 @@ namespace
         return access == CX_CXXPublic;
     }
 
+    CX_CXXAccessSpecifier MoreRestrictiveAccess(CX_CXXAccessSpecifier outer,
+                                                CX_CXXAccessSpecifier inner)
+    {
+        if (outer == CX_CXXPrivate || inner == CX_CXXPrivate) return CX_CXXPrivate;
+        if (outer == CX_CXXProtected || inner == CX_CXXProtected) return CX_CXXProtected;
+        return CX_CXXPublic;
+    }
+
     std::string GetCursorSourceText(CXTranslationUnit tu, CXCursor cursor)
     {
         std::string out;
@@ -2963,6 +2971,8 @@ namespace
 
         const std::string namedUnionField = FindNamedFieldForAnonymousUnion(ownerRecordCursor, unionCursor);
         const std::string accessPrefix = namedUnionField.empty() ? std::string() : (namedUnionField + ".");
+        const CX_CXXAccessSpecifier unionAccess =
+            NormalizeAccess(clang_getCXXAccessSpecifier(unionCursor), rec.isStruct);
 
         const long long unionStorageBytes = clang_Type_getSizeOf(clang_getCursorType(unionCursor));
         if (unionStorageBytes <= 0)
@@ -2982,7 +2992,8 @@ namespace
             bool* foundBody;
             long long unionStorageBytes;
             std::string accessPrefix;
-        } payload{ tu, ownerRecordCursor, &rec, ctx, foundBody, unionStorageBytes, accessPrefix };
+            CX_CXXAccessSpecifier unionAccess;
+        } payload{ tu, ownerRecordCursor, &rec, ctx, foundBody, unionStorageBytes, accessPrefix, unionAccess };
 
         clang_visitChildren(
             unionCursor,
@@ -3033,7 +3044,9 @@ namespace
                     }
                 }
 
-                f.access = NormalizeAccess(clang_getCXXAccessSpecifier(child), out->isStruct);
+                f.access = MoreRestrictiveAccess(
+                    payload->unionAccess,
+                    NormalizeAccess(clang_getCXXAccessSpecifier(child), true));
                 f.isBitField = clang_Cursor_isBitField(child) != 0;
                 f.isUnionField = true;
                 f.unionStorageBytes = payload->unionStorageBytes;
@@ -3181,6 +3194,16 @@ namespace
                         }
                     }
                     f.access = NormalizeAccess(clang_getCXXAccessSpecifier(child), out->isStruct);
+                    if (anonymousUnionInjectedField)
+                    {
+                        const CXCursor unionCursor = FindEnclosingUnionCursor(child);
+                        if (!clang_Cursor_isNull(unionCursor))
+                        {
+                            f.access = MoreRestrictiveAccess(
+                                NormalizeAccess(clang_getCXXAccessSpecifier(unionCursor), out->isStruct),
+                                NormalizeAccess(clang_getCXXAccessSpecifier(child), true));
+                        }
+                    }
                     f.isBitField = clang_Cursor_isBitField(child) != 0;
                     f.isUnionField = out->isUnion || anonymousUnionStorageBytes > 0;
                     f.unionStorageBytes = anonymousUnionStorageBytes;
@@ -3484,6 +3507,16 @@ namespace
                             }
                         }
                         f.access = NormalizeAccess(clang_getCXXAccessSpecifier(child), out->isStruct);
+                        if (anonymousUnionInjectedField)
+                        {
+                            const CXCursor unionCursor = FindEnclosingUnionCursor(child);
+                            if (!clang_Cursor_isNull(unionCursor))
+                            {
+                                f.access = MoreRestrictiveAccess(
+                                    NormalizeAccess(clang_getCXXAccessSpecifier(unionCursor), out->isStruct),
+                                    NormalizeAccess(clang_getCXXAccessSpecifier(child), true));
+                            }
+                        }
                         f.isBitField = clang_Cursor_isBitField(child) != 0;
                         f.isUnionField = out->isUnion || anonymousUnionStorageBytes > 0;
                         f.unionStorageBytes = anonymousUnionStorageBytes;

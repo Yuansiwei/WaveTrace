@@ -670,7 +670,7 @@ static_assert(alignof(array<std::uint32_t, 4>) == alignof(std::array<std::uint32
 
 #ifndef WAVE_REFLECT_FRIEND
 #define WAVE_REFLECT_FRIEND \
-    template <typename T> friend struct ::wave::ReflectAccess; \
+    template <typename WaveReflectAccessT> friend struct ::wave::ReflectAccess; \
     using wave_reflect_friend_marker_do_not_use = ::wave::ReflectFriendMarker;
 #endif
 

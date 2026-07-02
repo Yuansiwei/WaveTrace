@@ -105,6 +105,8 @@ private:
     QLabel* m_hoverLabel = nullptr;
     QLabel* m_windowLabel = nullptr;
     QLineEdit* m_treeSearchEdit = nullptr;
+    QPushButton* m_treeSearchCaseButton = nullptr;
+    QPushButton* m_treeSearchRegexButton = nullptr;
     QLineEdit* m_activeSearchEdit = nullptr;
     QLineEdit* m_jumpTimeEdit = nullptr;
     QTreeView* m_tree = nullptr;
@@ -143,6 +145,7 @@ private:
     void updateValueFindNavigationState();
     void jumpToValueFindHit(int hitIndex);
     void jumpToAdjacentValueFindHit(bool forward);
+    void jumpSelectedTreeSignalToViewportEvent(bool firstEvent);
     void showTreeSearchResults(const QString& query);
     void rebuildActiveListRows();
     void rebuildVisibleSignals();
@@ -153,11 +156,13 @@ private:
     bool handleWaveFileDropEvent(QEvent* event);
 
     void insertSignalIntoTree(const QString& fullName, int signalIndex);
+    QList<int> selectedTreeSignalIndexesForViewportJump() const;
+    bool selectActiveSignalByIndex(int signalIndex);
     bool canDeferSamplesWithLod(const WaveSignal& sig) const;
     bool ensureSignalLodLoaded(const QList<int>& signalIndexes);
-    bool ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool allowLodDefer = true);
+    bool ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool allowLodDefer = true, bool viewportRaw = false, bool quiet = false);
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-    bool ensureSignalSamplesLoaded(const QVector<int>& signalIndexes, bool allowLodDefer = true);
+    bool ensureSignalSamplesLoaded(const QVector<int>& signalIndexes, bool allowLodDefer = true, bool viewportRaw = false, bool quiet = false);
 #endif
     bool createDerivedSignal(const QString& name, const QString& expression, int widthOverride);
 

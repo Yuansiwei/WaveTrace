@@ -198,7 +198,9 @@ int main(int argc, char** argv) {
     wvz4::u64 rotating_updates_per_cycle = 1;
     wvz4::u64 progress_every = 100000;
     bool enable_lod_tables = true;
+    bool enable_residual_lod_tables = false;
     bool all_signals_every_cycle = false;
+    bool entropy_values = false;
     std::string helper_exe_path;
 
     std::vector<std::string> positional;
@@ -211,10 +213,17 @@ int main(int argc, char** argv) {
             return 2;
         } else if (arg == "--no-lod") {
             enable_lod_tables = false;
+            enable_residual_lod_tables = false;
         } else if (arg == "--lod") {
             enable_lod_tables = true;
+            enable_residual_lod_tables = false;
+        } else if (arg == "--residual-lod" || arg == "--experimental-residual-lod") {
+            enable_lod_tables = true;
+            enable_residual_lod_tables = true;
         } else if (arg == "--all-signals-every-cycle") {
             all_signals_every_cycle = true;
+        } else if (arg == "--entropy-values" || arg == "--dense-random-values") {
+            entropy_values = true;
         } else if (arg == "--helper-exe") {
             if (i + 1 >= argc) {
                 std::cerr << "--helper-exe requires a path\n";
@@ -230,7 +239,8 @@ int main(int argc, char** argv) {
             std::cout
                 << "usage: smoke_business_1m_writer [out.wvz4] [cycles] [signals] [updates_per_cycle]"
                 << " [--helper-exe path] [--progress cycles] [--no-lod|--lod]"
-                << " [--all-signals-every-cycle]\n";
+                << " [--residual-lod]"
+                << " [--all-signals-every-cycle] [--entropy-values]\n";
             return 0;
         } else {
             positional.push_back(arg);
@@ -288,6 +298,7 @@ int main(int argc, char** argv) {
     options.enable_stats_log = true;
     options.block_pipeline_queue_limit = 16;
     options.enable_lod_tables = enable_lod_tables;
+    options.enable_residual_lod_tables = enable_residual_lod_tables;
 
     wvz4::WriterProcessClient helper_writer;
     std::string error;
@@ -326,9 +337,12 @@ int main(int argc, char** argv) {
 
         if (all_signals_every_cycle) {
             for (wvz4::u32 signal_id = 1; signal_id <= signal_count; ++signal_id) {
-                wvz4::u64 value = (cycle << 20) ^ static_cast<wvz4::u64>(signal_id);
+                wvz4::u64 value = entropy_values
+                    ? mix64((cycle + 1ull) * 0x9E3779B97F4A7C15ull ^
+                            (static_cast<wvz4::u64>(signal_id) * 0xD1B54A32D192ED03ull))
+                    : ((cycle << 20) ^ static_cast<wvz4::u64>(signal_id));
                 if (metas[signal_id].type == wvz4::ValueType::Bool) {
-                    value = cycle + signal_id;
+                    value = cycle + signal_id; // force a toggle every business cycle.
                 }
                 append_update_once(submission, seen_epoch, epoch, signal_id, metas, value);
             }
@@ -397,7 +411,9 @@ int main(int argc, char** argv) {
     std::cout << "signals=" << signal_count << "\n";
     std::cout << "rotating_updates_per_cycle=" << rotating_updates_per_cycle << "\n";
     std::cout << "all_signals_every_cycle=" << (all_signals_every_cycle ? 1 : 0) << "\n";
+    std::cout << "entropy_values=" << (entropy_values ? 1 : 0) << "\n";
     std::cout << "lod_tables=" << (enable_lod_tables ? 1 : 0) << "\n";
+    std::cout << "residual_lod_tables=" << (enable_residual_lod_tables ? 1 : 0) << "\n";
     std::cout << "submitted_updates=" << submitted_updates << "\n";
     std::cout << "elapsed_ms=" << elapsed_ms << "\n";
     return 0;

@@ -38,6 +38,7 @@ public:
     bool jumpToNearestChange(int signalIndex, bool forward);
     bool jumpToNearestChangeForSignals(const QList<int>& signalIndexes, bool forward, bool diffOnly);
     bool jumpToTime(qint64 internalTime);
+    bool setCursorTime(qint64 internalTime);
 
 Q_SIGNALS:
     void cursorMoved(qint64 t);

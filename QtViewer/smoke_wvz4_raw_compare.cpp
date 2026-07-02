@@ -34,6 +34,24 @@ bool load_full_raw(const char* path, WaveFile& wave, QString& error) {
     return WaveParser4::loadFromFile(QString::fromLocal8Bit(path), wave, error, options);
 }
 
+bool load_first_n_raw(const QString& path,
+                      int requestedSignals,
+                      qint64 start,
+                      qint64 end,
+                      WaveFile& wave,
+                      QString& error) {
+    WaveParser4::LoadOptions options;
+    options.includeAllSignalDefinitions = true;
+    options.loadAllIfWindowEmpty = false;
+    options.loadRawSamples = true;
+    options.autoLoadFirstSignalCount = std::max(1, requestedSignals);
+    options.autoLoadFirstSignalLodCount = 0;
+    options.timeStart = start;
+    options.timeEnd = end;
+    options.maxDecodedSamples = 0;
+    return WaveParser4::loadFromFile(path, wave, error, options);
+}
+
 qint64 parse_i64_arg(const char* text, qint64 fallback) {
     bool ok = false;
     const qint64 value = QString::fromLocal8Bit(text ? text : "").toLongLong(&ok, 10);
@@ -44,6 +62,119 @@ int parse_int_arg(const char* text, int fallback) {
     bool ok = false;
     const int value = QString::fromLocal8Bit(text ? text : "").toInt(&ok, 10);
     return ok ? value : fallback;
+}
+
+const WaveSample* sample_at_time(const WaveSignal& signal, qint64 t) {
+    if (signal.samples.isEmpty()) return nullptr;
+    int lo = 0;
+    int hi = signal.samples.size();
+    while (lo < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (signal.samples.at(mid).time <= t) lo = mid + 1;
+        else hi = mid;
+    }
+    const int idx = lo - 1;
+    return idx >= 0 ? &signal.samples.at(idx) : nullptr;
+}
+
+bool sample_value_equal_at_time(const WaveSignal& left,
+                                const WaveSignal& right,
+                                qint64 t,
+                                QString& reason) {
+    const WaveSample* l = sample_at_time(left, t);
+    const WaveSample* r = sample_at_time(right, t);
+    if (!l || !r) {
+        reason = QStringLiteral("missing sample at t=%1 left=%2 right=%3")
+            .arg(t).arg(l ? 1 : 0).arg(r ? 1 : 0);
+        return false;
+    }
+    if (l->rawBits != r->rawBits ||
+        l->rawFieldsReady != r->rawFieldsReady ||
+        l->isZ != r->isZ ||
+        l->isAbsent != r->isAbsent) {
+        reason = QStringLiteral("value differs at t=%1 left_bits=%2 right_bits=%3")
+            .arg(t).arg(l->rawBits).arg(r->rawBits);
+        return false;
+    }
+    return true;
+}
+
+int run_window_verify(int argc, char** argv) {
+    if (argc < 6) {
+        std::cerr << "usage: smoke_wvz4_raw_compare --window-verify <file.wvz4> <signals> <start> <end>\n";
+        return 2;
+    }
+
+    const QString filePath = QString::fromLocal8Bit(argv[2]);
+    const int requestedSignals = std::max(1, parse_int_arg(argv[3], 10));
+    const qint64 start = parse_i64_arg(argv[4], 0);
+    const qint64 end = parse_i64_arg(argv[5], start + 1);
+    if (end <= start) {
+        std::cerr << "end must be greater than start\n";
+        return 2;
+    }
+
+    QString error;
+    WaveFile full;
+    WaveFile windowed;
+    if (!load_first_n_raw(filePath, requestedSignals, 0, std::numeric_limits<qint64>::max(), full, error)) {
+        std::cerr << "full load failed: " << error.toLocal8Bit().constData() << "\n";
+        return 3;
+    }
+    if (!load_first_n_raw(filePath, requestedSignals, start, end, windowed, error)) {
+        std::cerr << "window load failed: " << error.toLocal8Bit().constData() << "\n";
+        return 4;
+    }
+
+    QHash<int, int> windowBySignalId;
+    for (int i = 0; i < windowed.signalList.size(); ++i) {
+        windowBySignalId.insert(windowed.signalList.at(i).signalId, i);
+    }
+
+    quint64 checkedValues = 0;
+    int checkedSignals = 0;
+    for (const WaveSignal& fullSignal : full.signalList) {
+        if (!fullSignal.samplesLoaded) continue;
+        const auto it = windowBySignalId.constFind(fullSignal.signalId);
+        if (it == windowBySignalId.constEnd()) continue;
+        const WaveSignal& windowSignal = windowed.signalList.at(*it);
+        if (!windowSignal.samplesLoaded) continue;
+        ++checkedSignals;
+
+        QVector<qint64> probeTimes;
+        probeTimes.push_back(start);
+        probeTimes.push_back(start + (end - start) / 4);
+        probeTimes.push_back(start + (end - start) / 2);
+        probeTimes.push_back(end - 1);
+        for (const WaveSample& sample : fullSignal.samples) {
+            if (sample.time >= start && sample.time <= end) probeTimes.push_back(sample.time);
+        }
+        for (const WaveSample& sample : windowSignal.samples) {
+            if (sample.time >= start && sample.time <= end) probeTimes.push_back(sample.time);
+        }
+        std::sort(probeTimes.begin(), probeTimes.end());
+        probeTimes.erase(std::unique(probeTimes.begin(), probeTimes.end()), probeTimes.end());
+
+        for (qint64 t : probeTimes) {
+            QString reason;
+            if (!sample_value_equal_at_time(fullSignal, windowSignal, t, reason)) {
+                std::cerr << "window verify failed: signal_id=" << fullSignal.signalId
+                          << " name=" << fullSignal.name.toLocal8Bit().constData()
+                          << " " << reason.toLocal8Bit().constData() << "\n";
+                return 5;
+            }
+            ++checkedValues;
+        }
+    }
+
+    QTextStream out(stdout);
+    out << "window_verify,ok\n";
+    out << "file," << QFileInfo(filePath).fileName() << "\n";
+    out << "signals," << checkedSignals << "\n";
+    out << "checked_values," << checkedValues << "\n";
+    out << "time_start," << start << "\n";
+    out << "time_end," << end << "\n";
+    return 0;
 }
 
 int run_load_benchmark(int argc, char** argv) {
@@ -135,6 +266,9 @@ int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
     if (argc >= 2 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--load-benchmark")) {
         return run_load_benchmark(argc, argv);
+    }
+    if (argc >= 2 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--window-verify")) {
+        return run_window_verify(argc, argv);
     }
     if (argc < 3) {
         std::cerr << "usage: smoke_wvz4_raw_compare <left.wvz4> <right.wvz4>\n";
