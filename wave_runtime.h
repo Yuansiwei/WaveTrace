@@ -9405,10 +9405,7 @@ private:
         }
         for (std::size_t i = 0; i < ptr->size(); ++i) {
             typedef typename detail::remove_cvref<decltype((*ptr)[i])>::type ElementT;
-            expand_member_clean_dispatch<ElementT>(
-                make_index_child_path_(path, i),
-                node_id,
-                static_cast<const ElementT*>(&((*ptr)[i])));
+            expand_field(make_index_child_path_(path, i), node_id, &((*ptr)[i]));
         }
         return keep_node_or_rollback(cp, node_id);
     }
@@ -9423,16 +9420,8 @@ private:
             rollback_topology_to(cp);
             return 0;
         }
-        typedef typename detail::remove_cvref<decltype(ptr->first)>::type FirstT;
-        typedef typename detail::remove_cvref<decltype(ptr->second)>::type SecondT;
-        expand_member_clean_dispatch<FirstT>(
-            make_child_path_(path, "first"),
-            node_id,
-            static_cast<const FirstT*>(&ptr->first));
-        expand_member_clean_dispatch<SecondT>(
-            make_child_path_(path, "second"),
-            node_id,
-            static_cast<const SecondT*>(&ptr->second));
+        expand_field(make_child_path_(path, "first"), node_id, &ptr->first);
+        expand_field(make_child_path_(path, "second"), node_id, &ptr->second);
         return keep_node_or_rollback(cp, node_id);
     }
 
@@ -9686,10 +9675,7 @@ private:
         }
         typedef typename detail::remove_cvref<decltype((*ptr)[0])>::type ElementT;
         for (std::size_t i = 0; i < ptr->size(); ++i) {
-            expand_member_clean_dispatch<ElementT>(
-                make_index_child_path_(path, i),
-                node_id,
-                static_cast<const ElementT*>(&((*ptr)[i])));
+            expand_field(make_index_child_path_(path, i), node_id, &((*ptr)[i]));
         }
         return keep_node_or_rollback(cp, node_id);
     }
@@ -9720,14 +9706,14 @@ private:
         // becomes a scalar_ptr_track, and reflected/container V is recursively
         // expanded.
         const V& ref = ptr->read();
-        return expand_member_clean_dispatch<V>(path, parent_id, std::addressof(ref));
+        return expand_field(path, parent_id, std::addressof(ref));
     }
 
     template <typename T>
     typename std::enable_if<detail::is_sc_clock<T>::value, NodeId>::type
     expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
         const bool& ref = ptr->read();
-        return expand_member_clean_dispatch<bool>(path, parent_id, std::addressof(ref));
+        return expand_field(path, parent_id, std::addressof(ref));
     }
 #endif
 
@@ -9969,24 +9955,15 @@ private:
                                                  const FieldT* clean_ptr,
                                                  std::integral_constant<int, 10>) {
         if (options_.debug_log) debug_log_msg(std::string("member dispatch branch=vsip path=") + path);
-        return expand_member_vsip_dispatch<FieldT>(path, parent_id, clean_ptr);
+        return this->template expand_field<FieldT>(path, parent_id, clean_ptr);
     }
 
-    template <typename FieldT>
-    typename std::enable_if<detail::is_vsip_exact_port<FieldT>::value, NodeId>::type
-    expand_member_vsip_dispatch(const std::string& path,
-                                NodeId parent_id,
-                                const FieldT* clean_ptr) {
-        auto iface = read_vsip_exact_interface(clean_ptr);
-        return iface ? expand_dynamic_trace_interface_target(path, parent_id, iface) : 0;
-    }
-
-    template <typename FieldT>
-    typename std::enable_if<!detail::is_vsip_exact_port<FieldT>::value && detail::is_vsip_read_port<FieldT>::value, NodeId>::type
-    expand_member_vsip_dispatch(const std::string& path,
-                                NodeId parent_id,
-                                const FieldT* clean_ptr) {
-        typedef typename detail::vsip_port_value_type<FieldT>::type V;
+    template <typename FieldT, typename V, typename IsScalar>
+    NodeId expand_member_vsip_dispatch(const std::string& path,
+                                       NodeId parent_id,
+                                       const FieldT* clean_ptr,
+                                       IsScalar) {
+        (void)sizeof(IsScalar);
         // Legacy explicit trait hook for non-exact custom wrappers.
         return add_lazy_value_object<V>(path, parent_id, [this, clean_ptr]() -> const V* {
             return this->template read_vsip_value<FieldT, V>(clean_ptr);
@@ -10156,112 +10133,12 @@ private:
 
 #if WAVE_HAS_SYSTEMC
     template <typename FieldT>
-    struct systemc_member_dispatch_category {
-        enum {
-            value = detail::is_sc_vector<FieldT>::value ? 5 :
-                    detail::is_sc_port<FieldT>::value ? 4 :
-                    (detail::is_sc_in<FieldT>::value ||
-                     detail::is_sc_out<FieldT>::value ||
-                     detail::is_sc_inout<FieldT>::value) ? 3 :
-                    (detail::is_sc_signal<FieldT>::value ||
-                     detail::is_sc_buffer<FieldT>::value) ? 2 :
-                    detail::is_sc_clock<FieldT>::value ? 1 :
-                    0
-        };
-    };
-
-    template <typename FieldT>
-    NodeId expand_systemc_member_dispatch_selected(const std::string& path,
-                                                   NodeId parent_id,
-                                                   const FieldT* clean_ptr,
-                                                   std::integral_constant<int, 5>) {
-        if (!clean_ptr) return 0;
-        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
-        const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
-        if (node_id == 0) {
-            rollback_topology_to(cp);
-            return 0;
-        }
-        typedef typename detail::remove_cvref<decltype((*clean_ptr)[0])>::type ElementT;
-        for (std::size_t i = 0; i < clean_ptr->size(); ++i) {
-            expand_member_clean_dispatch<ElementT>(
-                make_index_child_path_(path, i),
-                node_id,
-                static_cast<const ElementT*>(&((*clean_ptr)[i])));
-        }
-        return keep_node_or_rollback(cp, node_id);
-    }
-
-    template <typename FieldT>
-    NodeId expand_systemc_member_dispatch_selected(const std::string& path,
-                                                   NodeId parent_id,
-                                                   const FieldT* clean_ptr,
-                                                   std::integral_constant<int, 4>) {
-        typedef typename detail::sc_generic_port_iface_type<FieldT>::type IFace;
-        if (!clean_ptr || clean_ptr->size() == 0) return 0;
-        const IFace* iface = (*clean_ptr).operator->();
-        return expand_dynamic_trace_interface_target<IFace>(path, parent_id, iface);
-    }
-
-    template <typename FieldT>
-    NodeId expand_systemc_member_dispatch_selected(const std::string& path,
-                                                   NodeId parent_id,
-                                                   const FieldT* clean_ptr,
-                                                   std::integral_constant<int, 3>) {
-        typedef typename detail::sc_port_value_type<FieldT>::type V;
-        return add_lazy_value_object<V>(path, parent_id, [clean_ptr]() -> const V* {
-            if (!clean_ptr || clean_ptr->size() == 0) return static_cast<const V*>(NULL);
-            const V& ref = clean_ptr->read();
-            return std::addressof(ref);
-        }, detail::maybe_wave_dirty_hook(clean_ptr), true);
-    }
-
-    template <typename FieldT>
-    NodeId expand_systemc_member_dispatch_selected(const std::string& path,
-                                                   NodeId parent_id,
-                                                   const FieldT* clean_ptr,
-                                                   std::integral_constant<int, 2>) {
-        typedef typename detail::sc_signal_value_type<FieldT>::type V;
-        const V& ref = clean_ptr->read();
-        return expand_member_clean_dispatch<V>(path, parent_id, std::addressof(ref));
-    }
-
-    template <typename FieldT>
-    NodeId expand_systemc_member_dispatch_selected(const std::string& path,
-                                                   NodeId parent_id,
-                                                   const FieldT* clean_ptr,
-                                                   std::integral_constant<int, 1>) {
-        const bool& ref = clean_ptr->read();
-        return expand_member_clean_dispatch<bool>(path, parent_id, std::addressof(ref));
-    }
-
-    template <typename FieldT>
-    NodeId expand_systemc_member_dispatch_selected(const std::string& path,
-                                                   NodeId parent_id,
-                                                   const FieldT*,
-                                                   std::integral_constant<int, 0>) {
-        debug_log_unsupported_type<FieldT>(path, parent_id, "member dispatch: no matching SystemC branch", "$systemc_type_unsupported");
-        return 0;
-    }
-
-    template <typename FieldT>
-    NodeId expand_systemc_member_dispatch(const std::string& path,
-                                          NodeId parent_id,
-                                          const FieldT* clean_ptr) {
-        return expand_systemc_member_dispatch_selected<FieldT>(
-            path,
-            parent_id,
-            clean_ptr,
-            std::integral_constant<int, systemc_member_dispatch_category<FieldT>::value>());
-    }
-
-    template <typename FieldT>
     NodeId expand_member_clean_dispatch_selected(const std::string& path,
                                                  NodeId parent_id,
                                                  const FieldT* clean_ptr,
                                                  std::integral_constant<int, 4>) {
         if (options_.debug_log) debug_log_msg(std::string("member dispatch branch=systemc_whitelist path=") + path);
-        return expand_systemc_member_dispatch<FieldT>(path, parent_id, clean_ptr);
+        return this->template expand_field<FieldT>(path, parent_id, clean_ptr);
     }
 #endif
 
@@ -10402,8 +10279,7 @@ private:
 
     template <typename U, std::size_t N>
     NodeId expand_member_ptr(const std::string& path, NodeId parent_id, const U (*field_ptr)[N]) {
-        typedef U ArrT[N];
-        return expand_c_array_field_impl<ArrT>(path, parent_id, field_ptr);
+        return expand_field(path, parent_id, field_ptr);
     }
 
     template <typename T>
