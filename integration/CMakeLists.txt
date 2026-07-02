@@ -268,11 +268,18 @@ if(WIN32)
 	if(MSVC)
 		if(ENABLE_WAVETRACE)
 			set(CMODEL_REGGEN_STAMP "${CMAKE_CURRENT_BINARY_DIR}/cmodel_reggen.stamp")
+			set(CMODEL_REGGEN_SCRIPT "${WAVETRACE_ROOT}/cmake/run_cmodel_reggen.cmake")
+			if(NOT EXISTS "${CMODEL_REGGEN_SCRIPT}")
+				message(FATAL_ERROR "WaveTrace cmodel reggen runner script was not found: ${CMODEL_REGGEN_SCRIPT}")
+			endif()
 			add_custom_command(
 							OUTPUT "${CMODEL_REGGEN_STAMP}"
-							COMMAND "${AQROOT}/tools/bin/python/python" "${AQROOT}/tools/bin/gcDefineGen.py" "${AQARCH}/cmodel" "${ARCH}"
-							COMMAND attrib -r "${AQARCH}/cmodel/isa/src/isa_instructions.h"
-							COMMAND ${CMAKE_COMMAND} -E touch "${CMODEL_REGGEN_STAMP}"
+							COMMAND ${CMAKE_COMMAND}
+								"-DAQROOT=${AQROOT}"
+								"-DAQARCH=${AQARCH}"
+								"-DARCH=${ARCH}"
+								"-DCMODEL_REGGEN_STAMP=${CMODEL_REGGEN_STAMP}"
+								-P "${CMODEL_REGGEN_SCRIPT}"
 							VERBATIM
 							#COMMAND python  "$(AQARCH)/infra/isa_auto_generator/main.py"  --generate cpp --output $(AQARCH)/cmodel/isa/src
 							)
