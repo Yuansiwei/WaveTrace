@@ -22,16 +22,35 @@ endif()
 option(GPGPU_ONLY "only GPGPU build" ON)
 option(ISAMODEL "amodel config" OFF)
 option(BUILD_SYSTEMC "systemc build" OFF)
-if(NOT DEFINED CMAKE_BUILD_TYPE)
-	set(CMAKE_BUILD_TYPE Debug)
+get_property(WAVETRACE_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(WAVETRACE_MULTI_CONFIG)
+	set(WAVETRACE_DEFAULT_CONFIGS Debug Release RelWithDebInfo MinSizeRel Profile)
+	foreach(_wavetrace_config IN LISTS WAVETRACE_DEFAULT_CONFIGS)
+		if(NOT _wavetrace_config IN_LIST CMAKE_CONFIGURATION_TYPES)
+			list(APPEND CMAKE_CONFIGURATION_TYPES "${_wavetrace_config}")
+		endif()
+	endforeach()
+	set(CMAKE_CONFIGURATION_TYPES "${CMAKE_CONFIGURATION_TYPES}" CACHE STRING "Available build configurations" FORCE)
+else()
+	if(NOT CMAKE_BUILD_TYPE)
+		set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+	endif()
+	set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel Profile)
 endif()
+set(WAVETRACE_MSVC_MP_COUNT "32" CACHE STRING "MSVC /MP process count for cmodel")
+set(WAVETRACE_RELEASE_DEBUG_INFO ON CACHE BOOL "Emit Release debug info and link flags so profilers can resolve symbols")
 if(WIN32)
 	if(MSVC)
 		add_compile_options(/Zf)
-		set(CMAKE_CXX_FLAGS_ALL_DEBUG " -O1 -DDEBUG /vmg -Zm300 /bigobj /MP4")
+		set(CMAKE_CXX_FLAGS_ALL_DEBUG " /O1 /DDEBUG /vmg -Zm300 /bigobj")
 	
 	# Custom All_Release flags
-		set(CMAKE_CXX_FLAGS_ALL_RELEASE "-O2 -DNDEBUG /vmg -Zm300 /bigobj /MP4")
+		set(CMAKE_CXX_FLAGS_ALL_RELEASE "/O2 /DNDEBUG /vmg -Zm300 /bigobj")
+		set(CMAKE_C_FLAGS_PROFILE "${CMAKE_C_FLAGS_RELEASE} /Z7 /Oy-" CACHE STRING "C flags for Profile builds" FORCE)
+		set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_RELEASE} /Z7 /Oy-" CACHE STRING "C++ flags for Profile builds" FORCE)
+		set(CMAKE_EXE_LINKER_FLAGS_PROFILE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /DEBUG:FULL /OPT:REF /OPT:ICF /INCREMENTAL:NO" CACHE STRING "Executable linker flags for Profile builds" FORCE)
+		set(CMAKE_SHARED_LINKER_FLAGS_PROFILE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} /DEBUG:FULL /OPT:REF /OPT:ICF /INCREMENTAL:NO" CACHE STRING "Shared linker flags for Profile builds" FORCE)
+		set(CMAKE_MODULE_LINKER_FLAGS_PROFILE "${CMAKE_MODULE_LINKER_FLAGS_RELEASE} /DEBUG:FULL /OPT:REF /OPT:ICF /INCREMENTAL:NO" CACHE STRING "Module linker flags for Profile builds" FORCE)
 	endif()
 	# Custom All_Debug flags
 
@@ -209,12 +228,31 @@ if(WIN32)
 	set(CMODEL_PATH "${WORKDIR}\\HW\\projects.se\\arch\\XAQ2\\cmodel")
 	#file(CMODEL_PATH_DEFINE "${CMODEL_PATH}" SANITIZED_PATH)
 	string(REPLACE "\\" "/" CMODEL_PATH "${AQARCH}/cmodel")
-	target_compile_options(cmodel PUBLIC -DAQ2_DMA=1 -DXAQ2=1 -DEMULATOR -DPATH_TO_CMODEL="${CMODEL_PATH}" $<$<CONFIG:DEBUG>:-DUSE_PRINTF> $<$<CONFIG:DEBUG>:-D_DEBUG> $<$<BOOL:${DV_DUMP}>:-DDV_DUMP=1> $<$<BOOL:${ISAMODEL}>:-DgcdMODELING_MODE=2>)
+	target_compile_options(cmodel PUBLIC -DAQ2_DMA=1 -DXAQ2=1 -DEMULATOR -DPATH_TO_CMODEL="${CMODEL_PATH}" $<$<CONFIG:Debug>:-DUSE_PRINTF> $<$<CONFIG:Debug>:-D_DEBUG> $<$<BOOL:${DV_DUMP}>:-DDV_DUMP=1> $<$<BOOL:${ISAMODEL}>:-DgcdMODELING_MODE=2>)
 	if (MSVC)
 		target_compile_options(cmodel PRIVATE ${WAVETRACE_CMODEL_FORCE_INCLUDE_MSVC}
 											/FI${AQARCH}/cmodel/inc/vsiPrecomp.h
-											/vmg -Zm300 /bigobj -D_CRT_SECURE_NO_WARNINGS )
-		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP4")
+											/vmg -Zm300 /bigobj -D_CRT_SECURE_NO_WARNINGS
+											/MP${WAVETRACE_MSVC_MP_COUNT}
+											"$<$<AND:$<BOOL:${WAVETRACE_RELEASE_DEBUG_INFO}>,$<CONFIG:Release>>:/Z7>"
+											"$<$<AND:$<BOOL:${WAVETRACE_RELEASE_DEBUG_INFO}>,$<CONFIG:Release>>:/Oy->"
+											"$<$<CONFIG:RelWithDebInfo>:/Z7>"
+											"$<$<CONFIG:RelWithDebInfo>:/Oy->"
+											"$<$<CONFIG:Profile>:/Z7>"
+											"$<$<CONFIG:Profile>:/Oy->")
+		set_property(TARGET cmodel APPEND PROPERTY INTERFACE_LINK_OPTIONS
+			"$<$<AND:$<BOOL:${WAVETRACE_RELEASE_DEBUG_INFO}>,$<CONFIG:Release>>:/DEBUG:FULL>"
+			"$<$<AND:$<BOOL:${WAVETRACE_RELEASE_DEBUG_INFO}>,$<CONFIG:Release>>:/OPT:REF>"
+			"$<$<AND:$<BOOL:${WAVETRACE_RELEASE_DEBUG_INFO}>,$<CONFIG:Release>>:/OPT:ICF>"
+			"$<$<AND:$<BOOL:${WAVETRACE_RELEASE_DEBUG_INFO}>,$<CONFIG:Release>>:/INCREMENTAL:NO>"
+			"$<$<CONFIG:RelWithDebInfo>:/DEBUG:FULL>"
+			"$<$<CONFIG:RelWithDebInfo>:/OPT:REF>"
+			"$<$<CONFIG:RelWithDebInfo>:/OPT:ICF>"
+			"$<$<CONFIG:RelWithDebInfo>:/INCREMENTAL:NO>"
+			"$<$<CONFIG:Profile>:/DEBUG:FULL>"
+			"$<$<CONFIG:Profile>:/OPT:REF>"
+			"$<$<CONFIG:Profile>:/OPT:ICF>"
+			"$<$<CONFIG:Profile>:/INCREMENTAL:NO>")
 	else()
 		target_compile_options(cmodel PRIVATE ${WAVETRACE_CMODEL_FORCE_INCLUDE_CLANG} -include ${AQARCH}/cmodel/inc/vsiPrecomp.h)
 		#target_compile_options(cmodel PRIVATE -flto)
@@ -230,14 +268,15 @@ if(WIN32)
 	if(MSVC)
 		if(ENABLE_WAVETRACE)
 			set(CMODEL_REGGEN_STAMP "${CMAKE_CURRENT_BINARY_DIR}/cmodel_reggen.stamp")
-			add_custom_target(cmodel_reggen
+			add_custom_command(
+							OUTPUT "${CMODEL_REGGEN_STAMP}"
 							COMMAND "${AQROOT}/tools/bin/python/python" "${AQROOT}/tools/bin/gcDefineGen.py" "${AQARCH}/cmodel" "${ARCH}"
 							COMMAND attrib -r "${AQARCH}/cmodel/isa/src/isa_instructions.h"
 							COMMAND ${CMAKE_COMMAND} -E touch "${CMODEL_REGGEN_STAMP}"
-							BYPRODUCTS "${CMODEL_REGGEN_STAMP}"
 							VERBATIM
 							#COMMAND python  "$(AQARCH)/infra/isa_auto_generator/main.py"  --generate cpp --output $(AQARCH)/cmodel/isa/src
 							)
+			add_custom_target(cmodel_reggen DEPENDS "${CMODEL_REGGEN_STAMP}")
 			add_dependencies(cmodel cmodel_reggen)
 		else()
 			add_custom_command(
@@ -249,32 +288,31 @@ if(WIN32)
 							)
 		endif()
 	endif()
-	if(CMAKE_BUILD_TYPE STREQUAL "Debug" )
-		if(MSVC)
-			target_link_directories(cmodel INTERFACE ${AQTOOLS}/GPU/perf/systemc-2.3.3/msvc10/SystemC/x64/Debug)
-			target_link_directories(cmodel INTERFACE cmonitor/cmodel_monitor/cmodel_monitor/x64/Debug)
-			target_link_directories(cmodel INTERFACE cmonitor/cmodel_monitor/cmodel_monitor/x64)
-			target_link_libraries(cmodel PUBLIC SystemC vsiMathlib cmonitor_protocol.lib)
-		else()
+	if(MSVC)
+		target_link_directories(cmodel INTERFACE
+			"$<$<CONFIG:Debug>:${AQTOOLS}/GPU/perf/systemc-2.3.3/msvc10/SystemC/x64/Debug>"
+			"$<$<NOT:$<CONFIG:Debug>>:${AQTOOLS}/GPU/perf/systemc-2.3.3/msvc10/SystemC/x64/Release>"
+			"$<$<CONFIG:Debug>:cmonitor/cmodel_monitor/cmodel_monitor/x64/Debug>"
+			"$<$<CONFIG:Debug>:cmonitor/cmodel_monitor/cmodel_monitor/x64>"
+			"$<$<NOT:$<CONFIG:Debug>>:cmonitor/cmodel_monitor/cmodel_monitor/x64/Release>")
+		target_link_libraries(cmodel PUBLIC SystemC vsiMathlib cmonitor_protocol.lib)
+	else()
+		if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 			add_subdirectory(${AQTOOLS}/GPU/perf/systemc-2.3.3 ${CMAKE_BINARY_DIR}/systemcLib)
 			target_link_directories(cmodel INTERFACE cmonitor/cmodel_monitor/cmodel_monitor/x64/Debug)
 			target_link_directories(cmodel INTERFACE cmonitor/cmodel_monitor/cmodel_monitor/x64)
 			target_link_libraries(cmodel PUBLIC systemc vsiMathlib cmonitor_protocol.lib)
+		else()
+			target_link_directories(cmodel INTERFACE ${AQTOOLS}/GPU/perf/systemc-2.3.3/msvc10/SystemC/x64/Release)
+			target_link_directories(cmodel INTERFACE cmonitor/cmodel_monitor/cmodel_monitor/x64/Release)
+			target_link_libraries(cmodel PUBLIC SystemC vsiMathlib cmonitor_protocol.lib)
 		endif()
-		
-		if(CMODEL_CODE_COVERAGE)
-			if(MINGW)
-				message(STATUS "==============set codecov===============")
-				target_compile_options(cmodel PRIVATE -fprofile-arcs -ftest-coverage)
-				target_link_options(cmodel PRIVATE -fprofile-arcs -ftest-coverage)
-				target_link_libraries(cmodel PRIVATE gcov)
-			endif()
-		endif()
-
-	elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
-		target_link_directories(cmodel INTERFACE ${AQTOOLS}/GPU/perf/systemc-2.3.3/msvc10/SystemC/x64/Release)
-		target_link_directories(cmodel INTERFACE cmonitor/cmodel_monitor/cmodel_monitor/x64/Release)
-		target_link_libraries(cmodel PUBLIC SystemC vsiMathlib cmonitor_protocol.lib)
+	endif()
+	if(CMODEL_CODE_COVERAGE AND MINGW)
+		message(STATUS "==============set codecov===============")
+		target_compile_options(cmodel PRIVATE -fprofile-arcs -ftest-coverage)
+		target_link_options(cmodel PRIVATE -fprofile-arcs -ftest-coverage)
+		target_link_libraries(cmodel PRIVATE gcov)
 	endif()
 	target_include_directories(cmodel PUBLIC ${ALL_INCLUDE_DIRECTORY})
 	target_include_directories(cmodel PUBLIC ${AQTOOLS}/GPU/perf/nlohmannjson-3.12.0/include)
@@ -309,7 +347,7 @@ if(WIN32)
 	endforeach()
 elseif(UNIX)
 
-	target_compile_options(cmodel PUBLIC -DAQ2_DMA=1 -DXAQ2=1 -DEMULATOR $<$<CONFIG:DEBUG>:-DUSE_PRINTF> $<$<CONFIG:DEBUG>:-D_DEBUG>
+	target_compile_options(cmodel PUBLIC -DAQ2_DMA=1 -DXAQ2=1 -DEMULATOR $<$<CONFIG:Debug>:-DUSE_PRINTF> $<$<CONFIG:Debug>:-D_DEBUG>
     -DvsidUSE_VSI_HEADERS=1)
 	target_compile_definitions(cmodel PRIVATE PATH_TO_CMODEL="${AQARCH}/cmodel")
 	if (MSVC)
@@ -406,12 +444,10 @@ if(ENABLE_WAVETRACE)
 		)
 	endif()
 
-	if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-		list(APPEND WAVETRACE_REFLECT_CLANG_ARGS
-			-DUSE_PRINTF
-			-D_DEBUG
-		)
-	endif()
+	list(APPEND WAVETRACE_REFLECT_CLANG_ARGS
+		"$<$<CONFIG:Debug>:-DUSE_PRINTF>"
+		"$<$<CONFIG:Debug>:-D_DEBUG>"
+	)
 	if(DV_DUMP)
 		list(APPEND WAVETRACE_REFLECT_CLANG_ARGS -DDV_DUMP=1)
 	endif()
@@ -579,6 +615,7 @@ if(ENABLE_WAVETRACE)
 			IMPORTED_LOCATION_RELEASE "${WAVETRACE_ZSTD_LIB_RELEASE}"
 			IMPORTED_LOCATION_RELWITHDEBINFO "${WAVETRACE_ZSTD_LIB_RELEASE}"
 			IMPORTED_LOCATION_MINSIZEREL "${WAVETRACE_ZSTD_LIB_RELEASE}"
+			IMPORTED_LOCATION_PROFILE "${WAVETRACE_ZSTD_LIB_RELEASE}"
 			INTERFACE_INCLUDE_DIRECTORIES "${WAVETRACE_ZSTD_INCLUDE_DIR}"
 		)
 		target_link_libraries(cmodel PUBLIC WaveTrace::zstd)
