@@ -13,6 +13,7 @@
     <WaveTraceReflectBatchDir Condition="'$(WaveTraceReflectBatchDir)'==''">$(ProjectDir)</WaveTraceReflectBatchDir>
     <WaveTraceReflectExtraArgs Condition="'$(WaveTraceReflectExtraArgs)'==''">--allow-errors</WaveTraceReflectExtraArgs>
     <WaveTraceReflectClangArgs Condition="'$(WaveTraceReflectClangArgs)'==''">-std=c++14 -ferror-limit=0 -DANON(x)= -I&quot;$(ProjectDir)&quot; -I&quot;$(WaveTraceRoot)&quot; -resource-dir=&quot;$(WaveTraceRoot)\tools\lib\clang\22&quot; -include &quot;$(WaveTraceRoot)\reflect_macro.h&quot;</WaveTraceReflectClangArgs>
+    <WaveTraceReflectCoreInputs>$(WaveTraceReflectGenExe);$(MSBuildProjectFullPath);$(WaveTraceRoot)\reflect_macro.h;$(WaveTraceRoot)\reflect_runtime.h;$(WaveTraceRoot)\wave_runtime.h</WaveTraceReflectCoreInputs>
   </PropertyGroup>
 
   <ItemDefinitionGroup>
@@ -29,18 +30,20 @@
   <Target Name="RunWaveTraceReflectGen"
           BeforeTargets="ClCompile"
           DependsOnTargets="CheckWaveTraceReflectGenPrebuilt"
-          Inputs="$(WaveTraceReflectGenExe);@(ClInclude);@(ClCompile)"
+          Inputs="$(WaveTraceReflectCoreInputs);$(WaveTraceReflectEntryHeader);@(ClInclude)"
           Outputs="$(WaveTraceReflectProjectHeader);$(WaveTraceReflectRootClosureHeader)">
     <MakeDir Directories="$(WaveTraceReflectGenDir)" />
     <WriteLinesToFile File="$(WaveTraceReflectTargetList)"
                       Lines="&quot;$(WaveTraceReflectEntryHeader)&quot;"
                       Overwrite="true"
                       Encoding="UTF-8"
+                      WriteOnlyWhenDifferent="true"
                       Condition="'$(WaveTraceReflectEntryHeader)'!=''" />
     <WriteLinesToFile File="$(WaveTraceReflectTargetList)"
                       Lines="@(ClInclude->'&quot;%(FullPath)&quot;')"
                       Overwrite="true"
                       Encoding="UTF-8"
+                      WriteOnlyWhenDifferent="true"
                       Condition="'$(WaveTraceReflectEntryHeader)'==''" />
     <Message Importance="High" Text="WaveTrace ReflectGen output: $(WaveTraceReflectGenDir)" />
     <Message Importance="High" Text="WaveTrace ReflectGen target list: $(WaveTraceReflectTargetList)" />

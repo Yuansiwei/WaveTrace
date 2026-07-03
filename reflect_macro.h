@@ -542,6 +542,16 @@ public:
     element_type* operator->() const noexcept { return get(); }
     element_type& operator[](std::size_t index) const noexcept { return get()[index]; }
     operator element_type*() const noexcept { return get(); }
+
+    template <typename U = PtrT, typename std::enable_if<!std::is_pointer<U>::value, int>::type = 0>
+    operator U&() noexcept { return ptr_; }
+
+    template <typename U = PtrT, typename std::enable_if<!std::is_pointer<U>::value, int>::type = 0>
+    operator const U&() const noexcept { return ptr_; }
+
+    template <typename U = PtrT, typename std::enable_if<!std::is_pointer<U>::value, int>::type = 0>
+    operator U&&() && noexcept { return std::move(ptr_); }
+
     explicit operator bool() const noexcept { return get() != NULL; }
 
     WavePtr& declareSize(std::size_t count) noexcept {

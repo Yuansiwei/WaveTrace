@@ -63,6 +63,8 @@ $files = @(
     "cmake\wavetrace_reflectgen.cmake",
     "cmake\wavetrace_writer_helper.cmake",
     "integration\CMakeLists.txt",
+    "props\systemc_local.props",
+    "props\wavetrace_app_common.props",
     "props\wavetrace_reflectgen_reference.props",
     "props\wvz4_writer_helper_reference.props",
     "props\zstd_embed.props",
@@ -94,6 +96,7 @@ $viewerFiles = @(
     "QtViewer\ActiveSignalItemWidget.h",
     "QtViewer\ActiveSignalListWidget.cpp",
     "QtViewer\ActiveSignalListWidget.h",
+    "QtViewer\app.ico",
     "QtViewer\app.manifest",
     "QtViewer\app.rc",
     "QtViewer\icons\compare.png",
@@ -129,6 +132,18 @@ foreach ($file in $viewerFiles) {
     Copy-ReleaseFile $file
 }
 
+$viewerRuntimeFiles = @(
+    "QtViewer\build\x64\Release\QtViewer.exe",
+    "QtViewer\build\x64\Release\Qt5Core.dll",
+    "QtViewer\build\x64\Release\Qt5Gui.dll",
+    "QtViewer\build\x64\Release\Qt5Widgets.dll",
+    "QtViewer\build\x64\Release\platforms\qwindows.dll"
+)
+
+foreach ($file in $viewerRuntimeFiles) {
+    Copy-ReleaseFile $file
+}
+
 $qtRoot = "QtViewer\third_party\Qt\5.15.2\msvc2019_64"
 $qtFiles = @(
     "bin\moc.exe",
@@ -156,7 +171,8 @@ Compress-Archive -Path (Join-Path $stageParent $packageTop) -DestinationPath $zi
 Remove-Item -LiteralPath $stageParent -Recurse -Force
 
 $blocked = @(
-    "SystemC",
+    "\SystemC\",
+    "/SystemC/",
     "systemc-",
     "smoke",
     "\tests\",

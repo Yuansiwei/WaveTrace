@@ -17,7 +17,7 @@
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
       <LanguageStandard>stdcpp14</LanguageStandard>
       <AdditionalOptions>/vmg %(AdditionalOptions)</AdditionalOptions>
-      <DisableSpecificWarnings>4244;4267;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <DisableSpecificWarnings>4244;4267;4819;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
     <Link>
       <AdditionalLibraryDirectories>$(SystemCLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>

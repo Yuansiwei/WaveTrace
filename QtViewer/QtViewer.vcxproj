@@ -139,6 +139,7 @@
 
   <ItemGroup>
     <ResourceCompile Include="app.rc" />
+    <Image Include="app.ico" />
     <None Include="app.manifest" />
     <None Include="QtSingalViewer.ui" />
     <None Include="QtSingalViewer.qrc" />

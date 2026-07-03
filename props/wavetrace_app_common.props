@@ -5,6 +5,7 @@
   </PropertyGroup>
 
   <PropertyGroup>
+    <VcpkgApplocalDeps>false</VcpkgApplocalDeps>
     <OutDir>$(WaveTraceRoot)\build_vs\$(ProjectName)\$(Configuration)\</OutDir>
     <IntDir>$(WaveTraceRoot)\build_vs\obj\$(ProjectName)\$(Configuration)\</IntDir>
   </PropertyGroup>

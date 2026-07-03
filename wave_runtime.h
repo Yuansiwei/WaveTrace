@@ -10311,7 +10311,18 @@ private:
     }
 
     template <typename T>
-    typename std::enable_if<reflect::is_reflected<T>::value && !detail::is_peek_trace_source<T>::value && !detail::is_vsip_read_port<T>::value && !detail::is_sc_namespace_blacklisted<T>::value, NodeId>::type
+    typename std::enable_if<reflect::is_reflected<T>::value &&
+                            !detail::is_peek_trace_source<T>::value &&
+                            !detail::is_vsip_read_port<T>::value &&
+                            !detail::is_sc_in<T>::value &&
+                            !detail::is_sc_out<T>::value &&
+                            !detail::is_sc_inout<T>::value &&
+                            !detail::is_sc_port<T>::value &&
+                            !detail::is_sc_signal<T>::value &&
+                            !detail::is_sc_buffer<T>::value &&
+                            !detail::is_sc_vector<T>::value &&
+                            !detail::is_sc_clock<T>::value &&
+                            !detail::is_sc_namespace_blacklisted<T>::value, NodeId>::type
     expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
         return expand_reflected_field_cached_or_direct_<T>(path, parent_id, ptr);
     }
