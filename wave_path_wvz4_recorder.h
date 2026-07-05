@@ -258,36 +258,43 @@ public:
     }
 
     void on_node_declared(const wave::NodeDecl& decl) override {
+        on_node_declared_fast(decl.node_id, decl.parent_id, decl.name, decl.kind);
+    }
+
+    void on_node_declared_fast(wave::NodeId node_id,
+                               wave::NodeId parent_id,
+                               const std::string& name,
+                               wave::NodeKind kind) override {
         if (writer_opened_) {
             set_error("WVZ4 recorder on_node_declared failed: topology changed after writer open");
             return;
         }
-        if (decl.node_id == 0) { set_error("WVZ4 recorder on_node_declared failed: node_id is zero"); return; }
-        if (decl.node_id > static_cast<wave::NodeId>(std::numeric_limits<wvz4::u32>::max())) {
+        if (node_id == 0) { set_error("WVZ4 recorder on_node_declared failed: node_id is zero"); return; }
+        if (node_id > static_cast<wave::NodeId>(std::numeric_limits<wvz4::u32>::max())) {
             set_error("WVZ4 recorder on_node_declared failed: node_id exceeds uint32 range"); return;
         }
-        if (decl.parent_id > static_cast<wave::NodeId>(std::numeric_limits<wvz4::u32>::max())) {
+        if (parent_id > static_cast<wave::NodeId>(std::numeric_limits<wvz4::u32>::max())) {
             set_error("WVZ4 recorder on_node_declared failed: parent_id exceeds uint32 range"); return;
         }
-        if (decl.name.empty()) { set_error("WVZ4 recorder on_node_declared failed: empty node name"); return; }
-        ensure_node_capacity(decl.node_id);
-        NodeState& st = node_states_[static_cast<std::size_t>(decl.node_id)];
+        if (name.empty()) { set_error("WVZ4 recorder on_node_declared failed: empty node name"); return; }
+        ensure_node_capacity(node_id);
+        NodeState& st = node_states_[static_cast<std::size_t>(node_id)];
         if (st.declared) { set_error("WVZ4 recorder on_node_declared failed: duplicate node_id"); return; }
         st.declared = true;
-        st.node_id = static_cast<wvz4::u32>(decl.node_id);
-        st.parent_id = static_cast<wvz4::u32>(decl.parent_id);
-        if (decl.name.size() > static_cast<std::size_t>(std::numeric_limits<wvz4::u32>::max())) {
+        st.node_id = static_cast<wvz4::u32>(node_id);
+        st.parent_id = static_cast<wvz4::u32>(parent_id);
+        if (name.size() > static_cast<std::size_t>(std::numeric_limits<wvz4::u32>::max())) {
             set_error("WVZ4 recorder on_node_declared failed: node name exceeds uint32 range");
             return;
         }
-        if (node_name_blob_.size() > static_cast<std::size_t>(std::numeric_limits<wvz4::u32>::max()) - decl.name.size()) {
+        if (node_name_blob_.size() > static_cast<std::size_t>(std::numeric_limits<wvz4::u32>::max()) - name.size()) {
             set_error("WVZ4 recorder on_node_declared failed: node name arena exceeds uint32 range");
             return;
         }
         st.name_offset = static_cast<wvz4::u32>(node_name_blob_.size());
-        st.name_size = static_cast<wvz4::u32>(decl.name.size());
-        node_name_blob_.append(decl.name.data(), decl.name.size());
-        st.kind = map_node_kind(decl.kind);
+        st.name_size = static_cast<wvz4::u32>(name.size());
+        node_name_blob_.append(name.data(), name.size());
+        st.kind = map_node_kind(kind);
         st.first_child = 0;
         st.last_child = 0;
         st.next_sibling = 0;
@@ -313,45 +320,64 @@ public:
     }
 
     void on_track_declared(const wave::TrackDecl& decl) override {
+        on_track_declared_fast(
+            decl.track_id,
+            decl.storage_id,
+            decl.node_id,
+            decl.kind,
+            decl.bit_width,
+            decl.bit_offset,
+            decl.storage_only,
+            decl.path);
+    }
+
+    void on_track_declared_fast(wave::TrackId track_id,
+                                wave::TrackId storage_id,
+                                wave::NodeId node_id,
+                                wave::ValueKind kind,
+                                std::uint32_t bit_width,
+                                std::uint32_t bit_offset,
+                                bool storage_only,
+                                const std::string&) override {
         if (writer_opened_) {
             set_error("WVZ4 recorder on_track_declared failed: topology changed after writer open");
             return;
         }
-        if (decl.track_id == 0) { set_error("WVZ4 recorder on_track_declared failed: track_id is zero"); return; }
+        if (track_id == 0) { set_error("WVZ4 recorder on_track_declared failed: track_id is zero"); return; }
         const wave::TrackId max_track_id = cfg_.emit_default_clk
             ? static_cast<wave::TrackId>(std::numeric_limits<wvz4::u32>::max() - 1u)
             : static_cast<wave::TrackId>(std::numeric_limits<wvz4::u32>::max());
-        if (decl.track_id > max_track_id) {
+        if (track_id > max_track_id) {
             set_error("WVZ4 recorder on_track_declared failed: track_id exceeds signal_id uint32 range"); return;
         }
-        const wave::TrackId logical_storage_id = decl.storage_id != 0 ? decl.storage_id : decl.track_id;
+        const wave::TrackId logical_storage_id = storage_id != 0 ? storage_id : track_id;
         if (logical_storage_id == 0 || logical_storage_id > max_track_id) {
             set_error("WVZ4 recorder on_track_declared failed: storage_id exceeds signal_id uint32 range"); return;
         }
-        if ((!decl.storage_only && decl.node_id == 0) ||
-            decl.node_id > static_cast<wave::NodeId>(std::numeric_limits<wvz4::u32>::max())) {
+        if ((!storage_only && node_id == 0) ||
+            node_id > static_cast<wave::NodeId>(std::numeric_limits<wvz4::u32>::max())) {
             set_error("WVZ4 recorder on_track_declared failed: invalid node_id"); return;
         }
-        ensure_track_capacity(decl.track_id);
-        TrackState& st = track_states_[static_cast<std::size_t>(decl.track_id)];
+        ensure_track_capacity(track_id);
+        TrackState& st = track_states_[static_cast<std::size_t>(track_id)];
         if (st.declared) { set_error("WVZ4 recorder on_track_declared failed: duplicate track_id"); return; }
         st.declared = true;
-        st.track_id = static_cast<wvz4::u32>(decl.track_id);
+        st.track_id = static_cast<wvz4::u32>(track_id);
         st.signal_id = cfg_.emit_default_clk
-            ? static_cast<wvz4::u32>(decl.track_id + 1u)
-            : static_cast<wvz4::u32>(decl.track_id);
+            ? static_cast<wvz4::u32>(track_id + 1u)
+            : static_cast<wvz4::u32>(track_id);
         st.storage_signal_id = cfg_.emit_default_clk
             ? static_cast<wvz4::u32>(logical_storage_id + 1u)
             : static_cast<wvz4::u32>(logical_storage_id);
         st.storage_track_id = logical_storage_id;
-        st.node_id = static_cast<wvz4::u32>(decl.node_id);
-        st.kind = decl.kind;
-        st.bit_width = decl.bit_width == 0 ? static_cast<wvz4::u32>(64) : decl.bit_width;
-        st.bit_offset = decl.bit_offset;
-        st.storage_only = decl.storage_only;
-        st.value_type = map_value_type(decl.kind, st.bit_width);
+        st.node_id = static_cast<wvz4::u32>(node_id);
+        st.kind = kind;
+        st.bit_width = bit_width == 0 ? static_cast<wvz4::u32>(64) : bit_width;
+        st.bit_offset = bit_offset;
+        st.storage_only = storage_only;
+        st.value_type = map_value_type(kind, st.bit_width);
         st.byte_width = byte_width_for_type(st.value_type);
-        st.radix = default_radix(decl.kind);
+        st.radix = default_radix(kind);
         if (!declared_track_ids_.empty() && declared_track_ids_.back() >= st.track_id) {
             declared_track_ids_strictly_increasing_ = false;
         }

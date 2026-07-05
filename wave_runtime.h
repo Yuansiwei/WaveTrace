@@ -243,7 +243,37 @@ class IWaveSink {
 public:
     virtual ~IWaveSink() {}
     virtual void on_node_declared(const NodeDecl&) {}
+    virtual void on_node_declared_fast(NodeId node_id,
+                                       NodeId parent_id,
+                                       const std::string& name,
+                                       NodeKind kind) {
+        NodeDecl decl;
+        decl.node_id = node_id;
+        decl.parent_id = parent_id;
+        decl.name = name;
+        decl.kind = kind;
+        on_node_declared(decl);
+    }
     virtual void on_track_declared(const TrackDecl& decl) = 0;
+    virtual void on_track_declared_fast(TrackId track_id,
+                                        TrackId storage_id,
+                                        NodeId node_id,
+                                        ValueKind kind,
+                                        std::uint32_t bit_width,
+                                        std::uint32_t bit_offset,
+                                        bool storage_only,
+                                        const std::string& path) {
+        TrackDecl decl;
+        decl.track_id = track_id;
+        decl.storage_id = storage_id;
+        decl.node_id = node_id;
+        decl.path = path;
+        decl.kind = kind;
+        decl.bit_width = bit_width;
+        decl.bit_offset = bit_offset;
+        decl.storage_only = storage_only;
+        on_track_declared(decl);
+    }
     virtual void on_sample(const TrackEvent& ev) = 0;
 };
 
@@ -687,15 +717,43 @@ inline const void* pointer_address(std::nullptr_t) {
 
 inline std::string pointer_to_string(const void* p) {
     if (!p) return "null";
-    std::ostringstream oss;
-    oss << "0x" << std::hex << std::uppercase << reinterpret_cast<std::uintptr_t>(p);
-    return oss.str();
+    static const char kHex[] = "0123456789ABCDEF";
+    std::uintptr_t value = reinterpret_cast<std::uintptr_t>(p);
+    char digits[2 + sizeof(std::uintptr_t) * 2];
+    char* out = digits + sizeof(digits);
+    do {
+        *--out = kHex[value & 0xFu];
+        value >>= 4;
+    } while (value != 0);
+    *--out = 'x';
+    *--out = '0';
+    return std::string(out, digits + sizeof(digits));
 }
 
 inline std::string to_string_unsigned(std::uint64_t value) {
-    std::ostringstream oss;
-    oss << value;
-    return oss.str();
+    char digits[20];
+    char* out = digits + sizeof(digits);
+    do {
+        *--out = static_cast<char>('0' + (value % 10u));
+        value /= 10u;
+    } while (value != 0);
+    return std::string(out, digits + sizeof(digits));
+}
+
+inline std::string to_string_signed(std::int64_t value) {
+    const bool negative = value < 0;
+    const std::uint64_t magnitude = negative
+        ? static_cast<std::uint64_t>(-(value + 1)) + 1u
+        : static_cast<std::uint64_t>(value);
+    char digits[21];
+    char* out = digits + sizeof(digits);
+    std::uint64_t v = magnitude;
+    do {
+        *--out = static_cast<char>('0' + (v % 10u));
+        v /= 10u;
+    } while (v != 0);
+    if (negative) *--out = '-';
+    return std::string(out, digits + sizeof(digits));
 }
 
 inline std::string scalar_to_string(const bool& value) {
@@ -719,9 +777,7 @@ inline typename std::enable_if<
     std::is_integral<T>::value && std::is_signed<T>::value && !std::is_same<T, bool>::value,
     std::string>::type
 scalar_to_string(const T& value) {
-    std::ostringstream oss;
-    oss << static_cast<long long>(value);
-    return oss.str();
+    return to_string_signed(static_cast<std::int64_t>(value));
 }
 
 template <typename T>
@@ -729,9 +785,7 @@ inline typename std::enable_if<
     std::is_integral<T>::value && std::is_unsigned<T>::value && !std::is_same<T, bool>::value,
     std::string>::type
 scalar_to_string(const T& value) {
-    std::ostringstream oss;
-    oss << static_cast<unsigned long long>(value);
-    return oss.str();
+    return to_string_unsigned(static_cast<std::uint64_t>(value));
 }
 
 template <typename T>
@@ -1663,12 +1717,15 @@ public:
     explicit Tracer(IWaveSink& sink, const BuildOptions& options = BuildOptions())
         : sink_(sink), options_(options), debug_log_event_count_(0),
           trace_level_limit_enabled_(detail::wave_trace_level_limit().enabled),
+          trace_level_limit_max_dot_count_(detail::wave_trace_level_limit().max_dot_count),
           next_node_id_(1), next_track_id_(1), next_object_id_(1), next_watch_id_(1),
           nodes_exported_(false), nodes_(1), tracks_(1), track_runtime_(1), objects_(1), lazy_value_watches_(1), root_watches_(1),
           flat_leaf_fast_table_valid_(false), flat_leaf_fast_table_complete_(false) {
         ::wave::detail::set_wave_value_notify_fn(&Tracer::wave_value_notify_bridge_);
         ::wave::detail::set_wave_array_index_notify_fn(&Tracer::wave_array_index_notify_bridge_);
         register_active_tracer_(this);
+        node_name_hot_cache_.reserve(128u);
+        node_name_literal_cache_.reserve(64u);
         open_debug_log();
         open_parallel_flat_leaf_load_log_();
         if (options_.debug_log) debug_log_msg(std::string("construct tracer"));
@@ -2167,6 +2224,23 @@ private:
     std::ofstream parallel_flat_leaf_load_log_stream_;
     std::size_t debug_log_event_count_;
     bool trace_level_limit_enabled_;
+    std::size_t trace_level_limit_max_dot_count_;
+
+    struct NodeNameHotCacheEntry {
+        std::string name;
+        std::uint32_t id;
+
+        NodeNameHotCacheEntry() : id(kInvalidIndex) {}
+        NodeNameHotCacheEntry(const std::string& n, std::uint32_t i) : name(n), id(i) {}
+    };
+
+    struct NodeNameLiteralCacheEntry {
+        const char* literal;
+        std::uint32_t id;
+
+        NodeNameLiteralCacheEntry() : literal(NULL), id(kInvalidIndex) {}
+        NodeNameLiteralCacheEntry(const char* n, std::uint32_t i) : literal(n), id(i) {}
+    };
 
     NodeId next_node_id_;
     TrackId next_track_id_;
@@ -2179,6 +2253,9 @@ private:
     std::vector<NodeDesc> nodes_;
     std::deque<std::string> node_names_;
     std::unordered_map<std::string, std::uint32_t> node_name_ids_;
+    std::vector<NodeNameHotCacheEntry> node_name_hot_cache_;
+    std::size_t node_name_hot_cache_next_ = 0;
+    std::vector<NodeNameLiteralCacheEntry> node_name_literal_cache_;
     std::deque<std::string> node_debug_paths_;
     std::vector<TrackDesc> tracks_;
     std::deque<std::string> track_paths_;
@@ -7387,14 +7464,103 @@ private:
         return id;
     }
 
+    std::uint32_t append_generated_index_node_name_(std::size_t index) {
+        char text[32];
+        char digits[24];
+        std::size_t digit_count = 0;
+        std::size_t value = index;
+        do {
+            digits[digit_count++] = static_cast<char>('0' + (value % 10u));
+            value /= 10u;
+        } while (value != 0u && digit_count < sizeof(digits));
+
+        const std::uint32_t id = static_cast<std::uint32_t>(node_names_.size());
+        node_names_.push_back(std::string());
+        std::string& name = node_names_.back();
+        std::size_t out = 0;
+        text[out++] = '[';
+        while (digit_count > 0u) text[out++] = digits[--digit_count];
+        text[out++] = ']';
+        name.assign(text, out);
+        return id;
+    }
+
+    bool hot_cache_eligible_node_name_(const std::string& name) const {
+        if (name.empty() || name.size() > 32u) return false;
+        for (std::size_t i = 0; i < name.size(); ++i) {
+            const char c = name[i];
+            if (c == '.' || c == '[' || c == ']' || c == ':' || c == '@') return false;
+        }
+        return true;
+    }
+
+    bool find_hot_node_name_id_(const std::string& name, std::uint32_t& id) const {
+        for (std::size_t i = 0; i < node_name_hot_cache_.size(); ++i) {
+            const NodeNameHotCacheEntry& entry = node_name_hot_cache_[i];
+            if (entry.id != kInvalidIndex && entry.name == name) {
+                id = entry.id;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void remember_hot_node_name_id_(const std::string& name, std::uint32_t id) {
+        if (!hot_cache_eligible_node_name_(name)) return;
+        static const std::size_t kHotNodeNameCacheLimit = 128u;
+        if (node_name_hot_cache_.size() < kHotNodeNameCacheLimit) {
+            node_name_hot_cache_.push_back(NodeNameHotCacheEntry(name, id));
+            return;
+        }
+        node_name_hot_cache_[node_name_hot_cache_next_] = NodeNameHotCacheEntry(name, id);
+        ++node_name_hot_cache_next_;
+        if (node_name_hot_cache_next_ >= kHotNodeNameCacheLimit) node_name_hot_cache_next_ = 0;
+    }
+
     std::uint32_t intern_node_name_(const std::string& name) {
         if (!options_.enable_node_name_interning || is_generated_index_node_name_(name)) {
             return append_node_name_(name);
         }
+        std::uint32_t cached_id = kInvalidIndex;
+        if (hot_cache_eligible_node_name_(name) && find_hot_node_name_id_(name, cached_id)) {
+            return cached_id;
+        }
         std::unordered_map<std::string, std::uint32_t>::const_iterator it = node_name_ids_.find(name);
-        if (it != node_name_ids_.end()) return it->second;
+        if (it != node_name_ids_.end()) {
+            remember_hot_node_name_id_(name, it->second);
+            return it->second;
+        }
         const std::uint32_t id = append_node_name_(name);
         node_name_ids_.insert(std::make_pair(name, id));
+        remember_hot_node_name_id_(name, id);
+        return id;
+    }
+
+    std::uint32_t node_name_id_for_literal_(const char* literal) {
+        if (!literal) literal = "";
+        if (!options_.enable_node_name_interning) {
+            return append_node_name_(std::string(literal));
+        }
+        for (std::size_t i = 0; i < node_name_literal_cache_.size(); ++i) {
+            const NodeNameLiteralCacheEntry& entry = node_name_literal_cache_[i];
+            if (entry.id == kInvalidIndex || !entry.literal) continue;
+            if (entry.literal == literal || std::strcmp(entry.literal, literal) == 0) {
+                return entry.id;
+            }
+        }
+
+        const std::string name(literal);
+        std::unordered_map<std::string, std::uint32_t>::const_iterator it = node_name_ids_.find(name);
+        if (it != node_name_ids_.end()) {
+            node_name_literal_cache_.push_back(NodeNameLiteralCacheEntry(literal, it->second));
+            remember_hot_node_name_id_(name, it->second);
+            return it->second;
+        }
+
+        const std::uint32_t id = append_node_name_(name);
+        node_name_ids_.insert(std::make_pair(name, id));
+        node_name_literal_cache_.push_back(NodeNameLiteralCacheEntry(literal, id));
+        remember_hot_node_name_id_(name, id);
         return id;
     }
 
@@ -7446,6 +7612,20 @@ private:
                trace_level_limit_enabled_;
     }
 
+    bool can_use_reflected_segment_fast_path_() const {
+        return !needs_full_topology_paths_();
+    }
+
+    bool trace_leaf_path_allowed_(const std::string& path) const {
+        return !trace_level_limit_enabled_ ||
+               detail::wave_trace_dot_count(path) <= trace_level_limit_max_dot_count_;
+    }
+
+    bool trace_descend_path_allowed_(const std::string& path) const {
+        return !trace_level_limit_enabled_ ||
+               detail::wave_trace_dot_count(path) < trace_level_limit_max_dot_count_;
+    }
+
     std::string make_child_path_(const std::string& parent, const char* child) const {
         return needs_full_topology_paths_()
             ? detail::compose_child_path(parent, child ? child : "")
@@ -7476,12 +7656,11 @@ private:
             const NodeDesc& node = nodes_[i];
             if (node.id == 0 || !node.alive) continue;
             if (!node_has_signal_subtree(node.id) && node.kind != NodeKind::Leaf) continue;
-            NodeDecl decl;
-            decl.node_id = node.id;
-            decl.parent_id = node.parent_id;
-            decl.name = node_name_ref(node);
-            decl.kind = node.kind;
-            sink_.on_node_declared(decl);
+            sink_.on_node_declared_fast(
+                node.id,
+                node.parent_id,
+                node_name_ref(node),
+                node.kind);
             ++exported_count;
         }
 
@@ -7506,8 +7685,8 @@ private:
         const bool trace_level_allowed =
             !trace_level_limit_enabled_ ||
             (kind == NodeKind::Leaf
-                ? detail::wave_trace_leaf_path_allowed(path)
-                : detail::wave_trace_descend_path_allowed(path));
+                ? trace_leaf_path_allowed_(path)
+                : trace_descend_path_allowed_(path));
         if (!trace_level_allowed) {
             if (options_.debug_log) {
                 debug_log_msg(std::string("trace level skip node kind=") +
@@ -7549,6 +7728,67 @@ private:
                       " object=" + detail::to_string_unsigned(object_id) +
                       " name=" + node_name_ref(node) +
                       " path=" + node_debug_path_ref(node));
+        return id;
+    }
+
+    NodeId create_node_with_name_id_(NodeId parent_id,
+                                     std::uint32_t name_id,
+                                     NodeKind kind,
+                                     ObjectId object_id) {
+        if (name_id == kInvalidIndex || trace_level_limit_enabled_ || needs_full_topology_paths_()) {
+            return 0;
+        }
+
+        const NodeId id = next_node_id_++;
+        NodeDesc& node = ensure_id_slot_reserved(nodes_, id, options_.id_slot_node_growth_chunk);
+        node = NodeDesc();
+        node.id = id;
+        node.parent_id = parent_id;
+        node.object_id = object_id;
+        node.name_id = name_id;
+        node.kind = kind;
+        node.alive = true;
+
+        if (parent_id != 0) {
+            NodeDesc* parent = find_node(parent_id);
+            if (parent) {
+                node.next_sibling = parent->first_child;
+                parent->first_child = id;
+            }
+        }
+
+        return id;
+    }
+
+    NodeId create_node_from_literal_(NodeId parent_id,
+                                     const char* name,
+                                     NodeKind kind,
+                                     ObjectId object_id) {
+        return create_node_with_name_id_(parent_id, node_name_id_for_literal_(name), kind, object_id);
+    }
+
+    NodeId create_generated_index_node_(NodeId parent_id,
+                                        std::size_t index,
+                                        NodeKind kind,
+                                        ObjectId object_id) {
+        const NodeId id = next_node_id_++;
+        NodeDesc& node = ensure_id_slot_reserved(nodes_, id, options_.id_slot_node_growth_chunk);
+        node = NodeDesc();
+        node.id = id;
+        node.parent_id = parent_id;
+        node.object_id = object_id;
+        node.name_id = append_generated_index_node_name_(index);
+        node.kind = kind;
+        node.alive = true;
+
+        if (parent_id != 0) {
+            NodeDesc* parent = find_node(parent_id);
+            if (parent) {
+                node.next_sibling = parent->first_child;
+                parent->first_child = id;
+            }
+        }
+
         return id;
     }
 
@@ -7656,18 +7896,15 @@ private:
 
         assign_track_storage_id_(track);
 
-        TrackDecl decl;
-        decl.track_id = track.id;
-        decl.storage_id = track.storage_id != 0 ? track.storage_id : track.id;
-        decl.node_id = node_id;
-        if (options_.emit_track_decl_path) {
-            decl.path = path;
-        }
-        decl.kind = kind;
-        decl.bit_width = track.bit_width != 0 ? track.bit_width : scalar_bit_width(track.scalar_kind);
-        decl.bit_offset = track.bit_offset;
-        decl.storage_only = track.storage_only;
-        sink_.on_track_declared(decl);
+        sink_.on_track_declared_fast(
+            track.id,
+            track.storage_id != 0 ? track.storage_id : track.id,
+            node_id,
+            kind,
+            track.bit_width != 0 ? track.bit_width : scalar_bit_width(track.scalar_kind),
+            track.bit_offset,
+            track.storage_only,
+            options_.emit_track_decl_path ? path : empty_node_string());
 
         all_track_ids_.push_back(track.id);
         // High-performance mode: every track is scheduled through the parallel
@@ -8733,6 +8970,23 @@ private:
     }
 
     template <typename T>
+    NodeId add_bool_storage_signal_named_(const char* name, NodeId parent_id, ::wave::BoolStoragePtr<T> ptr) {
+        if (!ptr.ptr) return 0;
+        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
+        const NodeId node_id = create_node_from_literal_(parent_id, name, NodeKind::Leaf, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        const TrackId tid = create_bool_storage_ptr_track<T>(node_id, empty_node_string(), ptr);
+        if (tid == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        return node_id;
+    }
+
+    template <typename T>
     typename std::enable_if<!detail::is_std_string<T>::value, NodeId>::type
     add_leaf_signal(const std::string& path, NodeId parent_id, const T* ptr) {
         if (!ptr) return 0;
@@ -9026,10 +9280,15 @@ private:
         if (it != bitfield_storage_by_key_.end()) return it->second;
 
         const unsigned char* address = base + range.byte_offset;
-        const std::string storage_path = path + "::$raw_storage@" +
-            detail::to_string_unsigned(range.byte_offset) + "+" +
-            detail::to_string_unsigned(range.byte_count);
-        const TrackId created = create_bitfield_storage_track_(storage_path, address, range.byte_count);
+        std::string storage_path;
+        const std::string* storage_path_ref = &empty_node_string();
+        if (options_.debug_log || options_.emit_track_decl_path) {
+            storage_path = path + "::$raw_storage@" +
+                detail::to_string_unsigned(range.byte_offset) + "+" +
+                detail::to_string_unsigned(range.byte_count);
+            storage_path_ref = &storage_path;
+        }
+        const TrackId created = create_bitfield_storage_track_(*storage_path_ref, address, range.byte_count);
         if (created != 0) {
             bitfield_storage_by_key_.insert(std::make_pair(key, created));
             bitfield_storage_created_keys_.push_back(key);
@@ -9139,6 +9398,91 @@ private:
     template <typename T>
     typename std::enable_if<!detail::is_leaf_scalar<T>::value || detail::is_std_string<T>::value, NodeId>::type
     add_union_alias_leaf_signal_(const std::string&, NodeId, const T*) {
+        return 0;
+    }
+
+    template <typename T>
+    typename std::enable_if<detail::is_leaf_scalar<T>::value && !detail::is_std_string<T>::value, NodeId>::type
+    add_union_alias_leaf_signal_named_(const char* name, NodeId parent_id, const T* ptr) {
+        if (!options_.enable_union_fields) return 0;
+        typedef typename detail::remove_cvref<T>::type CleanT;
+        const ScalarSampleKind sk = scalar_kind_for_type<CleanT>();
+        const std::size_t memory_bytes = scalar_sample_kind_byte_width(sk);
+        if (sk == ScalarSampleKind::None || ptr == NULL || memory_bytes == 0) return 0;
+        const UnionAliasContext* ctx = find_union_alias_context_for_(detail::pointer_address(ptr), memory_bytes);
+        if (!ctx) return 0;
+
+        const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(detail::pointer_address(ptr));
+        const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(ctx->base);
+        const std::uint32_t field_bit_width = scalar_bit_width(sk);
+        const long long field_bit_offset = static_cast<long long>((addr - base) * 8ull);
+        BitfieldStorageRange range;
+        if (!choose_union_alias_storage_range(ctx->byte_count, field_bit_offset, field_bit_width, range)) return 0;
+
+        const TrackId storage_id = get_or_create_raw_storage_track_(
+            empty_node_string(),
+            ctx->object_address,
+            ctx->type_tag,
+            ctx->base,
+            range);
+        if (storage_id == 0) return 0;
+
+        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
+        const NodeId node_id = create_node_from_literal_(parent_id, name, NodeKind::Leaf, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        const TrackId tid = create_bitfield_alias_track_(
+            node_id,
+            empty_node_string(),
+            detail::classify_value_kind<CleanT>(),
+            storage_id,
+            range.bit_offset,
+            field_bit_width);
+        if (tid == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        return node_id;
+    }
+
+    template <typename T>
+    typename std::enable_if<!detail::is_leaf_scalar<T>::value || detail::is_std_string<T>::value, NodeId>::type
+    add_union_alias_leaf_signal_named_(const char*, NodeId, const T*) {
+        return 0;
+    }
+
+    template <typename T>
+    typename std::enable_if<!detail::is_std_string<T>::value, NodeId>::type
+    add_leaf_signal_named_(const char* name, NodeId parent_id, const T* ptr) {
+        if (!ptr) return 0;
+        if (options_.enable_union_fields) {
+            if (NodeId union_alias = add_union_alias_leaf_signal_named_<T>(name, parent_id, ptr)) {
+                return union_alias;
+            }
+        }
+        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
+        const NodeId node_id = create_node_from_literal_(parent_id, name, NodeKind::Leaf, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        const TrackId tid = create_scalar_ptr_track(
+            node_id,
+            empty_node_string(),
+            detail::classify_value_kind<T>(),
+            ptr);
+        if (tid == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        return node_id;
+    }
+
+    template <typename T>
+    typename std::enable_if<detail::is_std_string<T>::value, NodeId>::type
+    add_leaf_signal_named_(const char*, NodeId, const T*) {
         return 0;
     }
 
@@ -9794,8 +10138,207 @@ private:
         return add_volatile_leaf_signal<RawFieldT>(path, parent_id, field_ptr);
     }
 
+    template <typename FieldT>
+    struct member_dispatch_category;
+
+    template <typename T>
+    NodeId expand_reflected_field_cached_or_direct_named_(const char* name, NodeId parent_id, const T* ptr) {
+        if (!ptr) return 0;
+        typedef typename detail::remove_cvref<T>::type CleanT;
+        const ObjectKey key(detail::pointer_address(ptr), reflect::type_tag_of<CleanT>());
+        if (contains_expanding_key(expanding_, key)) {
+            return 0;
+        }
+
+        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
+        const ObjectId object_id = ensure_object(key, typeid(CleanT).name());
+        const NodeId node_id = create_node_from_literal_(parent_id, name, NodeKind::Aggregate, object_id);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        ExpandingGuard expanding_guard(expanding_, key);
+        expand_reflected_children_uncached_<CleanT>(empty_node_string(), node_id, ptr);
+        return keep_node_or_rollback(cp, node_id);
+    }
+
+    template <typename FieldT>
+    NodeId expand_member_clean_dispatch_named_selected_(const char* name,
+                                                       NodeId parent_id,
+                                                       const FieldT* clean_ptr,
+                                                       std::integral_constant<int, 9>) {
+        return add_leaf_signal_named_<FieldT>(name, parent_id, clean_ptr);
+    }
+
+    template <typename FieldT>
+    NodeId expand_member_clean_dispatch_named_selected_(const char* name,
+                                                       NodeId parent_id,
+                                                       const FieldT* clean_ptr,
+                                                       std::integral_constant<int, 2>) {
+        return expand_reflected_field_cached_or_direct_named_<FieldT>(name, parent_id, clean_ptr);
+    }
+
+    template <typename FieldT>
+    NodeId expand_member_clean_dispatch_named_selected_(const char*,
+                                                       NodeId,
+                                                       const FieldT*,
+                                                       std::integral_constant<int, 11>) {
+        return 0;
+    }
+
+    template <typename FieldT, int Rank>
+    NodeId expand_member_clean_dispatch_named_selected_(const char* name,
+                                                       NodeId parent_id,
+                                                       const FieldT* clean_ptr,
+                                                       std::integral_constant<int, Rank>) {
+        const std::string path(name ? name : "");
+        return expand_member_clean_dispatch_selected<FieldT>(
+            path,
+            parent_id,
+            clean_ptr,
+            std::integral_constant<int, Rank>());
+    }
+
+    template <typename FieldT>
+    NodeId expand_member_clean_dispatch_named_(const char* name, NodeId parent_id, const FieldT* clean_ptr) {
+        return expand_member_clean_dispatch_named_selected_<FieldT>(
+            name,
+            parent_id,
+            clean_ptr,
+            std::integral_constant<int, member_dispatch_category<FieldT>::value>());
+    }
+
+    template <typename P>
+    typename std::enable_if<detail::is_bool_storage_ptr<typename detail::remove_cvref<P>::type>::value, NodeId>::type
+    expand_member_ptr_named_(const char* name, NodeId parent_id, P field_ptr) {
+        return add_bool_storage_signal_named_(name, parent_id, field_ptr);
+    }
+
+    template <typename P>
+    typename std::enable_if<detail::is_c_string_member_ptr<P>::value, NodeId>::type
+    expand_member_ptr_named_(const char*, NodeId, P) {
+        return 0;
+    }
+
+    template <typename P>
+    typename std::enable_if<!detail::is_bool_storage_ptr<typename detail::remove_cvref<P>::type>::value &&
+                            detail::is_volatile_leaf_member_ptr<P>::value, NodeId>::type
+    expand_member_ptr_named_(const char* name, NodeId parent_id, P field_ptr) {
+        const std::string path(name ? name : "");
+        typedef typename std::remove_pointer<P>::type RawFieldT;
+        return add_volatile_leaf_signal<RawFieldT>(path, parent_id, field_ptr);
+    }
+
+    template <typename P>
+    typename std::enable_if<!detail::is_bool_storage_ptr<typename detail::remove_cvref<P>::type>::value &&
+                            !detail::is_volatile_leaf_member_ptr<P>::value &&
+                            !detail::is_c_string_member_ptr<P>::value &&
+                            !std::is_array<typename detail::remove_cvref<typename std::remove_pointer<P>::type>::type>::value &&
+                            !std::is_volatile<typename std::remove_pointer<P>::type>::value, NodeId>::type
+    expand_member_ptr_named_(const char* name, NodeId parent_id, P field_ptr) {
+        typedef typename detail::remove_cvref<typename std::remove_pointer<P>::type>::type FieldT;
+        return expand_member_clean_dispatch_named_<FieldT>(
+            name,
+            parent_id,
+            static_cast<const FieldT*>(field_ptr));
+    }
+
+    template <typename P>
+    typename std::enable_if<!detail::is_bool_storage_ptr<typename detail::remove_cvref<P>::type>::value &&
+                            !detail::is_volatile_leaf_member_ptr<P>::value &&
+                            !detail::is_c_string_member_ptr<P>::value &&
+                            std::is_volatile<typename std::remove_pointer<P>::type>::value, NodeId>::type
+    expand_member_ptr_named_(const char* name, NodeId parent_id, P field_ptr) {
+        const std::string path(name ? name : "");
+        return expand_member_ptr(path, parent_id, field_ptr);
+    }
+
+    template <typename U, std::size_t N>
+    NodeId expand_member_ptr_named_(const char* name, NodeId parent_id, const U (*field_ptr)[N]) {
+        const std::string path(name ? name : "");
+        return expand_field(path, parent_id, field_ptr);
+    }
+
+    template <typename UnionT, typename FieldT>
+    NodeId expand_union_member_ptr_named_(const char* name,
+                                          NodeId parent_id,
+                                          const FieldT* field_ptr,
+                                          const UnionT* union_obj,
+                                          std::size_t union_storage_bytes,
+                                          const void* explicit_union_base = NULL) {
+        if (!field_ptr || !union_obj || union_storage_bytes == 0 ||
+            union_storage_bytes > static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())) {
+            return expand_member_ptr_named_(name, parent_id, field_ptr);
+        }
+        if (!options_.enable_union_fields) return 0;
+
+        typedef typename detail::remove_cvref<UnionT>::type CleanUnionT;
+        const void* union_base = explicit_union_base ? explicit_union_base : detail::pointer_address(union_obj);
+        ScopedUnionAliasContext guard(
+            this,
+            reinterpret_cast<const unsigned char*>(union_base),
+            union_base,
+            reflect::type_tag_of<CleanUnionT>(),
+            static_cast<std::uint32_t>(union_storage_bytes));
+        return expand_member_ptr_named_(name, parent_id, field_ptr);
+    }
+
+    template <typename UnionT, typename FieldT>
+    NodeId expand_reflected_child_ptr_with_union_meta_named_(const char* name,
+                                                            NodeId parent_id,
+                                                            const FieldT* field_ptr,
+                                                            const UnionT* union_obj,
+                                                            std::size_t union_storage_bytes,
+                                                            const void* union_base = NULL) {
+        if (union_storage_bytes != 0) {
+            if (!options_.enable_union_fields) return 0;
+            return expand_union_member_ptr_named_(name, parent_id, field_ptr, union_obj, union_storage_bytes, union_base);
+        }
+        return expand_member_ptr_named_(name, parent_id, field_ptr);
+    }
+
+    template <typename UnionT, typename FieldValue>
+    typename std::enable_if<!std::is_pointer<typename detail::remove_cvref<FieldValue>::type>::value, NodeId>::type
+    expand_reflected_child_ptr_with_union_meta_named_(const char* name,
+                                                     NodeId parent_id,
+                                                     FieldValue field_value,
+                                                     const UnionT*,
+                                                     std::size_t union_storage_bytes,
+                                                     const void* = NULL) {
+        if (union_storage_bytes != 0 && !options_.enable_union_fields) return 0;
+        return expand_member_ptr_named_(name, parent_id, field_value);
+    }
+
     template <typename T>
     void expand_reflected_children_uncached_(const std::string& path, NodeId node_id, const T* ptr) {
+        if (can_use_reflected_segment_fast_path_()) {
+            detail::call_reflected_visit<T>(
+                ptr,
+                [this, node_id, ptr](const char* name, auto child_field_ptr, auto... meta) {
+                    const std::size_t union_bytes = union_field_storage_bytes_or_zero(meta...);
+                    if (union_bytes != 0 && !options_.enable_union_fields) return;
+                    const void* union_base = union_field_base_or_null(meta...);
+                    expand_reflected_child_ptr_with_union_meta_named_(name, node_id, child_field_ptr, ptr, union_bytes, union_base);
+                },
+                [this, node_id](const char* name, const auto&) {
+                    if (!options_.enable_bitfield_fields) return;
+                    const std::string bit_path(name ? name : "");
+                    debug_log_unsupported_raw(bit_path, node_id, "bitfield/getter value not directly addressable", std::string(), "$bitfield_getter_missing");
+                },
+                [this, node_id, ptr](const char* name, auto getter, auto... meta) {
+                    if (!options_.enable_bitfield_fields) return;
+                    typedef typename detail::remove_cvref<decltype(getter(ptr))>::type GetterValueT;
+                    const std::string bit_path(name ? name : "");
+                    add_bitfield_range_signal<T, GetterValueT>(
+                        bit_path,
+                        node_id,
+                        ptr,
+                        getter,
+                        getter_bit_width_or_zero(meta...),
+                        getter_bit_offset_or_negative(meta...));
+                });
+            return;
+        }
         detail::call_reflected_visit<T>(
             ptr,
             [this, &path, node_id, ptr](const char* name, auto child_field_ptr, auto... meta) {
@@ -9851,6 +10394,56 @@ private:
         return expand_reflected_field_cached_or_direct_<FieldT>(path, parent_id, ptr);
     }
 
+    template <typename CleanPointee>
+    NodeId expand_reflected_wave_ptr_array_element_fast_(NodeId parent_id,
+                                                        std::size_t index,
+                                                        const CleanPointee* elem) {
+        if (!elem) return 0;
+
+        const ObjectKey key(detail::pointer_address(elem), reflect::type_tag_of<CleanPointee>());
+        if (contains_expanding_key(expanding_, key)) {
+            return 0;
+        }
+
+        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
+        const ObjectId object_id = ensure_object(key, typeid(CleanPointee).name());
+        const NodeId node_id = create_generated_index_node_(parent_id, index, NodeKind::Aggregate, object_id);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+
+        ExpandingGuard expanding_guard(expanding_, key);
+        expand_reflected_children_uncached_<CleanPointee>(empty_node_string(), node_id, elem);
+        return keep_node_or_rollback(cp, node_id);
+    }
+
+    template <typename CleanPointee>
+    typename std::enable_if<reflect::is_reflected<CleanPointee>::value, bool>::type
+    expand_wave_ptr_array_fast_if_possible_(NodeId node_id,
+                                           const CleanPointee* target,
+                                           std::size_t declared_count) {
+        if (needs_full_topology_paths_() || trace_level_limit_enabled_) return false;
+        for (std::size_t i = 0; i < declared_count; ++i) {
+            TopologyCheckpoint elem_cp = make_topology_checkpoint(node_id);
+            const CleanPointee* elem = static_cast<const CleanPointee*>(target + i);
+            const NodeId child_node = expand_reflected_wave_ptr_array_element_fast_<CleanPointee>(
+                node_id,
+                i,
+                elem);
+            if (child_node == 0) {
+                rollback_topology_to(elem_cp);
+            }
+        }
+        return true;
+    }
+
+    template <typename CleanPointee>
+    typename std::enable_if<!reflect::is_reflected<CleanPointee>::value, bool>::type
+    expand_wave_ptr_array_fast_if_possible_(NodeId, const CleanPointee*, std::size_t) {
+        return false;
+    }
+
     template <typename WavePtrT>
     typename std::enable_if<detail::is_wave_ptr<WavePtrT>::value, NodeId>::type
     expand_wave_ptr_field_impl(const std::string& path, NodeId parent_id, const WavePtrT* ptr) {
@@ -9885,6 +10478,13 @@ private:
         if (node_id == 0) {
             rollback_topology_to(cp);
             return 0;
+        }
+
+        if (expand_wave_ptr_array_fast_if_possible_<CleanPointee>(
+                node_id,
+                static_cast<const CleanPointee*>(target),
+                declared_count)) {
+            return keep_node_or_rollback(cp, node_id);
         }
 
         for (std::size_t i = 0; i < declared_count; ++i) {

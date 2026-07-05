@@ -96,10 +96,59 @@ struct EventSnapshot {
     std::uint64_t change_bits;
 };
 
+struct CountingWaveSink : public wave::IWaveSink {
+    std::size_t node_count;
+    std::size_t track_count;
+    std::size_t event_count;
+
+    CountingWaveSink() : node_count(0), track_count(0), event_count(0) {}
+
+    virtual void on_node_declared(const wave::NodeDecl&) {
+        ++node_count;
+    }
+
+    virtual void on_node_declared_fast(wave::NodeId,
+                                       wave::NodeId,
+                                       const std::string&,
+                                       wave::NodeKind) {
+        ++node_count;
+    }
+
+    virtual void on_track_declared(const wave::TrackDecl&) {
+        ++track_count;
+    }
+
+    virtual void on_track_declared_fast(wave::TrackId,
+                                        wave::TrackId,
+                                        wave::NodeId,
+                                        wave::ValueKind,
+                                        std::uint32_t,
+                                        std::uint32_t,
+                                        bool,
+                                        const std::string&) {
+        ++track_count;
+    }
+
+    virtual void on_sample(const wave::TrackEvent&) {
+        ++event_count;
+    }
+};
+
 struct RunResult {
     std::vector<wave::NodeDecl> nodes;
     std::vector<wave::TrackDecl> tracks;
     std::vector<EventSnapshot> events;
+    std::size_t top_visits;
+    std::size_t slot_visits;
+    std::size_t payload_visits;
+    std::uint64_t first_sample_ms;
+    std::uint64_t elapsed_ms;
+};
+
+struct CountRunResult {
+    std::size_t nodes;
+    std::size_t tracks;
+    std::size_t events;
     std::size_t top_visits;
     std::size_t slot_visits;
     std::size_t payload_visits;
@@ -233,6 +282,56 @@ static RunResult run_case(std::size_t slot_count, std::uint32_t cycles, bool ena
     return out;
 }
 
+static CountRunResult run_count_case(std::size_t slot_count,
+                                     std::uint32_t cycles,
+                                     bool enable_topology_fast_path) {
+    std::vector<Slot> slots(slot_count);
+    initialize_slots(slots);
+    Top top(slots.empty() ? static_cast<Slot*>(NULL) : &slots[0], slots.size());
+
+    g_top_visits = 0;
+    g_slot_visits = 0;
+    g_payload_visits = 0;
+
+    CountingWaveSink sink;
+    wave::BuildOptions opt;
+    opt.emit_track_decl_path = false;
+    opt.enable_union_fields = true;
+    opt.enable_bitfield_fields = true;
+    opt.enable_node_name_interning = enable_topology_fast_path;
+    opt.enable_wave_ptr_array_batch_reserve = enable_topology_fast_path;
+    opt.dump_leaf_distribution_after_topology = false;
+
+    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    std::uint64_t first_sample_ms = 0;
+    {
+        wave::Tracer tracer(sink, opt);
+        tracer.add_root("top", &top);
+        const std::chrono::steady_clock::time_point first0 = std::chrono::steady_clock::now();
+        tracer.sample(0);
+        const std::chrono::steady_clock::time_point first1 = std::chrono::steady_clock::now();
+        first_sample_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(first1 - first0).count());
+        for (std::uint32_t c = 1; c <= cycles; ++c) {
+            update_slots(slots, c);
+            tracer.sample(c);
+        }
+    }
+    const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+
+    CountRunResult out;
+    out.nodes = sink.node_count;
+    out.tracks = sink.track_count;
+    out.events = sink.event_count;
+    out.top_visits = g_top_visits;
+    out.slot_visits = g_slot_visits;
+    out.payload_visits = g_payload_visits;
+    out.first_sample_ms = first_sample_ms;
+    out.elapsed_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+    return out;
+}
+
 static bool compare_results(const RunResult& a, const RunResult& b) {
     if (a.nodes.size() != b.nodes.size()) {
         std::cerr << "node count mismatch " << a.nodes.size() << " vs " << b.nodes.size() << "\n";
@@ -274,10 +373,54 @@ static bool compare_results(const RunResult& a, const RunResult& b) {
 int main(int argc, char** argv) {
     std::size_t slot_count = 20000;
     std::uint32_t cycles = 12;
+    std::string mode = "compare";
     if (argc >= 2) slot_count = static_cast<std::size_t>(std::strtoull(argv[1], NULL, 10));
     if (argc >= 3) cycles = static_cast<std::uint32_t>(std::strtoul(argv[2], NULL, 10));
-    if (slot_count == 0 || cycles == 0) {
-        std::cerr << "usage: smoke_reflect_topology_cache_stress [slot_count] [cycles]\n";
+    if (argc >= 4) mode = argv[3];
+    if (slot_count == 0) {
+        std::cerr << "usage: smoke_reflect_topology_cache_stress [slot_count] [cycles] "
+                     "[compare|baseline|optimized|baseline-count|optimized-count]\n";
+        return 2;
+    }
+
+    if (mode == "baseline-count" || mode == "optimized-count") {
+        const bool fast_path = (mode == "optimized-count");
+        const CountRunResult result = run_count_case(slot_count, cycles, fast_path);
+        std::cout << "reflect_topology_batch_stress " << mode
+                  << " slots=" << slot_count
+                  << " cycles=" << cycles
+                  << " nodes=" << result.nodes
+                  << " tracks=" << result.tracks
+                  << " events=" << result.events
+                  << " first_sample_ms=" << result.first_sample_ms
+                  << " elapsed_ms=" << result.elapsed_ms
+                  << " top_visits=" << result.top_visits
+                  << " slot_visits=" << result.slot_visits
+                  << " payload_visits=" << result.payload_visits
+                  << "\n";
+        return 0;
+    }
+
+    if (mode == "baseline" || mode == "optimized") {
+        const bool fast_path = (mode == "optimized");
+        const RunResult result = run_case(slot_count, cycles, fast_path);
+        std::cout << "reflect_topology_batch_stress " << mode
+                  << " slots=" << slot_count
+                  << " cycles=" << cycles
+                  << " nodes=" << result.nodes.size()
+                  << " tracks=" << result.tracks.size()
+                  << " events=" << result.events.size()
+                  << " first_sample_ms=" << result.first_sample_ms
+                  << " elapsed_ms=" << result.elapsed_ms
+                  << " top_visits=" << result.top_visits
+                  << " slot_visits=" << result.slot_visits
+                  << " payload_visits=" << result.payload_visits
+                  << "\n";
+        return 0;
+    }
+
+    if (mode != "compare") {
+        std::cerr << "unknown mode: " << mode << "\n";
         return 2;
     }
 
