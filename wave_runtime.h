@@ -455,7 +455,7 @@ struct BuildOptions {
     // updates the shadow in the same pass, then precisely samples only leaves
     // whose byte ranges overlap changed bytes.
     bool enable_flat_memory_block_simd_mask = true;
-    std::size_t flat_memory_block_simd_min_bytes = 64;
+    std::size_t flat_memory_block_simd_min_bytes = 16;
     // Auto chooses the best compiled-in backend that the current CPU/OS supports.
     // On MSVC, AVX2 code is only compiled when _M_AVX2 is defined, so /arch:AVX2
     // is required for the AVX2 backend; otherwise Auto falls back to SSE2/scalar.
@@ -1002,6 +1002,19 @@ struct is_peek_trace_source_impl<T, true> : std::integral_constant<bool,
 
 template <typename T>
 struct is_peek_trace_source : is_peek_trace_source_impl<T> {};
+
+template <typename T, bool Complete = is_complete_type<typename remove_cvref<T>::type>::value>
+struct is_dynamic_trace_target_impl : std::false_type {};
+
+template <typename T>
+struct is_dynamic_trace_target_impl<T, true> : std::integral_constant<bool,
+    !std::is_void<typename remove_cvref<T>::type>::value &&
+    std::is_base_of<
+    ::wave::DynamicTraceTarget,
+    typename remove_cvref<T>::type>::value> {};
+
+template <typename T>
+struct is_dynamic_trace_target : is_dynamic_trace_target_impl<T> {};
 
 template <typename...>
 struct make_void {
@@ -3436,7 +3449,6 @@ private:
     }
 
     static void fill_flat_leaf_event(const FlatLeafFast& leaf, const ScalarSnapshot& sample, Cycle cycle, TrackEvent& ev) {
-        ev = TrackEvent();
         ev.cycle = cycle;
         ev.track_id = leaf.storage_id != 0 ? leaf.storage_id : leaf.track_id;
         ev.invalid = InvalidKind::None;
@@ -3748,24 +3760,64 @@ private:
         }
     }
 
+    void sample_flat_memory_flush_changed_run_(Cycle cycle,
+                                               FlatMemoryBlock& block,
+                                               std::size_t& run_begin,
+                                               std::size_t& run_end,
+                                               std::vector<TrackEvent>& out) {
+        if (run_begin != static_cast<std::size_t>(-1) && run_begin < run_end) {
+            sample_flat_memory_changed_byte_range_(cycle, block, run_begin, run_end, out);
+        }
+        run_begin = static_cast<std::size_t>(-1);
+        run_end = 0;
+    }
+
+    void sample_flat_memory_append_changed_range_(Cycle cycle,
+                                                  FlatMemoryBlock& block,
+                                                  std::size_t begin,
+                                                  std::size_t end,
+                                                  std::size_t& run_begin,
+                                                  std::size_t& run_end,
+                                                  std::vector<TrackEvent>& out) {
+        if (begin >= end) return;
+        if (run_begin == static_cast<std::size_t>(-1)) {
+            run_begin = begin;
+            run_end = end;
+            return;
+        }
+        if (begin <= run_end) {
+            if (end > run_end) run_end = end;
+            return;
+        }
+        sample_flat_memory_flush_changed_run_(cycle, block, run_begin, run_end, out);
+        run_begin = begin;
+        run_end = end;
+    }
+
     void sample_flat_memory_changed_mask32_(Cycle cycle,
                                             FlatMemoryBlock& block,
                                             std::size_t base_off,
                                             std::uint32_t diff_mask,
+                                            std::size_t& run_begin,
+                                            std::size_t& run_end,
                                             std::vector<TrackEvent>& out) {
+        if (diff_mask == static_cast<std::uint32_t>(0xFFFFFFFFu)) {
+            sample_flat_memory_append_changed_range_(cycle, block, base_off, base_off + 32u, run_begin, run_end, out);
+            return;
+        }
         std::uint32_t pos = 0;
         while (pos < 32) {
             while (pos < 32 && ((diff_mask & (static_cast<std::uint32_t>(1) << pos)) == 0)) {
                 ++pos;
             }
             if (pos >= 32) break;
-            const std::uint32_t run_begin = pos;
+            const std::uint32_t bit_run_begin = pos;
             while (pos < 32 && ((diff_mask & (static_cast<std::uint32_t>(1) << pos)) != 0)) {
                 ++pos;
             }
-            const std::size_t begin = base_off + static_cast<std::size_t>(run_begin);
+            const std::size_t begin = base_off + static_cast<std::size_t>(bit_run_begin);
             const std::size_t end = base_off + static_cast<std::size_t>(pos);
-            sample_flat_memory_changed_byte_range_(cycle, block, begin, end, out);
+            sample_flat_memory_append_changed_range_(cycle, block, begin, end, run_begin, run_end, out);
         }
     }
 
@@ -3773,20 +3825,26 @@ private:
                                             FlatMemoryBlock& block,
                                             std::size_t base_off,
                                             std::uint32_t diff_mask,
+                                            std::size_t& run_begin,
+                                            std::size_t& run_end,
                                             std::vector<TrackEvent>& out) {
+        if ((diff_mask & static_cast<std::uint32_t>(0xFFFFu)) == static_cast<std::uint32_t>(0xFFFFu)) {
+            sample_flat_memory_append_changed_range_(cycle, block, base_off, base_off + 16u, run_begin, run_end, out);
+            return;
+        }
         std::uint32_t pos = 0;
         while (pos < 16) {
             while (pos < 16 && ((diff_mask & (static_cast<std::uint32_t>(1) << pos)) == 0)) {
                 ++pos;
             }
             if (pos >= 16) break;
-            const std::uint32_t run_begin = pos;
+            const std::uint32_t bit_run_begin = pos;
             while (pos < 16 && ((diff_mask & (static_cast<std::uint32_t>(1) << pos)) != 0)) {
                 ++pos;
             }
-            const std::size_t begin = base_off + static_cast<std::size_t>(run_begin);
+            const std::size_t begin = base_off + static_cast<std::size_t>(bit_run_begin);
             const std::size_t end = base_off + static_cast<std::size_t>(pos);
-            sample_flat_memory_changed_byte_range_(cycle, block, begin, end, out);
+            sample_flat_memory_append_changed_range_(cycle, block, begin, end, run_begin, run_end, out);
         }
     }
 
@@ -3794,21 +3852,40 @@ private:
                                                          FlatMemoryBlock& block,
                                                          unsigned char* shadow,
                                                          std::vector<TrackEvent>& out,
-                                                         std::size_t start_off = 0) {
+                                                         std::size_t start_off = 0,
+                                                         std::size_t* external_run_begin = NULL,
+                                                         std::size_t* external_run_end = NULL) {
         std::size_t off = start_off;
+        std::size_t local_run_begin = static_cast<std::size_t>(-1);
+        std::size_t local_run_end = 0;
+        std::size_t& run_begin = external_run_begin ? *external_run_begin : local_run_begin;
+        std::size_t& run_end = external_run_end ? *external_run_end : local_run_end;
+
+        const std::size_t word_size = sizeof(std::size_t);
+        for (; off + word_size <= block.byte_count; off += word_size) {
+            std::size_t cur_word = 0;
+            std::size_t old_word = 0;
+            std::memcpy(&cur_word, block.base + off, word_size);
+            std::memcpy(&old_word, shadow + off, word_size);
+            if (cur_word == old_word) continue;
+
+            std::memcpy(shadow + off, &cur_word, word_size);
+            sample_flat_memory_append_changed_range_(cycle, block, off, off + word_size, run_begin, run_end, out);
+        }
+
         while (off < block.byte_count) {
             if (block.base[off] == shadow[off]) {
                 ++off;
                 continue;
             }
 
-            const std::size_t run_begin = off;
-            do {
-                shadow[off] = block.base[off];
-                ++off;
-            } while (off < block.byte_count && block.base[off] != shadow[off]);
+            shadow[off] = block.base[off];
+            sample_flat_memory_append_changed_range_(cycle, block, off, off + 1u, run_begin, run_end, out);
+            ++off;
+        }
 
-            sample_flat_memory_changed_byte_range_(cycle, block, run_begin, off, out);
+        if (!external_run_begin || !external_run_end) {
+            sample_flat_memory_flush_changed_run_(cycle, block, run_begin, run_end, out);
         }
     }
 
@@ -3860,6 +3937,8 @@ private:
                                                        unsigned char* shadow,
                                                        std::vector<TrackEvent>& out) {
         std::size_t off = 0;
+        std::size_t run_begin = static_cast<std::size_t>(-1);
+        std::size_t run_end = 0;
         const FlatMemoryBlockSimdBackend backend =
             (block.byte_count >= options_.flat_memory_block_simd_min_bytes)
                 ? resolve_flat_memory_block_simd_backend_()
@@ -3876,7 +3955,7 @@ private:
                 if (diff_mask == 0) continue;
 
                 _mm256_storeu_si256(reinterpret_cast<__m256i*>(shadow + off), cur);
-                sample_flat_memory_changed_mask32_(cycle, block, off, diff_mask, out);
+                sample_flat_memory_changed_mask32_(cycle, block, off, diff_mask, run_begin, run_end, out);
             }
         }
 #endif
@@ -3892,12 +3971,13 @@ private:
                 if (diff_mask == 0) continue;
 
                 _mm_storeu_si128(reinterpret_cast<__m128i*>(shadow + off), cur);
-                sample_flat_memory_changed_mask16_(cycle, block, off, diff_mask, out);
+                sample_flat_memory_changed_mask16_(cycle, block, off, diff_mask, run_begin, run_end, out);
             }
         }
 #endif
 
-        sample_flat_memory_block_scalar_mask_to_buffer_(cycle, block, shadow, out, off);
+        sample_flat_memory_block_scalar_mask_to_buffer_(cycle, block, shadow, out, off, &run_begin, &run_end);
+        sample_flat_memory_flush_changed_run_(cycle, block, run_begin, run_end, out);
     }
 
     void sample_flat_memory_block_initial_to_buffer_(Cycle cycle,
@@ -8898,8 +8978,35 @@ private:
 
 public:
     template <typename T>
-    NodeId expand_registered_dynamic(const std::string& path, NodeId parent_id, const T* ptr) {
+    typename std::enable_if<reflect::is_reflected<T>::value, NodeId>::type
+    expand_registered_dynamic_target_(const std::string& path, NodeId parent_id, const T* ptr) {
+        return expand_reflected_field_cached_or_direct_<T>(path, parent_id, ptr);
+    }
+
+    template <typename T>
+    typename std::enable_if<!reflect::is_reflected<T>::value, NodeId>::type
+    expand_registered_dynamic_target_(const std::string& path, NodeId parent_id, const T* ptr) {
+        debug_log_unsupported_type<T>(path, parent_id, "dynamic target type is not reflected", "$dynamic_target_unreflected", ptr);
+        return 0;
+    }
+
+    template <typename T>
+    NodeId expand_registered_dynamic_impl_(const std::string& path, NodeId parent_id, const T* ptr, std::true_type) {
+        return expand_registered_dynamic_target_<T>(path, parent_id, ptr);
+    }
+
+    template <typename T>
+    NodeId expand_registered_dynamic_impl_(const std::string& path, NodeId parent_id, const T* ptr, std::false_type) {
         return expand_field<T>(path, parent_id, ptr);
+    }
+
+    template <typename T>
+    NodeId expand_registered_dynamic(const std::string& path, NodeId parent_id, const T* ptr) {
+        return expand_registered_dynamic_impl_<T>(
+            path,
+            parent_id,
+            ptr,
+            typename detail::is_dynamic_trace_target<T>::type());
     }
 
 private:
@@ -9749,7 +9856,7 @@ private:
         }
         for (std::size_t i = 0; i < ptr->size(); ++i) {
             typedef typename detail::remove_cvref<decltype((*ptr)[i])>::type ElementT;
-            expand_field(make_index_child_path_(path, i), node_id, &((*ptr)[i]));
+            expand_field(make_index_child_path_(path, i), node_id, std::addressof((*ptr)[i]));
         }
         return keep_node_or_rollback(cp, node_id);
     }
@@ -9975,7 +10082,18 @@ private:
     }
 
     template <typename T>
-    typename std::enable_if<!detail::is_peek_trace_source<T>::value && detail::is_vsip_exact_port<T>::value, NodeId>::type
+    typename std::enable_if<!detail::is_peek_trace_source<T>::value &&
+                            detail::is_dynamic_trace_target<T>::value,
+                            NodeId>::type
+    expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
+        ensure_dynamic_type_registered<typename detail::remove_cvref<T>::type>();
+        return add_dynamic_trace_target_object(path, parent_id, static_cast<const DynamicTraceTarget*>(ptr));
+    }
+
+    template <typename T>
+    typename std::enable_if<!detail::is_peek_trace_source<T>::value &&
+                            !detail::is_dynamic_trace_target<T>::value &&
+                            detail::is_vsip_exact_port<T>::value, NodeId>::type
     expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
         // vsip* is sc_port-like.  Treat it as a pointer to its bound vsii*
         // interface, then let the bound object explicitly decide how to expand.
@@ -9984,7 +10102,10 @@ private:
     }
 
     template <typename T>
-    typename std::enable_if<!detail::is_peek_trace_source<T>::value && !detail::is_vsip_exact_port<T>::value && detail::is_vsip_read_port<T>::value, NodeId>::type
+    typename std::enable_if<!detail::is_peek_trace_source<T>::value &&
+                            !detail::is_dynamic_trace_target<T>::value &&
+                            !detail::is_vsip_exact_port<T>::value &&
+                            detail::is_vsip_read_port<T>::value, NodeId>::type
     expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
         typedef typename detail::vsip_port_value_type<T>::type V;
         // Legacy explicit trait hook: peek() returns a stable pointer.  Expand
@@ -10019,7 +10140,7 @@ private:
         }
         typedef typename detail::remove_cvref<decltype((*ptr)[0])>::type ElementT;
         for (std::size_t i = 0; i < ptr->size(); ++i) {
-            expand_field(make_index_child_path_(path, i), node_id, &((*ptr)[i]));
+            expand_field(make_index_child_path_(path, i), node_id, std::addressof((*ptr)[i]));
         }
         return keep_node_or_rollback(cp, node_id);
     }
@@ -10598,7 +10719,7 @@ private:
             expand_member_clean_dispatch<ElemT>(
                 make_index_child_path_(path, i),
                 node_id,
-                static_cast<const ElemT*>(&((*clean_ptr)[i])));
+                static_cast<const ElemT*>(std::addressof((*clean_ptr)[i])));
         }
         return keep_node_or_rollback(cp, node_id);
     }
@@ -10621,11 +10742,11 @@ private:
         expand_member_clean_dispatch<FirstT>(
             make_child_path_(path, "first"),
             node_id,
-            static_cast<const FirstT*>(&clean_ptr->first));
+            static_cast<const FirstT*>(std::addressof(clean_ptr->first)));
         expand_member_clean_dispatch<SecondT>(
             make_child_path_(path, "second"),
             node_id,
-            static_cast<const SecondT*>(&clean_ptr->second));
+            static_cast<const SecondT*>(std::addressof(clean_ptr->second)));
         return keep_node_or_rollback(cp, node_id);
     }
 
@@ -10795,7 +10916,9 @@ private:
 #else
             is_systemc_whitelist = false,
 #endif
-            value = is_c_array ? 16 :
+            value = detail::is_dynamic_trace_target<FieldT>::value &&
+                    !detail::is_peek_trace_source<FieldT>::value ? 17 :
+                    is_c_array ? 16 :
                     is_wave_ptr ? 15 :
                     detail::is_peek_trace_source<FieldT>::value ? 14 :
                     is_wave_array ? 13 :
@@ -10813,6 +10936,16 @@ private:
                     0
         };
     };
+
+    template <typename FieldT>
+    NodeId expand_member_clean_dispatch_selected(const std::string& path,
+                                                 NodeId parent_id,
+                                                 const FieldT* clean_ptr,
+                                                 std::integral_constant<int, 17>) {
+        if (options_.debug_log) debug_log_msg(std::string("member dispatch branch=dynamic_target path=") + path);
+        ensure_dynamic_type_registered<typename detail::remove_cvref<FieldT>::type>();
+        return add_dynamic_trace_target_object(path, parent_id, static_cast<const DynamicTraceTarget*>(clean_ptr));
+    }
 
     template <typename FieldT>
     NodeId expand_member_clean_dispatch_selected(const std::string& path,
@@ -10895,6 +11028,7 @@ private:
         !detail::is_weak_ptr<T>::value &&
         !detail::is_wave_ptr<T>::value &&
         !detail::is_peek_trace_source<T>::value &&
+        !detail::is_dynamic_trace_target<T>::value &&
         !detail::is_vsip_read_port<T>::value &&
         !detail::is_sc_in<T>::value &&
         !detail::is_sc_out<T>::value &&
@@ -10913,6 +11047,7 @@ private:
     template <typename T>
     typename std::enable_if<reflect::is_reflected<T>::value &&
                             !detail::is_peek_trace_source<T>::value &&
+                            !detail::is_dynamic_trace_target<T>::value &&
                             !detail::is_vsip_read_port<T>::value &&
                             !detail::is_sc_in<T>::value &&
                             !detail::is_sc_out<T>::value &&
@@ -10942,6 +11077,7 @@ private:
                             !detail::is_weak_ptr<T>::value &&
                             !detail::is_wave_ptr<T>::value &&
                             !detail::is_peek_trace_source<T>::value &&
+                            !detail::is_dynamic_trace_target<T>::value &&
                             !detail::is_vsip_read_port<T>::value &&
                             !detail::is_sc_in<T>::value &&
                             !detail::is_sc_out<T>::value &&
@@ -10970,10 +11106,6 @@ template <typename T>
 NodeId dynamic_expand_bridge(Tracer& tracer, const std::string& path, NodeId parent_id, const void* obj) {
     return tracer.template expand_registered_dynamic<T>(path, parent_id, static_cast<const T*>(obj));
 }
-
-
-
-
 
 } // namespace wave
 

@@ -9,6 +9,17 @@ endforeach()
 set(_reggen_python "${AQROOT}/tools/bin/python/python")
 set(_reggen_script "${AQROOT}/tools/bin/gcDefineGen.py")
 set(_cmodel_dir "${AQARCH}/cmodel")
+set(_reggen_inputs ${CMODEL_REGGEN_INPUTS})
+set(_reggen_outputs ${CMODEL_REGGEN_OUTPUTS})
+
+if(NOT _reggen_inputs)
+	list(APPEND _reggen_inputs "${_reggen_script}")
+endif()
+if(NOT _reggen_outputs)
+	list(APPEND _reggen_outputs
+		"${_cmodel_dir}/inc/gcDefines.h"
+		"${_cmodel_dir}/isa/src/isa_instructions.h")
+endif()
 
 if(WIN32 AND NOT EXISTS "${_reggen_python}")
 	foreach(_reggen_python_ext .exe .bat .cmd)
@@ -19,21 +30,43 @@ if(WIN32 AND NOT EXISTS "${_reggen_python}")
 	endforeach()
 endif()
 
-execute_process(
-	COMMAND "${_reggen_python}" "${_reggen_script}" "${_cmodel_dir}" "${ARCH}"
-	RESULT_VARIABLE _reggen_result
-	OUTPUT_VARIABLE _reggen_stdout
-	ERROR_VARIABLE _reggen_stderr
-)
+set(_need_reggen FALSE)
+if(NOT EXISTS "${CMODEL_REGGEN_STAMP}")
+	set(_need_reggen TRUE)
+endif()
 
-if(NOT "${_reggen_stdout}" STREQUAL "")
-	message("${_reggen_stdout}")
-endif()
-if(NOT "${_reggen_stderr}" STREQUAL "")
-	message("${_reggen_stderr}")
-endif()
-if(NOT _reggen_result EQUAL 0)
-	message(FATAL_ERROR "cmodel reggen failed with exit code ${_reggen_result}")
+foreach(_reggen_output IN LISTS _reggen_outputs)
+	if(NOT EXISTS "${_reggen_output}")
+		set(_need_reggen TRUE)
+	endif()
+endforeach()
+
+foreach(_reggen_input IN LISTS _reggen_inputs)
+	if(EXISTS "${_reggen_input}" AND "${_reggen_input}" IS_NEWER_THAN "${CMODEL_REGGEN_STAMP}")
+		set(_need_reggen TRUE)
+	endif()
+endforeach()
+
+if(_need_reggen)
+	message(STATUS "Running cmodel register generator")
+	execute_process(
+		COMMAND "${_reggen_python}" "${_reggen_script}" "${_cmodel_dir}" "${ARCH}"
+		RESULT_VARIABLE _reggen_result
+		OUTPUT_VARIABLE _reggen_stdout
+		ERROR_VARIABLE _reggen_stderr
+	)
+
+	if(NOT "${_reggen_stdout}" STREQUAL "")
+		message("${_reggen_stdout}")
+	endif()
+	if(NOT "${_reggen_stderr}" STREQUAL "")
+		message("${_reggen_stderr}")
+	endif()
+	if(NOT _reggen_result EQUAL 0)
+		message(FATAL_ERROR "cmodel reggen failed with exit code ${_reggen_result}")
+	endif()
+else()
+	return()
 endif()
 
 set(_isa_instructions_header "${_cmodel_dir}/isa/src/isa_instructions.h")

@@ -76,8 +76,8 @@ int main(int argc, char** argv) {
         std::cerr << "too many positional arguments\n";
         return 2;
     }
-    if (signal_count_64 == 0 || signal_count_64 > 1000000ull) {
-        std::cerr << "signal count must be in 1..1000000\n";
+    if (signal_count_64 == 0 || signal_count_64 > 50000000ull) {
+        std::cerr << "signal count must be in 1..50000000\n";
         return 2;
     }
     const std::uint32_t signal_count = static_cast<std::uint32_t>(signal_count_64);

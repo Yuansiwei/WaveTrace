@@ -250,6 +250,7 @@ static RunResult run_case(std::size_t slot_count, std::uint32_t cycles, bool ena
     opt.enable_bitfield_fields = true;
     opt.enable_node_name_interning = enable_topology_fast_path;
     opt.enable_wave_ptr_array_batch_reserve = enable_topology_fast_path;
+    opt.enable_flat_memory_block_precheck = enable_topology_fast_path;
     opt.dump_leaf_distribution_after_topology = false;
 
     const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
@@ -284,7 +285,9 @@ static RunResult run_case(std::size_t slot_count, std::uint32_t cycles, bool ena
 
 static CountRunResult run_count_case(std::size_t slot_count,
                                      std::uint32_t cycles,
-                                     bool enable_topology_fast_path) {
+                                     bool enable_topology_fast_path,
+                                     bool enable_parallel_sampling,
+                                     std::size_t sampling_threads) {
     std::vector<Slot> slots(slot_count);
     initialize_slots(slots);
     Top top(slots.empty() ? static_cast<Slot*>(NULL) : &slots[0], slots.size());
@@ -300,6 +303,9 @@ static CountRunResult run_count_case(std::size_t slot_count,
     opt.enable_bitfield_fields = true;
     opt.enable_node_name_interning = enable_topology_fast_path;
     opt.enable_wave_ptr_array_batch_reserve = enable_topology_fast_path;
+    opt.enable_flat_memory_block_precheck = enable_topology_fast_path;
+    opt.enable_parallel_sampling = enable_parallel_sampling;
+    opt.sampling_threads = sampling_threads;
     opt.dump_leaf_distribution_after_topology = false;
 
     const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
@@ -379,16 +385,21 @@ int main(int argc, char** argv) {
     if (argc >= 4) mode = argv[3];
     if (slot_count == 0) {
         std::cerr << "usage: smoke_reflect_topology_cache_stress [slot_count] [cycles] "
-                     "[compare|baseline|optimized|baseline-count|optimized-count]\n";
+                     "[compare|baseline|optimized|baseline-count|optimized-count|optimized-parallel-count] [threads]\n";
         return 2;
     }
 
-    if (mode == "baseline-count" || mode == "optimized-count") {
-        const bool fast_path = (mode == "optimized-count");
-        const CountRunResult result = run_count_case(slot_count, cycles, fast_path);
+    if (mode == "baseline-count" || mode == "optimized-count" || mode == "optimized-parallel-count") {
+        const bool fast_path = (mode != "baseline-count");
+        const bool parallel_sampling = (mode == "optimized-parallel-count");
+        const std::size_t sampling_threads = argc >= 5
+            ? static_cast<std::size_t>(std::strtoull(argv[4], NULL, 10))
+            : static_cast<std::size_t>(0);
+        const CountRunResult result = run_count_case(slot_count, cycles, fast_path, parallel_sampling, sampling_threads);
         std::cout << "reflect_topology_batch_stress " << mode
                   << " slots=" << slot_count
                   << " cycles=" << cycles
+                  << " sampling_threads=" << sampling_threads
                   << " nodes=" << result.nodes
                   << " tracks=" << result.tracks
                   << " events=" << result.events

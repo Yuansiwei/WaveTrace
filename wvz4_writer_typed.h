@@ -150,8 +150,79 @@ enum class Compression : u8 {
 };
 
 struct NameRecord {
+    struct LazyName {
+        LazyName() {}
+        LazyName(const LazyName& other) : value_(other.value_ ? new std::string(*other.value_) : NULL) {}
+        LazyName(LazyName&& other) noexcept : value_(other.value_) { other.value_ = NULL; }
+        LazyName(const char* text) : value_(NULL) { assign(text ? text : ""); }
+        LazyName(const std::string& text) : value_(NULL) { assign(text); }
+
+        LazyName& operator=(const LazyName& other) {
+            if (this == &other) return *this;
+            if (other.value_) {
+                ensure() = *other.value_;
+            } else {
+                release();
+            }
+            return *this;
+        }
+
+        LazyName& operator=(LazyName&& other) noexcept {
+            if (this == &other) return *this;
+            release();
+            value_ = other.value_;
+            other.value_ = NULL;
+            return *this;
+        }
+
+        LazyName& operator=(const char* text) {
+            assign(text ? text : "");
+            return *this;
+        }
+
+        LazyName& operator=(const std::string& text) {
+            assign(text);
+            return *this;
+        }
+
+        ~LazyName() { release(); }
+
+        bool empty() const { return value_ == NULL || value_->empty(); }
+        const char* data() const { return value_ ? value_->data() : ""; }
+        std::size_t size() const { return value_ ? value_->size() : 0u; }
+
+        void assign(const char* data, std::size_t size) {
+            ensure().assign(data, size);
+        }
+
+        void assign(const std::string& text) {
+            ensure() = text;
+        }
+
+        void assign(const char* text) {
+            ensure().assign(text ? text : "");
+        }
+
+        void clear() {
+            if (value_) value_->clear();
+        }
+
+    private:
+        std::string& ensure() {
+            if (!value_) value_ = new std::string();
+            return *value_;
+        }
+
+        void release() {
+            delete value_;
+            value_ = NULL;
+        }
+
+        std::string* value_ = NULL;
+    };
+
     u32 name_id = 0;       // positive, unique
-    std::string name;      // segment name, e.g. "top", "gpu", "warp[3]"
+    LazyName name;         // segment name, e.g. "top", "gpu", "warp[3]"; allocated only when not using name_blob
     u32 name_offset = 0;   // optional offset into Layout::name_blob
     u32 name_size = 0;     // optional byte length in Layout::name_blob
 };
@@ -1024,6 +1095,101 @@ private:
         ScalarValue value;
     };
 
+    class LazyTransitionList {
+    public:
+        typedef std::vector<Transition> Vector;
+        typedef Vector::iterator iterator;
+        typedef Vector::const_iterator const_iterator;
+
+        LazyTransitionList() {}
+
+        LazyTransitionList(const LazyTransitionList& other) : data_(NULL) {
+            if (other.data_ && !other.data_->empty()) {
+                data_ = new Vector(*other.data_);
+            }
+        }
+
+        LazyTransitionList(LazyTransitionList&& other) noexcept : data_(other.data_) {
+            other.data_ = NULL;
+        }
+
+        LazyTransitionList& operator=(const LazyTransitionList& other) {
+            if (this == &other) return *this;
+            if (other.data_ && !other.data_->empty()) {
+                ensure() = *other.data_;
+            } else {
+                release();
+            }
+            return *this;
+        }
+
+        LazyTransitionList& operator=(LazyTransitionList&& other) noexcept {
+            if (this == &other) return *this;
+            release();
+            data_ = other.data_;
+            other.data_ = NULL;
+            return *this;
+        }
+
+        ~LazyTransitionList() { release(); }
+
+        bool empty() const { return data_ == NULL || data_->empty(); }
+        std::size_t size() const { return data_ ? data_->size() : 0u; }
+
+        void reserve(std::size_t n) {
+            if (n != 0) ensure().reserve(n);
+        }
+
+        void push_back(const Transition& tr) {
+            ensure().push_back(tr);
+        }
+
+        Transition& back() { return ensure().back(); }
+        const Transition& back() const { return data_->back(); }
+
+        Transition& operator[](std::size_t index) { return ensure()[index]; }
+        const Transition& operator[](std::size_t index) const { return (*data_)[index]; }
+
+        iterator begin() { return ensure().begin(); }
+        iterator end() { return ensure().end(); }
+        const_iterator begin() const { return data_ ? data_->begin() : empty_vector().begin(); }
+        const_iterator end() const { return data_ ? data_->end() : empty_vector().end(); }
+
+        iterator erase(iterator first, iterator last) {
+            if (!data_) return first;
+            return data_->erase(first, last);
+        }
+
+        template <typename InputIt>
+        void insert(iterator, InputIt first, InputIt last) {
+            if (first == last) return;
+            Vector& v = ensure();
+            v.insert(v.end(), first, last);
+        }
+
+        void clear() {
+            if (data_) data_->clear();
+        }
+
+    private:
+        Vector& ensure() {
+            if (!data_) data_ = new Vector();
+            return *data_;
+        }
+
+        void release() {
+            delete data_;
+            data_ = NULL;
+        }
+
+        static const Vector& empty_vector() {
+            static const Vector empty;
+            return empty;
+        }
+
+        Vector* data_ = NULL;
+    };
+
     struct SignalState {
         bool valid = false;
         bool is_periodic_clock = false;
@@ -1036,7 +1202,7 @@ private:
         // and the viewer would have no explicit value at the first sampled cycle.
         bool has_current = false;
         ScalarValue current;
-        std::vector<Transition> transitions;
+        LazyTransitionList transitions;
     };
 
     struct WdatByteBreakdown {
@@ -5242,6 +5408,12 @@ public:
         if (pos_ >= data_.size()) return false;
         v = data_[pos_++]; return true;
     }
+    bool read_u32(u32& v) {
+        if (pos_ + 4 > data_.size()) return false;
+        v = load_u32_le(&data_[pos_]);
+        pos_ += 4;
+        return true;
+    }
     bool read_varuint(u64& v) {
         v = 0;
         unsigned shift = 0;
@@ -5356,10 +5528,35 @@ inline void serialize_layout(std::vector<u8>& out, const Layout& l) {
                 l.signals.size() * 24u +
                 l.clocks.size() * 12u +
                 l.name_blob.size() + 16u);
-    append_varuint(out, static_cast<u64>(l.names.size()));
+    bool can_use_compact_blob_names = !l.name_blob.empty();
+    std::size_t expected_name_offset = 0;
     for (std::size_t i = 0; i < l.names.size(); ++i) {
-        append_varuint(out, l.names[i].name_id);
-        append_string_bytes(out, layout_name_data(l, l.names[i]), layout_name_size(l, l.names[i]));
+        const NameRecord& n = l.names[i];
+        if (n.name_id == 0 ||
+            n.name.empty() == false ||
+            n.name_offset != expected_name_offset ||
+            !layout_name_range_valid(l, n)) {
+            can_use_compact_blob_names = false;
+            break;
+        }
+        expected_name_offset += static_cast<std::size_t>(n.name_size);
+    }
+    if (can_use_compact_blob_names && expected_name_offset == l.name_blob.size()) {
+        append_varuint(out, 0);
+        append_u8(out, 2u);
+        append_varuint(out, static_cast<u64>(l.names.size()));
+        append_varuint(out, static_cast<u64>(l.name_blob.size()));
+        out.insert(out.end(), l.name_blob.begin(), l.name_blob.end());
+        for (std::size_t i = 0; i < l.names.size(); ++i) {
+            append_varuint(out, l.names[i].name_id);
+            append_varuint(out, l.names[i].name_size);
+        }
+    } else {
+        append_varuint(out, static_cast<u64>(l.names.size()));
+        for (std::size_t i = 0; i < l.names.size(); ++i) {
+            append_varuint(out, l.names[i].name_id);
+            append_string_bytes(out, layout_name_data(l, l.names[i]), layout_name_size(l, l.names[i]));
+        }
     }
     append_varuint(out, static_cast<u64>(l.nodes.size()));
     for (std::size_t i = 0; i < l.nodes.size(); ++i) {
@@ -5624,9 +5821,16 @@ static const std::size_t kWriterProcessQueueBytesLimit = 256u * 1024u * 1024u;
 } // namespace detail
 
 enum class WriterProcessFrameType : u32 {
-    Layout   = 1,
-    Cycle    = 2,
-    Finalize = 3
+    Layout           = 1,
+    Cycle            = 2,
+    Finalize         = 3,
+    LayoutBegin      = 4,
+    LayoutNameBlob   = 5,
+    LayoutNames      = 6,
+    LayoutNodes      = 7,
+    LayoutSignals    = 8,
+    LayoutClocks     = 9,
+    LayoutEnd        = 10
 };
 
 class WriterProcessClient {
@@ -5664,15 +5868,27 @@ public:
             return false;
         }
         if (!connect_pipe(connect_timeout_ms, error)) {
+            if (!helper.empty()) {
+                error += "; helper='";
+                error += helper;
+                error += "'";
+            }
             cleanup_handles(true);
             return false;
         }
 
-        std::vector<u8> payload;
-        detail::serialize_options(payload, options);
-        detail::serialize_layout(payload, layout);
-        if (!send_frame(WriterProcessFrameType::Layout, payload, error) ||
-            !read_ack(seq_, error)) {
+        bool layout_sent = false;
+        if (should_stream_layout(layout)) {
+            layout_sent = send_layout_stream(layout, options, error);
+        } else {
+            std::vector<u8> payload;
+            detail::serialize_options(payload, options);
+            detail::serialize_layout(payload, layout);
+            u64 layout_seq = 0;
+            layout_sent = send_frame(WriterProcessFrameType::Layout, payload, error, &layout_seq) &&
+                          read_ack(layout_seq, error);
+        }
+        if (!layout_sent) {
             cleanup_handles(true);
             return false;
         }
@@ -5755,6 +5971,13 @@ private:
         if (!explicit_path.empty() && detail::file_exists(explicit_path)) return explicit_path;
 
         std::vector<std::string> candidates;
+        const std::string source_dir = detail::parent_dir(std::string(__FILE__));
+        if (!source_dir.empty()) {
+            candidates.push_back(detail::join_path(
+                detail::join_path(detail::join_path(source_dir, "tools"), "bin"),
+                "wvz4_writer_monitor.exe"));
+        }
+
         const std::string exe_dir = detail::current_exe_dir();
         if (!exe_dir.empty()) {
             candidates.push_back(detail::join_path(exe_dir, "wvz4_writer_monitor.exe"));
@@ -5778,12 +6001,6 @@ private:
         candidates.push_back(detail::join_path("build_vs\\wvz4_writer_monitor\\Release", "wvz4_writer_monitor.exe"));
         candidates.push_back(detail::join_path("build_vs\\wvz4_writer_monitor\\Debug", "wvz4_writer_monitor.exe"));
 #endif
-        const std::string source_dir = detail::parent_dir(std::string(__FILE__));
-        if (!source_dir.empty()) {
-            candidates.push_back(detail::join_path(
-                detail::join_path(detail::join_path(source_dir, "tools"), "bin"),
-                "wvz4_writer_monitor.exe"));
-        }
         candidates.push_back("wvz4_writer_monitor.exe");
         for (std::size_t i = 0; i < candidates.size(); ++i) {
             if (detail::file_exists(candidates[i])) return candidates[i];
@@ -5853,6 +6070,131 @@ private:
             }
             Sleep(20);
         }
+    }
+
+    static bool should_stream_layout(const Layout& layout) {
+        const u64 record_count =
+            static_cast<u64>(layout.names.size()) +
+            static_cast<u64>(layout.nodes.size()) +
+            static_cast<u64>(layout.signals.size()) +
+            static_cast<u64>(layout.clocks.size());
+        return record_count >= 5000000ull ||
+               static_cast<u64>(layout.name_blob.size()) >= 64ull * 1024ull * 1024ull;
+    }
+
+    bool send_frame_sync(WriterProcessFrameType type,
+                         const std::vector<u8>& payload,
+                         std::string& error) {
+        u64 sent_seq = 0;
+        return send_frame(type, payload, error, &sent_seq) && read_ack(sent_seq, error);
+    }
+
+    bool send_layout_stream(const Layout& layout,
+                            const WriterOptions& options,
+                            std::string& error) {
+        static const std::size_t kBlobChunkBytes = 32u * 1024u * 1024u;
+        static const std::size_t kRecordChunkCount = 1000000u;
+
+        std::vector<u8> payload;
+        detail::serialize_options(payload, options);
+        detail::append_u64(payload, static_cast<u64>(layout.name_blob.size()));
+        detail::append_u64(payload, static_cast<u64>(layout.names.size()));
+        detail::append_u64(payload, static_cast<u64>(layout.nodes.size()));
+        detail::append_u64(payload, static_cast<u64>(layout.signals.size()));
+        detail::append_u64(payload, static_cast<u64>(layout.clocks.size()));
+        if (!send_frame_sync(WriterProcessFrameType::LayoutBegin, payload, error)) return false;
+
+        for (std::size_t offset = 0; offset < layout.name_blob.size(); ) {
+            const std::size_t chunk = (std::min)(kBlobChunkBytes, layout.name_blob.size() - offset);
+            payload.clear();
+            payload.reserve(16u + chunk);
+            detail::append_u64(payload, static_cast<u64>(offset));
+            detail::append_u64(payload, static_cast<u64>(chunk));
+            detail::append_bytes(payload, layout.name_blob.data() + offset, chunk);
+            if (!send_frame_sync(WriterProcessFrameType::LayoutNameBlob, payload, error)) return false;
+            offset += chunk;
+        }
+
+        for (std::size_t start = 0; start < layout.names.size(); ) {
+            const std::size_t count = (std::min)(kRecordChunkCount, layout.names.size() - start);
+            payload.clear();
+            payload.reserve(16u + count * 16u);
+            detail::append_u64(payload, static_cast<u64>(start));
+            detail::append_u64(payload, static_cast<u64>(count));
+            for (std::size_t i = 0; i < count; ++i) {
+                const NameRecord& n = layout.names[start + i];
+                detail::append_u32(payload, n.name_id);
+                if (layout_name_uses_blob(n)) {
+                    detail::append_u8(payload, 1u);
+                    detail::append_u32(payload, n.name_offset);
+                    detail::append_u32(payload, n.name_size);
+                } else {
+                    detail::append_u8(payload, 0u);
+                    detail::append_string_bytes(payload, n.name.data(), n.name.size());
+                }
+            }
+            if (!send_frame_sync(WriterProcessFrameType::LayoutNames, payload, error)) return false;
+            start += count;
+        }
+
+        for (std::size_t start = 0; start < layout.nodes.size(); ) {
+            const std::size_t count = (std::min)(kRecordChunkCount, layout.nodes.size() - start);
+            payload.clear();
+            payload.reserve(16u + count * 21u);
+            detail::append_u64(payload, static_cast<u64>(start));
+            detail::append_u64(payload, static_cast<u64>(count));
+            for (std::size_t i = 0; i < count; ++i) {
+                const NodeRecord& n = layout.nodes[start + i];
+                detail::append_u32(payload, n.node_id);
+                detail::append_u32(payload, n.parent_id);
+                detail::append_u32(payload, n.name_id);
+                detail::append_u8(payload, static_cast<u8>(n.kind));
+                detail::append_u32(payload, n.first_child);
+                detail::append_u32(payload, n.next_sibling);
+            }
+            if (!send_frame_sync(WriterProcessFrameType::LayoutNodes, payload, error)) return false;
+            start += count;
+        }
+
+        for (std::size_t start = 0; start < layout.signals.size(); ) {
+            const std::size_t count = (std::min)(kRecordChunkCount, layout.signals.size() - start);
+            payload.clear();
+            payload.reserve(16u + count * 23u);
+            detail::append_u64(payload, static_cast<u64>(start));
+            detail::append_u64(payload, static_cast<u64>(count));
+            for (std::size_t i = 0; i < count; ++i) {
+                const SignalDefinition& s = layout.signals[start + i];
+                detail::append_u32(payload, s.signal_id);
+                detail::append_u32(payload, s.storage_id != 0 ? s.storage_id : s.signal_id);
+                detail::append_u32(payload, s.node_id);
+                detail::append_u8(payload, static_cast<u8>(s.type));
+                detail::append_u32(payload, s.bit_width);
+                detail::append_u8(payload, static_cast<u8>(s.radix));
+                detail::append_u32(payload, s.bit_offset);
+                detail::append_u8(payload, s.storage_only ? kSignalFlagStorageOnly : 0u);
+            }
+            if (!send_frame_sync(WriterProcessFrameType::LayoutSignals, payload, error)) return false;
+            start += count;
+        }
+
+        for (std::size_t start = 0; start < layout.clocks.size(); ) {
+            const std::size_t count = (std::min)(kRecordChunkCount, layout.clocks.size() - start);
+            payload.clear();
+            payload.reserve(16u + count * 13u);
+            detail::append_u64(payload, static_cast<u64>(start));
+            detail::append_u64(payload, static_cast<u64>(count));
+            for (std::size_t i = 0; i < count; ++i) {
+                const ClockDefinition& c = layout.clocks[start + i];
+                detail::append_u32(payload, c.signal_id);
+                detail::append_u8(payload, c.initial_value ? 1u : 0u);
+                detail::append_u64(payload, c.period_ticks);
+            }
+            if (!send_frame_sync(WriterProcessFrameType::LayoutClocks, payload, error)) return false;
+            start += count;
+        }
+
+        payload.clear();
+        return send_frame_sync(WriterProcessFrameType::LayoutEnd, payload, error);
     }
 
     bool send_frame(WriterProcessFrameType type,
@@ -6118,6 +6460,236 @@ public:
         std::mutex ack_mutex;
         HelperQueue helper(ack_pipe, ack_mutex);
         bool have_writer = false;
+        struct LayoutStreamState {
+            bool active = false;
+            WriterOptions opt;
+            Layout layout;
+            u64 expected_name_blob_size = 0;
+            u64 expected_names = 0;
+            u64 expected_nodes = 0;
+            u64 expected_signals = 0;
+            u64 expected_clocks = 0;
+
+            void reset() {
+                active = false;
+                opt = WriterOptions();
+                Layout empty;
+                layout = std::move(empty);
+                expected_name_blob_size = 0;
+                expected_names = 0;
+                expected_nodes = 0;
+                expected_signals = 0;
+                expected_clocks = 0;
+            }
+
+            static bool fits_size_t(u64 value) {
+                return value <= static_cast<u64>((std::numeric_limits<std::size_t>::max)());
+            }
+
+            bool begin(detail::PayloadReader& r, std::string& error) {
+                reset();
+                if (!detail::deserialize_options(r, opt) ||
+                    !r.read_u64(expected_name_blob_size) ||
+                    !r.read_u64(expected_names) ||
+                    !r.read_u64(expected_nodes) ||
+                    !r.read_u64(expected_signals) ||
+                    !r.read_u64(expected_clocks) ||
+                    !r.at_end()) {
+                    error = "WVZ4 writer helper received corrupt streamed layout begin";
+                    return false;
+                }
+                if (!fits_size_t(expected_name_blob_size) ||
+                    !fits_size_t(expected_names) ||
+                    !fits_size_t(expected_nodes) ||
+                    !fits_size_t(expected_signals) ||
+                    !fits_size_t(expected_clocks) ||
+                    expected_name_blob_size > static_cast<u64>((std::numeric_limits<u32>::max)())) {
+                    error = "WVZ4 writer helper streamed layout is too large";
+                    return false;
+                }
+                layout.name_blob.reserve(static_cast<std::size_t>(expected_name_blob_size));
+                layout.names.reserve(static_cast<std::size_t>(expected_names));
+                layout.nodes.reserve(static_cast<std::size_t>(expected_nodes));
+                layout.signals.reserve(static_cast<std::size_t>(expected_signals));
+                layout.clocks.reserve(static_cast<std::size_t>(expected_clocks));
+                active = true;
+                return true;
+            }
+
+            bool append_name_blob(detail::PayloadReader& r, std::string& error) {
+                u64 offset = 0, size = 0;
+                const u8* data = NULL;
+                if (!active || !r.read_u64(offset) || !r.read_u64(size) ||
+                    !fits_size_t(offset) || !fits_size_t(size) ||
+                    size > r.remaining() ||
+                    !r.read_bytes_ptr(data, static_cast<std::size_t>(size)) ||
+                    !r.at_end()) {
+                    error = "WVZ4 writer helper received corrupt streamed name blob";
+                    return false;
+                }
+                if (offset != static_cast<u64>(layout.name_blob.size()) ||
+                    offset + size > expected_name_blob_size) {
+                    error = "WVZ4 writer helper received out-of-order streamed name blob";
+                    return false;
+                }
+                if (size != 0) layout.name_blob.append(reinterpret_cast<const char*>(data), static_cast<std::size_t>(size));
+                return true;
+            }
+
+            bool append_names(detail::PayloadReader& r, std::string& error) {
+                u64 start = 0, count = 0;
+                if (!active || !r.read_u64(start) || !r.read_u64(count) ||
+                    !fits_size_t(start) || !fits_size_t(count) ||
+                    start != static_cast<u64>(layout.names.size()) ||
+                    start + count > expected_names) {
+                    error = "WVZ4 writer helper received out-of-order streamed names";
+                    return false;
+                }
+                for (u64 i = 0; i < count; ++i) {
+                    NameRecord rec;
+                    u8 flags = 0;
+                    if (!r.read_u32(rec.name_id) || !r.read_u8(flags)) {
+                        error = "WVZ4 writer helper received corrupt streamed name record";
+                        return false;
+                    }
+                    if (flags != 0) {
+                        if (!r.read_u32(rec.name_offset) || !r.read_u32(rec.name_size) ||
+                            static_cast<u64>(rec.name_offset) + static_cast<u64>(rec.name_size) > expected_name_blob_size) {
+                            error = "WVZ4 writer helper received corrupt streamed blob name record";
+                            return false;
+                        }
+                    } else {
+                        const u8* name_data = NULL;
+                        std::size_t name_size = 0;
+                        if (!r.read_string_view(name_data, name_size) ||
+                            name_size > static_cast<std::size_t>((std::numeric_limits<u32>::max)())) {
+                            error = "WVZ4 writer helper received corrupt streamed inline name record";
+                            return false;
+                        }
+                        rec.name.assign(reinterpret_cast<const char*>(name_data), name_size);
+                    }
+                    layout.names.push_back(rec);
+                }
+                if (!r.at_end()) {
+                    error = "WVZ4 writer helper received trailing bytes in streamed names";
+                    return false;
+                }
+                return true;
+            }
+
+            bool append_nodes(detail::PayloadReader& r, std::string& error) {
+                u64 start = 0, count = 0;
+                if (!active || !r.read_u64(start) || !r.read_u64(count) ||
+                    !fits_size_t(start) || !fits_size_t(count) ||
+                    start != static_cast<u64>(layout.nodes.size()) ||
+                    start + count > expected_nodes) {
+                    error = "WVZ4 writer helper received out-of-order streamed nodes";
+                    return false;
+                }
+                for (u64 i = 0; i < count; ++i) {
+                    NodeRecord rec;
+                    u8 kind = 0;
+                    if (!r.read_u32(rec.node_id) ||
+                        !r.read_u32(rec.parent_id) ||
+                        !r.read_u32(rec.name_id) ||
+                        !r.read_u8(kind) ||
+                        !r.read_u32(rec.first_child) ||
+                        !r.read_u32(rec.next_sibling)) {
+                        error = "WVZ4 writer helper received corrupt streamed node record";
+                        return false;
+                    }
+                    rec.kind = static_cast<NodeKind>(kind);
+                    layout.nodes.push_back(rec);
+                }
+                if (!r.at_end()) {
+                    error = "WVZ4 writer helper received trailing bytes in streamed nodes";
+                    return false;
+                }
+                return true;
+            }
+
+            bool append_signals(detail::PayloadReader& r, std::string& error) {
+                u64 start = 0, count = 0;
+                if (!active || !r.read_u64(start) || !r.read_u64(count) ||
+                    !fits_size_t(start) || !fits_size_t(count) ||
+                    start != static_cast<u64>(layout.signals.size()) ||
+                    start + count > expected_signals) {
+                    error = "WVZ4 writer helper received out-of-order streamed signals";
+                    return false;
+                }
+                for (u64 i = 0; i < count; ++i) {
+                    SignalDefinition rec;
+                    u8 type = 0, radix = 0, flags = 0;
+                    if (!r.read_u32(rec.signal_id) ||
+                        !r.read_u32(rec.storage_id) ||
+                        !r.read_u32(rec.node_id) ||
+                        !r.read_u8(type) ||
+                        !r.read_u32(rec.bit_width) ||
+                        !r.read_u8(radix) ||
+                        !r.read_u32(rec.bit_offset) ||
+                        !r.read_u8(flags)) {
+                        error = "WVZ4 writer helper received corrupt streamed signal record";
+                        return false;
+                    }
+                    if (rec.storage_id == 0) rec.storage_id = rec.signal_id;
+                    rec.type = static_cast<ValueType>(type);
+                    rec.radix = static_cast<Radix>(radix);
+                    rec.storage_only = (flags & kSignalFlagStorageOnly) != 0;
+                    layout.signals.push_back(rec);
+                }
+                if (!r.at_end()) {
+                    error = "WVZ4 writer helper received trailing bytes in streamed signals";
+                    return false;
+                }
+                return true;
+            }
+
+            bool append_clocks(detail::PayloadReader& r, std::string& error) {
+                u64 start = 0, count = 0;
+                if (!active || !r.read_u64(start) || !r.read_u64(count) ||
+                    !fits_size_t(start) || !fits_size_t(count) ||
+                    start != static_cast<u64>(layout.clocks.size()) ||
+                    start + count > expected_clocks) {
+                    error = "WVZ4 writer helper received out-of-order streamed clocks";
+                    return false;
+                }
+                for (u64 i = 0; i < count; ++i) {
+                    ClockDefinition rec;
+                    u8 initial = 0;
+                    if (!r.read_u32(rec.signal_id) ||
+                        !r.read_u8(initial) ||
+                        !r.read_u64(rec.period_ticks)) {
+                        error = "WVZ4 writer helper received corrupt streamed clock record";
+                        return false;
+                    }
+                    rec.initial_value = (initial != 0);
+                    layout.clocks.push_back(rec);
+                }
+                if (!r.at_end()) {
+                    error = "WVZ4 writer helper received trailing bytes in streamed clocks";
+                    return false;
+                }
+                return true;
+            }
+
+            bool finish(detail::PayloadReader& r, std::string& error) {
+                if (!active || !r.at_end()) {
+                    error = "WVZ4 writer helper received corrupt streamed layout end";
+                    return false;
+                }
+                if (static_cast<u64>(layout.name_blob.size()) != expected_name_blob_size ||
+                    static_cast<u64>(layout.names.size()) != expected_names ||
+                    static_cast<u64>(layout.nodes.size()) != expected_nodes ||
+                    static_cast<u64>(layout.signals.size()) != expected_signals ||
+                    static_cast<u64>(layout.clocks.size()) != expected_clocks) {
+                    error = "WVZ4 writer helper received incomplete streamed layout";
+                    return false;
+                }
+                active = false;
+                return true;
+            }
+        };
+        LayoutStreamState layout_stream;
         bool result = true;
         while (true) {
             WriterProcessFrameType type = WriterProcessFrameType::Finalize;
@@ -6144,7 +6716,7 @@ public:
             bool ack_now = true;
             detail::PayloadReader r(payload);
             if (type == WriterProcessFrameType::Layout) {
-                if (have_writer) {
+                if (have_writer || layout_stream.active) {
                     ok = false;
                     op_error = "WVZ4 writer helper received duplicate layout";
                 } else {
@@ -6161,9 +6733,40 @@ public:
                         have_writer = ok;
                     }
                 }
+            } else if (type == WriterProcessFrameType::LayoutBegin) {
+                if (have_writer || layout_stream.active) {
+                    ok = false;
+                    op_error = "WVZ4 writer helper received duplicate streamed layout";
+                } else {
+                    ok = layout_stream.begin(r, op_error);
+                }
+            } else if (type == WriterProcessFrameType::LayoutNameBlob) {
+                ok = layout_stream.append_name_blob(r, op_error);
+            } else if (type == WriterProcessFrameType::LayoutNames) {
+                ok = layout_stream.append_names(r, op_error);
+            } else if (type == WriterProcessFrameType::LayoutNodes) {
+                ok = layout_stream.append_nodes(r, op_error);
+            } else if (type == WriterProcessFrameType::LayoutSignals) {
+                ok = layout_stream.append_signals(r, op_error);
+            } else if (type == WriterProcessFrameType::LayoutClocks) {
+                ok = layout_stream.append_clocks(r, op_error);
+            } else if (type == WriterProcessFrameType::LayoutEnd) {
+                if (have_writer) {
+                    ok = false;
+                    op_error = "WVZ4 writer helper received duplicate streamed layout end";
+                } else if (layout_stream.finish(r, op_error)) {
+                    if (layout_stream.opt.enable_stats_log && layout_stream.opt.stats_log_path.empty()) {
+                        layout_stream.opt.stats_log_path = output_path + ".log";
+                    }
+                    ok = helper.open(output_path, std::move(layout_stream.layout), layout_stream.opt, op_error);
+                    have_writer = ok;
+                    if (!ok) layout_stream.reset();
+                } else {
+                    ok = false;
+                }
             } else if (type == WriterProcessFrameType::Cycle) {
                 ack_now = false;
-                if (!have_writer) {
+                if (!have_writer || layout_stream.active) {
                     ok = false;
                     op_error = "WVZ4 writer helper received cycle before layout";
                     ack_now = true;

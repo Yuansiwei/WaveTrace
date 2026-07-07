@@ -19,8 +19,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -121,10 +124,6 @@ public:
 
     std::uint32_t wave_trace_target_byte_width() const override {
         return static_cast<std::uint32_t>(sizeof(T));
-    }
-
-    DynamicExpandFn wave_trace_dynamic_expander() const override {
-        return NULL;
     }
 
     WaveDirtyHook* wave_trace_dirty_hook() const override {
@@ -608,7 +607,15 @@ class array {
 public:
     typedef T value_type;
     typedef std::size_t size_type;
+    typedef std::ptrdiff_t difference_type;
+    typedef T& reference;
+    typedef const T& const_reference;
+    typedef T* pointer;
+    typedef const T* const_pointer;
+    typedef T* iterator;
     typedef const T* const_iterator;
+    typedef std::reverse_iterator<iterator> reverse_iterator;
+    typedef std::reverse_iterator<const_iterator> const_reverse_iterator;
 
     array() = default;
     array(const array& other) = default;
@@ -639,30 +646,151 @@ public:
     }
 
     const T& operator[](size_type i) const noexcept { return storage_[i]; }
+    T& at(size_type i) {
+        if (i >= N) throw std::out_of_range("wave::array::at");
+        return (*this)[i];
+    }
+    const T& at(size_type i) const {
+        if (i >= N) throw std::out_of_range("wave::array::at");
+        return storage_[i];
+    }
+    T& front() noexcept { return (*this)[0]; }
+    const T& front() const noexcept { return storage_[0]; }
+    T& back() noexcept { return (*this)[N - 1]; }
+    const T& back() const noexcept { return storage_[N - 1]; }
     const T& read(size_type i) const noexcept { return storage_[i]; }
     const std::array<T, N>& read() const noexcept { return storage_; }
 
     constexpr size_type size() const noexcept { return N; }
-    bool empty() const noexcept { return N == 0; }
+    constexpr size_type max_size() const noexcept { return N; }
+    constexpr bool empty() const noexcept { return N == 0; }
 
+    T* data() noexcept {
+        notify_all_elements_dirty_();
+        return storage_.data();
+    }
     const T* data() const noexcept { return storage_.data(); }
+    iterator begin() noexcept {
+        notify_all_elements_dirty_();
+        return storage_.data();
+    }
     const_iterator begin() const noexcept { return storage_.data(); }
+    const_iterator cbegin() const noexcept { return storage_.data(); }
+    iterator end() noexcept {
+        notify_all_elements_dirty_();
+        return storage_.data() + N;
+    }
     const_iterator end() const noexcept { return storage_.data() + N; }
+    const_iterator cend() const noexcept { return storage_.data() + N; }
 
-    T* data() noexcept = delete;
-    T* begin() noexcept = delete;
-    T* end() noexcept = delete;
-    array* operator&() = delete;
-    const array* operator&() const = delete;
+    reverse_iterator rbegin() noexcept { return reverse_iterator(end()); }
+    const_reverse_iterator rbegin() const noexcept { return const_reverse_iterator(end()); }
+    const_reverse_iterator crbegin() const noexcept { return const_reverse_iterator(cend()); }
+    reverse_iterator rend() noexcept { return reverse_iterator(begin()); }
+    const_reverse_iterator rend() const noexcept { return const_reverse_iterator(begin()); }
+    const_reverse_iterator crend() const noexcept { return const_reverse_iterator(cbegin()); }
 
-    operator std::array<T, N>&() = delete;
-    operator const std::array<T, N>&() const = delete;
+    void fill(const T& value) {
+        for (size_type i = 0; i < N; ++i) {
+            (*this)[i] = value;
+        }
+    }
+
+    void swap(array& other) noexcept(noexcept(std::swap(std::declval<T&>(), std::declval<T&>()))) {
+        if (this == std::addressof(other)) return;
+        using std::swap;
+        for (size_type i = 0; i < N; ++i) {
+            swap((*this)[i], other[i]);
+        }
+    }
+
+    array* operator&() noexcept {
+        notify_all_elements_dirty_();
+        return this;
+    }
+    const array* operator&() const noexcept {
+        notify_all_elements_dirty_();
+        return this;
+    }
+
+    operator const std::array<T, N>&() const noexcept {
+        return storage_;
+    }
     operator T*() = delete;
     operator const T*() const = delete;
 
 private:
+    void notify_all_elements_dirty_() const noexcept {
+        for (size_type i = 0; i < N; ++i) {
+            notify_wave_array_index_access(
+                i,
+                static_cast<const void*>(std::addressof(storage_[i])),
+                reflect::type_tag_of<T>(),
+                sizeof(T));
+        }
+    }
+
     std::array<T, N> storage_;
 };
+
+template <typename T, std::size_t N>
+inline bool operator==(const array<T, N>& lhs, const array<T, N>& rhs) {
+    return lhs.read() == rhs.read();
+}
+
+template <typename T, std::size_t N>
+inline bool operator!=(const array<T, N>& lhs, const array<T, N>& rhs) {
+    return !(lhs == rhs);
+}
+
+template <typename T, std::size_t N>
+inline bool operator<(const array<T, N>& lhs, const array<T, N>& rhs) {
+    return lhs.read() < rhs.read();
+}
+
+template <typename T, std::size_t N>
+inline bool operator>(const array<T, N>& lhs, const array<T, N>& rhs) {
+    return rhs < lhs;
+}
+
+template <typename T, std::size_t N>
+inline bool operator<=(const array<T, N>& lhs, const array<T, N>& rhs) {
+    return !(rhs < lhs);
+}
+
+template <typename T, std::size_t N>
+inline bool operator>=(const array<T, N>& lhs, const array<T, N>& rhs) {
+    return !(lhs < rhs);
+}
+
+template <typename T, std::size_t N>
+inline void swap(array<T, N>& lhs, array<T, N>& rhs) noexcept(noexcept(lhs.swap(rhs))) {
+    lhs.swap(rhs);
+}
+
+template <std::size_t I, typename T, std::size_t N>
+inline T& get(array<T, N>& a) noexcept {
+    static_assert(I < N, "wave::array get index out of range");
+    return a[I];
+}
+
+template <std::size_t I, typename T, std::size_t N>
+inline const T& get(const array<T, N>& a) noexcept {
+    static_assert(I < N, "wave::array get index out of range");
+    return a[I];
+}
+
+template <std::size_t I, typename T, std::size_t N>
+inline T&& get(array<T, N>&& a) noexcept {
+    static_assert(I < N, "wave::array get index out of range");
+    return std::move(a[I]);
+}
+
+template <std::size_t I, typename T, std::size_t N>
+inline const T&& get(const array<T, N>&& a) noexcept {
+    static_assert(I < N, "wave::array get index out of range");
+    return std::move(a[I]);
+}
 
 template <typename T, std::size_t N>
 struct detail::is_wave_array<array<T, N> > : std::true_type {};
@@ -677,6 +805,19 @@ static_assert(sizeof(array<std::uint32_t, 4>) == sizeof(std::array<std::uint32_t
 static_assert(alignof(array<std::uint32_t, 4>) == alignof(std::array<std::uint32_t, 4>), "wave::array align mismatch");
 
 } // namespace wave
+
+namespace std {
+
+template <typename T, std::size_t N>
+struct tuple_size< ::wave::array<T, N> > : integral_constant<std::size_t, N> {};
+
+template <std::size_t I, typename T, std::size_t N>
+struct tuple_element<I, ::wave::array<T, N> > {
+    static_assert(I < N, "wave::array tuple_element index out of range");
+    typedef T type;
+};
+
+} // namespace std
 
 #ifndef WAVE_REFLECT_FRIEND
 #define WAVE_REFLECT_FRIEND \
