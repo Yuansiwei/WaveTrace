@@ -1,9 +1,6 @@
 ﻿#include "MainWindow.h"
 
 #include "WaveCanvas.h"
-#include "WaveParser.h"
-#include "WaveParser2.h"
-#include "WaveParser3.h"
 #include "WaveParser4.h"
 
 #include <QApplication>
@@ -253,29 +250,18 @@ static bool loadWaveForCaptureTool(const QString& wavePath,
                                    QString& error,
                                    int autoLoadFirstSignalCount,
                                    quint64 maxDecodedSamples) {
-    if (wavePath.endsWith(QStringLiteral(".wvz4"), Qt::CaseInsensitive)) {
-        WaveParser4::LoadOptions options;
-        options.includeAllSignalDefinitions = true;
-        options.autoLoadFirstSignalCount = autoLoadFirstSignalCount;
-        options.autoLoadFirstSignalLodCount = autoLoadFirstSignalCount;
-        options.loadAllIfWindowEmpty = false;
-        options.maxDecodedSamples = maxDecodedSamples;
-        return WaveParser4::loadFromFile(wavePath, wave, error, options);
+    if (!wavePath.endsWith(QStringLiteral(".wvz4"), Qt::CaseInsensitive)) {
+        error = QStringLiteral("Only WVZ4 wave files (*.wvz4) are supported.");
+        return false;
     }
 
-    if (wavePath.endsWith(QStringLiteral(".wvz3"), Qt::CaseInsensitive)) {
-        WaveParser3::LoadOptions options;
-        options.includeAllSignalDefinitions = true;
-        options.autoLoadFirstSignalCount = autoLoadFirstSignalCount;
-        options.loadAllIfWindowEmpty = false;
-        return WaveParser3::loadFromFile(wavePath, wave, error, options);
-    }
-
-    if (wavePath.endsWith(QStringLiteral(".wvz2"), Qt::CaseInsensitive)) {
-        return WaveParser2::loadFromFile(wavePath, wave, error);
-    }
-
-    return WaveParser::loadFromFile(wavePath, wave, error);
+    WaveParser4::LoadOptions options;
+    options.includeAllSignalDefinitions = true;
+    options.autoLoadFirstSignalCount = autoLoadFirstSignalCount;
+    options.autoLoadFirstSignalLodCount = autoLoadFirstSignalCount;
+    options.loadAllIfWindowEmpty = false;
+    options.maxDecodedSamples = maxDecodedSamples;
+    return WaveParser4::loadFromFile(wavePath, wave, error, options);
 }
 
 static int runValueFindBenchmark(const QStringList& args) {
