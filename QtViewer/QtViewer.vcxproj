@@ -110,9 +110,6 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="MainWindow.cpp" />
     <ClCompile Include="WaveCanvas.cpp" />
-    <ClCompile Include="WaveParser.cpp" />
-    <ClCompile Include="WaveParser2.cpp" />
-    <ClCompile Include="WaveParser3.cpp" />
     <ClCompile Include="WaveParser4.cpp" />
     <ClCompile Include="$(QtGeneratedDir)moc_ActiveSignalListWidget.cpp" />
     <ClCompile Include="$(QtGeneratedDir)moc_MainWindow.cpp" />
@@ -126,13 +123,8 @@
     <ClInclude Include="ActiveSignalListWidget.h" />
     <ClInclude Include="MainWindow.h" />
     <ClInclude Include="WaveCanvas.h" />
-    <ClInclude Include="WaveParser.h" />
-    <ClInclude Include="WaveParser2.h" />
-    <ClInclude Include="WaveParser3.h" />
     <ClInclude Include="WaveParser4.h" />
     <ClInclude Include="WaveTypes.h" />
-    <ClInclude Include="WVZ2Format.h" />
-    <ClInclude Include="WVZ3Format.h" />
     <ClInclude Include="wave_path_wvz4_recorder.h" />
     <ClInclude Include="wvz4_writer_typed.h" />
   </ItemGroup>

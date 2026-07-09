@@ -1,9 +1,6 @@
 #include "MainWindow.h"
 #include "ActiveSignalListWidget.h"
 #include "WaveCanvas.h"
-#include "WaveParser.h"
-#include "WaveParser2.h"
-#include "WaveParser3.h"
 #include "WaveParser4.h"
 #include <QApplication>
 #include <QGuiApplication>
@@ -81,7 +78,6 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
-#include <thread>
 #include <vector>
 
 #if defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2) || defined(__SSE2__)
@@ -115,9 +111,7 @@ constexpr int kTreeRoleSignalIndex = Qt::UserRole;
 constexpr int kTreeRoleNodeId = Qt::UserRole + 100;
 constexpr int kValueFindRoleFirstHit = Qt::UserRole;
 constexpr int kValueFindRoleSignalIndex = Qt::UserRole + 1;
-constexpr qint64 kLargeWvz4FullLoadLimitBytes = 1024ll * 1024ll * 1024ll;
 constexpr quint64 kViewerOnDemandSampleBudget = 20ull * 1000ull * 1000ull;
-constexpr quint64 kViewerFullLoadSampleBudget = 50ull * 1000ull * 1000ull;
 constexpr int kCompareStreamingDefaultSignalBatchSize = 32768;
 constexpr int kCompareStreamingHugeFileSignalBatchSize = 2048;
 constexpr qint64 kCompareStreamingHugeFileThresholdBytes = 2ll * 1024ll * 1024ll * 1024ll;
@@ -153,13 +147,20 @@ bool isSupportedWaveFilePath(const QString& path) {
     if (path.isEmpty()) return false;
     const QFileInfo info(path);
     if (!info.exists() || !info.isFile()) return false;
-    const QString suffix = info.suffix().toLower();
-    return suffix == QStringLiteral("json") ||
-           suffix == QStringLiteral("wvjson") ||
-           suffix == QStringLiteral("wvz") ||
-           suffix == QStringLiteral("wvz2") ||
-           suffix == QStringLiteral("wvz3") ||
-           suffix == QStringLiteral("wvz4");
+    return info.suffix().compare(QStringLiteral("wvz4"), Qt::CaseInsensitive) == 0;
+}
+
+bool hasWvz4Suffix(const QString& path) {
+    return path.endsWith(QStringLiteral(".wvz4"), Qt::CaseInsensitive);
+}
+
+QString unsupportedWaveFormatError(const QString& path) {
+    const QString suffix = QFileInfo(path).suffix();
+    if (suffix.isEmpty()) {
+        return QStringLiteral("Only WVZ4 wave files (*.wvz4) are supported.");
+    }
+    return QStringLiteral("Unsupported wave format '.%1'. Only WVZ4 wave files (*.wvz4) are supported.")
+        .arg(suffix);
 }
 
 QString firstSupportedWaveFilePathFromMime(const QMimeData* mime) {
@@ -171,14 +172,6 @@ QString firstSupportedWaveFilePathFromMime(const QMimeData* mime) {
         if (isSupportedWaveFilePath(path)) return path;
     }
     return QString();
-}
-
-QString formatLargeWvz4FullLoadError(qint64 fileSize, const QString& operation) {
-    return QStringLiteral("WVZ4 %1 full-load is disabled for files over %2 MiB (%3 bytes). "
-                          "Open the file normally and use LOD/on-demand viewing instead.")
-        .arg(operation)
-        .arg(kLargeWvz4FullLoadLimitBytes / (1024ll * 1024ll))
-        .arg(fileSize);
 }
 
 bool viewerPerfLogEnabled() {
@@ -1365,37 +1358,6 @@ bool waveDirectoriesEquivalentForRawBlockCompare(const WaveFile& leftWave,
     return true;
 }
 
-bool loadWaveFileFullyForCompare(const QString& path, WaveFile& wave, QString& error) {
-    error.clear();
-    const bool isWvz4 = path.endsWith(QStringLiteral(".wvz4"), Qt::CaseInsensitive);
-    const bool isWvz3 = path.endsWith(QStringLiteral(".wvz3"), Qt::CaseInsensitive);
-    if (isWvz4) {
-        const qint64 fileSize = QFileInfo(path).size();
-        if (fileSize > kLargeWvz4FullLoadLimitBytes) {
-            error = formatLargeWvz4FullLoadError(fileSize, QStringLiteral("compare"));
-            return false;
-        }
-
-        WaveParser4::LoadOptions options;
-        options.includeAllSignalDefinitions = true;
-        options.autoLoadFirstSignalCount = -1;
-        options.loadAllIfWindowEmpty = true;
-        options.maxDecodedSamples = kViewerFullLoadSampleBudget;
-        return WaveParser4::loadFromFile(path, wave, error, options);
-    }
-    if (isWvz3) {
-        WaveParser3::LoadOptions options;
-        options.includeAllSignalDefinitions = true;
-        options.autoLoadFirstSignalCount = -1;
-        options.loadAllIfWindowEmpty = true;
-        return WaveParser3::loadFromFile(path, wave, error, options);
-    }
-    if (path.endsWith(QStringLiteral(".wvz2"), Qt::CaseInsensitive)) {
-        return WaveParser2::loadFromFile(path, wave, error);
-    }
-    return WaveParser::loadFromFile(path, wave, error);
-}
-
 struct CompareCycleRange {
     qint64 start = 0;
     qint64 end = 0;
@@ -1807,91 +1769,10 @@ WaveSignal makeAbsentComparedSideSignal(const QString& fullName,
     return out;
 }
 
-bool buildComparedWaveFile(const QString& leftPath,
-                           const WaveFile& leftWave,
-                           const QString& rightPath,
-                           const WaveFile& rightWave,
-                           WaveFile& outWave,
-                           QString& error) {
-    error.clear();
-    outWave = WaveFile();
-
-    QHash<QString, int> leftByPath;
-    QVector<QString> leftPathOrder;
-    leftByPath.reserve(leftWave.signalList.size() * 2 + 1);
-    leftPathOrder.reserve(leftWave.signalList.size());
-    for (int i = 0; i < leftWave.signalList.size(); ++i) {
-        const QString path = fullSignalPathFromWave(leftWave, i);
-        if (path.isEmpty() || leftByPath.contains(path)) continue;
-        leftByPath.insert(path, i);
-        leftPathOrder.push_back(path);
-    }
-
-    QHash<QString, int> rightByPath;
-    rightByPath.reserve(rightWave.signalList.size() * 2 + 1);
-    for (int i = 0; i < rightWave.signalList.size(); ++i) {
-        const QString path = fullSignalPathFromWave(rightWave, i);
-        if (path.isEmpty() || rightByPath.contains(path)) continue;
-        rightByPath.insert(path, i);
-    }
-
-    outWave.meta.title = QStringLiteral("Compare_%1_vs_%2")
-        .arg(QFileInfo(leftPath).completeBaseName(), QFileInfo(rightPath).completeBaseName());
-    outWave.meta.timescale = (leftWave.meta.timescale == rightWave.meta.timescale)
-        ? leftWave.meta.timescale
-        : QStringLiteral("cycle");
-    const CompareCycleRange compareRange = makeMaxCompareCycleRange(leftWave.meta, rightWave.meta);
-    const CompareCycleRange diffRange = makeOverlappedCompareCycleRange(leftWave.meta, rightWave.meta);
-    outWave.meta.start = compareRange.start;
-    outWave.meta.end = qMax(compareRange.end, outWave.meta.start + 1);
-    initializeCompareMeta(outWave.meta, leftPath, leftWave.meta, rightPath, rightWave.meta);
-
-    int commonPathCount = 0;
-    int nextSignalId = 1;
-    for (const QString& path : leftPathOrder) {
-        const int li = leftByPath.value(path, -1);
-        const int ri = rightByPath.value(path, -1);
-        if (li < 0 || ri < 0) continue;
-        ++commonPathCount;
-        const WaveSignal& leftSig = leftWave.signalList.at(li);
-        const WaveSignal& rightSig = rightWave.signalList.at(ri);
-        QVector<WaveDiffRegion> diffRegions;
-        if (diffRange.hasRange) {
-            diffRegions = computeSignalDiffRegions(leftSig, rightSig,
-                                                   diffRange.start, diffRange.end,
-                                                   diffRange.end, diffRange.end);
-        }
-        if (diffRegions.isEmpty()) continue;
-
-        const QString leftName = comparedSideFullPath(path, QStringLiteral("A"));
-        const QString rightName = comparedSideFullPath(path, QStringLiteral("B"));
-        outWave.signalList.push_back(makeComparedSideSignal(leftName, leftSig, nextSignalId++, diffRegions,
-                                                            leftWave.meta.start, leftWave.meta.end));
-        outWave.signalList.push_back(makeComparedSideSignal(rightName, rightSig, nextSignalId++, diffRegions,
-                                                            rightWave.meta.start, rightWave.meta.end));
-    }
-
-    if (commonPathCount == 0) {
-        error = QString::fromUtf8("两个文件没有路径完全相同的信号。");
-        return false;
-    }
-    if (outWave.signalList.isEmpty()) {
-        error = formatNoSignalDiffMessage(leftWave.meta, rightWave.meta);
-        return false;
-    }
-    return true;
-}
-
 struct CompareSignalJob {
     QString path;
     int leftIndex = -1;
     int rightIndex = -1;
-};
-
-struct CompareSignalResult {
-    int leftIndex = -1;
-    int rightIndex = -1;
-    QVector<WaveDiffRegion> diffRegions;
 };
 
 struct CompareProgressState {
@@ -1900,147 +1781,6 @@ struct CompareProgressState {
     std::atomic<int> outputSignalPairs{0};
     std::atomic<bool> cancelRequested{false};
 };
-
-bool buildComparedWaveFileOptimized(const QString& leftPath,
-                                    const WaveFile& leftWave,
-                                    const QString& rightPath,
-                                    const WaveFile& rightWave,
-                                    WaveFile& outWave,
-                                    QString& error,
-                                    CompareProgressState* progress = nullptr) {
-    error.clear();
-    outWave = WaveFile();
-
-    QHash<QString, int> leftByPath;
-    QVector<QString> leftPathOrder;
-    leftByPath.reserve(leftWave.signalList.size() * 2 + 1);
-    leftPathOrder.reserve(leftWave.signalList.size());
-    for (int i = 0; i < leftWave.signalList.size(); ++i) {
-        const QString path = fullSignalPathFromWave(leftWave, i);
-        if (path.isEmpty() || leftByPath.contains(path)) continue;
-        leftByPath.insert(path, i);
-        leftPathOrder.push_back(path);
-    }
-
-    QHash<QString, int> rightByPath;
-    QVector<QString> rightPathOrder;
-    rightByPath.reserve(rightWave.signalList.size() * 2 + 1);
-    rightPathOrder.reserve(rightWave.signalList.size());
-    for (int i = 0; i < rightWave.signalList.size(); ++i) {
-        const QString path = fullSignalPathFromWave(rightWave, i);
-        if (path.isEmpty() || rightByPath.contains(path)) continue;
-        rightByPath.insert(path, i);
-        rightPathOrder.push_back(path);
-    }
-
-    outWave.meta.title = QStringLiteral("Compare_%1_vs_%2")
-        .arg(QFileInfo(leftPath).completeBaseName(), QFileInfo(rightPath).completeBaseName());
-    outWave.meta.timescale = (leftWave.meta.timescale == rightWave.meta.timescale)
-        ? leftWave.meta.timescale
-        : QStringLiteral("cycle");
-    const CompareCycleRange compareRange = makeMaxCompareCycleRange(leftWave.meta, rightWave.meta);
-    const CompareCycleRange diffRange = makeOverlappedCompareCycleRange(leftWave.meta, rightWave.meta);
-    outWave.meta.start = compareRange.start;
-    outWave.meta.end = qMax(compareRange.end, outWave.meta.start + 1);
-    initializeCompareMeta(outWave.meta, leftPath, leftWave.meta, rightPath, rightWave.meta);
-
-    std::vector<CompareSignalJob> jobs;
-    jobs.reserve(std::size_t(qMin(leftPathOrder.size(), rightPathOrder.size())));
-    int commonPathCount = 0;
-    for (const QString& path : leftPathOrder) {
-        const int li = leftByPath.value(path, -1);
-        const int ri = rightByPath.value(path, -1);
-        if (li < 0 || ri < 0) continue;
-        ++commonPathCount;
-        CompareSignalJob job;
-        job.path = path;
-        job.leftIndex = li;
-        job.rightIndex = ri;
-        jobs.push_back(std::move(job));
-    }
-
-    if (jobs.empty()) {
-        error = QStringLiteral("The two files have no matching-path signals to compare.");
-        return false;
-    }
-    if (progress) {
-        progress->totalJobs.store(int(jobs.size()), std::memory_order_release);
-        progress->completedJobs.store(0, std::memory_order_release);
-        progress->outputSignalPairs.store(0, std::memory_order_release);
-    }
-
-    std::vector<CompareSignalResult> results(jobs.size());
-    std::atomic<int> nextJob(0);
-    const unsigned hw = std::thread::hardware_concurrency();
-    const int maxWorkers = int(hw == 0 ? 1 : hw);
-    const int workerCount = qBound(1, maxWorkers, int(qMax<std::size_t>(std::size_t(1), jobs.size())));
-    std::vector<std::thread> workers;
-    workers.reserve(std::size_t(workerCount));
-    for (int worker = 0; worker < workerCount; ++worker) {
-        Q_UNUSED(worker);
-        workers.emplace_back([&]() {
-            for (;;) {
-                if (progress && progress->cancelRequested.load(std::memory_order_acquire)) break;
-                const int jobIndex = nextJob.fetch_add(1, std::memory_order_relaxed);
-                if (jobIndex < 0 || jobIndex >= int(jobs.size())) break;
-                const CompareSignalJob& job = jobs[std::size_t(jobIndex)];
-                QVector<WaveDiffRegion> diffRegions;
-                if (!diffRange.hasRange) {
-                    diffRegions.clear();
-                } else {
-                    const WaveSignal& leftSig = leftWave.signalList.at(job.leftIndex);
-                    const WaveSignal& rightSig = rightWave.signalList.at(job.rightIndex);
-                    diffRegions = computeSignalDiffRegions(leftSig, rightSig,
-                                                           diffRange.start, diffRange.end,
-                                                           diffRange.end, diffRange.end);
-                }
-                if (progress) progress->completedJobs.fetch_add(1, std::memory_order_release);
-                if (diffRegions.isEmpty()) continue;
-                CompareSignalResult& result = results[std::size_t(jobIndex)];
-                result.leftIndex = job.leftIndex;
-                result.rightIndex = job.rightIndex;
-                result.diffRegions = std::move(diffRegions);
-                if (progress) progress->outputSignalPairs.fetch_add(1, std::memory_order_relaxed);
-            }
-        });
-    }
-    for (std::thread& worker : workers) {
-        if (worker.joinable()) worker.join();
-    }
-    if (progress && progress->cancelRequested.load(std::memory_order_acquire)) {
-        error = QStringLiteral("Compare cancelled.");
-        return false;
-    }
-
-    int diffSignalCount = 0;
-    for (const CompareSignalResult& result : results) {
-        if (!result.diffRegions.isEmpty()) ++diffSignalCount;
-    }
-    if (diffSignalCount == 0) {
-        if (commonPathCount > 0) {
-            error = formatNoSignalDiffMessage(leftWave.meta, rightWave.meta);
-        } else {
-            error = QStringLiteral("No signal differences were found.");
-        }
-        return false;
-    }
-
-    outWave.signalList.reserve(diffSignalCount * 2);
-    int nextSignalId = 1;
-    for (std::size_t i = 0; i < jobs.size(); ++i) {
-        const CompareSignalResult& result = results[i];
-        if (result.diffRegions.isEmpty()) continue;
-        const QString leftName = comparedSideFullPath(jobs[i].path, QStringLiteral("A"));
-        const QString rightName = comparedSideFullPath(jobs[i].path, QStringLiteral("B"));
-        const WaveSignal& leftSig = leftWave.signalList.at(result.leftIndex);
-        const WaveSignal& rightSig = rightWave.signalList.at(result.rightIndex);
-        outWave.signalList.push_back(makeComparedSideSignal(leftName, leftSig, nextSignalId++, result.diffRegions,
-                                                            leftWave.meta.start, leftWave.meta.end));
-        outWave.signalList.push_back(makeComparedSideSignal(rightName, rightSig, nextSignalId++, result.diffRegions,
-                                                            rightWave.meta.start, rightWave.meta.end));
-    }
-    return true;
-}
 
 bool isDecodedSampleBudgetError(const QString& error) {
     return error.contains(QStringLiteral("decoded sample limit exceeded"), Qt::CaseInsensitive);
@@ -3809,42 +3549,6 @@ private:
         return makeColorfulToolbarIcon(fallbackKind);
     }
 
-    QString sanitizeNoZTextValue(const QString& raw, const bool isBit) {
-        static const QString kAbsentValueText = QStringLiteral("__WVZ_ABSENT__");
-        if (raw == kAbsentValueText) return raw;
-
-        const QString trimmed = raw.trimmed();
-        if (isBit) {
-            return trimmed == QStringLiteral("1") ? QStringLiteral("1") : QStringLiteral("0");
-        }
-
-        QString out = trimmed;
-        if (out.isEmpty()) return QStringLiteral("0");
-        for (QChar& ch : out) {
-            if (ch == QLatin1Char('z') || ch == QLatin1Char('Z') ||
-                ch == QLatin1Char('x') || ch == QLatin1Char('X')) {
-                ch = QLatin1Char('0');
-            }
-        }
-        return out;
-    }
-
-    WaveFile buildExportWaveNoZ(const WaveFile& src) {
-        WaveFile dst = src;
-        for (WaveSignal& sig : dst.signalList) {
-            sig.supportsZState = false;
-            const bool isBit = (sig.kind == SignalKind::Bit);
-            for (WaveSample& sample : sig.samples) {
-                if (sample.isAbsent) continue;
-                sample.isZ = false;
-                if (isBit) sample.rawBits = (sample.rawBits & 1ull);
-                sample.value = sanitizeNoZTextValue(waveSampleRawText(sig, sample), isBit);
-                hydrateWaveSampleRawFields(sig.kind, sig.width, sample);
-            }
-        }
-        return dst;
-    }
-
 }
 
 MainWindow::MainWindow(QWidget* parent)
@@ -4048,7 +3752,6 @@ void MainWindow::buildUi() {
     auto* btnOpen = new QPushButton(topBarCard);
     auto* btnCompare = new QPushButton(topBarCard);
     auto* btnDerivedSignal = new QPushButton(topBarCard);
-    auto* btnExportCompressed = new QPushButton(topBarCard);
     auto* btnZoomIn = new QPushButton(topBarCard);
     auto* btnZoomOut = new QPushButton(topBarCard);
     auto* btnPanLeft = new QPushButton(topBarCard);
@@ -4060,7 +3763,6 @@ void MainWindow::buildUi() {
     setupToolbarButton(btnOpen, loadImageIconOrFallback("open", "open"), QStringLiteral("toolbarOpenButton"), QString::fromUtf8("打开波形文件"));
     setupToolbarButton(btnCompare, loadImageIconOrFallback("compare", "compare"), QStringLiteral("toolbarCompareButton"), QString::fromUtf8("比较两个波形文件"));
     setupToolbarButton(btnDerivedSignal, loadImageIconOrFallback("derive", "derive"), QStringLiteral("toolbarDerivedSignalButton"), QStringLiteral("Create temporary signal"));
-    setupToolbarButton(btnExportCompressed, loadImageIconOrFallback("save", "save"), QStringLiteral("toolbarExportButton"), QString::fromUtf8("导出波形文件"));
     setupToolbarButton(btnZoomIn, loadImageIconOrFallback("zoom_in", "zoom_in"), QStringLiteral("toolbarZoomInButton"), QString::fromUtf8("放大"));
     setupToolbarButton(btnZoomOut, loadImageIconOrFallback("zoom_out", "zoom_out"), QStringLiteral("toolbarZoomOutButton"), QString::fromUtf8("缩小"));
     setupToolbarButton(btnPanLeft, loadImageIconOrFallback("left", "left"), QStringLiteral("toolbarPanLeftButton"), QString::fromUtf8("左移"));
@@ -4086,7 +3788,6 @@ void MainWindow::buildUi() {
     topBarLayout->addWidget(btnOpen);
     topBarLayout->addWidget(btnCompare);
     topBarLayout->addWidget(btnDerivedSignal);
-    topBarLayout->addWidget(btnExportCompressed);
     topBarLayout->addSpacing(4);
     topBarLayout->addWidget(btnZoomIn);
     topBarLayout->addWidget(btnZoomOut);
@@ -4118,7 +3819,6 @@ void MainWindow::buildUi() {
     connect(btnOpen, &QPushButton::clicked, this, &MainWindow::openWaveFile);
     connect(btnCompare, &QPushButton::clicked, this, &MainWindow::compareWaveFiles);
     connect(btnDerivedSignal, &QPushButton::clicked, this, &MainWindow::openDerivedSignalDialog);
-    connect(btnExportCompressed, &QPushButton::clicked, this, &MainWindow::exportCompressedWaveFile);
     connect(btnZoomIn, &QPushButton::clicked, this, &MainWindow::zoomIn);
     connect(btnZoomOut, &QPushButton::clicked, this, &MainWindow::zoomOut);
     connect(btnPanLeft, &QPushButton::clicked, this, &MainWindow::panLeft);
@@ -4396,18 +4096,6 @@ QString MainWindow::formatNameWithRange(const WaveSignal& sig) const {
     return formatNameWidthBeforeCompareSuffix(sig.name, sig.width);
 }
 
-WaveFile MainWindow::materializeWaveSignalNames(const WaveFile& src) const {
-    WaveFile dst = src;
-    if (!m_signalTreeModel) return dst;
-
-    const int n = qMin(dst.signalList.size(), m_wave.signalList.size());
-    for (int i = 0; i < n; ++i) {
-        const QString full = m_signalTreeModel->fullPathForSignalIndex(i);
-        if (!full.isEmpty()) dst.signalList[i].name = full;
-    }
-    return dst;
-}
-
 void MainWindow::loadDemoWave() {
     WaveFile wave;
     wave.meta.title = "demo_soc";
@@ -4592,6 +4280,12 @@ void MainWindow::updateMetaLabel() {
 
 bool MainWindow::openWaveFilePath(const QString& path, bool showError) {
     if (path.isEmpty()) return false;
+    if (!hasWvz4Suffix(path)) {
+        if (showError) {
+            QMessageBox::critical(this, QStringLiteral("Open failed"), unsupportedWaveFormatError(path));
+        }
+        return false;
+    }
 
     const bool perf = viewerPerfLogEnabled();
     QElapsedTimer totalTimer;
@@ -4603,31 +4297,13 @@ bool MainWindow::openWaveFilePath(const QString& path, bool showError) {
 
     WaveFile wave;
     QString error;
-    bool ok = false;
-    const bool isWvz3 = path.endsWith(".wvz3", Qt::CaseInsensitive);
-    const bool isWvz4 = path.endsWith(".wvz4", Qt::CaseInsensitive);
-    if (isWvz4) {
-        WaveParser4::LoadOptions loadOptions;
-        const bool rawOnly = viewerDisableLodEnabled();
-        loadOptions.includeAllSignalDefinitions = true;
-        loadOptions.autoLoadFirstSignalCount = rawOnly ? 6 : 0;
-        loadOptions.autoLoadFirstSignalLodCount = 0;
-        loadOptions.loadAllIfWindowEmpty = false;
-        ok = WaveParser4::loadFromFile(path, wave, error, loadOptions);
-    }
-    else if (isWvz3) {
-        WaveParser3::LoadOptions loadOptions;
-        loadOptions.includeAllSignalDefinitions = true;
-        loadOptions.autoLoadFirstSignalCount = 6;
-        loadOptions.loadAllIfWindowEmpty = false;
-        ok = WaveParser3::loadFromFile(path, wave, error, loadOptions);
-    }
-    else if (path.endsWith(".wvz2", Qt::CaseInsensitive)) {
-        ok = WaveParser2::loadFromFile(path, wave, error);
-    }
-    else {
-        ok = WaveParser::loadFromFile(path, wave, error);
-    }
+    WaveParser4::LoadOptions loadOptions;
+    const bool rawOnly = viewerDisableLodEnabled();
+    loadOptions.includeAllSignalDefinitions = true;
+    loadOptions.autoLoadFirstSignalCount = rawOnly ? 6 : 0;
+    loadOptions.autoLoadFirstSignalLodCount = 0;
+    loadOptions.loadAllIfWindowEmpty = false;
+    const bool ok = WaveParser4::loadFromFile(path, wave, error, loadOptions);
     if (perf) {
         viewerPerfLog("open.load", stepTimer.restart(),
                       wave.signalList.size(), wave.tree.nodesById.size());
@@ -4638,8 +4314,8 @@ bool MainWindow::openWaveFilePath(const QString& path, bool showError) {
         return false;
     }
 
-    m_currentWaveFilePath = (isWvz3 || isWvz4) ? path : QString();
-    m_currentWaveSupportsOnDemand = (isWvz3 || isWvz4);
+    m_currentWaveFilePath = path;
+    m_currentWaveSupportsOnDemand = true;
     applyWave(std::move(wave));
     if (perf) {
         viewerPerfLog("open.apply", stepTimer.restart(),
@@ -4655,7 +4331,7 @@ void MainWindow::openWaveFile() {
         this,
         QString::fromUtf8("打开波形文件"),
         QString(),
-        "Wave Files (*.wvjson *.json *.wvz *.wvz2 *.wvz3 *.wvz4)");
+        QStringLiteral("WVZ4 Wave (*.wvz4)"));
     if (path.isEmpty()) return;
 
     openWaveFilePath(path);
@@ -4671,6 +4347,13 @@ bool MainWindow::compareWaveFilePaths(const QString& leftPath,
     if (errorMessage) errorMessage->clear();
     if (elapsedMs) *elapsedMs = 0;
     if (resultSignalCount) *resultSignalCount = 0;
+
+    if (!hasWvz4Suffix(leftPath) || !hasWvz4Suffix(rightPath)) {
+        const QString error = QStringLiteral("Compare supports WVZ4 files (*.wvz4) only.");
+        if (errorMessage) *errorMessage = error;
+        if (showMessages) QMessageBox::critical(this, QStringLiteral("Compare failed"), error);
+        return false;
+    }
 
     QElapsedTimer totalTimer;
     totalTimer.start();
@@ -4689,145 +4372,13 @@ bool MainWindow::compareWaveFilePaths(const QString& leftPath,
         return false;
     }
 
-    const bool streamingWvz4Compare =
-        leftPath.endsWith(QStringLiteral(".wvz4"), Qt::CaseInsensitive) &&
-        rightPath.endsWith(QStringLiteral(".wvz4"), Qt::CaseInsensitive);
-    if (streamingWvz4Compare) {
-        WaveFile comparedWave;
-        QString error;
-        bool ok = false;
-        CompareProgressState progressState;
-
-        if (showProgress) {
-            QProgressDialog compareProgress(QStringLiteral("Loading WVZ4 directories..."),
-                                            QStringLiteral("Cancel"), 0, 0, this);
-            compareProgress.setWindowTitle(QStringLiteral("Compare wave files"));
-            compareProgress.setWindowModality(Qt::WindowModal);
-            compareProgress.setMinimumDuration(0);
-            compareProgress.setAutoClose(false);
-            compareProgress.show();
-
-            auto compareFuture = std::async(std::launch::async, [&]() {
-                return buildComparedWaveFileWvz4Streaming(leftPath, rightPath,
-                                                          comparedWave, error, &progressState);
-            });
-
-            int lastTotal = 0;
-            while (compareFuture.wait_for(std::chrono::milliseconds(20)) != std::future_status::ready) {
-                if (compareProgress.wasCanceled()) {
-                    progressState.cancelRequested.store(true, std::memory_order_release);
-                    compareProgress.setLabelText(QStringLiteral("Cancelling comparison..."));
-                } else {
-                    const int total = progressState.totalJobs.load(std::memory_order_acquire);
-                    const int done = progressState.completedJobs.load(std::memory_order_acquire);
-                    if (total > 0) {
-                        if (total != lastTotal) {
-                            compareProgress.setRange(0, total);
-                            lastTotal = total;
-                        }
-                        compareProgress.setValue(qBound(0, done, total));
-                        compareProgress.setLabelText(QStringLiteral("Streaming compare %1 / %2 signals...")
-                                                     .arg(done).arg(total));
-                    }
-                }
-                QCoreApplication::processEvents();
-            }
-            ok = compareFuture.get();
-            const int total = progressState.totalJobs.load(std::memory_order_acquire);
-            if (total > 0) {
-                compareProgress.setRange(0, total);
-                compareProgress.setValue(qMin(total, progressState.completedJobs.load(std::memory_order_acquire)));
-            }
-            compareProgress.setLabelText(QStringLiteral("Building result tree..."));
-            QCoreApplication::processEvents();
-            compareProgress.close();
-        } else {
-            ok = buildComparedWaveFileWvz4Streaming(leftPath, rightPath,
-                                                    comparedWave, error, nullptr);
-        }
-
-        if (!ok) {
-            if (errorMessage) *errorMessage = error;
-            if (elapsedMs) *elapsedMs = totalTimer.elapsed();
-            if (showMessages) {
-                QMessageBox::information(this,
-                    QStringLiteral("Compare finished"),
-                    error.isEmpty() ? QStringLiteral("No signal differences were found.") : error);
-            }
-            return false;
-        }
-
-        const int comparedSignalCount = comparedWave.signalList.size();
-        m_currentWaveFilePath.clear();
-        m_currentWaveSupportsOnDemand = false;
-        m_signalIndexBySignalId.clear();
-        applyWave(std::move(comparedWave));
-
-        if (resultSignalCount) *resultSignalCount = comparedSignalCount;
-        if (elapsedMs) *elapsedMs = totalTimer.elapsed();
-        return true;
-    }
-
-    WaveFile leftWave;
-    WaveFile rightWave;
-    QString leftError;
-    QString rightError;
-
-    auto leftLoad = std::async(std::launch::async, [&]() {
-        return loadWaveFileFullyForCompare(leftPath, leftWave, leftError);
-    });
-    auto rightLoad = std::async(std::launch::async, [&]() {
-        return loadWaveFileFullyForCompare(rightPath, rightWave, rightError);
-    });
-
-    if (showProgress) {
-        QProgressDialog loadProgress(QStringLiteral("Loading wave files..."), QString(), 0, 0, this);
-        loadProgress.setWindowTitle(QStringLiteral("Compare wave files"));
-        loadProgress.setWindowModality(Qt::WindowModal);
-        loadProgress.setCancelButton(nullptr);
-        loadProgress.setMinimumDuration(0);
-        loadProgress.show();
-
-        bool leftReady = false;
-        bool rightReady = false;
-        while (!leftReady || !rightReady) {
-            if (!leftReady) {
-                leftReady = leftLoad.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
-            }
-            if (!rightReady) {
-                rightReady = rightLoad.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
-            }
-            QCoreApplication::processEvents();
-            if (!leftReady || !rightReady) std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-        loadProgress.close();
-    }
-
-    if (!leftLoad.get()) {
-        const QString error = QStringLiteral("Failed to load first file:\n%1").arg(leftError);
-        if (errorMessage) *errorMessage = error;
-        if (elapsedMs) *elapsedMs = totalTimer.elapsed();
-        if (showMessages) QMessageBox::critical(this, QStringLiteral("Compare failed"), error);
-        return false;
-    }
-    if (!rightLoad.get()) {
-        const QString error = QStringLiteral("Failed to load second file:\n%1").arg(rightError);
-        if (errorMessage) *errorMessage = error;
-        if (elapsedMs) *elapsedMs = totalTimer.elapsed();
-        if (showMessages) QMessageBox::critical(this, QStringLiteral("Compare failed"), error);
-        return false;
-    }
-
-    rebuildWaveFileDerivedCaches(leftWave);
-    rebuildWaveFileDerivedCaches(rightWave);
-
     WaveFile comparedWave;
     QString error;
     bool ok = false;
     CompareProgressState progressState;
 
     if (showProgress) {
-        QProgressDialog compareProgress(QStringLiteral("Preparing comparison..."),
+        QProgressDialog compareProgress(QStringLiteral("Loading WVZ4 directories..."),
                                         QStringLiteral("Cancel"), 0, 0, this);
         compareProgress.setWindowTitle(QStringLiteral("Compare wave files"));
         compareProgress.setWindowModality(Qt::WindowModal);
@@ -4836,8 +4387,8 @@ bool MainWindow::compareWaveFilePaths(const QString& leftPath,
         compareProgress.show();
 
         auto compareFuture = std::async(std::launch::async, [&]() {
-            return buildComparedWaveFileOptimized(leftPath, leftWave, rightPath, rightWave,
-                                                  comparedWave, error, &progressState);
+            return buildComparedWaveFileWvz4Streaming(leftPath, rightPath,
+                                                      comparedWave, error, &progressState);
         });
 
         int lastTotal = 0;
@@ -4854,7 +4405,7 @@ bool MainWindow::compareWaveFilePaths(const QString& leftPath,
                         lastTotal = total;
                     }
                     compareProgress.setValue(qBound(0, done, total));
-                    compareProgress.setLabelText(QStringLiteral("Comparing signals %1 / %2...")
+                    compareProgress.setLabelText(QStringLiteral("Streaming compare %1 / %2 signals...")
                                                  .arg(done).arg(total));
                 }
             }
@@ -4870,8 +4421,8 @@ bool MainWindow::compareWaveFilePaths(const QString& leftPath,
         QCoreApplication::processEvents();
         compareProgress.close();
     } else {
-        ok = buildComparedWaveFileOptimized(leftPath, leftWave, rightPath, rightWave,
-                                            comparedWave, error, nullptr);
+        ok = buildComparedWaveFileWvz4Streaming(leftPath, rightPath,
+                                                comparedWave, error, nullptr);
     }
 
     if (!ok) {
@@ -4890,9 +4441,6 @@ bool MainWindow::compareWaveFilePaths(const QString& leftPath,
     m_currentWaveSupportsOnDemand = false;
     m_signalIndexBySignalId.clear();
     applyWave(std::move(comparedWave));
-    if (showMessages && compareFileRangesDiffer(leftWave.meta, rightWave.meta)) {
-        statusBar()->showMessage(formatCompareRangeNote(leftWave.meta, rightWave.meta), 15000);
-    }
 
     if (resultSignalCount) *resultSignalCount = comparedSignalCount;
     if (elapsedMs) *elapsedMs = totalTimer.elapsed();
@@ -4904,7 +4452,7 @@ void MainWindow::compareWaveFiles() {
         this,
         QString::fromUtf8("选择两个波形文件进行比较"),
         QString(),
-        QStringLiteral("Wave Files (*.wvjson *.json *.wvz *.wvz2 *.wvz3 *.wvz4)"));
+        QStringLiteral("WVZ4 Wave (*.wvz4)"));
     if (paths.isEmpty()) return;
     if (paths.size() != 2) {
         QMessageBox::warning(this,
@@ -4914,164 +4462,7 @@ void MainWindow::compareWaveFiles() {
     }
 
     compareWaveFilePaths(paths.at(0), paths.at(1), true, true);
-    return;
-
-    {
-        WaveFile leftWave;
-        WaveFile rightWave;
-        QString leftError;
-        QString rightError;
-        auto leftLoad = std::async(std::launch::async, [&]() {
-            return loadWaveFileFullyForCompare(paths.at(0), leftWave, leftError);
-        });
-        auto rightLoad = std::async(std::launch::async, [&]() {
-            return loadWaveFileFullyForCompare(paths.at(1), rightWave, rightError);
-        });
-
-        if (!leftLoad.get()) {
-            QMessageBox::critical(this, QStringLiteral("Compare failed"),
-                                  QStringLiteral("Failed to load first file:\n%1").arg(leftError));
-            return;
-        }
-        if (!rightLoad.get()) {
-            QMessageBox::critical(this, QStringLiteral("Compare failed"),
-                                  QStringLiteral("Failed to load second file:\n%1").arg(rightError));
-            return;
-        }
-
-        rebuildWaveFileDerivedCaches(leftWave);
-        rebuildWaveFileDerivedCaches(rightWave);
-
-        WaveFile comparedWave;
-        QString error;
-        if (!buildComparedWaveFileOptimized(paths.at(0), leftWave, paths.at(1), rightWave, comparedWave, error)) {
-            QMessageBox::information(this,
-                QStringLiteral("Compare finished"),
-                error.isEmpty() ? QStringLiteral("No differing signal with the same path was found.") : error);
-            return;
-        }
-
-        m_currentWaveFilePath.clear();
-        m_currentWaveSupportsOnDemand = false;
-        m_signalIndexBySignalId.clear();
-        applyWave(std::move(comparedWave));
-        return;
-    }
-
-    WaveFile leftWave;
-    WaveFile rightWave;
-    QString error;
-    if (!loadWaveFileFullyForCompare(paths.at(0), leftWave, error)) {
-        QMessageBox::critical(this,
-            QString::fromUtf8("比较失败"),
-            QString::fromUtf8("第一个文件解析失败：\n%1").arg(error));
-        return;
-    }
-    if (!loadWaveFileFullyForCompare(paths.at(1), rightWave, error)) {
-        QMessageBox::critical(this,
-            QString::fromUtf8("比较失败"),
-            QString::fromUtf8("第二个文件解析失败：\n%1").arg(error));
-        return;
-    }
-
-    rebuildWaveFileDerivedCaches(leftWave);
-    rebuildWaveFileDerivedCaches(rightWave);
-
-    WaveFile comparedWave;
-    if (!buildComparedWaveFileOptimized(paths.at(0), leftWave, paths.at(1), rightWave, comparedWave, error)) {
-        QMessageBox::information(this,
-            QString::fromUtf8("比较完成"),
-            error.isEmpty() ? QString::fromUtf8("没有发现路径相同且数据不同的信号。") : error);
-        return;
-    }
-
-    m_currentWaveFilePath.clear();
-    m_currentWaveSupportsOnDemand = false;
-    m_signalIndexBySignalId.clear();
-    applyWave(std::move(comparedWave));
 }
-
-void MainWindow::exportCompressedWaveFile() {
-    QString selectedFilter = QStringLiteral("WVZ3 Wave (*.wvz3)");
-    QString path = QFileDialog::getSaveFileName(
-        this,
-        QString::fromUtf8("导出波形文件"),
-        m_wave.meta.title + ".wvz3",
-        QStringLiteral("WVZ3 Wave (*.wvz3);;WVZ2 Wave (*.wvz2);;Compressed Wave (*.wvz)"),
-        &selectedFilter);
-    if (path.isEmpty()) return;
-
-    if (m_currentWaveSupportsOnDemand) {
-        if (m_currentWaveFilePath.endsWith(".wvz4", Qt::CaseInsensitive)) {
-            const qint64 fileSize = QFileInfo(m_currentWaveFilePath).size();
-            if (fileSize > kLargeWvz4FullLoadLimitBytes) {
-                QMessageBox::warning(this,
-                    QStringLiteral("Export disabled"),
-                    formatLargeWvz4FullLoadError(fileSize, QStringLiteral("export")));
-                return;
-            }
-        }
-
-        QList<int> allSignalIndexes;
-        allSignalIndexes.reserve(m_wave.signalList.size());
-        for (int i = 0; i < m_wave.signalList.size(); ++i) {
-            allSignalIndexes.push_back(i);
-        }
-        if (!ensureSignalSamplesLoaded(allSignalIndexes, false)) {
-            return;
-        }
-    }
-
-    const WaveFile namedWave = materializeWaveSignalNames(m_wave);
-    const WaveFile exportWave = buildExportWaveNoZ(namedWave);
-
-    auto ensureSuffix = [](QString value, const QString& suffix) {
-        if (!value.endsWith(suffix, Qt::CaseInsensitive)) value += suffix;
-        return value;
-    };
-
-    if (QFileInfo(path).suffix().isEmpty()) {
-        if (selectedFilter.contains("*.wvz3")) path = ensureSuffix(path, ".wvz3");
-        else if (selectedFilter.contains("*.wvz2")) path = ensureSuffix(path, ".wvz2");
-        else path = ensureSuffix(path, ".wvz");
-    }
-
-    QString error;
-    bool ok = false;
-    if (path.endsWith(".wvz3", Qt::CaseInsensitive)) {
-        WaveParser3::SaveOptions options;
-        options.timescalePs = 1000;
-        options.targetBlockSpan = 100000;
-        options.compression = wvz3::Comp_Zstd;
-        options.enableChecksum = false;
-        options.enableClockDeltaOptimization = true;
-        options.clockHalfPeriodTolerance = 0;
-        options.minClockToggleCount = 6;
-        options.forceDurableCommit = true;
-        options.enableSharedTimeTable = true;
-        ok = WaveParser3::saveToFile(path, exportWave, error, options);
-    }
-    else if (path.endsWith(".wvz2", Qt::CaseInsensitive)) {
-        WaveParser2::SaveOptions options;
-        options.timescalePs = 1000;
-        options.targetBlockSpan = 256;
-        options.compression = wvz2::Comp_Zlib;
-        options.enableClockDeltaOptimization = true;
-        options.clockHalfPeriodTolerance = 0;
-        options.minClockToggleCount = 6;
-        ok = WaveParser2::saveToFile(path, exportWave, error, options);
-    }
-    else {
-        ok = WaveParser::saveToCompressedFile(path, exportWave, error);
-    }
-
-    if (!ok) {
-        QMessageBox::critical(this, QString::fromUtf8("导出失败"), error);
-        return;
-    }
-    QMessageBox::information(this, QString::fromUtf8("导出成功"), QString::fromUtf8("已导出波形文件： %1").arg(path));
-}
-
 
 void MainWindow::zoomIn() { m_canvas->zoomByFactor(0.70); }
 void MainWindow::zoomOut() { m_canvas->zoomByFactor(1.35); }
@@ -6276,7 +5667,9 @@ bool MainWindow::ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool
     WaveFile loadedWave;
     QString error;
     bool loadOk = false;
-    if (m_currentWaveFilePath.endsWith(".wvz4", Qt::CaseInsensitive)) {
+    if (!hasWvz4Suffix(m_currentWaveFilePath)) {
+        error = QStringLiteral("On-demand loading supports WVZ4 files (*.wvz4) only.");
+    } else {
         WaveParser4::LoadOptions loadOptions;
         loadOptions.signalIds = signalIdsToLoad;
         loadOptions.includeAllSignalDefinitions = false;
@@ -6287,12 +5680,6 @@ bool MainWindow::ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool
             loadOptions.timeEnd = qMax(rawLoadStart + 1, rawLoadEnd);
         }
         loadOk = WaveParser4::loadFromFile(m_currentWaveFilePath, loadedWave, error, loadOptions);
-    } else {
-        WaveParser3::LoadOptions loadOptions;
-        loadOptions.signalIds = signalIdsToLoad;
-        loadOptions.includeAllSignalDefinitions = false;
-        loadOptions.loadAllIfWindowEmpty = false;
-        loadOk = WaveParser3::loadFromFile(m_currentWaveFilePath, loadedWave, error, loadOptions);
     }
 
     if (!loadOk && allowLodDefer && isDecodedSampleBudgetError(error)) {

@@ -52,7 +52,6 @@ protected:
 private:
     void openWaveFile();
     void compareWaveFiles();
-    void exportCompressedWaveFile();
     void zoomIn();
     void zoomOut();
     void panLeft();
@@ -176,5 +175,4 @@ private:
     QString signalDisplayName(int signalIndex) const;
     QString formatNameWithRange(int signalIndex) const;
     QString formatNameWithRange(const WaveSignal& sig) const;
-    WaveFile materializeWaveSignalNames(const WaveFile& src) const;
 };

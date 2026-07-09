@@ -114,18 +114,10 @@ $viewerFiles = @(
     "QtViewer\resources.qrc",
     "QtViewer\WaveCanvas.cpp",
     "QtViewer\WaveCanvas.h",
-    "QtViewer\WaveParser.cpp",
-    "QtViewer\WaveParser.h",
-    "QtViewer\WaveParser2.cpp",
-    "QtViewer\WaveParser2.h",
-    "QtViewer\WaveParser3.cpp",
-    "QtViewer\WaveParser3.h",
     "QtViewer\WaveParser4.cpp",
     "QtViewer\WaveParser4.h",
     "QtViewer\WaveTypes.h",
     "QtViewer\wave_path_wvz4_recorder.h",
-    "QtViewer\WVZ2Format.h",
-    "QtViewer\WVZ3Format.h",
     "QtViewer\wvz4_writer_typed.h"
 )
 
