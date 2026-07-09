@@ -18,14 +18,30 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <tuple>
 #include <type_traits>
+#include <typeinfo>
+#include <unordered_set>
 #include <utility>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <tlhelp32.h>
+#endif
 
 namespace reflect {
 
@@ -258,6 +274,118 @@ struct bool_storage_ptr_value_type< ::wave::BoolStoragePtr<T> > {
 
 typedef void (*WaveValueNotifyFn)(const void*);
 typedef void (*WaveArrayIndexNotifyFn)(std::size_t, const void*, const void*, std::size_t);
+typedef bool (*WaveArrayBulkNotifyFn)(const void*, const void*, std::size_t, std::size_t);
+typedef std::uint64_t (*WaveArrayBulkNotifyEpochFn)();
+
+struct WaveArrayBulkNotifyKey {
+    const void* first_element_address;
+    const void* element_type_tag;
+    std::size_t element_size;
+    std::size_t element_count;
+
+    WaveArrayBulkNotifyKey()
+        : first_element_address(NULL), element_type_tag(NULL), element_size(0), element_count(0) {}
+
+    WaveArrayBulkNotifyKey(const void* address,
+                           const void* type_tag,
+                           std::size_t size,
+                           std::size_t count)
+        : first_element_address(address),
+          element_type_tag(type_tag),
+          element_size(size),
+          element_count(count) {}
+
+    bool operator==(const WaveArrayBulkNotifyKey& other) const noexcept {
+        return first_element_address == other.first_element_address &&
+               element_type_tag == other.element_type_tag &&
+               element_size == other.element_size &&
+               element_count == other.element_count;
+    }
+};
+
+struct WaveArrayBulkNotifyKeyHash {
+    std::size_t operator()(const WaveArrayBulkNotifyKey& key) const noexcept {
+        std::size_t h = std::hash<const void*>()(key.first_element_address);
+        h ^= std::hash<const void*>()(key.element_type_tag) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<std::size_t>()(key.element_size) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<std::size_t>()(key.element_count) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct WaveArrayBulkNotifyDedupeTls {
+    std::uint64_t epoch_token;
+    std::unordered_set<WaveArrayBulkNotifyKey, WaveArrayBulkNotifyKeyHash> seen;
+
+    WaveArrayBulkNotifyDedupeTls() : epoch_token(0) {}
+};
+
+inline WaveArrayBulkNotifyDedupeTls& wave_array_bulk_notify_dedupe_tls() {
+    thread_local WaveArrayBulkNotifyDedupeTls tls;
+    return tls;
+}
+
+#if defined(_WIN32)
+inline FARPROC resolve_wave_runtime_export(const char* name) noexcept {
+    if (!name || !name[0]) return NULL;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE) return NULL;
+
+    MODULEENTRY32 entry;
+    std::memset(&entry, 0, sizeof(entry));
+    entry.dwSize = sizeof(entry);
+    FARPROC proc = NULL;
+    if (Module32First(snapshot, &entry)) {
+        do {
+            if (!entry.hModule) continue;
+            proc = GetProcAddress(entry.hModule, name);
+            if (proc) break;
+        } while (Module32Next(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    return proc;
+}
+
+inline bool should_retry_wave_runtime_export_resolve(unsigned miss_count) noexcept {
+    return miss_count < 16u || (miss_count & (miss_count - 1u)) == 0u;
+}
+
+inline WaveValueNotifyFn exported_wave_value_notify_fn() noexcept {
+    static WaveValueNotifyFn fn = NULL;
+    static unsigned miss_count = 0;
+    if (!fn && should_retry_wave_runtime_export_resolve(miss_count++)) {
+        fn = reinterpret_cast<WaveValueNotifyFn>(resolve_wave_runtime_export("WaveTrace_wave_value_notify"));
+    }
+    return fn;
+}
+
+inline WaveArrayIndexNotifyFn exported_wave_array_index_notify_fn() noexcept {
+    static WaveArrayIndexNotifyFn fn = NULL;
+    static unsigned miss_count = 0;
+    if (!fn && should_retry_wave_runtime_export_resolve(miss_count++)) {
+        fn = reinterpret_cast<WaveArrayIndexNotifyFn>(resolve_wave_runtime_export("WaveTrace_wave_array_index_notify"));
+    }
+    return fn;
+}
+
+inline WaveArrayBulkNotifyFn exported_wave_array_bulk_notify_fn() noexcept {
+    static WaveArrayBulkNotifyFn fn = NULL;
+    static unsigned miss_count = 0;
+    if (!fn && should_retry_wave_runtime_export_resolve(miss_count++)) {
+        fn = reinterpret_cast<WaveArrayBulkNotifyFn>(resolve_wave_runtime_export("WaveTrace_wave_array_bulk_notify"));
+    }
+    return fn;
+}
+
+inline WaveArrayBulkNotifyEpochFn exported_wave_array_bulk_notify_epoch_fn() noexcept {
+    static WaveArrayBulkNotifyEpochFn fn = NULL;
+    static unsigned miss_count = 0;
+    if (!fn && should_retry_wave_runtime_export_resolve(miss_count++)) {
+        fn = reinterpret_cast<WaveArrayBulkNotifyEpochFn>(resolve_wave_runtime_export("WaveTrace_wave_array_bulk_notify_epoch"));
+    }
+    return fn;
+}
+#endif
 
 inline WaveValueNotifyFn& wave_value_notify_slot() noexcept {
     static WaveValueNotifyFn fn = NULL;
@@ -269,12 +397,76 @@ inline WaveArrayIndexNotifyFn& wave_array_index_notify_slot() noexcept {
     return fn;
 }
 
+inline WaveArrayBulkNotifyFn& wave_array_bulk_notify_slot() noexcept {
+    static WaveArrayBulkNotifyFn fn = NULL;
+    return fn;
+}
+
+inline WaveArrayBulkNotifyEpochFn& wave_array_bulk_notify_epoch_slot() noexcept {
+    static WaveArrayBulkNotifyEpochFn fn = NULL;
+    return fn;
+}
+
 inline void set_wave_value_notify_fn(WaveValueNotifyFn fn) noexcept {
     wave_value_notify_slot() = fn;
 }
 
 inline void set_wave_array_index_notify_fn(WaveArrayIndexNotifyFn fn) noexcept {
     wave_array_index_notify_slot() = fn;
+}
+
+inline void set_wave_array_bulk_notify_fn(WaveArrayBulkNotifyFn fn) noexcept {
+    wave_array_bulk_notify_slot() = fn;
+}
+
+inline void set_wave_array_bulk_notify_epoch_fn(WaveArrayBulkNotifyEpochFn fn) noexcept {
+    wave_array_bulk_notify_epoch_slot() = fn;
+}
+
+inline std::uint64_t current_wave_array_bulk_notify_epoch() noexcept {
+    WaveArrayBulkNotifyEpochFn fn = wave_array_bulk_notify_epoch_slot();
+    if (fn) return fn();
+#if defined(_WIN32)
+    fn = exported_wave_array_bulk_notify_epoch_fn();
+    if (fn) return fn();
+#endif
+    return 0;
+}
+
+inline bool wave_array_bulk_notify_seen_this_epoch(const void* first_element_address,
+                                                   const void* element_type_tag,
+                                                   std::size_t element_size,
+                                                   std::size_t element_count) noexcept {
+    const std::uint64_t epoch = current_wave_array_bulk_notify_epoch();
+    if (epoch == 0) return false;
+    try {
+        WaveArrayBulkNotifyDedupeTls& tls = wave_array_bulk_notify_dedupe_tls();
+        if (tls.epoch_token != epoch) {
+            tls.epoch_token = epoch;
+            tls.seen.clear();
+        }
+        const WaveArrayBulkNotifyKey key(first_element_address, element_type_tag, element_size, element_count);
+        return tls.seen.find(key) != tls.seen.end();
+    } catch (...) {
+        return false;
+    }
+}
+
+inline void remember_wave_array_bulk_notify_this_epoch(const void* first_element_address,
+                                                       const void* element_type_tag,
+                                                       std::size_t element_size,
+                                                       std::size_t element_count) noexcept {
+    const std::uint64_t epoch = current_wave_array_bulk_notify_epoch();
+    if (epoch == 0) return;
+    try {
+        WaveArrayBulkNotifyDedupeTls& tls = wave_array_bulk_notify_dedupe_tls();
+        if (tls.epoch_token != epoch) {
+            tls.epoch_token = epoch;
+            tls.seen.clear();
+        }
+        tls.seen.insert(WaveArrayBulkNotifyKey(first_element_address, element_type_tag, element_size, element_count));
+    } catch (...) {
+    }
 }
 
 template <typename T>
@@ -340,15 +532,92 @@ template <typename T> struct is_wave_ptr : std::false_type {};
 
 inline void notify_wave_value_write_address(const void* address) noexcept {
     detail::WaveValueNotifyFn fn = detail::wave_value_notify_slot();
+    if (fn) {
+        fn(address);
+        return;
+    }
+#if defined(_WIN32)
+    fn = detail::exported_wave_value_notify_fn();
     if (fn) fn(address);
+#endif
 }
 
 inline void notify_wave_array_index_access(std::size_t index,
                                            const void* element_address,
-                                           const void* element_type_tag,
-                                           std::size_t element_size) noexcept {
+                                            const void* element_type_tag,
+                                            std::size_t element_size) noexcept {
     detail::WaveArrayIndexNotifyFn fn = detail::wave_array_index_notify_slot();
+    if (fn) {
+        fn(index, element_address, element_type_tag, element_size);
+        return;
+    }
+#if defined(_WIN32)
+    fn = detail::exported_wave_array_index_notify_fn();
     if (fn) fn(index, element_address, element_type_tag, element_size);
+#endif
+}
+
+inline bool notify_wave_array_all_elements_access(const void* first_element_address,
+                                                  const void* element_type_tag,
+                                                  std::size_t element_size,
+                                                  std::size_t element_count) noexcept {
+    detail::WaveArrayBulkNotifyFn fn = detail::wave_array_bulk_notify_slot();
+    if (fn) {
+        if (detail::wave_array_bulk_notify_seen_this_epoch(first_element_address, element_type_tag, element_size, element_count)) return true;
+        if (fn(first_element_address, element_type_tag, element_size, element_count)) {
+            detail::remember_wave_array_bulk_notify_this_epoch(first_element_address, element_type_tag, element_size, element_count);
+            return true;
+        }
+        return false;
+    }
+#if defined(_WIN32)
+    fn = detail::exported_wave_array_bulk_notify_fn();
+    if (fn) {
+        if (detail::wave_array_bulk_notify_seen_this_epoch(first_element_address, element_type_tag, element_size, element_count)) return true;
+        if (fn(first_element_address, element_type_tag, element_size, element_count)) {
+            detail::remember_wave_array_bulk_notify_this_epoch(first_element_address, element_type_tag, element_size, element_count);
+            return true;
+        }
+        return false;
+    }
+#endif
+    return true;
+}
+
+inline void fail_wave_array_bulk_notify(const void* first_element_address,
+                                        const void* element_type_tag,
+                                        std::size_t element_size,
+                                        std::size_t element_count,
+                                        const char* element_type_name,
+                                        const char* function_signature,
+                                        const char* reason) noexcept {
+    if (FILE* fp = std::fopen("wave_runtime_error.log", "ab")) {
+        std::fprintf(fp,
+                     "[wave] fatal wave::array bulk dirty notify failed in reflect header "
+                     "reason=%s first=%p type_tag=%p element_size=%llu element_count=%llu "
+                     "element_type=%s caller=%s\n",
+                     reason ? reason : "unknown",
+                     first_element_address,
+                     element_type_tag,
+                     static_cast<unsigned long long>(element_size),
+                     static_cast<unsigned long long>(element_count),
+                     element_type_name ? element_type_name : "(unknown)",
+                     function_signature ? function_signature : "(unknown)");
+        std::fclose(fp);
+    }
+    std::fprintf(stderr,
+                 "[wave] fatal: wave::array bulk dirty notify failed "
+                 "reason=%s first=%p type_tag=%p element_size=%llu element_count=%llu "
+                 "element_type=%s caller=%s\n",
+                 reason ? reason : "unknown",
+                 first_element_address,
+                 element_type_tag,
+                 static_cast<unsigned long long>(element_size),
+                 static_cast<unsigned long long>(element_count),
+                 element_type_name ? element_type_name : "(unknown)",
+                 function_signature ? function_signature : "(unknown)");
+    std::fflush(stderr);
+    std::abort();
 }
 
 // WaveValue<T> is a size-preserving scalar wrapper for write-driven waveform
@@ -619,29 +888,51 @@ public:
 
     array() = default;
     array(const array& other) = default;
+    array(array&& other) noexcept(std::is_nothrow_move_constructible<std::array<T, N> >::value) = default;
     array(const std::array<T, N>& rhs) : storage_(rhs) {}
+    array(std::array<T, N>&& rhs) noexcept(std::is_nothrow_move_constructible<std::array<T, N> >::value)
+        : storage_(std::move(rhs)) {}
 
     array& operator=(const array& rhs) {
         if (this == std::addressof(rhs)) return *this;
-        for (size_type i = 0; i < N; ++i) {
-            (*this)[i] = rhs.storage_[i];
-        }
+        notify_all_elements_dirty_();
+        storage_ = rhs.storage_;
         return *this;
     }
 
     array& operator=(const std::array<T, N>& rhs) {
-        for (size_type i = 0; i < N; ++i) {
-            (*this)[i] = rhs[i];
-        }
+        notify_all_elements_dirty_();
+        storage_ = rhs;
         return *this;
     }
 
-    T& operator[](size_type i) noexcept {
+    array& operator=(array&& rhs) noexcept(noexcept(std::declval<std::array<T, N>&>() = std::declval<std::array<T, N>&&>())) {
+        if (this == std::addressof(rhs)) return *this;
+        notify_all_elements_dirty_();
+        storage_ = std::move(rhs.storage_);
+        return *this;
+    }
+
+    array& operator=(std::array<T, N>&& rhs) noexcept(noexcept(std::declval<std::array<T, N>&>() = std::declval<std::array<T, N>&&>())) {
+        notify_all_elements_dirty_();
+        storage_ = std::move(rhs);
+        return *this;
+    }
+
+    template <typename U = T>
+    typename std::enable_if<!detail::is_wave_array<U>::value, U&>::type
+    operator[](size_type i) noexcept {
         notify_wave_array_index_access(
             i,
             static_cast<const void*>(std::addressof(storage_[i])),
-            reflect::type_tag_of<T>(),
-            sizeof(T));
+            reflect::type_tag_of<U>(),
+            sizeof(U));
+        return storage_[i];
+    }
+
+    template <typename U = T>
+    typename std::enable_if<detail::is_wave_array<U>::value, U&>::type
+    operator[](size_type i) noexcept {
         return storage_[i];
     }
 
@@ -676,42 +967,37 @@ public:
     }
     const_iterator begin() const noexcept { return storage_.data(); }
     const_iterator cbegin() const noexcept { return storage_.data(); }
-    iterator end() noexcept {
-        notify_all_elements_dirty_();
-        return storage_.data() + N;
-    }
+    iterator end() noexcept { return storage_.data() + N; }
     const_iterator end() const noexcept { return storage_.data() + N; }
     const_iterator cend() const noexcept { return storage_.data() + N; }
 
-    reverse_iterator rbegin() noexcept { return reverse_iterator(end()); }
+    reverse_iterator rbegin() noexcept {
+        notify_all_elements_dirty_();
+        return reverse_iterator(storage_.data() + N);
+    }
     const_reverse_iterator rbegin() const noexcept { return const_reverse_iterator(end()); }
     const_reverse_iterator crbegin() const noexcept { return const_reverse_iterator(cend()); }
-    reverse_iterator rend() noexcept { return reverse_iterator(begin()); }
+    reverse_iterator rend() noexcept { return reverse_iterator(storage_.data()); }
     const_reverse_iterator rend() const noexcept { return const_reverse_iterator(begin()); }
     const_reverse_iterator crend() const noexcept { return const_reverse_iterator(cbegin()); }
 
     void fill(const T& value) {
-        for (size_type i = 0; i < N; ++i) {
-            (*this)[i] = value;
-        }
+        notify_all_elements_dirty_();
+        storage_.fill(value);
     }
 
     void swap(array& other) noexcept(noexcept(std::swap(std::declval<T&>(), std::declval<T&>()))) {
         if (this == std::addressof(other)) return;
-        using std::swap;
-        for (size_type i = 0; i < N; ++i) {
-            swap((*this)[i], other[i]);
-        }
+        notify_all_elements_dirty_();
+        other.notify_all_elements_dirty_();
+        storage_.swap(other.storage_);
     }
 
     array* operator&() noexcept {
         notify_all_elements_dirty_();
         return this;
     }
-    const array* operator&() const noexcept {
-        notify_all_elements_dirty_();
-        return this;
-    }
+    const array* operator&() const noexcept { return this; }
 
     operator const std::array<T, N>&() const noexcept {
         return storage_;
@@ -721,13 +1007,28 @@ public:
 
 private:
     void notify_all_elements_dirty_() const noexcept {
-        for (size_type i = 0; i < N; ++i) {
-            notify_wave_array_index_access(
-                i,
-                static_cast<const void*>(std::addressof(storage_[i])),
+        if (N == 0) return;
+        if (notify_wave_array_all_elements_access(
+                static_cast<const void*>(storage_.data()),
                 reflect::type_tag_of<T>(),
-                sizeof(T));
+                sizeof(T),
+                N)) {
+            return;
         }
+        fail_wave_array_bulk_notify(
+            static_cast<const void*>(storage_.data()),
+            reflect::type_tag_of<T>(),
+            sizeof(T),
+            N,
+            typeid(T).name(),
+#if defined(_MSC_VER)
+            __FUNCSIG__,
+#elif defined(__GNUC__) || defined(__clang__)
+            __PRETTY_FUNCTION__,
+#else
+            __func__,
+#endif
+            "notify callback unavailable or runtime mapping failed");
     }
 
     std::array<T, N> storage_;

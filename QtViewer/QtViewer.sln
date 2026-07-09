@@ -6,6 +6,10 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "QtViewer", "QtViewer.vcxpro
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_wvz4_raw_compare", "smoke_wvz4_raw_compare.vcxproj", "{BB2D0C1C-8B28-4E43-85A7-82D8521FA4C6}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_wvz4_dirty_array_parser", "smoke_wvz4_dirty_array_parser.vcxproj", "{4D64BC9C-84EA-4736-B941-D1F6C6948360}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_wvz4_dirty_peek_dynamic_parser", "smoke_wvz4_dirty_peek_dynamic_parser.vcxproj", "{9A06519D-0A21-43AF-B26A-C28FA1222276}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -20,6 +24,14 @@ Global
 		{BB2D0C1C-8B28-4E43-85A7-82D8521FA4C6}.Debug|x64.Build.0 = Debug|x64
 		{BB2D0C1C-8B28-4E43-85A7-82D8521FA4C6}.Release|x64.ActiveCfg = Release|x64
 		{BB2D0C1C-8B28-4E43-85A7-82D8521FA4C6}.Release|x64.Build.0 = Release|x64
+		{4D64BC9C-84EA-4736-B941-D1F6C6948360}.Debug|x64.ActiveCfg = Debug|x64
+		{4D64BC9C-84EA-4736-B941-D1F6C6948360}.Debug|x64.Build.0 = Debug|x64
+		{4D64BC9C-84EA-4736-B941-D1F6C6948360}.Release|x64.ActiveCfg = Release|x64
+		{4D64BC9C-84EA-4736-B941-D1F6C6948360}.Release|x64.Build.0 = Release|x64
+		{9A06519D-0A21-43AF-B26A-C28FA1222276}.Debug|x64.ActiveCfg = Debug|x64
+		{9A06519D-0A21-43AF-B26A-C28FA1222276}.Debug|x64.Build.0 = Debug|x64
+		{9A06519D-0A21-43AF-B26A-C28FA1222276}.Release|x64.ActiveCfg = Release|x64
+		{9A06519D-0A21-43AF-B26A-C28FA1222276}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

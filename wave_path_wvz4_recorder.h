@@ -31,6 +31,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -182,14 +183,10 @@ public:
                                   error,
                                   std::string(),
                                   cfg_.writer_process_connect_timeout_ms)) {
-            if (node_name_blob_.empty() && !layout.name_blob.empty()) {
-                if (cfg_.emit_default_clk && cfg_.default_clk_name.size() <= layout.name_blob.size()) {
-                    layout.name_blob.resize(layout.name_blob.size() - cfg_.default_clk_name.size());
-                }
-                node_name_blob_.swap(layout.name_blob);
-            }
+            restore_node_name_blob_for_log(layout);
             return false;
         }
+        restore_node_name_blob_for_log(layout);
         writer_opened_ = true;
         ensure_frame_work_capacity_prepared();
         return true;
@@ -402,9 +399,16 @@ public:
         const wave::TrackId frame_id = st.storage_track_id != 0 ? st.storage_track_id : ev.track_id;
         ensure_frame_capacity(frame_id);
         FrameSlot& slot = frame_slots_[static_cast<std::size_t>(frame_id)];
-        if (slot.has_sample) { set_error("WVZ4 recorder on_sample failed: duplicate storage sample in one cycle"); return; }
+        if (slot.has_sample) {
+            log_duplicate_storage_sample(ev, st, frame_id, slot);
+            set_error("WVZ4 recorder on_sample failed: duplicate storage sample in one cycle");
+            return;
+        }
         if (!append_update(st, ev, submission_work_)) return;
         slot.has_sample = true;
+        slot.first_track_id = ev.track_id;
+        slot.first_signature_valid = ev.has_change_bits;
+        slot.first_signature = ev.has_change_bits ? ev.change_bits : 0;
         current_sample_ids_.push_back(frame_id);
     }
 
@@ -439,6 +443,9 @@ private:
 
     struct FrameSlot {
         bool has_sample = false;
+        wave::TrackId first_track_id = 0;
+        bool first_signature_valid = false;
+        std::uint64_t first_signature = 0;
     };
 
     OpenConfig cfg_;
@@ -454,6 +461,7 @@ private:
 
     std::vector<NodeState> node_states_;       // id-indexed, id 0 unused
     std::string node_name_blob_;
+    std::string node_name_blob_log_;
     std::vector<TrackState> track_states_;     // track-id indexed
     std::vector<FrameSlot> frame_slots_;       // track-id indexed, touched slots cleared after each cycle
     std::vector<wvz4::u32> declared_node_ids_;
@@ -478,6 +486,7 @@ private:
         clear_frame_work();
         node_states_.clear();
         node_name_blob_.clear();
+        node_name_blob_log_.clear();
         track_states_.clear();
         frame_slots_.clear();
         declared_node_ids_.clear();
@@ -510,6 +519,15 @@ private:
         if (frame_slots_.size() <= index) frame_slots_.resize(index + 1);
     }
 
+    void restore_node_name_blob_for_log(wvz4::Layout& layout) {
+        if (!node_name_blob_log_.empty() || layout.name_blob.empty()) return;
+        std::string names = layout.name_blob;
+        if (cfg_.emit_default_clk && cfg_.default_clk_name.size() <= names.size()) {
+            names.resize(names.size() - cfg_.default_clk_name.size());
+        }
+        node_name_blob_log_.swap(names);
+    }
+
     void ensure_frame_work_capacity_prepared() {
         const std::size_t sample_capacity = frame_slots_.size();
 
@@ -530,10 +548,115 @@ private:
     void clear_frame_work() {
         for (std::size_t i = 0; i < current_sample_ids_.size(); ++i) {
             const std::size_t index = static_cast<std::size_t>(current_sample_ids_[i]);
-            if (index < frame_slots_.size()) frame_slots_[index].has_sample = false;
+            if (index < frame_slots_.size()) {
+                frame_slots_[index].has_sample = false;
+                frame_slots_[index].first_track_id = 0;
+                frame_slots_[index].first_signature_valid = false;
+                frame_slots_[index].first_signature = 0;
+            }
         }
         current_sample_ids_.clear();
         submission_work_.clear_updates();
+    }
+
+    std::string node_name_for_log(wvz4::u32 node_id) const {
+        if (node_id == 0 || node_id >= node_states_.size()) return std::string();
+        const NodeState& ns = node_states_[node_id];
+        if (!ns.declared) return std::string();
+        const std::size_t off = static_cast<std::size_t>(ns.name_offset);
+        const std::size_t size = static_cast<std::size_t>(ns.name_size);
+        const std::string& names = !node_name_blob_.empty() ? node_name_blob_ : node_name_blob_log_;
+        if (off > names.size() || size > names.size() - off) return std::string();
+        return names.substr(off, size);
+    }
+
+    std::string node_path_for_log(wvz4::u32 node_id) const {
+        if (node_id == 0) return std::string("(storage-only)");
+        std::vector<std::string> parts;
+        wvz4::u32 current = node_id;
+        for (std::size_t depth = 0; depth < 256 && current != 0; ++depth) {
+            if (current >= node_states_.size() || !node_states_[current].declared) {
+                break;
+            }
+            std::string name = node_name_for_log(current);
+            if (name.empty()) {
+                std::ostringstream os;
+                os << "(path unavailable: node_name_blob missing/corrupt, node=" << current << ")";
+                return os.str();
+            }
+            parts.push_back(name);
+            current = node_states_[current].parent_id;
+        }
+        if (parts.empty()) {
+            std::ostringstream os;
+            os << "(path unavailable: node=" << node_id << ")";
+            return os.str();
+        }
+        std::ostringstream os;
+        for (std::size_t i = parts.size(); i > 0; --i) {
+            if (i != parts.size()) os << '.';
+            os << parts[i - 1u];
+        }
+        return os.str();
+    }
+
+    void append_track_log(std::ostream& os, const char* label, wave::TrackId track_id) const {
+        os << label << " track=" << static_cast<unsigned long long>(track_id);
+        if (track_id == 0 || track_id >= track_states_.size() ||
+            !track_states_[static_cast<std::size_t>(track_id)].declared) {
+            os << " undeclared\n";
+            return;
+        }
+        const TrackState& ts = track_states_[static_cast<std::size_t>(track_id)];
+        os << " signal=" << static_cast<unsigned long long>(ts.signal_id)
+           << " storage_track=" << static_cast<unsigned long long>(ts.storage_track_id)
+           << " storage_signal=" << static_cast<unsigned long long>(ts.storage_signal_id)
+           << " node=" << static_cast<unsigned long long>(ts.node_id)
+           << " bit_offset=" << static_cast<unsigned long long>(ts.bit_offset)
+           << " bit_width=" << static_cast<unsigned long long>(ts.bit_width)
+           << " byte_width=" << static_cast<unsigned int>(ts.byte_width)
+           << " kind=" << static_cast<int>(ts.kind)
+           << " storage_only=" << (ts.storage_only ? 1 : 0)
+           << " path=" << node_path_for_log(ts.node_id)
+           << "\n";
+    }
+
+    void log_duplicate_storage_sample(const wave::TrackEvent& ev,
+                                      const TrackState& new_track,
+                                      wave::TrackId frame_id,
+                                      const FrameSlot& slot) const {
+        try {
+            std::ofstream os("wave_runtime_error.log", std::ios::out | std::ios::app);
+            if (!os.is_open()) return;
+            os << "[wave] WVZ4 duplicate storage sample"
+               << " cycle=" << static_cast<unsigned long long>(current_cycle_)
+               << " frame_storage_track=" << static_cast<unsigned long long>(frame_id)
+               << " new_track=" << static_cast<unsigned long long>(ev.track_id)
+               << " first_track=" << static_cast<unsigned long long>(slot.first_track_id)
+               << " first_signature_valid=" << (slot.first_signature_valid ? 1 : 0)
+               << " new_signature_valid=" << (ev.has_change_bits ? 1 : 0)
+               << " first_signature=" << static_cast<unsigned long long>(slot.first_signature)
+               << " new_signature=" << static_cast<unsigned long long>(ev.has_change_bits ? ev.change_bits : 0)
+               << " new_storage_track=" << static_cast<unsigned long long>(new_track.storage_track_id)
+               << " new_storage_signal=" << static_cast<unsigned long long>(new_track.storage_signal_id)
+               << "\n";
+            append_track_log(os, "  first", slot.first_track_id);
+            append_track_log(os, "  second", ev.track_id);
+            os << "  aliases_for_storage:\n";
+            std::size_t alias_count = 0;
+            for (std::size_t i = 1; i < track_states_.size(); ++i) {
+                const TrackState& ts = track_states_[i];
+                if (!ts.declared) continue;
+                const wave::TrackId sid = ts.storage_track_id != 0 ? ts.storage_track_id : static_cast<wave::TrackId>(i);
+                if (sid != frame_id) continue;
+                if (alias_count < 64u) {
+                    append_track_log(os, "    alias", static_cast<wave::TrackId>(i));
+                }
+                ++alias_count;
+            }
+            os << "  alias_count=" << static_cast<unsigned long long>(alias_count) << "\n";
+        } catch (...) {
+        }
     }
 
     bool submit_to_writer(const wvz4::CycleSubmission& submission, std::string& error) {
@@ -810,6 +933,7 @@ private:
             void commit() { active = false; }
         };
 
+        node_name_blob_log_ = node_name_blob_;
         layout.name_blob.swap(node_name_blob_);
         NameBlobMoveGuard name_blob_guard(node_name_blob_, layout.name_blob);
         layout.name_blob.reserve(layout.name_blob.size() + (cfg_.emit_default_clk ? cfg_.default_clk_name.size() : 0u));

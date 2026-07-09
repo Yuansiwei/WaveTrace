@@ -28,7 +28,9 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -70,6 +72,7 @@ static const u64 kLodResidualLevelMultiplier = 10;
 static const u32 kLodLevelCount = 7;
 static const u64 kLodMinRawTransitionsForTable = 4096;
 static const u64 kLodMaxRecordsToSourceRatio = 5; // one LOD level may keep at most 20% of its source records.
+static const u32 kWriterProcessProtocolVersion = 2;
 
 // Raw WDAT payload encoding flags. The outer WDAT section and block index remain
 // unchanged; these flags describe the uncompressed raw_payload inside each block.
@@ -369,6 +372,7 @@ struct WriterOptions {
     // Emit a sidecar text report at close. Empty path means <wvz4-file>.log.
     bool enable_stats_log = true;
     std::string stats_log_path;
+    std::string diagnostic_log_path; // empty unless a caller wants low-frequency init diagnostics
 
     // Optional initial capacity hints. They only reduce allocation; semantics unchanged.
     std::size_t transition_reserve_per_signal = 0;
@@ -853,6 +857,7 @@ public:
     }
 
     bool open(const std::string& path, Layout&& layout, const WriterOptions& options, std::string& error) {
+        const auto open_start = std::chrono::steady_clock::now();
         std::string close_error;
         if (!close(close_error)) {
             error = close_error.empty() ? "failed to close previous WVZ4 writer before reopen" : close_error;
@@ -877,26 +882,45 @@ public:
             error = "WVZ4 WriterOptions.signals_per_chunk must be > 0 when signal chunking is enabled";
             return false;
         }
+        auto phase_start = std::chrono::steady_clock::now();
         if (!validate_and_prepare_layout(std::move(layout), error)) return false;
+        {
+            std::ostringstream os;
+            os << "names=" << static_cast<unsigned long long>(layout_.names.size())
+               << " nodes=" << static_cast<unsigned long long>(layout_.nodes.size())
+               << " signals=" << static_cast<unsigned long long>(layout_.signals.size())
+               << " clocks=" << static_cast<unsigned long long>(layout_.clocks.size())
+               << " max_signal_id=" << static_cast<unsigned long long>(max_signal_id_);
+            writer_init_diag_log_("writer-validate-layout", phase_start, os.str());
+        }
 
+        phase_start = std::chrono::steady_clock::now();
         out_.open(path.c_str(), std::ios::binary | std::ios::trunc);
         if (!out_) {
             error = "failed to open output file: " + path;
             reset_all();
             return false;
         }
+        writer_init_diag_log_("writer-open-file", phase_start);
         opened_ = true;
         current_block_start_ = 0;
         current_cycle_ = 0;
         next_block_id_ = 0;
         footer_offset_ = 0;
 
+        phase_start = std::chrono::steady_clock::now();
         if (!write_file_header(error)) { if (out_.is_open()) out_.close(); reset_all(); return false; }
+        writer_init_diag_log_("writer-file-header", phase_start);
+        phase_start = std::chrono::steady_clock::now();
         if (!write_layout_sections(layout_, error)) { if (out_.is_open()) out_.close(); reset_all(); return false; }
+        writer_init_diag_log_("writer-layout-sections", phase_start);
 
         if (options_.enable_block_pipeline) {
+            phase_start = std::chrono::steady_clock::now();
             start_block_pipeline();
+            writer_init_diag_log_("writer-start-block-pipeline", phase_start);
         }
+        writer_init_diag_log_("writer-open-total", open_start);
         return true;
     }
 
@@ -1815,6 +1839,206 @@ private:
         next_residual_finalize_cycle_ = (std::numeric_limits<i64>::max)();
     }
 
+    void finish_layout_validation_common_() {
+        const u32 chunk_count = options_.enable_signal_chunking
+            ? ((max_signal_id_ + options_.signals_per_chunk - 1u) / options_.signals_per_chunk)
+            : 1u;
+        current_block_shared_times_by_chunk_.clear();
+        current_block_shared_times_by_chunk_.resize(chunk_count == 0 ? 1u : chunk_count);
+        if (options_.enable_lod_tables) {
+            initialize_lod_storage();
+        } else {
+            initialize_lod_bucket_cycles();
+            lod_states_.clear();
+        }
+    }
+
+    bool try_validate_and_prepare_dense_self_storage_layout_(std::string& error) {
+        error.clear();
+        if (layout_.names.empty() || layout_.nodes.empty() || layout_.signals.empty()) return false;
+        if (layout_.names.size() > static_cast<std::size_t>((std::numeric_limits<u32>::max)()) ||
+            layout_.nodes.size() > static_cast<std::size_t>((std::numeric_limits<u32>::max)()) ||
+            layout_.signals.size() > static_cast<std::size_t>((std::numeric_limits<u32>::max)())) {
+            return false;
+        }
+
+        const u32 name_count = static_cast<u32>(layout_.names.size());
+        const u32 node_count = static_cast<u32>(layout_.nodes.size());
+        const u32 signal_count = static_cast<u32>(layout_.signals.size());
+
+        for (std::size_t i = 0; i < layout_.names.size(); ++i) {
+            const NameRecord& r = layout_.names[i];
+            if (r.name_id != static_cast<u32>(i + 1u)) return false;
+            if (!layout_name_range_valid(layout_, r)) {
+                error = detail::make_error("NameRecord.name must not be empty or out of range for name_id: ", r.name_id);
+                return false;
+            }
+        }
+
+        std::vector<u32> node_parent(static_cast<std::size_t>(node_count) + 1u, 0);
+        std::vector<u32> node_first_child(static_cast<std::size_t>(node_count) + 1u, 0);
+        std::vector<u32> node_next_sibling(static_cast<std::size_t>(node_count) + 1u, 0);
+        std::vector<NodeKind> node_kind(static_cast<std::size_t>(node_count) + 1u, NodeKind::Object);
+        std::vector<u32> child_count(static_cast<std::size_t>(node_count) + 1u, 0);
+        for (std::size_t i = 0; i < layout_.nodes.size(); ++i) {
+            const NodeRecord& r = layout_.nodes[i];
+            if (r.node_id != static_cast<u32>(i + 1u)) return false;
+            if (r.name_id == 0 || r.name_id > name_count) {
+                error = detail::make_error("NodeRecord references missing name_id: ", r.name_id);
+                return false;
+            }
+            if (!detail::is_valid_node_kind(r.kind)) {
+                error = detail::make_error("invalid NodeKind for node_id: ", r.node_id);
+                return false;
+            }
+            if (r.parent_id > node_count) {
+                error = detail::make_error("NodeRecord references missing parent_id: ", r.parent_id);
+                return false;
+            }
+            if (r.first_child > node_count) {
+                error = detail::make_error("NodeRecord references missing first_child: ", r.first_child);
+                return false;
+            }
+            if (r.next_sibling > node_count) {
+                error = detail::make_error("NodeRecord references missing next_sibling: ", r.next_sibling);
+                return false;
+            }
+            node_parent[r.node_id] = r.parent_id;
+            node_first_child[r.node_id] = r.first_child;
+            node_next_sibling[r.node_id] = r.next_sibling;
+            node_kind[r.node_id] = r.kind;
+            if (r.parent_id != 0) ++child_count[r.parent_id];
+        }
+        for (std::size_t i = 0; i < layout_.nodes.size(); ++i) {
+            const NodeRecord& r = layout_.nodes[i];
+            if (r.next_sibling != 0 && node_parent[r.next_sibling] != r.parent_id) {
+                error = detail::make_error("next_sibling has different parent_id for node_id: ", r.node_id);
+                return false;
+            }
+        }
+        std::vector<u32> visit_stamp(static_cast<std::size_t>(node_count) + 1u, 0);
+        u32 stamp = 1;
+        for (std::size_t i = 0; i < layout_.nodes.size(); ++i) {
+            const NodeRecord& parent = layout_.nodes[i];
+            u32 count = 0;
+            for (u32 child = parent.first_child; child != 0; child = node_next_sibling[child]) {
+                if (node_parent[child] != parent.node_id) {
+                    error = detail::make_error("child chain node has wrong parent_id: ", child);
+                    return false;
+                }
+                if (visit_stamp[child] == stamp) {
+                    error = detail::make_error("cycle in child sibling chain under node_id: ", parent.node_id);
+                    return false;
+                }
+                visit_stamp[child] = stamp;
+                ++count;
+            }
+            if (count != child_count[parent.node_id]) {
+                error = detail::make_error("child chain does not enumerate all children for node_id: ", parent.node_id);
+                return false;
+            }
+            ++stamp;
+            if (stamp == 0) { std::fill(visit_stamp.begin(), visit_stamp.end(), 0); stamp = 1; }
+        }
+
+        max_signal_id_ = signal_count;
+        signal_states_.clear();
+        signal_states_.resize(static_cast<std::size_t>(signal_count) + 1u);
+        signal_order_.clear();
+        signal_order_.resize(layout_.signals.size());
+        for (std::size_t i = 0; i < layout_.signals.size(); ++i) {
+            SignalDefinition s = layout_.signals[i];
+            if (s.signal_id != static_cast<u32>(i + 1u)) return false;
+            if (s.storage_id != 0 && s.storage_id != s.signal_id) return false;
+            s.storage_id = s.signal_id;
+            if (s.storage_only) {
+                if (s.node_id != 0) {
+                    error = detail::make_error("storage-only SignalDefinition must not reference a node_id: ", s.signal_id);
+                    return false;
+                }
+                if (s.bit_offset != 0) {
+                    error = detail::make_error("storage-only SignalDefinition bit_offset must be zero for signal_id: ", s.signal_id);
+                    return false;
+                }
+            } else {
+                if (s.node_id == 0 || s.node_id > node_count) {
+                    error = detail::make_error("SignalDefinition references missing node_id: ", s.node_id);
+                    return false;
+                }
+                if (node_first_child[s.node_id] != 0) {
+                    error = detail::make_error("SignalDefinition node_id must be a leaf node: ", s.node_id);
+                    return false;
+                }
+                if (node_kind[s.node_id] != NodeKind::SignalLeaf) {
+                    error = detail::make_error("SignalDefinition node_id must reference a SignalLeaf node: ", s.node_id);
+                    return false;
+                }
+            }
+            if (!detail::is_valid_radix(s.radix)) {
+                error = detail::make_error("invalid Radix for signal_id: ", s.signal_id);
+                return false;
+            }
+            if (s.bit_width == 0 || s.bit_width > 64) {
+                error = detail::make_error("WVZ4 signal bit_width must be 1..64 for signal_id: ", s.signal_id);
+                return false;
+            }
+            u8 bytes = 0;
+            if (!detail::value_type_byte_width(s.type, bytes)) {
+                error = detail::make_error("invalid ValueType for signal_id: ", s.signal_id);
+                return false;
+            }
+            if (s.bit_width > static_cast<u32>(bytes) * 8u) {
+                error = detail::make_error("signal bit_width exceeds ValueType capacity for signal_id: ", s.signal_id);
+                return false;
+            }
+            if (s.bit_offset >= 64u || s.bit_offset + s.bit_width > 64u || s.bit_offset + s.bit_width < s.bit_width) {
+                error = detail::make_error("SignalDefinition bit range is invalid for signal_id: ", s.signal_id);
+                return false;
+            }
+            SignalState st;
+            st.valid = true;
+            st.def = s;
+            st.byte_width_bytes = bytes;
+            st.has_current = false;
+            st.current.byte_count = bytes;
+            st.current.bytes.fill(0);
+            if (options_.transition_reserve_per_signal > 0) st.transitions.reserve(options_.transition_reserve_per_signal);
+            signal_states_[s.signal_id] = st;
+            signal_order_[i] = s.signal_id;
+        }
+
+        std::vector<u8> seen_clocks(static_cast<std::size_t>(signal_count) + 1u, 0);
+        for (std::size_t i = 0; i < layout_.clocks.size(); ++i) {
+            const ClockDefinition& c = layout_.clocks[i];
+            if (c.signal_id == 0 || c.signal_id > signal_count) {
+                error = detail::make_error("ClockDefinition references missing signal_id: ", c.signal_id);
+                return false;
+            }
+            if (seen_clocks[c.signal_id]) {
+                error = detail::make_error("duplicate ClockDefinition signal_id: ", c.signal_id);
+                return false;
+            }
+            if (c.period_ticks == 0) {
+                error = detail::make_error("ClockDefinition.period_ticks must be positive for signal_id: ", c.signal_id);
+                return false;
+            }
+            SignalState& st = signal_states_[c.signal_id];
+            if (st.def.type != ValueType::Bool || st.def.bit_width != 1u) {
+                error = detail::make_error("ClockDefinition must reference a 1-bit Bool signal_id: ", c.signal_id);
+                return false;
+            }
+            st.is_periodic_clock = true;
+            st.has_current = true;
+            st.current.byte_count = 1;
+            st.current.bytes.fill(0);
+            st.current.bytes[0] = c.initial_value ? 1u : 0u;
+            seen_clocks[c.signal_id] = 1;
+        }
+
+        finish_layout_validation_common_();
+        return true;
+    }
+
     void update_lod_tables(u32 storage_id, const Transition& transition) {
         if (!options_.enable_lod_tables) return;
         if (transition.cycle < 0 || storage_id >= lod_states_.size()) return;
@@ -1855,6 +2079,9 @@ private:
         if (layout_.names.empty()) { error = "WVZ4 layout requires a non-empty NameTable"; return false; }
         if (layout_.nodes.empty()) { error = "WVZ4 layout requires a non-empty NodeTable"; return false; }
         if (layout_.signals.empty()) { error = "WVZ4 layout requires a non-empty SignalTable"; return false; }
+
+        if (try_validate_and_prepare_dense_self_storage_layout_(error)) return true;
+        if (!error.empty()) return false;
 
         u32 max_name_id = 0, max_node_id = 0, max_signal_id = 0;
         for (std::size_t i = 0; i < layout_.names.size(); ++i) max_name_id = (std::max)(max_name_id, layout_.names[i].name_id);
@@ -1950,6 +2177,8 @@ private:
         signal_order_.reserve(layout_.signals.size());
         std::vector<u8> seen_signals(max_signal_id + 1, 0);
         std::vector<u8> seen_storages(max_signal_id + 1, 0);
+        bool signal_order_sorted = true;
+        u32 last_storage_id = 0;
         for (std::size_t i = 0; i < layout_.signals.size(); ++i) {
             SignalDefinition s = layout_.signals[i];
             if (s.storage_id == 0) s.storage_id = s.signal_id;
@@ -2009,6 +2238,8 @@ private:
                 if (options_.transition_reserve_per_signal > 0) st.transitions.reserve(options_.transition_reserve_per_signal);
                 signal_states_[s.storage_id] = st;
                 signal_order_.push_back(s.storage_id);
+                if (s.storage_id < last_storage_id) signal_order_sorted = false;
+                last_storage_id = s.storage_id;
                 seen_storages[s.storage_id] = 1;
             } else {
                 const SignalState& existing = signal_states_[s.storage_id];
@@ -2052,23 +2283,40 @@ private:
             seen_clocks[c.signal_id] = 1;
         }
 
-        std::sort(signal_order_.begin(), signal_order_.end());
+        if (!signal_order_sorted) {
+            std::sort(signal_order_.begin(), signal_order_.end());
+        }
 
         // One shared-time vector per signal chunk for the current time block.
         // These vectors are maintained incrementally in submit_cycle(), so
         // commit_block() no longer needs to rescan all transitions and sort.
-        const u32 chunk_count = options_.enable_signal_chunking
-            ? ((max_signal_id_ + options_.signals_per_chunk - 1u) / options_.signals_per_chunk)
-            : 1u;
-        current_block_shared_times_by_chunk_.clear();
-        current_block_shared_times_by_chunk_.resize(chunk_count == 0 ? 1u : chunk_count);
-        if (options_.enable_lod_tables) {
-            initialize_lod_storage();
-        } else {
-            initialize_lod_bucket_cycles();
-            lod_states_.clear();
-        }
+        finish_layout_validation_common_();
         return true;
+    }
+
+    void writer_init_diag_log_(const char* phase,
+                               std::chrono::steady_clock::time_point start,
+                               const std::string& extra = std::string()) const {
+        if (options_.diagnostic_log_path.empty()) return;
+        std::ofstream f(options_.diagnostic_log_path.c_str(), std::ios::out | std::ios::app);
+        if (!f) return;
+#if defined(_WIN32)
+        f << "[pid=" << static_cast<unsigned long>(GetCurrentProcessId()) << "] ";
+#endif
+        f << phase << " ms="
+          << std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - start).count();
+        if (!extra.empty()) f << " " << extra;
+        f << "\n";
+    }
+
+    void writer_init_diag_log_bytes_(const char* phase,
+                                     std::chrono::steady_clock::time_point start,
+                                     u64 payload_bytes) const {
+        if (options_.diagnostic_log_path.empty()) return;
+        std::ostringstream os;
+        os << "payload_bytes=" << static_cast<unsigned long long>(payload_bytes);
+        writer_init_diag_log_(phase, start, os.str());
     }
 
     bool write_file_header(std::string& error) {
@@ -2162,6 +2410,213 @@ private:
         return write_section(raw_tag, raw_payload, error);
     }
 
+    struct EncodedLayoutSection {
+        std::array<char, 4> tag;
+        std::vector<u8> payload;
+        u64 raw_payload_bytes = 0;
+        u64 stored_payload_bytes = 0;
+        u64 compressed_payload_bytes = 0;
+        bool used_zstd = false;
+
+        EncodedLayoutSection() : tag{{0, 0, 0, 0}} {}
+    };
+
+    static std::array<char, 4> make_layout_section_tag_(const char tag[4]) {
+        std::array<char, 4> out;
+        out[0] = tag[0];
+        out[1] = tag[1];
+        out[2] = tag[2];
+        out[3] = tag[3];
+        return out;
+    }
+
+    bool encode_layout_section_payload_(const char raw_tag[4], const char zstd_tag[4],
+                                        std::vector<u8>& raw_payload,
+                                        EncodedLayoutSection& out,
+                                        std::string& error) const {
+        out = EncodedLayoutSection();
+        out.raw_payload_bytes = static_cast<u64>(raw_payload.size());
+        if (options_.compression != Compression::Zstd || raw_payload.empty()) {
+            out.tag = make_layout_section_tag_(raw_tag);
+            out.payload.swap(raw_payload);
+            out.stored_payload_bytes = static_cast<u64>(out.payload.size());
+            return true;
+        }
+
+        std::vector<u8> compressed;
+        if (!compress_payload_zstd(raw_payload, compressed, error)) return false;
+        std::vector<u8> zpayload;
+        zpayload.reserve(1 + 10 + 10 + compressed.size());
+        detail::append_u8(zpayload, static_cast<u8>(Compression::Zstd));
+        detail::append_varuint(zpayload, static_cast<u64>(raw_payload.size()));
+        detail::append_varuint(zpayload, static_cast<u64>(compressed.size()));
+        detail::append_vector_bytes(zpayload, compressed);
+        if (zpayload.size() < raw_payload.size()) {
+            out.tag = make_layout_section_tag_(zstd_tag);
+            out.compressed_payload_bytes = static_cast<u64>(compressed.size());
+            out.payload.swap(zpayload);
+            out.used_zstd = true;
+        } else {
+            out.tag = make_layout_section_tag_(raw_tag);
+            out.payload.swap(raw_payload);
+            out.used_zstd = false;
+        }
+        out.stored_payload_bytes = static_cast<u64>(out.payload.size());
+        return true;
+    }
+
+    bool write_encoded_layout_section_(const EncodedLayoutSection& section, std::string& error) {
+        return write_section(section.tag.data(), section.payload, error);
+    }
+
+    class BufferedSectionWriter {
+    public:
+        explicit BufferedSectionWriter(std::ofstream& out)
+            : out_(out), bytes_written_(0) {
+            buffer_.reserve(4u * 1024u * 1024u);
+        }
+
+        bool append_u8(u8 v, std::string& error) {
+            if (!ensure_room(1u, error)) return false;
+            buffer_.push_back(v);
+            ++bytes_written_;
+            return true;
+        }
+
+        bool append_varuint(u64 v, std::string& error) {
+            if (!ensure_room(10u, error)) return false;
+            if (v < 0x80u) {
+                buffer_.push_back(static_cast<u8>(v));
+                ++bytes_written_;
+                return true;
+            }
+            if (v < 0x4000u) {
+                buffer_.push_back(static_cast<u8>((v & 0x7fu) | 0x80u));
+                buffer_.push_back(static_cast<u8>(v >> 7));
+                bytes_written_ += 2u;
+                return true;
+            }
+            do {
+                u8 b = static_cast<u8>(v & 0x7fu);
+                v >>= 7;
+                if (v != 0) b = static_cast<u8>(b | 0x80u);
+                buffer_.push_back(b);
+                ++bytes_written_;
+            } while (v != 0);
+            return true;
+        }
+
+        bool ensure_room(std::size_t bytes, std::string& error) {
+            if (buffer_.capacity() - buffer_.size() >= bytes) return true;
+            if (!flush(error)) return false;
+            if (buffer_.capacity() < bytes) {
+                try {
+                    buffer_.reserve(bytes);
+                } catch (const std::exception& e) {
+                    error = std::string("failed to reserve layout stream buffer: ") + e.what();
+                    return false;
+                } catch (...) {
+                    error = "failed to reserve layout stream buffer";
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool append_string_bytes(const char* data, std::size_t size, std::string& error) {
+            if (!append_varuint(static_cast<u64>(size), error)) return false;
+            return append_bytes(data, size, error);
+        }
+
+        bool append_bytes(const void* data, std::size_t size, std::string& error) {
+            if (size == 0) return true;
+            const u8* p = static_cast<const u8*>(data);
+            bytes_written_ += static_cast<u64>(size);
+
+            if (size >= buffer_.capacity()) {
+                if (!flush(error)) return false;
+                if (!detail::write_all(out_, p, size)) {
+                    error = "failed to stream layout section payload";
+                    return false;
+                }
+                return true;
+            }
+
+            if (buffer_.size() + size > buffer_.capacity() && !flush(error)) return false;
+            const std::size_t old = buffer_.size();
+            buffer_.resize(old + size);
+            std::memcpy(buffer_.data() + old, p, size);
+            return true;
+        }
+
+        bool flush(std::string& error) {
+            if (buffer_.empty()) return true;
+            if (!detail::write_all(out_, buffer_.data(), buffer_.size())) {
+                error = "failed to flush layout section payload";
+                return false;
+            }
+            buffer_.clear();
+            return true;
+        }
+
+        u64 bytes_written() const { return bytes_written_; }
+
+    private:
+        std::ofstream& out_;
+        std::vector<u8> buffer_;
+        u64 bytes_written_;
+    };
+
+    template <typename WriteFn>
+    bool write_streamed_layout_section(const char tag[4],
+                                       const char* phase,
+                                       WriteFn write_fn,
+                                       std::string& error) {
+        const auto phase_start = std::chrono::steady_clock::now();
+        const std::streampos section_start = out_.tellp();
+        if (section_start == std::streampos(-1)) {
+            error = "failed to query layout section file position";
+            return false;
+        }
+        if (!detail::write_all(out_, tag, 4)) {
+            error = "failed to write streamed section tag";
+            return false;
+        }
+        if (!detail::write_u64(out_, 0)) {
+            error = "failed to write streamed section length placeholder";
+            return false;
+        }
+
+        BufferedSectionWriter writer(out_);
+        if (!write_fn(writer, error)) return false;
+        if (!writer.flush(error)) return false;
+
+        const u64 payload_size = writer.bytes_written();
+        const std::streampos section_end = out_.tellp();
+        if (section_end == std::streampos(-1)) {
+            error = "failed to query streamed section end position";
+            return false;
+        }
+        out_.seekp(section_start + static_cast<std::streamoff>(4));
+        if (!out_) {
+            error = "failed to seek streamed section length";
+            return false;
+        }
+        if (!detail::write_u64(out_, payload_size)) {
+            error = "failed to patch streamed section length";
+            return false;
+        }
+        out_.seekp(section_end);
+        if (!out_) {
+            error = "failed to restore streamed section file position";
+            return false;
+        }
+
+        record_section_stats(tag, payload_size);
+        writer_init_diag_log_bytes_(phase, phase_start, payload_size);
+        return true;
+    }
+
     static bool names_sorted_by_id(const std::vector<NameRecord>& records) {
         for (std::size_t i = 1; i < records.size(); ++i) {
             if (records[i - 1u].name_id > records[i].name_id) return false;
@@ -2190,8 +2645,8 @@ private:
         return true;
     }
 
-    bool write_layout_sections(const Layout& layout, std::string& error) {
-        std::vector<u8> payload;
+    static void build_name_layout_payload(const Layout& layout, std::vector<u8>& payload) {
+        payload.clear();
         const std::size_t name_bytes = layout.name_blob.empty()
             ? 0u
             : layout.name_blob.size();
@@ -2209,8 +2664,9 @@ private:
             detail::append_varuint(payload, r.name_id);
             detail::append_string_bytes(payload, layout_name_data(layout, r), layout_name_size(layout, r));
         }
-        if (!write_layout_section("NAME", "NAMZ", payload, error)) return false;
+    }
 
+    static void build_node_layout_payload(const Layout& layout, std::vector<u8>& payload) {
         payload.clear();
         payload.reserve(layout.nodes.size() * 20);
         detail::append_varuint(payload, static_cast<u64>(layout.nodes.size()));
@@ -2230,8 +2686,9 @@ private:
             detail::append_varuint(payload, n.first_child);
             detail::append_varuint(payload, n.next_sibling);
         }
-        if (!write_layout_section("NODE", "NODZ", payload, error)) return false;
+    }
 
+    static void build_signal_layout_payload(const Layout& layout, std::vector<u8>& payload) {
         payload.clear();
         payload.reserve(layout.signals.size() * 20);
         detail::append_varuint(payload, static_cast<u64>(layout.signals.size()));
@@ -2253,8 +2710,9 @@ private:
             detail::append_varuint(payload, s.bit_offset);
             detail::append_u8(payload, s.storage_only ? kSignalFlagStorageOnly : 0u);
         }
-        if (!write_layout_section("SIGT", "SIGZ", payload, error)) return false;
+    }
 
+    static void build_clock_layout_payload(const Layout& layout, std::vector<u8>& payload) {
         payload.clear();
         detail::append_varuint(payload, static_cast<u64>(layout.clocks.size()));
         std::vector<ClockDefinition> sorted_clocks;
@@ -2270,10 +2728,401 @@ private:
             detail::append_u8(payload, c.initial_value ? 1u : 0u);
             detail::append_varuint(payload, c.period_ticks);
         }
-        stats_.clock_count = static_cast<u64>(clocks->size());
+    }
+
+    bool should_stream_layout_sections_(const Layout& layout) const {
+        if (options_.compression != Compression::None) return false;
+        if (!names_sorted_by_id(layout.names) ||
+            !nodes_sorted_by_id(layout.nodes) ||
+            !signals_sorted_by_id(layout.signals) ||
+            !clocks_sorted_by_id(layout.clocks)) {
+            return false;
+        }
+        const u64 record_count =
+            static_cast<u64>(layout.names.size()) +
+            static_cast<u64>(layout.nodes.size()) +
+            static_cast<u64>(layout.signals.size()) +
+            static_cast<u64>(layout.clocks.size());
+        return record_count >= 1000000ull;
+    }
+
+    bool stream_name_layout_section_(const Layout& layout, std::string& error) {
+        return write_streamed_layout_section("NAME", "writer-layout-stream-NAME",
+            [&](BufferedSectionWriter& writer, std::string& local_error) -> bool {
+                if (!writer.append_varuint(static_cast<u64>(layout.names.size()), local_error)) return false;
+                for (std::size_t i = 0; i < layout.names.size(); ++i) {
+                    const NameRecord& r = layout.names[i];
+                    if (!writer.append_varuint(r.name_id, local_error)) return false;
+                    if (!writer.append_string_bytes(layout_name_data(layout, r), layout_name_size(layout, r), local_error)) return false;
+                }
+                return true;
+            }, error);
+    }
+
+    bool stream_node_layout_section_(const Layout& layout, std::string& error) {
+        return write_streamed_layout_section("NODE", "writer-layout-stream-NODE",
+            [&](BufferedSectionWriter& writer, std::string& local_error) -> bool {
+                if (!writer.append_varuint(static_cast<u64>(layout.nodes.size()), local_error)) return false;
+                for (std::size_t i = 0; i < layout.nodes.size(); ++i) {
+                    const NodeRecord& n = layout.nodes[i];
+                    if (!writer.append_varuint(n.node_id, local_error)) return false;
+                    if (!writer.append_varuint(n.parent_id, local_error)) return false;
+                    if (!writer.append_varuint(n.name_id, local_error)) return false;
+                    if (!writer.append_u8(static_cast<u8>(n.kind), local_error)) return false;
+                    if (!writer.append_varuint(n.first_child, local_error)) return false;
+                    if (!writer.append_varuint(n.next_sibling, local_error)) return false;
+                }
+                return true;
+            }, error);
+    }
+
+    bool stream_signal_layout_section_(const Layout& layout, std::string& error) {
+        return write_streamed_layout_section("SIGT", "writer-layout-stream-SIGT",
+            [&](BufferedSectionWriter& writer, std::string& local_error) -> bool {
+                if (!writer.append_varuint(static_cast<u64>(layout.signals.size()), local_error)) return false;
+                for (std::size_t i = 0; i < layout.signals.size(); ++i) {
+                    const SignalDefinition& s = layout.signals[i];
+                    if (!writer.append_varuint(s.signal_id, local_error)) return false;
+                    if (!writer.append_varuint(s.storage_id != 0 ? s.storage_id : s.signal_id, local_error)) return false;
+                    if (!writer.append_varuint(s.node_id, local_error)) return false;
+                    if (!writer.append_u8(static_cast<u8>(s.type), local_error)) return false;
+                    if (!writer.append_varuint(s.bit_width, local_error)) return false;
+                    if (!writer.append_u8(static_cast<u8>(s.radix), local_error)) return false;
+                    if (!writer.append_varuint(s.bit_offset, local_error)) return false;
+                    if (!writer.append_u8(s.storage_only ? kSignalFlagStorageOnly : 0u, local_error)) return false;
+                }
+                return true;
+            }, error);
+    }
+
+    bool stream_clock_layout_section_(const Layout& layout, std::string& error) {
+        return write_streamed_layout_section("CLKD", "writer-layout-stream-CLKD",
+            [&](BufferedSectionWriter& writer, std::string& local_error) -> bool {
+                if (!writer.append_varuint(static_cast<u64>(layout.clocks.size()), local_error)) return false;
+                for (std::size_t i = 0; i < layout.clocks.size(); ++i) {
+                    const ClockDefinition& c = layout.clocks[i];
+                    if (!writer.append_varuint(c.signal_id, local_error)) return false;
+                    if (!writer.append_u8(c.initial_value ? 1u : 0u, local_error)) return false;
+                    if (!writer.append_varuint(c.period_ticks, local_error)) return false;
+                }
+                return true;
+            }, error);
+    }
+
+    bool write_layout_sections_streamed_(const Layout& layout, std::string& error) {
+        const auto total_start = std::chrono::steady_clock::now();
+        if (!stream_name_layout_section_(layout, error)) return false;
+        if (!stream_node_layout_section_(layout, error)) return false;
+        if (!stream_signal_layout_section_(layout, error)) return false;
+        stats_.clock_count = static_cast<u64>(layout.clocks.size());
+        stats_.clock_section_payload_bytes = static_cast<u64>(detail::varuint_size(static_cast<u64>(layout.clocks.size())));
+        for (std::size_t i = 0; i < layout.clocks.size(); ++i) {
+            stats_.clock_section_payload_bytes += static_cast<u64>(detail::varuint_size(layout.clocks[i].signal_id));
+            stats_.clock_section_payload_bytes += 1u;
+            stats_.clock_section_payload_bytes += static_cast<u64>(detail::varuint_size(layout.clocks[i].period_ticks));
+        }
+        if (!layout.clocks.empty()) {
+            if (!stream_clock_layout_section_(layout, error)) return false;
+        }
+        writer_init_diag_log_("writer-layout-stream-total", total_start);
+        return true;
+    }
+
+    bool should_parallel_build_layout_sections_(const Layout& layout) const {
+        if (options_.compression != Compression::None) return false;
+        const u64 record_count =
+            static_cast<u64>(layout.names.size()) +
+            static_cast<u64>(layout.nodes.size()) +
+            static_cast<u64>(layout.signals.size()) +
+            static_cast<u64>(layout.clocks.size());
+        if (record_count < 1000000ull) return false;
+        return std::thread::hardware_concurrency() > 1u;
+    }
+
+    bool should_parallel_compress_layout_sections_(const Layout& layout) const {
+        if (options_.compression != Compression::Zstd) return false;
+        const u64 record_count =
+            static_cast<u64>(layout.names.size()) +
+            static_cast<u64>(layout.nodes.size()) +
+            static_cast<u64>(layout.signals.size()) +
+            static_cast<u64>(layout.clocks.size());
+        if (record_count < 1000000ull) return false;
+        return std::thread::hardware_concurrency() > 1u;
+    }
+
+    static void set_layout_thread_error_(std::mutex& mutex,
+                                         std::string& error,
+                                         const char* section,
+                                         const char* message) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!error.empty()) return;
+        error = "WVZ4 layout ";
+        error += section ? section : "?";
+        error += " payload build failed";
+        if (message && message[0]) {
+            error += ": ";
+            error += message;
+        }
+    }
+
+    bool write_layout_sections_parallel_build_(const Layout& layout, std::string& error) {
+        const auto total_start = std::chrono::steady_clock::now();
+        std::vector<u8> name_payload;
+        std::vector<u8> node_payload;
+        std::vector<u8> signal_payload;
+        std::vector<u8> clock_payload;
+        std::mutex thread_error_mutex;
+        std::string thread_error;
+
+        auto phase_start = std::chrono::steady_clock::now();
+        std::thread node_thread([&]() {
+            try {
+                build_node_layout_payload(layout, node_payload);
+            } catch (const std::exception& e) {
+                set_layout_thread_error_(thread_error_mutex, thread_error, "NODE", e.what());
+            } catch (...) {
+                set_layout_thread_error_(thread_error_mutex, thread_error, "NODE", "unknown exception");
+            }
+        });
+        std::thread signal_thread([&]() {
+            try {
+                build_signal_layout_payload(layout, signal_payload);
+            } catch (const std::exception& e) {
+                set_layout_thread_error_(thread_error_mutex, thread_error, "SIGT", e.what());
+            } catch (...) {
+                set_layout_thread_error_(thread_error_mutex, thread_error, "SIGT", "unknown exception");
+            }
+        });
+
+        try {
+            build_name_layout_payload(layout, name_payload);
+        } catch (const std::exception& e) {
+            set_layout_thread_error_(thread_error_mutex, thread_error, "NAME", e.what());
+        } catch (...) {
+            set_layout_thread_error_(thread_error_mutex, thread_error, "NAME", "unknown exception");
+        }
+
+        if (node_thread.joinable()) node_thread.join();
+        if (signal_thread.joinable()) signal_thread.join();
+        if (!thread_error.empty()) {
+            error = thread_error;
+            return false;
+        }
+        {
+            std::ostringstream os;
+            os << "name_payload=" << static_cast<unsigned long long>(name_payload.size())
+               << " node_payload=" << static_cast<unsigned long long>(node_payload.size())
+               << " signal_payload=" << static_cast<unsigned long long>(signal_payload.size());
+            writer_init_diag_log_("writer-layout-build-parallel", phase_start, os.str());
+        }
+
+        phase_start = std::chrono::steady_clock::now();
+        if (!write_layout_section("NAME", "NAMZ", name_payload, error)) return false;
+        writer_init_diag_log_bytes_("writer-layout-write-NAME", phase_start, static_cast<u64>(name_payload.size()));
+        name_payload.clear();
+        name_payload.shrink_to_fit();
+        phase_start = std::chrono::steady_clock::now();
+        if (!write_layout_section("NODE", "NODZ", node_payload, error)) return false;
+        writer_init_diag_log_bytes_("writer-layout-write-NODE", phase_start, static_cast<u64>(node_payload.size()));
+        node_payload.clear();
+        node_payload.shrink_to_fit();
+        phase_start = std::chrono::steady_clock::now();
+        if (!write_layout_section("SIGT", "SIGZ", signal_payload, error)) return false;
+        writer_init_diag_log_bytes_("writer-layout-write-SIGT", phase_start, static_cast<u64>(signal_payload.size()));
+        signal_payload.clear();
+        signal_payload.shrink_to_fit();
+
+        phase_start = std::chrono::steady_clock::now();
+        build_clock_layout_payload(layout, clock_payload);
+        writer_init_diag_log_bytes_("writer-layout-build-CLKD", phase_start, static_cast<u64>(clock_payload.size()));
+        stats_.clock_count = static_cast<u64>(layout.clocks.size());
+        stats_.clock_section_payload_bytes = static_cast<u64>(clock_payload.size());
+        if (!layout.clocks.empty()) {
+            phase_start = std::chrono::steady_clock::now();
+            if (!write_layout_section("CLKD", "CLKZ", clock_payload, error)) return false;
+            writer_init_diag_log_bytes_("writer-layout-write-CLKD", phase_start, static_cast<u64>(clock_payload.size()));
+        }
+        writer_init_diag_log_("writer-layout-parallel-total", total_start);
+        return true;
+    }
+
+    struct LayoutSectionWork {
+        const char* name = "";
+        const char* raw_tag = "";
+        const char* zstd_tag = "";
+        EncodedLayoutSection encoded;
+        u64 raw_payload_bytes = 0;
+        long long build_ms = 0;
+        long long encode_ms = 0;
+        long long total_ms = 0;
+    };
+
+    typedef void (*LayoutPayloadBuildFn)(const Layout&, std::vector<u8>&);
+
+    bool build_and_encode_layout_section_(const Layout& layout,
+                                          LayoutPayloadBuildFn build_fn,
+                                          LayoutSectionWork& work,
+                                          std::string& error) {
+        const auto total_start = std::chrono::steady_clock::now();
+        std::vector<u8> raw_payload;
+        auto phase_start = std::chrono::steady_clock::now();
+        build_fn(layout, raw_payload);
+        work.build_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - phase_start).count();
+        work.raw_payload_bytes = static_cast<u64>(raw_payload.size());
+        phase_start = std::chrono::steady_clock::now();
+        if (!encode_layout_section_payload_(work.raw_tag, work.zstd_tag, raw_payload, work.encoded, error)) {
+            return false;
+        }
+        work.encode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - phase_start).count();
+        work.total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - total_start).count();
+        return true;
+    }
+
+    void log_layout_section_work_(const char* phase, const LayoutSectionWork& work) const {
+        if (options_.diagnostic_log_path.empty()) return;
+        std::ostringstream os;
+        os << "section=" << work.name
+           << " build_ms=" << work.build_ms
+           << " encode_ms=" << work.encode_ms
+           << " total_ms=" << work.total_ms
+           << " raw_payload_bytes=" << static_cast<unsigned long long>(work.raw_payload_bytes)
+           << " stored_payload_bytes=" << static_cast<unsigned long long>(work.encoded.stored_payload_bytes)
+           << " compressed_payload_bytes=" << static_cast<unsigned long long>(work.encoded.compressed_payload_bytes)
+           << " used_zstd=" << (work.encoded.used_zstd ? 1 : 0)
+           << " zstd_level=" << options_.zstd_level;
+        writer_init_diag_log_(phase, std::chrono::steady_clock::now(), os.str());
+    }
+
+    bool write_parallel_encoded_layout_section_(const char* phase,
+                                                const LayoutSectionWork& work,
+                                                std::string& error) {
+        const auto phase_start = std::chrono::steady_clock::now();
+        if (!write_encoded_layout_section_(work.encoded, error)) return false;
+        std::ostringstream os;
+        os << "section=" << work.name
+           << " stored_payload_bytes=" << static_cast<unsigned long long>(work.encoded.stored_payload_bytes)
+           << " raw_payload_bytes=" << static_cast<unsigned long long>(work.encoded.raw_payload_bytes)
+           << " used_zstd=" << (work.encoded.used_zstd ? 1 : 0);
+        writer_init_diag_log_(phase, phase_start, os.str());
+        return true;
+    }
+
+    bool write_layout_sections_parallel_compress_(const Layout& layout, std::string& error) {
+        const auto total_start = std::chrono::steady_clock::now();
+        LayoutSectionWork name_work;
+        name_work.name = "NAME";
+        name_work.raw_tag = "NAME";
+        name_work.zstd_tag = "NAMZ";
+        LayoutSectionWork node_work;
+        node_work.name = "NODE";
+        node_work.raw_tag = "NODE";
+        node_work.zstd_tag = "NODZ";
+        LayoutSectionWork signal_work;
+        signal_work.name = "SIGT";
+        signal_work.raw_tag = "SIGT";
+        signal_work.zstd_tag = "SIGZ";
+
+        std::mutex thread_error_mutex;
+        std::string thread_error;
+        auto run_work = [&](LayoutPayloadBuildFn build_fn, LayoutSectionWork& work) {
+            try {
+                std::string local_error;
+                if (!build_and_encode_layout_section_(layout, build_fn, work, local_error)) {
+                    set_layout_thread_error_(thread_error_mutex, thread_error, work.name, local_error.c_str());
+                }
+            } catch (const std::exception& e) {
+                set_layout_thread_error_(thread_error_mutex, thread_error, work.name, e.what());
+            } catch (...) {
+                set_layout_thread_error_(thread_error_mutex, thread_error, work.name, "unknown exception");
+            }
+        };
+
+        std::thread name_thread(run_work, &Writer::build_name_layout_payload, std::ref(name_work));
+        std::thread node_thread(run_work, &Writer::build_node_layout_payload, std::ref(node_work));
+        std::thread signal_thread(run_work, &Writer::build_signal_layout_payload, std::ref(signal_work));
+
+        if (name_thread.joinable()) name_thread.join();
+        if (node_thread.joinable()) node_thread.join();
+        if (signal_thread.joinable()) signal_thread.join();
+        if (!thread_error.empty()) {
+            error = thread_error;
+            return false;
+        }
+
+        log_layout_section_work_("writer-layout-build-compress", name_work);
+        log_layout_section_work_("writer-layout-build-compress", node_work);
+        log_layout_section_work_("writer-layout-build-compress", signal_work);
+
+        if (!write_parallel_encoded_layout_section_("writer-layout-write-encoded-NAME", name_work, error)) return false;
+        name_work.encoded.payload.clear();
+        name_work.encoded.payload.shrink_to_fit();
+        if (!write_parallel_encoded_layout_section_("writer-layout-write-encoded-NODE", node_work, error)) return false;
+        node_work.encoded.payload.clear();
+        node_work.encoded.payload.shrink_to_fit();
+        if (!write_parallel_encoded_layout_section_("writer-layout-write-encoded-SIGT", signal_work, error)) return false;
+        signal_work.encoded.payload.clear();
+        signal_work.encoded.payload.shrink_to_fit();
+
+        std::vector<u8> clock_payload;
+        auto phase_start = std::chrono::steady_clock::now();
+        build_clock_layout_payload(layout, clock_payload);
+        writer_init_diag_log_bytes_("writer-layout-build-CLKD", phase_start, static_cast<u64>(clock_payload.size()));
+        stats_.clock_count = static_cast<u64>(layout.clocks.size());
+        stats_.clock_section_payload_bytes = static_cast<u64>(clock_payload.size());
+        if (!layout.clocks.empty()) {
+            phase_start = std::chrono::steady_clock::now();
+            if (!write_layout_section("CLKD", "CLKZ", clock_payload, error)) return false;
+            writer_init_diag_log_bytes_("writer-layout-write-CLKD", phase_start, static_cast<u64>(clock_payload.size()));
+        }
+        writer_init_diag_log_("writer-layout-parallel-compress-total", total_start);
+        return true;
+    }
+
+    bool write_layout_sections(const Layout& layout, std::string& error) {
+        if (should_stream_layout_sections_(layout)) {
+            return write_layout_sections_streamed_(layout, error);
+        }
+        if (should_parallel_compress_layout_sections_(layout)) {
+            return write_layout_sections_parallel_compress_(layout, error);
+        }
+        if (should_parallel_build_layout_sections_(layout)) {
+            return write_layout_sections_parallel_build_(layout, error);
+        }
+
+        std::vector<u8> payload;
+        auto phase_start = std::chrono::steady_clock::now();
+        build_name_layout_payload(layout, payload);
+        writer_init_diag_log_bytes_("writer-layout-build-NAME", phase_start, static_cast<u64>(payload.size()));
+        phase_start = std::chrono::steady_clock::now();
+        if (!write_layout_section("NAME", "NAMZ", payload, error)) return false;
+        writer_init_diag_log_bytes_("writer-layout-write-NAME", phase_start, static_cast<u64>(payload.size()));
+
+        phase_start = std::chrono::steady_clock::now();
+        build_node_layout_payload(layout, payload);
+        writer_init_diag_log_bytes_("writer-layout-build-NODE", phase_start, static_cast<u64>(payload.size()));
+        phase_start = std::chrono::steady_clock::now();
+        if (!write_layout_section("NODE", "NODZ", payload, error)) return false;
+        writer_init_diag_log_bytes_("writer-layout-write-NODE", phase_start, static_cast<u64>(payload.size()));
+
+        phase_start = std::chrono::steady_clock::now();
+        build_signal_layout_payload(layout, payload);
+        writer_init_diag_log_bytes_("writer-layout-build-SIGT", phase_start, static_cast<u64>(payload.size()));
+        phase_start = std::chrono::steady_clock::now();
+        if (!write_layout_section("SIGT", "SIGZ", payload, error)) return false;
+        writer_init_diag_log_bytes_("writer-layout-write-SIGT", phase_start, static_cast<u64>(payload.size()));
+
+        phase_start = std::chrono::steady_clock::now();
+        build_clock_layout_payload(layout, payload);
+        writer_init_diag_log_bytes_("writer-layout-build-CLKD", phase_start, static_cast<u64>(payload.size()));
+        stats_.clock_count = static_cast<u64>(layout.clocks.size());
         stats_.clock_section_payload_bytes = static_cast<u64>(payload.size());
         if (!layout.clocks.empty()) {
+            phase_start = std::chrono::steady_clock::now();
             if (!write_layout_section("CLKD", "CLKZ", payload, error)) return false;
+            writer_init_diag_log_bytes_("writer-layout-write-CLKD", phase_start, static_cast<u64>(payload.size()));
         }
         return true;
     }
@@ -5683,6 +6532,74 @@ inline std::size_t serializable_cycle_group_count(const CycleValueWidthGroup& gr
     return (std::min)(group.signal_ids.size(), group.values.size() / static_cast<std::size_t>(byte_count));
 }
 
+inline std::string describe_cycle_payload_composition(const CycleSubmission& s,
+                                                      std::size_t serialized_payload_bytes) {
+    static const std::size_t kCycleValueWidthCount = kMaxScalarBytes + 1u;
+    std::array<u64, kCycleValueWidthCount> counts;
+    counts.fill(0);
+    for (std::size_t width = 0; width < s.width_groups.size(); ++width) {
+        counts[width] += static_cast<u64>(
+            serializable_cycle_group_count(s.width_groups[width], static_cast<u8>(width)));
+    }
+    for (std::size_t i = 0; i < s.updates.size(); ++i) {
+        const u8 width = s.updates[i].value.byte_count;
+        if (width <= kMaxScalarBytes) ++counts[width];
+    }
+
+    u64 serialized_updates = 0;
+    u64 id_bytes = 0;
+    u64 value_bytes = 0;
+    u64 group_header_bytes = 0;
+    u8 non_empty_groups = 0;
+    for (std::size_t width = 0; width < counts.size(); ++width) {
+        const u64 count = counts[width];
+        if (count == 0) continue;
+        ++non_empty_groups;
+        serialized_updates += count;
+        id_bytes += count * sizeof(u32);
+        value_bytes += count * static_cast<u64>(width);
+        group_header_bytes += 1u + sizeof(u64);
+    }
+    const u64 fixed_header_bytes = sizeof(i64) + sizeof(u64) + 1u;
+    const u64 header_bytes = fixed_header_bytes + group_header_bytes;
+    const u64 accounted_payload_bytes = header_bytes + id_bytes + value_bytes;
+    const u64 total_updates = static_cast<u64>(s.total_update_count());
+    const u64 invalid_or_unserialized_updates =
+        total_updates >= serialized_updates ? total_updates - serialized_updates : 0;
+
+    std::ostringstream os;
+    os << "cycle=" << static_cast<long long>(s.cycle)
+       << " ipc_payload_bytes=" << static_cast<unsigned long long>(serialized_payload_bytes)
+       << " accounted_payload_bytes=" << static_cast<unsigned long long>(accounted_payload_bytes)
+       << " total_updates=" << static_cast<unsigned long long>(total_updates)
+       << " serialized_updates=" << static_cast<unsigned long long>(serialized_updates)
+       << " grouped_updates=" << static_cast<unsigned long long>(s.grouped_update_count())
+       << " legacy_updates=" << static_cast<unsigned long long>(s.updates.size())
+       << " invalid_or_unserialized_updates=" << static_cast<unsigned long long>(invalid_or_unserialized_updates)
+       << " non_empty_groups=" << static_cast<unsigned long>(non_empty_groups)
+       << " header_bytes=" << static_cast<unsigned long long>(header_bytes)
+       << " id_bytes=" << static_cast<unsigned long long>(id_bytes)
+       << " value_bytes=" << static_cast<unsigned long long>(value_bytes)
+       << " heap_bytes_est=" << static_cast<unsigned long long>(s.estimate_heap_bytes())
+       << " groups=[";
+    bool first = true;
+    for (std::size_t width = 0; width < counts.size(); ++width) {
+        const u64 count = counts[width];
+        if (count == 0) continue;
+        if (!first) os << ";";
+        first = false;
+        const u64 group_id_bytes = count * sizeof(u32);
+        const u64 group_value_bytes = count * static_cast<u64>(width);
+        os << "w" << width
+           << ":count=" << static_cast<unsigned long long>(count)
+           << ",id_bytes=" << static_cast<unsigned long long>(group_id_bytes)
+           << ",value_bytes=" << static_cast<unsigned long long>(group_value_bytes)
+           << ",payload_bytes=" << static_cast<unsigned long long>(1u + sizeof(u64) + group_id_bytes + group_value_bytes);
+    }
+    os << "]";
+    return os.str();
+}
+
 inline void serialize_cycle(std::vector<u8>& out, const CycleSubmission& s) {
     static const std::size_t kCycleValueWidthCount = kMaxScalarBytes + 1u;
     append_i64(out, s.cycle);
@@ -5816,8 +6733,10 @@ static const u32 kIpcAckMagic = 0x34415057u; // "WPA4" little-endian spelling.
 static const std::size_t kIpcHeaderSize = 28;
 static const std::size_t kIpcAckHeaderSize = 24;
 static const u64 kMaxIpcPayloadBytes = 512ull * 1024ull * 1024ull;
-static const long kWriterProcessCycleCredits = 4096;
-static const std::size_t kWriterProcessQueueBytesLimit = 256u * 1024u * 1024u;
+static const u32 kIpcChecksumDisabled = 0u;
+static const std::size_t kIpcChecksumLargePayloadThreshold = 1024u * 1024u;
+static const long kWriterProcessCycleCredits = 32768;
+static const std::size_t kWriterProcessQueueBytesLimit = static_cast<std::size_t>(1024ull * 1024ull * 1024ull);
 } // namespace detail
 
 enum class WriterProcessFrameType : u32 {
@@ -5832,6 +6751,86 @@ enum class WriterProcessFrameType : u32 {
     LayoutClocks     = 9,
     LayoutEnd        = 10
 };
+
+inline const char* writer_process_frame_type_name(WriterProcessFrameType type) {
+    switch (type) {
+    case WriterProcessFrameType::Layout: return "Layout";
+    case WriterProcessFrameType::Cycle: return "Cycle";
+    case WriterProcessFrameType::Finalize: return "Finalize";
+    case WriterProcessFrameType::LayoutBegin: return "LayoutBegin";
+    case WriterProcessFrameType::LayoutNameBlob: return "LayoutNameBlob";
+    case WriterProcessFrameType::LayoutNames: return "LayoutNames";
+    case WriterProcessFrameType::LayoutNodes: return "LayoutNodes";
+    case WriterProcessFrameType::LayoutSignals: return "LayoutSignals";
+    case WriterProcessFrameType::LayoutClocks: return "LayoutClocks";
+    case WriterProcessFrameType::LayoutEnd: return "LayoutEnd";
+    default: return "Unknown";
+    }
+}
+
+inline bool writer_process_frame_is_layout_init(WriterProcessFrameType type) {
+    switch (type) {
+    case WriterProcessFrameType::Layout:
+    case WriterProcessFrameType::LayoutBegin:
+    case WriterProcessFrameType::LayoutNameBlob:
+    case WriterProcessFrameType::LayoutNames:
+    case WriterProcessFrameType::LayoutNodes:
+    case WriterProcessFrameType::LayoutSignals:
+    case WriterProcessFrameType::LayoutClocks:
+    case WriterProcessFrameType::LayoutEnd:
+        return true;
+    default:
+        return false;
+    }
+}
+
+namespace detail {
+
+inline void writer_process_diag_log(const std::string& path, const std::string& message) {
+    if (path.empty()) return;
+    std::ofstream f(path.c_str(), std::ios::out | std::ios::app);
+    if (!f) return;
+#if defined(_WIN32)
+    f << "[pid=" << static_cast<unsigned long>(GetCurrentProcessId()) << "] ";
+#endif
+    f << message << "\n";
+}
+
+inline void writer_process_diag_reset(const std::string& path) {
+    if (path.empty()) return;
+    std::ofstream f(path.c_str(), std::ios::out | std::ios::trunc);
+}
+
+inline long long writer_process_elapsed_ms(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+}
+
+inline double writer_process_mib_per_s(u64 bytes, long long ms) {
+    if (bytes == 0 || ms <= 0) return 0.0;
+    return (static_cast<double>(bytes) / (1024.0 * 1024.0)) / (static_cast<double>(ms) / 1000.0);
+}
+
+inline void writer_process_append_mib_per_s(std::ostringstream& os,
+                                            const char* label,
+                                            u64 bytes,
+                                            long long ms) {
+    os << " " << label << "=" << std::fixed << std::setprecision(2)
+       << writer_process_mib_per_s(bytes, ms)
+       << std::defaultfloat << std::setprecision(6) << "MiB/s";
+}
+
+inline void writer_process_diag_log_phase(const std::string& path,
+                                          const char* phase,
+                                          std::chrono::steady_clock::time_point start,
+                                          const std::string& extra = std::string()) {
+    std::ostringstream os;
+    os << phase << " ms=" << writer_process_elapsed_ms(start);
+    if (!extra.empty()) os << " " << extra;
+    writer_process_diag_log(path, os.str());
+}
+
+} // namespace detail
 
 class WriterProcessClient {
 public:
@@ -5855,6 +6854,7 @@ public:
         std::string close_error;
         close(close_error);
         error.clear();
+        const auto open_start = std::chrono::steady_clock::now();
 
         const std::string helper = resolve_helper_path(helper_exe_path);
         if (helper.empty()) {
@@ -5862,22 +6862,42 @@ public:
             return false;
         }
 
+        helper_path_ = helper;
+        output_path_ = output_path;
+        diag_log_path_ = output_path + ".writer.log";
+        last_ipc_op_.clear();
+        detail::writer_process_diag_reset(diag_log_path_);
+        {
+            std::ostringstream os;
+            os << "client-open protocol=" << static_cast<unsigned long>(kWriterProcessProtocolVersion)
+               << " helper='" << helper_path_ << "'"
+               << " output='" << output_path_ << "'"
+               << " layout_names=" << static_cast<unsigned long long>(layout.names.size())
+               << " layout_nodes=" << static_cast<unsigned long long>(layout.nodes.size())
+               << " layout_signals=" << static_cast<unsigned long long>(layout.signals.size())
+               << " layout_clocks=" << static_cast<unsigned long long>(layout.clocks.size())
+               << " name_blob=" << static_cast<unsigned long long>(layout.name_blob.size());
+            detail::writer_process_diag_log(diag_log_path_, os.str());
+        }
+
         pipe_name_ = make_pipe_name();
+        auto phase_start = std::chrono::steady_clock::now();
         if (!start_helper_process(helper, output_path, error)) {
+            decorate_ipc_error(error);
             cleanup_handles(false);
             return false;
         }
+        detail::writer_process_diag_log_phase(diag_log_path_, "client-start-helper", phase_start);
+        phase_start = std::chrono::steady_clock::now();
         if (!connect_pipe(connect_timeout_ms, error)) {
-            if (!helper.empty()) {
-                error += "; helper='";
-                error += helper;
-                error += "'";
-            }
+            decorate_ipc_error(error);
             cleanup_handles(true);
             return false;
         }
+        detail::writer_process_diag_log_phase(diag_log_path_, "client-connect-pipes", phase_start);
 
         bool layout_sent = false;
+        phase_start = std::chrono::steady_clock::now();
         if (should_stream_layout(layout)) {
             layout_sent = send_layout_stream(layout, options, error);
         } else {
@@ -5886,9 +6906,15 @@ public:
             detail::serialize_layout(payload, layout);
             u64 layout_seq = 0;
             layout_sent = send_frame(WriterProcessFrameType::Layout, payload, error, &layout_seq) &&
-                          read_ack(layout_seq, error);
+                          read_ack(layout_seq, error, WriterProcessFrameType::Layout, payload.size());
         }
+        detail::writer_process_diag_log_phase(
+            diag_log_path_,
+            should_stream_layout(layout) ? "client-send-stream-layout" : "client-send-inline-layout",
+            phase_start);
         if (!layout_sent) {
+            decorate_ipc_error(error);
+            detail::writer_process_diag_log(diag_log_path_, std::string("client-open failed: ") + error);
             cleanup_handles(true);
             return false;
         }
@@ -5902,6 +6928,7 @@ public:
         closing_seq_.store(0, std::memory_order_release);
         ack_thread_ = std::thread([this]() { this->ack_loop(); });
         opened_ = true;
+        detail::writer_process_diag_log_phase(diag_log_path_, "client-open-ready", open_start);
         return true;
 #endif
     }
@@ -5917,6 +6944,14 @@ public:
         if (!acquire_cycle_credit(error)) return false;
         std::vector<u8> payload;
         detail::serialize_cycle(payload, submission);
+        if (submission.cycle == 0) {
+            std::ostringstream os;
+            os << "client-cycle0-payload"
+               << " ipc_frame_bytes=" << static_cast<unsigned long long>(payload.size() + detail::kIpcHeaderSize)
+               << " "
+               << detail::describe_cycle_payload_composition(submission, payload.size());
+            detail::writer_process_diag_log(diag_log_path_, os.str());
+        }
         if (!send_frame(WriterProcessFrameType::Cycle, payload, error)) {
             cycle_credits_.fetch_add(1, std::memory_order_release);
             set_ack_error(error);
@@ -6012,7 +7047,7 @@ private:
                               const std::string& output_path,
                               std::string& error) {
         std::string cmd;
-        cmd.reserve(helper.size() + output_path.size() + pipe_name_.size() + 128);
+        cmd.reserve(helper.size() + output_path.size() + pipe_name_.size() + diag_log_path_.size() + 192);
         cmd += detail::quote_process_arg(helper);
         cmd += " --writer-helper --pipe ";
         cmd += detail::quote_process_arg(pipe_name_);
@@ -6020,6 +7055,10 @@ private:
         cmd += std::to_string(static_cast<unsigned long>(GetCurrentProcessId()));
         cmd += " --out ";
         cmd += detail::quote_process_arg(output_path);
+        cmd += " --ipc-version ";
+        cmd += std::to_string(static_cast<unsigned long>(kWriterProcessProtocolVersion));
+        cmd += " --log ";
+        cmd += detail::quote_process_arg(diag_log_path_);
 
         std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
         mutable_cmd.push_back('\0');
@@ -6033,6 +7072,7 @@ private:
             error = detail::win32_error_message("failed to start WVZ4 writer helper");
             return false;
         }
+        detail::writer_process_diag_log(diag_log_path_, std::string("client-started-helper command=") + cmd);
         return true;
     }
 
@@ -6056,6 +7096,7 @@ private:
             const DWORD code = GetLastError();
             if (pi_.hProcess && WaitForSingleObject(pi_.hProcess, 0) == WAIT_OBJECT_0) {
                 error = "WVZ4 writer helper exited before pipe connection";
+                decorate_ipc_error(error);
                 return false;
             }
             const unsigned long long elapsed_ms = static_cast<unsigned long long>(
@@ -6086,7 +7127,7 @@ private:
                          const std::vector<u8>& payload,
                          std::string& error) {
         u64 sent_seq = 0;
-        return send_frame(type, payload, error, &sent_seq) && read_ack(sent_seq, error);
+        return send_frame(type, payload, error, &sent_seq) && read_ack(sent_seq, error, type, payload.size());
     }
 
     bool send_layout_stream(const Layout& layout,
@@ -6095,15 +7136,75 @@ private:
         static const std::size_t kBlobChunkBytes = 32u * 1024u * 1024u;
         static const std::size_t kRecordChunkCount = 1000000u;
 
+        struct LayoutAckWait {
+            u64 seq;
+            WriterProcessFrameType type;
+            std::size_t payload_size;
+        };
+
         std::vector<u8> payload;
+        std::vector<LayoutAckWait> layout_ack_seqs;
+        const auto stream_start = std::chrono::steady_clock::now();
+        std::size_t layout_frame_count = 0;
+        u64 layout_payload_bytes = 0;
+        layout_ack_seqs.reserve(
+            2u +
+            (layout.name_blob.size() + kBlobChunkBytes - 1u) / kBlobChunkBytes +
+            (layout.names.size() + kRecordChunkCount - 1u) / kRecordChunkCount +
+            (layout.nodes.size() + kRecordChunkCount - 1u) / kRecordChunkCount +
+            (layout.signals.size() + kRecordChunkCount - 1u) / kRecordChunkCount +
+            (layout.clocks.size() + kRecordChunkCount - 1u) / kRecordChunkCount);
+
+        const auto send_layout_frame = [&](WriterProcessFrameType type) -> bool {
+            u64 sent_seq = 0;
+            if (!send_frame(type, payload, error, &sent_seq)) return false;
+            LayoutAckWait wait;
+            wait.seq = sent_seq;
+            wait.type = type;
+            wait.payload_size = payload.size();
+            layout_ack_seqs.push_back(wait);
+            ++layout_frame_count;
+            layout_payload_bytes += static_cast<u64>(payload.size());
+            return true;
+        };
+        const auto read_layout_acks = [&]() -> bool {
+            for (std::size_t i = 0; i < layout_ack_seqs.size(); ++i) {
+                const LayoutAckWait& wait = layout_ack_seqs[i];
+                if (!read_ack(wait.seq, error, wait.type, wait.payload_size)) return false;
+            }
+            return true;
+        };
+        const auto log_stream_stage = [&](const char* stage,
+                                          std::chrono::steady_clock::time_point stage_start,
+                                          u64 records,
+                                          std::size_t frames_before,
+                                          u64 bytes_before) {
+            std::ostringstream os;
+            os << stage
+               << " records=" << static_cast<unsigned long long>(records)
+               << " frames=" << static_cast<unsigned long long>(layout_frame_count - frames_before)
+               << " payload_bytes=" << static_cast<unsigned long long>(layout_payload_bytes - bytes_before)
+               << " total_frames=" << static_cast<unsigned long long>(layout_frame_count)
+               << " total_payload_bytes=" << static_cast<unsigned long long>(layout_payload_bytes)
+               << " total_ms=" << detail::writer_process_elapsed_ms(stream_start);
+            detail::writer_process_diag_log_phase(diag_log_path_, "client-layout-stream-stage", stage_start, os.str());
+        };
+        auto stage_start = std::chrono::steady_clock::now();
+        std::size_t frames_before = layout_frame_count;
+        u64 bytes_before = layout_payload_bytes;
+
         detail::serialize_options(payload, options);
         detail::append_u64(payload, static_cast<u64>(layout.name_blob.size()));
         detail::append_u64(payload, static_cast<u64>(layout.names.size()));
         detail::append_u64(payload, static_cast<u64>(layout.nodes.size()));
         detail::append_u64(payload, static_cast<u64>(layout.signals.size()));
         detail::append_u64(payload, static_cast<u64>(layout.clocks.size()));
-        if (!send_frame_sync(WriterProcessFrameType::LayoutBegin, payload, error)) return false;
+        if (!send_layout_frame(WriterProcessFrameType::LayoutBegin)) return false;
+        log_stream_stage("begin", stage_start, 0, frames_before, bytes_before);
 
+        stage_start = std::chrono::steady_clock::now();
+        frames_before = layout_frame_count;
+        bytes_before = layout_payload_bytes;
         for (std::size_t offset = 0; offset < layout.name_blob.size(); ) {
             const std::size_t chunk = (std::min)(kBlobChunkBytes, layout.name_blob.size() - offset);
             payload.clear();
@@ -6111,10 +7212,14 @@ private:
             detail::append_u64(payload, static_cast<u64>(offset));
             detail::append_u64(payload, static_cast<u64>(chunk));
             detail::append_bytes(payload, layout.name_blob.data() + offset, chunk);
-            if (!send_frame_sync(WriterProcessFrameType::LayoutNameBlob, payload, error)) return false;
+            if (!send_layout_frame(WriterProcessFrameType::LayoutNameBlob)) return false;
             offset += chunk;
         }
+        log_stream_stage("name_blob", stage_start, static_cast<u64>(layout.name_blob.size()), frames_before, bytes_before);
 
+        stage_start = std::chrono::steady_clock::now();
+        frames_before = layout_frame_count;
+        bytes_before = layout_payload_bytes;
         for (std::size_t start = 0; start < layout.names.size(); ) {
             const std::size_t count = (std::min)(kRecordChunkCount, layout.names.size() - start);
             payload.clear();
@@ -6133,10 +7238,14 @@ private:
                     detail::append_string_bytes(payload, n.name.data(), n.name.size());
                 }
             }
-            if (!send_frame_sync(WriterProcessFrameType::LayoutNames, payload, error)) return false;
+            if (!send_layout_frame(WriterProcessFrameType::LayoutNames)) return false;
             start += count;
         }
+        log_stream_stage("names", stage_start, static_cast<u64>(layout.names.size()), frames_before, bytes_before);
 
+        stage_start = std::chrono::steady_clock::now();
+        frames_before = layout_frame_count;
+        bytes_before = layout_payload_bytes;
         for (std::size_t start = 0; start < layout.nodes.size(); ) {
             const std::size_t count = (std::min)(kRecordChunkCount, layout.nodes.size() - start);
             payload.clear();
@@ -6152,10 +7261,14 @@ private:
                 detail::append_u32(payload, n.first_child);
                 detail::append_u32(payload, n.next_sibling);
             }
-            if (!send_frame_sync(WriterProcessFrameType::LayoutNodes, payload, error)) return false;
+            if (!send_layout_frame(WriterProcessFrameType::LayoutNodes)) return false;
             start += count;
         }
+        log_stream_stage("nodes", stage_start, static_cast<u64>(layout.nodes.size()), frames_before, bytes_before);
 
+        stage_start = std::chrono::steady_clock::now();
+        frames_before = layout_frame_count;
+        bytes_before = layout_payload_bytes;
         for (std::size_t start = 0; start < layout.signals.size(); ) {
             const std::size_t count = (std::min)(kRecordChunkCount, layout.signals.size() - start);
             payload.clear();
@@ -6173,10 +7286,14 @@ private:
                 detail::append_u32(payload, s.bit_offset);
                 detail::append_u8(payload, s.storage_only ? kSignalFlagStorageOnly : 0u);
             }
-            if (!send_frame_sync(WriterProcessFrameType::LayoutSignals, payload, error)) return false;
+            if (!send_layout_frame(WriterProcessFrameType::LayoutSignals)) return false;
             start += count;
         }
+        log_stream_stage("signals", stage_start, static_cast<u64>(layout.signals.size()), frames_before, bytes_before);
 
+        stage_start = std::chrono::steady_clock::now();
+        frames_before = layout_frame_count;
+        bytes_before = layout_payload_bytes;
         for (std::size_t start = 0; start < layout.clocks.size(); ) {
             const std::size_t count = (std::min)(kRecordChunkCount, layout.clocks.size() - start);
             payload.clear();
@@ -6189,12 +7306,84 @@ private:
                 detail::append_u8(payload, c.initial_value ? 1u : 0u);
                 detail::append_u64(payload, c.period_ticks);
             }
-            if (!send_frame_sync(WriterProcessFrameType::LayoutClocks, payload, error)) return false;
+            if (!send_layout_frame(WriterProcessFrameType::LayoutClocks)) return false;
             start += count;
         }
+        log_stream_stage("clocks", stage_start, static_cast<u64>(layout.clocks.size()), frames_before, bytes_before);
 
+        stage_start = std::chrono::steady_clock::now();
+        frames_before = layout_frame_count;
+        bytes_before = layout_payload_bytes;
         payload.clear();
-        return send_frame_sync(WriterProcessFrameType::LayoutEnd, payload, error);
+        if (!send_layout_frame(WriterProcessFrameType::LayoutEnd)) return false;
+        log_stream_stage("end", stage_start, 0, frames_before, bytes_before);
+
+        stage_start = std::chrono::steady_clock::now();
+        frames_before = layout_frame_count;
+        bytes_before = layout_payload_bytes;
+        if (!read_layout_acks()) return false;
+        log_stream_stage("acks", stage_start, static_cast<u64>(layout_ack_seqs.size()), frames_before, bytes_before);
+        detail::writer_process_diag_log_phase(diag_log_path_, "client-layout-stream-total", stream_start);
+        return true;
+    }
+
+    struct IpcSendStats {
+        u64 payload_bytes = 0;
+        u32 checksum = 0;
+        bool checksum_disabled = false;
+        long long checksum_ms = 0;
+        long long header_ms = 0;
+        long long payload_ms = 0;
+        long long total_ms = 0;
+    };
+
+    struct IpcAckReadStats {
+        u64 message_bytes = 0;
+        long long header_ms = 0;
+        long long message_ms = 0;
+        long long checksum_ms = 0;
+        long long total_ms = 0;
+    };
+
+    void log_client_ipc_send_frame(WriterProcessFrameType type,
+                                   u64 seq,
+                                   const IpcSendStats& stats) const {
+        if (!writer_process_frame_is_layout_init(type)) return;
+        std::ostringstream os;
+        os << "client-ipc-send-frame"
+           << " type=" << writer_process_frame_type_name(type)
+           << " seq=" << static_cast<unsigned long long>(seq)
+           << " payload_bytes=" << static_cast<unsigned long long>(stats.payload_bytes);
+        if (stats.checksum_disabled) {
+            os << " checksum=disabled";
+        } else {
+            os << " checksum=0x" << std::hex << stats.checksum << std::dec;
+        }
+        os << " checksum_ms=" << stats.checksum_ms
+           << " header_ms=" << stats.header_ms
+           << " payload_ms=" << stats.payload_ms
+           << " total_ms=" << stats.total_ms;
+        detail::writer_process_append_mib_per_s(os, "payload_write_rate", stats.payload_bytes, stats.payload_ms);
+        detail::writer_process_append_mib_per_s(os, "total_send_rate", stats.payload_bytes, stats.total_ms);
+        detail::writer_process_diag_log(diag_log_path_, os.str());
+    }
+
+    void log_client_ipc_ack_frame(WriterProcessFrameType type,
+                                  u64 seq,
+                                  std::size_t sent_payload_size,
+                                  const IpcAckReadStats& stats) const {
+        if (!writer_process_frame_is_layout_init(type)) return;
+        std::ostringstream os;
+        os << "client-ipc-read-ack"
+           << " type=" << writer_process_frame_type_name(type)
+           << " seq=" << static_cast<unsigned long long>(seq)
+           << " sent_payload_bytes=" << static_cast<unsigned long long>(sent_payload_size)
+           << " ack_message_bytes=" << static_cast<unsigned long long>(stats.message_bytes)
+           << " header_ms=" << stats.header_ms
+           << " message_ms=" << stats.message_ms
+           << " checksum_ms=" << stats.checksum_ms
+           << " total_ms=" << stats.total_ms;
+        detail::writer_process_diag_log(diag_log_path_, os.str());
     }
 
     bool send_frame(WriterProcessFrameType type,
@@ -6207,15 +7396,53 @@ private:
             closing_seq_.store(seq, std::memory_order_release);
         }
         if (seq_out) *seq_out = seq;
-        return send_frame_locked(type, payload, seq, error);
+        if (type != WriterProcessFrameType::Cycle) {
+            set_last_ipc_op(type, payload.size(), seq);
+        }
+        IpcSendStats stats;
+        IpcSendStats* stats_ptr = writer_process_frame_is_layout_init(type) ? &stats : NULL;
+        const bool ok = send_frame_locked(type, payload, seq, error, stats_ptr);
+        if (ok && stats_ptr) log_client_ipc_send_frame(type, seq, stats);
+        return ok;
+    }
+
+    static std::string describe_ipc_op(WriterProcessFrameType type, std::size_t payload_size, u64 seq) {
+        std::ostringstream os;
+        os << writer_process_frame_type_name(type)
+           << " seq=" << static_cast<unsigned long long>(seq)
+           << " payload=" << static_cast<unsigned long long>(payload_size);
+        return os.str();
+    }
+
+    void set_last_ipc_op(WriterProcessFrameType type, std::size_t payload_size, u64 seq) {
+        last_ipc_op_ = describe_ipc_op(type, payload_size, seq);
     }
 
     bool send_frame_locked(WriterProcessFrameType type,
                            const std::vector<u8>& payload,
                            u64 seq,
-                           std::string& error) {
-        if (pipe_ == INVALID_HANDLE_VALUE) { error = "WVZ4 writer helper pipe is not connected"; return false; }
-        const u32 checksum = detail::fnv1a32(payload);
+                           std::string& error,
+                           IpcSendStats* stats = NULL) {
+        const auto total_start = std::chrono::steady_clock::now();
+        if (stats) {
+            *stats = IpcSendStats();
+            stats->payload_bytes = static_cast<u64>(payload.size());
+        }
+        if (pipe_ == INVALID_HANDLE_VALUE) {
+            set_last_ipc_op(type, payload.size(), seq);
+            error = "WVZ4 writer helper pipe is not connected";
+            decorate_ipc_error(error);
+            return false;
+        }
+        const auto checksum_start = std::chrono::steady_clock::now();
+        const u32 checksum = payload.size() >= detail::kIpcChecksumLargePayloadThreshold
+            ? detail::kIpcChecksumDisabled
+            : detail::fnv1a32(payload);
+        if (stats) {
+            stats->checksum = checksum;
+            stats->checksum_disabled = (checksum == detail::kIpcChecksumDisabled);
+            stats->checksum_ms = detail::writer_process_elapsed_ms(checksum_start);
+        }
         std::vector<u8> header;
         header.reserve(detail::kIpcHeaderSize);
         detail::append_u32(header, detail::kIpcMagic);
@@ -6223,22 +7450,61 @@ private:
         detail::append_u64(header, seq);
         detail::append_u64(header, static_cast<u64>(payload.size()));
         detail::append_u32(header, checksum);
-        if (!detail::write_all_handle(pipe_, header.data(), header.size(), error)) return false;
-        if (!payload.empty() && !detail::write_all_handle(pipe_, payload.data(), payload.size(), error)) return false;
+        const auto header_start = std::chrono::steady_clock::now();
+        if (!detail::write_all_handle(pipe_, header.data(), header.size(), error)) {
+            if (stats) {
+                stats->header_ms = detail::writer_process_elapsed_ms(header_start);
+                stats->total_ms = detail::writer_process_elapsed_ms(total_start);
+            }
+            set_last_ipc_op(type, payload.size(), seq);
+            decorate_ipc_error(error);
+            detail::writer_process_diag_log(diag_log_path_, std::string("client-write-header failed: ") + error);
+            return false;
+        }
+        if (stats) stats->header_ms = detail::writer_process_elapsed_ms(header_start);
+        const auto payload_start = std::chrono::steady_clock::now();
+        if (!payload.empty() && !detail::write_all_handle(pipe_, payload.data(), payload.size(), error)) {
+            if (stats) {
+                stats->payload_ms = detail::writer_process_elapsed_ms(payload_start);
+                stats->total_ms = detail::writer_process_elapsed_ms(total_start);
+            }
+            set_last_ipc_op(type, payload.size(), seq);
+            decorate_ipc_error(error);
+            detail::writer_process_diag_log(diag_log_path_, std::string("client-write-payload failed: ") + error);
+            return false;
+        }
+        if (stats) {
+            stats->payload_ms = detail::writer_process_elapsed_ms(payload_start);
+            stats->total_ms = detail::writer_process_elapsed_ms(total_start);
+        }
         return true;
     }
 
-    bool read_ack_frame(u64& seq, bool& ok, std::string& message, std::string& error) {
+    bool read_ack_frame(u64& seq,
+                        bool& ok,
+                        std::string& message,
+                        std::string& error,
+                        IpcAckReadStats* stats = NULL) {
         seq = 0;
         ok = false;
         message.clear();
         error.clear();
+        const auto total_start = std::chrono::steady_clock::now();
+        if (stats) *stats = IpcAckReadStats();
         u8 hdr[detail::kIpcAckHeaderSize];
         bool disconnected = false;
+        const auto header_start = std::chrono::steady_clock::now();
         if (!detail::read_all_handle(ack_pipe_, hdr, sizeof(hdr), disconnected, error)) {
+            if (stats) {
+                stats->header_ms = detail::writer_process_elapsed_ms(header_start);
+                stats->total_ms = detail::writer_process_elapsed_ms(total_start);
+            }
             if (disconnected) error = "WVZ4 writer helper pipe disconnected before ack";
+            decorate_ipc_error(error);
+            detail::writer_process_diag_log(diag_log_path_, std::string("client-read-ack-header failed: ") + error);
             return false;
         }
+        if (stats) stats->header_ms = detail::writer_process_elapsed_ms(header_start);
         const u32 magic = detail::load_u32_le(hdr + 0);
         seq = detail::load_u64_le(hdr + 4);
         const u32 ok_u = detail::load_u32_le(hdr + 12);
@@ -6246,35 +7512,64 @@ private:
         const u32 checksum = detail::load_u32_le(hdr + 20);
         if (magic != detail::kIpcAckMagic) {
             error = "WVZ4 writer helper returned an invalid ack";
+            decorate_ipc_error(error);
             return false;
         }
         std::vector<u8> msg(message_size);
+        if (stats) stats->message_bytes = static_cast<u64>(message_size);
+        const auto message_start = std::chrono::steady_clock::now();
         if (message_size > 0 &&
             !detail::read_all_handle(ack_pipe_, msg.data(), msg.size(), disconnected, error)) {
+            if (stats) {
+                stats->message_ms = detail::writer_process_elapsed_ms(message_start);
+                stats->total_ms = detail::writer_process_elapsed_ms(total_start);
+            }
             if (disconnected) error = "WVZ4 writer helper pipe disconnected during ack";
+            decorate_ipc_error(error);
+            detail::writer_process_diag_log(diag_log_path_, std::string("client-read-ack-message failed: ") + error);
             return false;
         }
+        if (stats) stats->message_ms = detail::writer_process_elapsed_ms(message_start);
+        const auto checksum_start = std::chrono::steady_clock::now();
         if (detail::fnv1a32(msg) != checksum) {
+            if (stats) {
+                stats->checksum_ms = detail::writer_process_elapsed_ms(checksum_start);
+                stats->total_ms = detail::writer_process_elapsed_ms(total_start);
+            }
             error = "WVZ4 writer helper ack checksum mismatch";
+            decorate_ipc_error(error);
             return false;
+        }
+        if (stats) {
+            stats->checksum_ms = detail::writer_process_elapsed_ms(checksum_start);
+            stats->total_ms = detail::writer_process_elapsed_ms(total_start);
         }
         ok = (ok_u != 0);
         message.assign(reinterpret_cast<const char*>(msg.data()), msg.size());
         return true;
     }
 
-    bool read_ack(u64 expected_seq, std::string& error) {
+    bool read_ack(u64 expected_seq,
+                  std::string& error,
+                  WriterProcessFrameType expected_type = WriterProcessFrameType::Cycle,
+                  std::size_t sent_payload_size = 0) {
         u64 seq = 0;
         bool ok = false;
         std::string message;
-        if (!read_ack_frame(seq, ok, message, error)) return false;
+        IpcAckReadStats stats;
+        IpcAckReadStats* stats_ptr = writer_process_frame_is_layout_init(expected_type) ? &stats : NULL;
+        if (!read_ack_frame(seq, ok, message, error, stats_ptr)) return false;
+        if (stats_ptr) log_client_ipc_ack_frame(expected_type, seq, sent_payload_size, stats);
         if (seq != expected_seq) {
             error = "WVZ4 writer helper returned an invalid ack";
+            decorate_ipc_error(error);
             return false;
         }
         if (!ok) {
             error = message;
             if (error.empty()) error = "WVZ4 writer helper reported failure";
+            decorate_ipc_error(error);
+            detail::writer_process_diag_log(diag_log_path_, std::string("client-ack-error: ") + error);
             return false;
         }
         return true;
@@ -6354,6 +7649,41 @@ private:
         }
     }
 
+    std::string helper_exit_summary() const {
+        if (!pi_.hProcess) return std::string("helper_exit=unknown");
+        DWORD code = STILL_ACTIVE;
+        if (!GetExitCodeProcess(pi_.hProcess, &code)) {
+            return detail::win32_error_message("helper_exit=GetExitCodeProcess failed");
+        }
+        if (code == STILL_ACTIVE) return std::string("helper_exit=still_active");
+        std::ostringstream os;
+        os << "helper_exit=" << static_cast<unsigned long>(code);
+        return os.str();
+    }
+
+    void decorate_ipc_error(std::string& error) const {
+        if (error.empty()) error = "WVZ4 writer helper IPC failed";
+        if (error.find("helper='") == std::string::npos && !helper_path_.empty()) {
+            error += "; helper='";
+            error += helper_path_;
+            error += "'";
+        }
+        if (error.find("ipc_op='") == std::string::npos && !last_ipc_op_.empty()) {
+            error += "; ipc_op='";
+            error += last_ipc_op_;
+            error += "'";
+        }
+        if (error.find("writer_log='") == std::string::npos && !diag_log_path_.empty()) {
+            error += "; writer_log='";
+            error += diag_log_path_;
+            error += "'";
+        }
+        if (error.find("helper_exit=") == std::string::npos) {
+            error += "; ";
+            error += helper_exit_summary();
+        }
+    }
+
     void cleanup_handles(bool wait_for_process) {
         if (pipe_ != INVALID_HANDLE_VALUE) {
             CloseHandle(pipe_);
@@ -6393,6 +7723,10 @@ private:
     bool opened_ = false;
     u64 seq_ = 0;
     std::string pipe_name_;
+    std::string helper_path_;
+    std::string output_path_;
+    std::string diag_log_path_;
+    std::string last_ipc_op_;
 };
 
 class WriterProcessServer {
@@ -6403,13 +7737,22 @@ public:
     static bool run(const std::string& pipe_name,
                     const std::string& output_path,
                     unsigned long parent_pid,
+                    const std::string& log_path,
                     std::string& error) {
 #if !defined(_WIN32)
-        (void)pipe_name; (void)output_path; (void)parent_pid;
+        (void)pipe_name; (void)output_path; (void)parent_pid; (void)log_path;
         error = "WVZ4 writer helper process is only implemented on Windows";
         return false;
 #else
         error.clear();
+        const auto server_start = std::chrono::steady_clock::now();
+        {
+            std::ostringstream os;
+            os << "server-run protocol=" << static_cast<unsigned long>(kWriterProcessProtocolVersion)
+               << " output='" << output_path << "'"
+               << " parent_pid=" << parent_pid;
+            detail::writer_process_diag_log(log_path, os.str());
+        }
         HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(parent_pid));
         HANDLE pipe = CreateNamedPipeA(pipe_name.c_str(),
                                        PIPE_ACCESS_DUPLEX,
@@ -6439,7 +7782,9 @@ public:
             error = detail::win32_error_message("failed to create WVZ4 writer helper ack pipe");
             return false;
         }
+        detail::writer_process_diag_log_phase(log_path, "server-create-pipes", server_start);
 
+        auto phase_start = std::chrono::steady_clock::now();
         if (!connect_pipe_client(pipe, parent, "WVZ4 writer helper data pipe", error)) {
             CloseHandle(pipe);
             CloseHandle(ack_pipe);
@@ -6452,13 +7797,15 @@ public:
             if (parent) CloseHandle(parent);
             return error.empty();
         }
+        detail::writer_process_diag_log_phase(log_path, "server-connect-pipes", phase_start);
 
         DWORD mode = PIPE_READMODE_BYTE | PIPE_WAIT;
         SetNamedPipeHandleState(pipe, &mode, NULL, NULL);
         SetNamedPipeHandleState(ack_pipe, &mode, NULL, NULL);
+        detail::writer_process_diag_log_phase(log_path, "server-ready", server_start);
 
         std::mutex ack_mutex;
-        HelperQueue helper(ack_pipe, ack_mutex);
+        HelperQueue helper(ack_pipe, ack_mutex, log_path);
         bool have_writer = false;
         struct LayoutStreamState {
             bool active = false;
@@ -6690,13 +8037,45 @@ public:
             }
         };
         LayoutStreamState layout_stream;
+        auto layout_stream_start = std::chrono::steady_clock::now();
+        bool logged_name_blob = false;
+        bool logged_names = false;
+        bool logged_nodes = false;
+        bool logged_signals = false;
+        bool logged_clocks = false;
+        const auto reset_layout_stream_logs = [&]() {
+            layout_stream_start = std::chrono::steady_clock::now();
+            logged_name_blob = false;
+            logged_names = false;
+            logged_nodes = false;
+            logged_signals = false;
+            logged_clocks = false;
+        };
+        const auto log_layout_stream_stage = [&](const char* stage, u64 records) {
+            std::ostringstream os;
+            os << stage
+               << " records=" << static_cast<unsigned long long>(records)
+               << " name_blob=" << static_cast<unsigned long long>(layout_stream.layout.name_blob.size())
+               << "/" << static_cast<unsigned long long>(layout_stream.expected_name_blob_size)
+               << " names=" << static_cast<unsigned long long>(layout_stream.layout.names.size())
+               << "/" << static_cast<unsigned long long>(layout_stream.expected_names)
+               << " nodes=" << static_cast<unsigned long long>(layout_stream.layout.nodes.size())
+               << "/" << static_cast<unsigned long long>(layout_stream.expected_nodes)
+               << " signals=" << static_cast<unsigned long long>(layout_stream.layout.signals.size())
+               << "/" << static_cast<unsigned long long>(layout_stream.expected_signals)
+               << " clocks=" << static_cast<unsigned long long>(layout_stream.layout.clocks.size())
+               << "/" << static_cast<unsigned long long>(layout_stream.expected_clocks);
+            detail::writer_process_diag_log_phase(log_path, "server-layout-stream-stage", layout_stream_start, os.str());
+        };
         bool result = true;
         while (true) {
             WriterProcessFrameType type = WriterProcessFrameType::Finalize;
             u64 seq = 0;
             std::vector<u8> payload;
             bool disconnected = false;
-            if (!read_frame(pipe, type, seq, payload, disconnected, error)) {
+            IpcFrameReadStats frame_read_stats;
+            if (!read_frame(pipe, type, seq, payload, disconnected, error, &frame_read_stats)) {
+                if (!error.empty()) detail::writer_process_diag_log(log_path, std::string("server-read-frame failed: ") + error);
                 if (disconnected) {
                     if (have_writer) {
                         std::string close_error;
@@ -6711,15 +8090,22 @@ public:
                 break;
             }
 
+            const bool log_init_frame = writer_process_frame_is_layout_init(type);
+            if (log_init_frame) {
+                log_server_ipc_read_frame(log_path, type, seq, frame_read_stats);
+            }
+
             std::string op_error;
             bool ok = true;
             bool ack_now = true;
             detail::PayloadReader r(payload);
+            const auto process_start = std::chrono::steady_clock::now();
             if (type == WriterProcessFrameType::Layout) {
                 if (have_writer || layout_stream.active) {
                     ok = false;
                     op_error = "WVZ4 writer helper received duplicate layout";
                 } else {
+                    const auto layout_decode_start = std::chrono::steady_clock::now();
                     WriterOptions opt;
                     Layout layout;
                     if (!detail::deserialize_options(r, opt) ||
@@ -6728,8 +8114,19 @@ public:
                         ok = false;
                         op_error = "WVZ4 writer helper received corrupt layout payload";
                     } else {
+                        {
+                            std::ostringstream os;
+                            os << "names=" << static_cast<unsigned long long>(layout.names.size())
+                               << " nodes=" << static_cast<unsigned long long>(layout.nodes.size())
+                               << " signals=" << static_cast<unsigned long long>(layout.signals.size())
+                               << " clocks=" << static_cast<unsigned long long>(layout.clocks.size());
+                            detail::writer_process_diag_log_phase(log_path, "server-inline-layout-decode", layout_decode_start, os.str());
+                        }
                         if (opt.enable_stats_log && opt.stats_log_path.empty()) opt.stats_log_path = output_path + ".log";
+                        opt.diagnostic_log_path = log_path;
+                        const auto writer_open_start = std::chrono::steady_clock::now();
                         ok = helper.open(output_path, std::move(layout), opt, op_error);
+                        detail::writer_process_diag_log_phase(log_path, "server-inline-writer-open", writer_open_start);
                         have_writer = ok;
                     }
                 }
@@ -6738,18 +8135,53 @@ public:
                     ok = false;
                     op_error = "WVZ4 writer helper received duplicate streamed layout";
                 } else {
+                    reset_layout_stream_logs();
                     ok = layout_stream.begin(r, op_error);
+                    if (ok) {
+                        std::ostringstream os;
+                        os << "expected_name_blob=" << static_cast<unsigned long long>(layout_stream.expected_name_blob_size)
+                           << " expected_names=" << static_cast<unsigned long long>(layout_stream.expected_names)
+                           << " expected_nodes=" << static_cast<unsigned long long>(layout_stream.expected_nodes)
+                           << " expected_signals=" << static_cast<unsigned long long>(layout_stream.expected_signals)
+                           << " expected_clocks=" << static_cast<unsigned long long>(layout_stream.expected_clocks);
+                        detail::writer_process_diag_log_phase(log_path, "server-layout-stream-begin", layout_stream_start, os.str());
+                    }
                 }
             } else if (type == WriterProcessFrameType::LayoutNameBlob) {
                 ok = layout_stream.append_name_blob(r, op_error);
+                if (ok && !logged_name_blob &&
+                    static_cast<u64>(layout_stream.layout.name_blob.size()) == layout_stream.expected_name_blob_size) {
+                    logged_name_blob = true;
+                    log_layout_stream_stage("name_blob_complete", layout_stream.expected_name_blob_size);
+                }
             } else if (type == WriterProcessFrameType::LayoutNames) {
                 ok = layout_stream.append_names(r, op_error);
+                if (ok && !logged_names &&
+                    static_cast<u64>(layout_stream.layout.names.size()) == layout_stream.expected_names) {
+                    logged_names = true;
+                    log_layout_stream_stage("names_complete", layout_stream.expected_names);
+                }
             } else if (type == WriterProcessFrameType::LayoutNodes) {
                 ok = layout_stream.append_nodes(r, op_error);
+                if (ok && !logged_nodes &&
+                    static_cast<u64>(layout_stream.layout.nodes.size()) == layout_stream.expected_nodes) {
+                    logged_nodes = true;
+                    log_layout_stream_stage("nodes_complete", layout_stream.expected_nodes);
+                }
             } else if (type == WriterProcessFrameType::LayoutSignals) {
                 ok = layout_stream.append_signals(r, op_error);
+                if (ok && !logged_signals &&
+                    static_cast<u64>(layout_stream.layout.signals.size()) == layout_stream.expected_signals) {
+                    logged_signals = true;
+                    log_layout_stream_stage("signals_complete", layout_stream.expected_signals);
+                }
             } else if (type == WriterProcessFrameType::LayoutClocks) {
                 ok = layout_stream.append_clocks(r, op_error);
+                if (ok && !logged_clocks &&
+                    static_cast<u64>(layout_stream.layout.clocks.size()) == layout_stream.expected_clocks) {
+                    logged_clocks = true;
+                    log_layout_stream_stage("clocks_complete", layout_stream.expected_clocks);
+                }
             } else if (type == WriterProcessFrameType::LayoutEnd) {
                 if (have_writer) {
                     ok = false;
@@ -6758,7 +8190,12 @@ public:
                     if (layout_stream.opt.enable_stats_log && layout_stream.opt.stats_log_path.empty()) {
                         layout_stream.opt.stats_log_path = output_path + ".log";
                     }
+                    layout_stream.opt.diagnostic_log_path = log_path;
+                    log_layout_stream_stage("received_complete", 0);
+                    const auto writer_open_start = std::chrono::steady_clock::now();
                     ok = helper.open(output_path, std::move(layout_stream.layout), layout_stream.opt, op_error);
+                    detail::writer_process_diag_log_phase(log_path, "server-stream-writer-open", writer_open_start);
+                    detail::writer_process_diag_log_phase(log_path, "server-stream-layout-open-total", layout_stream_start);
                     have_writer = ok;
                     if (!ok) layout_stream.reset();
                 } else {
@@ -6777,6 +8214,14 @@ public:
                         op_error = "WVZ4 writer helper received corrupt cycle payload";
                         ack_now = true;
                     } else {
+                        if (s.cycle == 0) {
+                            std::ostringstream os;
+                            os << "server-cycle0-payload"
+                               << " ipc_frame_bytes=" << static_cast<unsigned long long>(payload.size() + detail::kIpcHeaderSize)
+                               << " "
+                               << detail::describe_cycle_payload_composition(s, payload.size());
+                            detail::writer_process_diag_log(log_path, os.str());
+                        }
                         ok = helper.enqueue(seq, std::move(s), op_error);
                         if (!ok) ack_now = true;
                     }
@@ -6789,12 +8234,22 @@ public:
                 op_error = "WVZ4 writer helper received unknown IPC frame type";
             }
 
+            if (log_init_frame) {
+                log_server_ipc_process_frame(log_path, type, seq, payload.size(), ok, process_start);
+            }
             if (ack_now) {
                 std::lock_guard<std::mutex> ack_lock(ack_mutex);
-                if (!send_ack(ack_pipe, seq, ok, op_error, error)) {
+                IpcAckSendStats ack_stats;
+                IpcAckSendStats* ack_stats_ptr = log_init_frame ? &ack_stats : NULL;
+                if (!send_ack(ack_pipe, seq, ok, op_error, error, ack_stats_ptr)) {
+                    detail::writer_process_diag_log(log_path, std::string("server-send-ack failed: ") + error);
                     result = false;
                     break;
                 }
+                if (ack_stats_ptr) {
+                    log_server_ipc_send_ack(log_path, type, seq, ok, ack_stats);
+                }
+                if (!ok) detail::writer_process_diag_log(log_path, std::string("server-ack-error: ") + op_error);
             }
             if (!ok) {
                 result = false;
@@ -6812,12 +8267,95 @@ public:
         CloseHandle(pipe);
         CloseHandle(ack_pipe);
         if (parent) CloseHandle(parent);
+        detail::writer_process_diag_log(log_path, result ? "server-exit ok" : std::string("server-exit failed: ") + error);
         return result;
 #endif
     }
 
+    static bool run(const std::string& pipe_name,
+                    const std::string& output_path,
+                    unsigned long parent_pid,
+                    std::string& error) {
+        return run(pipe_name, output_path, parent_pid, std::string(), error);
+    }
+
 private:
 #if defined(_WIN32)
+    struct IpcFrameReadStats {
+        u64 payload_bytes = 0;
+        u32 checksum = 0;
+        bool checksum_disabled = false;
+        long long header_ms = 0;
+        long long payload_ms = 0;
+        long long checksum_ms = 0;
+        long long total_ms = 0;
+    };
+
+    struct IpcAckSendStats {
+        u64 message_bytes = 0;
+        long long header_ms = 0;
+        long long message_ms = 0;
+        long long checksum_ms = 0;
+        long long total_ms = 0;
+    };
+
+    static void log_server_ipc_read_frame(const std::string& log_path,
+                                          WriterProcessFrameType type,
+                                          u64 seq,
+                                          const IpcFrameReadStats& stats) {
+        std::ostringstream os;
+        os << "server-ipc-read-frame"
+           << " type=" << writer_process_frame_type_name(type)
+           << " seq=" << static_cast<unsigned long long>(seq)
+           << " payload_bytes=" << static_cast<unsigned long long>(stats.payload_bytes);
+        if (stats.checksum_disabled) {
+            os << " checksum=disabled";
+        } else {
+            os << " checksum=0x" << std::hex << stats.checksum << std::dec;
+        }
+        os << " header_ms=" << stats.header_ms
+           << " payload_ms=" << stats.payload_ms
+           << " checksum_ms=" << stats.checksum_ms
+           << " total_ms=" << stats.total_ms;
+        detail::writer_process_append_mib_per_s(os, "payload_read_rate", stats.payload_bytes, stats.payload_ms);
+        detail::writer_process_append_mib_per_s(os, "total_read_rate", stats.payload_bytes, stats.total_ms);
+        detail::writer_process_diag_log(log_path, os.str());
+    }
+
+    static void log_server_ipc_process_frame(const std::string& log_path,
+                                             WriterProcessFrameType type,
+                                             u64 seq,
+                                             std::size_t payload_size,
+                                             bool ok,
+                                             std::chrono::steady_clock::time_point start) {
+        std::ostringstream os;
+        os << "server-ipc-process-frame"
+           << " type=" << writer_process_frame_type_name(type)
+           << " seq=" << static_cast<unsigned long long>(seq)
+           << " payload_bytes=" << static_cast<unsigned long long>(payload_size)
+           << " ok=" << (ok ? 1 : 0)
+           << " process_ms=" << detail::writer_process_elapsed_ms(start);
+        detail::writer_process_diag_log(log_path, os.str());
+    }
+
+    static void log_server_ipc_send_ack(const std::string& log_path,
+                                        WriterProcessFrameType type,
+                                        u64 seq,
+                                        bool ok,
+                                        const IpcAckSendStats& stats) {
+        std::ostringstream os;
+        os << "server-ipc-send-ack"
+           << " type=" << writer_process_frame_type_name(type)
+           << " seq=" << static_cast<unsigned long long>(seq)
+           << " ok=" << (ok ? 1 : 0)
+           << " message_bytes=" << static_cast<unsigned long long>(stats.message_bytes)
+           << " checksum_ms=" << stats.checksum_ms
+           << " header_ms=" << stats.header_ms
+           << " message_ms=" << stats.message_ms
+           << " total_ms=" << stats.total_ms;
+        detail::writer_process_diag_log(log_path, os.str());
+    }
+
     static bool connect_pipe_client(HANDLE pipe,
                                     HANDLE parent,
                                     const char* label,
@@ -6851,55 +8389,119 @@ private:
                            u64& seq,
                            std::vector<u8>& payload,
                            bool& disconnected,
-                           std::string& error) {
+                           std::string& error,
+                           IpcFrameReadStats* stats = NULL) {
+        const auto total_start = std::chrono::steady_clock::now();
+        if (stats) *stats = IpcFrameReadStats();
         u8 hdr[detail::kIpcHeaderSize];
-        if (!detail::read_all_handle(pipe, hdr, sizeof(hdr), disconnected, error)) return false;
+        const auto header_start = std::chrono::steady_clock::now();
+        if (!detail::read_all_handle(pipe, hdr, sizeof(hdr), disconnected, error)) {
+            if (stats) {
+                stats->header_ms = detail::writer_process_elapsed_ms(header_start);
+                stats->total_ms = detail::writer_process_elapsed_ms(total_start);
+            }
+            return false;
+        }
+        if (stats) stats->header_ms = detail::writer_process_elapsed_ms(header_start);
         const u32 magic = detail::load_u32_le(hdr + 0);
         const u32 type_u = detail::load_u32_le(hdr + 4);
         seq = detail::load_u64_le(hdr + 8);
         const u64 size = detail::load_u64_le(hdr + 16);
         const u32 checksum = detail::load_u32_le(hdr + 24);
+        if (stats) {
+            stats->payload_bytes = size;
+            stats->checksum = checksum;
+            stats->checksum_disabled = (checksum == detail::kIpcChecksumDisabled);
+        }
         if (magic != detail::kIpcMagic) {
             error = "WVZ4 writer helper received invalid IPC magic";
+            if (stats) stats->total_ms = detail::writer_process_elapsed_ms(total_start);
             return false;
         }
         if (size > detail::kMaxIpcPayloadBytes ||
             size > static_cast<u64>((std::numeric_limits<std::size_t>::max)())) {
             error = "WVZ4 writer helper IPC payload is too large";
+            if (stats) stats->total_ms = detail::writer_process_elapsed_ms(total_start);
             return false;
         }
-        payload.assign(static_cast<std::size_t>(size), 0);
+        payload.resize(static_cast<std::size_t>(size));
+        const auto payload_start = std::chrono::steady_clock::now();
         if (size > 0 && !detail::read_all_handle(pipe, payload.data(), payload.size(), disconnected, error)) {
+            if (stats) {
+                stats->payload_ms = detail::writer_process_elapsed_ms(payload_start);
+                stats->total_ms = detail::writer_process_elapsed_ms(total_start);
+            }
             return false;
         }
-        if (detail::fnv1a32(payload) != checksum) {
+        if (stats) stats->payload_ms = detail::writer_process_elapsed_ms(payload_start);
+        const auto checksum_start = std::chrono::steady_clock::now();
+        if (checksum != detail::kIpcChecksumDisabled && detail::fnv1a32(payload) != checksum) {
+            if (stats) {
+                stats->checksum_ms = detail::writer_process_elapsed_ms(checksum_start);
+                stats->total_ms = detail::writer_process_elapsed_ms(total_start);
+            }
             error = "WVZ4 writer helper IPC payload checksum mismatch";
             return false;
+        }
+        if (stats) {
+            stats->checksum_ms = detail::writer_process_elapsed_ms(checksum_start);
+            stats->total_ms = detail::writer_process_elapsed_ms(total_start);
         }
         type = static_cast<WriterProcessFrameType>(type_u);
         return true;
     }
 
-    static bool send_ack(HANDLE pipe, u64 seq, bool ok, const std::string& message, std::string& error) {
+    static bool send_ack(HANDLE pipe,
+                         u64 seq,
+                         bool ok,
+                         const std::string& message,
+                         std::string& error,
+                         IpcAckSendStats* stats = NULL) {
+        const auto total_start = std::chrono::steady_clock::now();
+        if (stats) *stats = IpcAckSendStats();
         std::vector<u8> msg;
         if (!message.empty()) {
             msg.assign(message.begin(), message.end());
         }
+        if (stats) stats->message_bytes = static_cast<u64>(msg.size());
+        const auto checksum_start = std::chrono::steady_clock::now();
+        const u32 checksum = detail::fnv1a32(msg);
+        if (stats) stats->checksum_ms = detail::writer_process_elapsed_ms(checksum_start);
         std::vector<u8> header;
         header.reserve(detail::kIpcAckHeaderSize);
         detail::append_u32(header, detail::kIpcAckMagic);
         detail::append_u64(header, seq);
         detail::append_u32(header, ok ? 1u : 0u);
         detail::append_u32(header, static_cast<u32>(msg.size()));
-        detail::append_u32(header, detail::fnv1a32(msg));
-        if (!detail::write_all_handle(pipe, header.data(), header.size(), error)) return false;
-        if (!msg.empty() && !detail::write_all_handle(pipe, msg.data(), msg.size(), error)) return false;
+        detail::append_u32(header, checksum);
+        const auto header_start = std::chrono::steady_clock::now();
+        if (!detail::write_all_handle(pipe, header.data(), header.size(), error)) {
+            if (stats) {
+                stats->header_ms = detail::writer_process_elapsed_ms(header_start);
+                stats->total_ms = detail::writer_process_elapsed_ms(total_start);
+            }
+            return false;
+        }
+        if (stats) stats->header_ms = detail::writer_process_elapsed_ms(header_start);
+        const auto message_start = std::chrono::steady_clock::now();
+        if (!msg.empty() && !detail::write_all_handle(pipe, msg.data(), msg.size(), error)) {
+            if (stats) {
+                stats->message_ms = detail::writer_process_elapsed_ms(message_start);
+                stats->total_ms = detail::writer_process_elapsed_ms(total_start);
+            }
+            return false;
+        }
+        if (stats) {
+            stats->message_ms = detail::writer_process_elapsed_ms(message_start);
+            stats->total_ms = detail::writer_process_elapsed_ms(total_start);
+        }
         return true;
     }
 
     class HelperQueue {
     public:
-        HelperQueue(HANDLE pipe, std::mutex& ack_mutex) : pipe_(pipe), ack_mutex_(&ack_mutex) {}
+        HelperQueue(HANDLE pipe, std::mutex& ack_mutex, const std::string& log_path)
+            : pipe_(pipe), ack_mutex_(&ack_mutex), log_path_(log_path) {}
         ~HelperQueue() { std::string ignored; close(ignored); }
 
         HelperQueue(const HelperQueue&) = delete;
@@ -6930,6 +8532,12 @@ private:
                 error_.clear();
                 queue_.clear();
                 queued_bytes_ = 0;
+                queued_bytes_high_water_ = 0;
+                queue_size_high_water_ = 0;
+                enqueue_count_ = 0;
+                dequeue_count_ = 0;
+                queue_wait_count_ = 0;
+                queue_wait_ms_ = 0;
             }
             worker_ = std::thread([this]() { this->worker_loop(); });
             return true;
@@ -6947,13 +8555,19 @@ private:
                 error = error_;
                 return false;
             }
-            cv_space_.wait(lock, [this, approx_bytes]() {
+            auto has_space = [this, approx_bytes]() {
                 if (stopping_ || !error_.empty()) return true;
                 const bool count_ok = queue_.size() < static_cast<std::size_t>(detail::kWriterProcessCycleCredits);
                 const bool bytes_ok = queued_bytes_ + approx_bytes <= detail::kWriterProcessQueueBytesLimit ||
                                       queue_.empty();
                 return count_ok && bytes_ok;
-            });
+            };
+            if (!has_space()) {
+                ++queue_wait_count_;
+                const auto wait_start = std::chrono::steady_clock::now();
+                cv_space_.wait(lock, has_space);
+                queue_wait_ms_ += detail::writer_process_elapsed_ms(wait_start);
+            }
             if (!error_.empty()) {
                 error = error_;
                 return false;
@@ -6969,6 +8583,9 @@ private:
             item.submission = std::move(submission);
             item.approx_bytes = approx_bytes;
             queued_bytes_ += approx_bytes;
+            ++enqueue_count_;
+            if (queued_bytes_ > queued_bytes_high_water_) queued_bytes_high_water_ = queued_bytes_;
+            if (queue_.size() > queue_size_high_water_) queue_size_high_water_ = queue_.size();
             cv_not_empty_.notify_one();
             return true;
         }
@@ -6986,6 +8603,7 @@ private:
 
             bool ok = true;
             std::string local_error;
+            log_queue_summary_();
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (!error_.empty()) {
@@ -7016,6 +8634,39 @@ private:
             return sizeof(CycleSubmission) + submission.estimate_heap_bytes();
         }
 
+        void log_queue_summary_() {
+            if (log_path_.empty()) return;
+            std::size_t pending = 0;
+            std::size_t high_queue = 0;
+            std::size_t high_bytes = 0;
+            u64 enqueued = 0;
+            u64 dequeued = 0;
+            u64 wait_count = 0;
+            long long wait_ms = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                pending = queue_.size();
+                high_queue = queue_size_high_water_;
+                high_bytes = queued_bytes_high_water_;
+                enqueued = enqueue_count_;
+                dequeued = dequeue_count_;
+                wait_count = queue_wait_count_;
+                wait_ms = queue_wait_ms_;
+            }
+            std::ostringstream os;
+            os << "server-cycle-queue-summary"
+               << " enqueued=" << static_cast<unsigned long long>(enqueued)
+               << " dequeued=" << static_cast<unsigned long long>(dequeued)
+               << " pending=" << static_cast<unsigned long long>(pending)
+               << " high_queue=" << static_cast<unsigned long long>(high_queue)
+               << " high_bytes=" << static_cast<unsigned long long>(high_bytes)
+               << " byte_limit=" << static_cast<unsigned long long>(detail::kWriterProcessQueueBytesLimit)
+               << " credit_limit=" << static_cast<unsigned long>(detail::kWriterProcessCycleCredits)
+               << " wait_count=" << static_cast<unsigned long long>(wait_count)
+               << " wait_ms=" << wait_ms;
+            detail::writer_process_diag_log(log_path_, os.str());
+        }
+
         void set_error_locked(const std::string& error) {
             if (error_.empty()) error_ = error.empty() ? "WVZ4 writer helper queue failed" : error;
             stopping_ = true;
@@ -7039,6 +8690,7 @@ private:
                     queue_.pop_front();
                     if (queued_bytes_ >= item.approx_bytes) queued_bytes_ -= item.approx_bytes;
                     else queued_bytes_ = 0;
+                    ++dequeue_count_;
                     cv_space_.notify_one();
                 }
 
@@ -7068,10 +8720,17 @@ private:
 
         HANDLE pipe_ = INVALID_HANDLE_VALUE;
         std::mutex* ack_mutex_ = NULL;
+        std::string log_path_;
         Writer writer_;
         bool opened_ = false;
         bool stopping_ = false;
         std::size_t queued_bytes_ = 0;
+        std::size_t queued_bytes_high_water_ = 0;
+        std::size_t queue_size_high_water_ = 0;
+        u64 enqueue_count_ = 0;
+        u64 dequeue_count_ = 0;
+        u64 queue_wait_count_ = 0;
+        long long queue_wait_ms_ = 0;
         std::string error_;
         std::thread worker_;
         std::mutex mutex_;

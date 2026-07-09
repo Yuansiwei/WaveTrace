@@ -200,8 +200,35 @@ public:
     std::set<std::string> declared_track_paths;
 
     void on_track_declared(const wave::TrackDecl& decl) override {
-        declared_track_paths.insert(decl.path);
-        PathStableWvz4Recorder::on_track_declared(decl);
+        on_track_declared_fast(
+            decl.track_id,
+            decl.storage_id,
+            decl.node_id,
+            decl.kind,
+            decl.bit_width,
+            decl.bit_offset,
+            decl.storage_only,
+            decl.path);
+    }
+
+    void on_track_declared_fast(wave::TrackId track_id,
+                                wave::TrackId storage_id,
+                                wave::NodeId node_id,
+                                wave::ValueKind kind,
+                                std::uint32_t bit_width,
+                                std::uint32_t bit_offset,
+                                bool storage_only,
+                                const std::string& path) override {
+        declared_track_paths.insert(path);
+        PathStableWvz4Recorder::on_track_declared_fast(
+            track_id,
+            storage_id,
+            node_id,
+            kind,
+            bit_width,
+            bit_offset,
+            storage_only,
+            path);
     }
 };
 

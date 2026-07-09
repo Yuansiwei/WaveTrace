@@ -72,6 +72,12 @@ if(WIN32)
 		set(CMODEL_OUTPUT_DIR ${VIVANTE_SDK_DIR}/lib)
 	endif()
 endif()
+foreach(_wavetrace_cmake_path WORKDIR AQROOT AQARCH AQTOOLS AQCMODEL VIVANTE_SDK_DIR CMODEL_OUTPUT_DIR)
+	if(DEFINED ${_wavetrace_cmake_path})
+		file(TO_CMAKE_PATH "${${_wavetrace_cmake_path}}" _wavetrace_cmake_path_value)
+		set(${_wavetrace_cmake_path} "${_wavetrace_cmake_path_value}")
+	endif()
+endforeach()
 if(NOT DEFINED DV_DUMP)
 	set(DV_DUMP OFF)
 endif()
@@ -87,6 +93,8 @@ set(WAVETRACE_REFLECT_ENTRY_HEADER "" CACHE FILEPATH "Header that defines the Wa
 set(WAVETRACE_REFLECT_BATCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH "Directory scanned by ReflectGen")
 set(WAVETRACE_REFLECT_EXTRA_ARGS "" CACHE STRING "Extra ReflectGen arguments, for example --allow-errors")
 set(WAVETRACE_REFLECT_EXTRA_CLANG_ARGS "" CACHE STRING "Extra clang parse arguments for ReflectGen, for example -Ipath -DMACRO=1")
+set(WAVETRACE_REFLECT_VERBOSE OFF CACHE BOOL "Print full WaveTrace ReflectGen stdout/stderr/log on successful builds")
+set(WAVETRACE_VERBOSE_BUILD OFF CACHE BOOL "Enable verbose generated build command output")
 
 if(ENABLE_WAVETRACE)
 	if(NOT EXISTS "${WAVETRACE_ROOT}/reflect_macro.h")
@@ -218,7 +226,9 @@ if(MSVC)
 	set_target_properties(cmodel PROPERTIES OUTPUT_NAME "arch.cmodel")
 	target_compile_definitions(cmodel PUBLIC _MSVC)
 endif()
-set (CMAKE_VERBOSE_MAKEFILE ON)
+if(WAVETRACE_VERBOSE_BUILD)
+	set(CMAKE_VERBOSE_MAKEFILE ON)
+endif()
 # Set output directories
 if(ISAMODEL)
 	target_compile_definitions(cmodel PUBLIC gcdMODELING_MODE=2)
@@ -266,52 +276,100 @@ if(WIN32)
 	
 	#add pre-build event
 	if(MSVC)
-		if(ENABLE_WAVETRACE)
-			set(CMODEL_REGGEN_STAMP "${CMAKE_CURRENT_BINARY_DIR}/cmodel_reggen.stamp")
-			set(CMODEL_REGGEN_SCRIPT "${WAVETRACE_ROOT}/cmake/run_cmodel_reggen.cmake")
-			if(NOT EXISTS "${CMODEL_REGGEN_SCRIPT}")
-				message(FATAL_ERROR "WaveTrace cmodel reggen runner script was not found: ${CMODEL_REGGEN_SCRIPT}")
+		set(CMODEL_REGGEN_STAMP "${CMAKE_CURRENT_BINARY_DIR}/cmodel_reggen.stamp")
+		set(CMODEL_REGGEN_INPUTS)
+		foreach(_cmodel_reggen_input
+			"${AQROOT}/tools/bin/gcDefineGen.py"
+			"${AQARCH}/.aqtree"
+			"${AQARCH}/cmodel/CModelFeatureDB.csv"
+			"${AQARCH}/cmodel/inc/AQ.h")
+			if(EXISTS "${_cmodel_reggen_input}")
+				list(APPEND CMODEL_REGGEN_INPUTS "${_cmodel_reggen_input}")
 			endif()
-			add_custom_command(
-							OUTPUT "${CMODEL_REGGEN_STAMP}"
-							COMMAND ${CMAKE_COMMAND}
-								"-DAQROOT=${AQROOT}"
-								"-DAQARCH=${AQARCH}"
-								"-DARCH=${ARCH}"
-								"-DCMODEL_REGGEN_STAMP=${CMODEL_REGGEN_STAMP}"
-								-P "${CMODEL_REGGEN_SCRIPT}"
-							VERBATIM
-							#COMMAND python  "$(AQARCH)/infra/isa_auto_generator/main.py"  --generate cpp --output $(AQARCH)/cmodel/isa/src
-							)
-			add_custom_target(cmodel_reggen DEPENDS "${CMODEL_REGGEN_STAMP}")
-			add_dependencies(cmodel cmodel_reggen)
-		else()
-			add_custom_command(
-							TARGET cmodel
-							PRE_BUILD
-							COMMAND $(AQROOT)/tools/bin/python/python  "$(AQROOT)/tools/bin/gcDefineGen.py"    $(AQARCH)/cmodel   $(ARCH)
-							COMMAND attrib -r $(AQARCH)/cmodel/isa/src/isa_instructions.h
-							#COMMAND python  "$(AQARCH)/infra/isa_auto_generator/main.py"  --generate cpp --output $(AQARCH)/cmodel/isa/src
-							)
+		endforeach()
+		if(EXISTS "${REG_DIR}")
+			file(GLOB CMODEL_REGGEN_REG_INPUTS CONFIGURE_DEPENDS "${REG_DIR}/*")
+			list(APPEND CMODEL_REGGEN_INPUTS ${CMODEL_REGGEN_REG_INPUTS})
 		endif()
+		set(CMODEL_REGGEN_OUTPUTS
+			"${AQARCH}/cmodel/inc/gcDefines.h"
+			"${AQARCH}/cmodel/isa/src/isa_instructions.h")
+		set(CMODEL_REGGEN_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/run_cmodel_reggen_if_needed.cmake")
+		file(WRITE "${CMODEL_REGGEN_SCRIPT}" "
+set(_stamp [==[${CMODEL_REGGEN_STAMP}]==])
+set(_python [==[${AQROOT}/tools/bin/python/python]==])
+set(_generator [==[${AQROOT}/tools/bin/gcDefineGen.py]==])
+set(_cmodel_dir [==[${AQARCH}/cmodel]==])
+set(_arch [==[${ARCH}]==])
+set(_inputs [==[${CMODEL_REGGEN_INPUTS}]==])
+set(_outputs [==[${CMODEL_REGGEN_OUTPUTS}]==])
+set(_isa_header [==[${AQARCH}/cmodel/isa/src/isa_instructions.h]==])
+if(WIN32 AND NOT EXISTS \"\${_python}\")
+	foreach(_python_ext .exe .bat .cmd)
+		if(EXISTS \"\${_python}\${_python_ext}\")
+			set(_python \"\${_python}\${_python_ext}\")
+			break()
+		endif()
+	endforeach()
+endif()
+set(_need_run FALSE)
+if(NOT EXISTS \"\${_stamp}\")
+	set(_need_run TRUE)
+endif()
+foreach(_out IN LISTS _outputs)
+	if(NOT EXISTS \"\${_out}\")
+		set(_need_run TRUE)
 	endif()
+endforeach()
+foreach(_in IN LISTS _inputs)
+	if(EXISTS \"\${_in}\" AND (NOT EXISTS \"\${_stamp}\" OR \"\${_in}\" IS_NEWER_THAN \"\${_stamp}\"))
+		set(_need_run TRUE)
+	endif()
+endforeach()
+if(_need_run)
+	message(STATUS \"Running cmodel register generator\")
+	execute_process(COMMAND \"\${_python}\" \"\${_generator}\" \"\${_cmodel_dir}\" \"\${_arch}\" RESULT_VARIABLE _rc)
+	if(NOT _rc EQUAL 0)
+		message(FATAL_ERROR \"cmodel register generator failed: \${_rc}\")
+	endif()
+	if(EXISTS \"\${_isa_header}\")
+		execute_process(COMMAND attrib -r \"\${_isa_header}\")
+	endif()
+	execute_process(COMMAND \"${CMAKE_COMMAND}\" -E touch \"\${_stamp}\" RESULT_VARIABLE _touch_rc)
+	if(NOT _touch_rc EQUAL 0)
+		message(FATAL_ERROR \"failed to touch cmodel reggen stamp: \${_touch_rc}\")
+	endif()
+else()
+	message(STATUS \"cmodel register generator is up to date\")
+endif()
+")
+		add_custom_target(cmodel_reggen
+						COMMAND "${CMAKE_COMMAND}" -P "${CMODEL_REGGEN_SCRIPT}"
+						VERBATIM
+						#COMMAND python  "$(AQARCH)/infra/isa_auto_generator/main.py"  --generate cpp --output $(AQARCH)/cmodel/isa/src
+						)
+		add_dependencies(cmodel cmodel_reggen)
+	endif()
+	set(CMODEL_MONITOR_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cmonitor/cmodel_monitor/cmodel_monitor/x64")
+	file(TO_CMAKE_PATH "${CMODEL_MONITOR_LIB_DIR}" CMODEL_MONITOR_LIB_DIR)
 	if(MSVC)
 		target_link_directories(cmodel INTERFACE
 			"$<$<CONFIG:Debug>:${AQTOOLS}/GPU/perf/systemc-2.3.3/msvc10/SystemC/x64/Debug>"
 			"$<$<NOT:$<CONFIG:Debug>>:${AQTOOLS}/GPU/perf/systemc-2.3.3/msvc10/SystemC/x64/Release>"
-			"$<$<CONFIG:Debug>:cmonitor/cmodel_monitor/cmodel_monitor/x64/Debug>"
-			"$<$<CONFIG:Debug>:cmonitor/cmodel_monitor/cmodel_monitor/x64>"
-			"$<$<NOT:$<CONFIG:Debug>>:cmonitor/cmodel_monitor/cmodel_monitor/x64/Release>")
+			"$<$<CONFIG:Debug>:${CMODEL_MONITOR_LIB_DIR}/Debug>"
+			"$<$<CONFIG:Debug>:${CMODEL_MONITOR_LIB_DIR}>"
+			"$<$<NOT:$<CONFIG:Debug>>:${CMODEL_MONITOR_LIB_DIR}/Release>"
+			"${CMODEL_MONITOR_LIB_DIR}")
 		target_link_libraries(cmodel PUBLIC SystemC vsiMathlib cmonitor_protocol.lib)
 	else()
 		if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 			add_subdirectory(${AQTOOLS}/GPU/perf/systemc-2.3.3 ${CMAKE_BINARY_DIR}/systemcLib)
-			target_link_directories(cmodel INTERFACE cmonitor/cmodel_monitor/cmodel_monitor/x64/Debug)
-			target_link_directories(cmodel INTERFACE cmonitor/cmodel_monitor/cmodel_monitor/x64)
+			target_link_directories(cmodel INTERFACE "${CMODEL_MONITOR_LIB_DIR}/Debug")
+			target_link_directories(cmodel INTERFACE "${CMODEL_MONITOR_LIB_DIR}")
 			target_link_libraries(cmodel PUBLIC systemc vsiMathlib cmonitor_protocol.lib)
 		else()
 			target_link_directories(cmodel INTERFACE ${AQTOOLS}/GPU/perf/systemc-2.3.3/msvc10/SystemC/x64/Release)
-			target_link_directories(cmodel INTERFACE cmonitor/cmodel_monitor/cmodel_monitor/x64/Release)
+			target_link_directories(cmodel INTERFACE "${CMODEL_MONITOR_LIB_DIR}/Release")
 			target_link_libraries(cmodel PUBLIC SystemC vsiMathlib cmonitor_protocol.lib)
 		endif()
 	endif()
@@ -582,6 +640,16 @@ if(ENABLE_WAVETRACE)
 	if(DEFINED CMODEL_REGGEN_STAMP)
 		list(APPEND WAVETRACE_REFLECT_DEPENDS "${CMODEL_REGGEN_STAMP}")
 	endif()
+	set(WAVETRACE_REFLECT_INPUT_LIST "${WAVETRACE_BUILD_TOP_DIR}/wavetrace_reflect_inputs.txt")
+	file(WRITE "${WAVETRACE_REFLECT_INPUT_LIST}" "")
+	foreach(_wavetrace_reflect_input IN LISTS WAVETRACE_REFLECT_DEPENDS)
+		if(NOT "${_wavetrace_reflect_input}" STREQUAL "" AND NOT "${_wavetrace_reflect_input}" MATCHES "\\$<")
+			get_filename_component(_wavetrace_reflect_input_abs "${_wavetrace_reflect_input}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+			file(TO_CMAKE_PATH "${_wavetrace_reflect_input_abs}" _wavetrace_reflect_input_abs)
+			file(APPEND "${WAVETRACE_REFLECT_INPUT_LIST}" "${_wavetrace_reflect_input_abs}\n")
+		endif()
+	endforeach()
+	list(APPEND WAVETRACE_REFLECT_DEPENDS "${WAVETRACE_REFLECT_INPUT_LIST}")
 
 	set(WAVETRACE_RUN_REFLECTGEN_SCRIPT "${WAVETRACE_ROOT}/cmake/run_reflectgen.cmake")
 	if(NOT EXISTS "${WAVETRACE_RUN_REFLECTGEN_SCRIPT}")
@@ -595,12 +663,14 @@ if(ENABLE_WAVETRACE)
 			"-DWAVETRACE_REFLECTGEN_EXE=${WAVETRACE_REFLECTGEN_EXE}"
 			"-DWAVETRACE_REFLECT_BATCH_DIR=${WAVETRACE_REFLECT_BATCH_DIR}"
 			"-DWAVETRACE_REFLECT_TARGET_LIST=${WAVETRACE_REFLECT_TARGET_LIST}"
+			"-DWAVETRACE_REFLECT_INPUT_LIST=${WAVETRACE_REFLECT_INPUT_LIST}"
 			"-DWAVETRACE_REFLECT_ROOT_CLASS=${WAVETRACE_REFLECT_ROOT_CLASS}"
 			"-DWAVETRACE_REFLECT_EXTRA_ARGS=${WAVETRACE_REFLECT_EXTRA_ARGS_LIST}"
 			"-DWAVETRACE_REFLECT_OUTPUT_DIR=${WAVETRACE_GEN_DIR}"
 			"-DWAVETRACE_REFLECT_AGGREGATE_HEADER=project_reflect_auto.h"
 			"-DWAVETRACE_REFLECT_LOG_FILE=${WAVETRACE_GEN_DIR}/reflectgen.log"
 			"-DWAVETRACE_REFLECT_CLANG_ARGS=${WAVETRACE_REFLECT_CLANG_ARGS}"
+			"-DWAVETRACE_REFLECT_VERBOSE=${WAVETRACE_REFLECT_VERBOSE}"
 			-P "${WAVETRACE_RUN_REFLECTGEN_SCRIPT}"
 		DEPENDS ${WAVETRACE_REFLECT_DEPENDS}
 		VERBATIM
