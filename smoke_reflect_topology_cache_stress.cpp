@@ -114,6 +114,12 @@ struct WideTop {
     }
 };
 
+struct RuntimeNamedFields {
+    std::array<std::uint32_t, 4> values;
+
+    RuntimeNamedFields() : values() {}
+};
+
 struct Top {
     wave::WavePtr<Slot*> slots;
 
@@ -215,6 +221,18 @@ template<> struct reflected_visitor<WideTop> {
     template<class P, class V, class G>
     static void visit(const WideTop* obj, P&& on_ptr, V&&, G&&) {
         on_ptr("slots", std::addressof(obj->slots));
+    }
+};
+
+template<> struct is_reflected<RuntimeNamedFields> : std::true_type {};
+template<> struct reflected_visitor<RuntimeNamedFields> {
+    template<class P, class V, class G>
+    static void visit(const RuntimeNamedFields* obj, P&& on_ptr, V&&, G&&) {
+        char name[3] = {'f', '0', '\0'};
+        for (std::size_t i = 0; i < obj->values.size(); ++i) {
+            name[1] = static_cast<char>('0' + i);
+            on_ptr(name, std::addressof(obj->values[i]));
+        }
     }
 };
 
@@ -780,6 +798,42 @@ static bool verify_wide_parallel_topology() {
     return true;
 }
 
+static bool verify_runtime_name_buffer_cache() {
+    RuntimeNamedFields value;
+    wave::InMemoryWaveSink sink;
+    wave::BuildOptions opt;
+    opt.dump_leaf_distribution_after_topology = false;
+    {
+        wave::Tracer tracer(sink, opt);
+        tracer.add_root("runtime_names", &value);
+        tracer.sample(0);
+    }
+
+    bool seen[4] = {false, false, false, false};
+    std::size_t leaf_count = 0;
+    for (std::size_t i = 0; i < sink.node_declarations.size(); ++i) {
+        const wave::NodeDecl& node = sink.node_declarations[i];
+        if (node.kind != wave::NodeKind::Leaf) continue;
+        ++leaf_count;
+        if (node.name.size() != 2u || node.name[0] != 'f' ||
+            node.name[1] < '0' || node.name[1] > '3') {
+            std::cerr << "runtime name buffer produced bad node name: " << node.name << "\n";
+            return false;
+        }
+        const std::size_t index = static_cast<std::size_t>(node.name[1] - '0');
+        if (seen[index]) {
+            std::cerr << "runtime name buffer collapsed duplicate node name: " << node.name << "\n";
+            return false;
+        }
+        seen[index] = true;
+    }
+    if (leaf_count != 4u || !seen[0] || !seen[1] || !seen[2] || !seen[3]) {
+        std::cerr << "runtime name buffer node set incomplete\n";
+        return false;
+    }
+    return true;
+}
+
 static CountRunResult run_wide_topology_count(std::size_t slot_count,
                                               bool enable_parallel,
                                               std::size_t threads) {
@@ -907,6 +961,7 @@ int main(int argc, char** argv) {
     if (!verify_guarded_dirty_parallel_merge()) return 1;
     if (!verify_guarded_hook_parallel_merge()) return 1;
     if (!verify_wide_parallel_topology()) return 1;
+    if (!verify_runtime_name_buffer_cache()) return 1;
 
     const double speedup = optimized.elapsed_ms == 0
         ? 0.0

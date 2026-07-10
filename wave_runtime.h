@@ -1892,7 +1892,11 @@ class Tracer {
             }
         }
         node_name_hot_cache_.reserve(128u);
-        node_name_literal_cache_.reserve(64u);
+        // Direct-mapped pointer cache.  Visitors normally pass stable string
+        // literals, while generated visitors may reuse one stack buffer with
+        // changing contents.  Fixed storage keeps both cases O(1) without
+        // retaining an unbounded list of transient pointer values.
+        node_name_literal_cache_.resize(64u);
         open_debug_log();
         open_parallel_flat_leaf_load_log_();
         if (options_.debug_log) debug_log_msg(std::string("construct tracer"));
@@ -2856,10 +2860,12 @@ private:
 
     struct NodeNameLiteralCacheEntry {
         const char* literal;
+        std::string name;
         std::uint32_t id;
 
         NodeNameLiteralCacheEntry() : literal(NULL), id(kInvalidIndex) {}
-        NodeNameLiteralCacheEntry(const char* n, std::uint32_t i) : literal(n), id(i) {}
+        NodeNameLiteralCacheEntry(const char* n, std::uint32_t i)
+            : literal(n), name(n ? n : ""), id(i) {}
     };
 
     NodeId next_node_id_;
@@ -9752,25 +9758,31 @@ private:
         if (!options_.enable_node_name_interning) {
             return append_node_name_(std::string(literal));
         }
-        for (std::size_t i = 0; i < node_name_literal_cache_.size(); ++i) {
-            const NodeNameLiteralCacheEntry& entry = node_name_literal_cache_[i];
-            if (entry.id == kInvalidIndex || !entry.literal) continue;
-            if (entry.literal == literal || std::strcmp(entry.literal, literal) == 0) {
-                return entry.id;
-            }
+        const std::size_t cache_index =
+            (reinterpret_cast<std::uintptr_t>(literal) >> 4u) &
+            (node_name_literal_cache_.size() - 1u);
+        NodeNameLiteralCacheEntry& cache_entry = node_name_literal_cache_[cache_index];
+        // Reflect visitors receive const char* for compatibility, but the
+        // caller may reuse a stack buffer for generated member names.  A
+        // pointer-only cache hit would collapse every name to the first value
+        // observed at that address, so validate the owned content snapshot.
+        if (cache_entry.id != kInvalidIndex &&
+            cache_entry.literal == literal &&
+            cache_entry.name == literal) {
+            return cache_entry.id;
         }
 
         const std::string name(literal);
         std::unordered_map<std::string, std::uint32_t>::const_iterator it = node_name_ids_.find(name);
         if (it != node_name_ids_.end()) {
-            node_name_literal_cache_.push_back(NodeNameLiteralCacheEntry(literal, it->second));
+            cache_entry = NodeNameLiteralCacheEntry(literal, it->second);
             remember_hot_node_name_id_(name, it->second);
             return it->second;
         }
 
         const std::uint32_t id = append_node_name_(name);
         node_name_ids_.insert(std::make_pair(name, id));
-        node_name_literal_cache_.push_back(NodeNameLiteralCacheEntry(literal, id));
+        cache_entry = NodeNameLiteralCacheEntry(literal, id);
         remember_hot_node_name_id_(name, id);
         return id;
     }
