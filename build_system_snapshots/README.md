@@ -1,5 +1,7 @@
 # Sea-Eagle build-system snapshots
 
+Detailed Chinese guide: [SEA_EAGLE_BUILD_SYSTEM_GUIDE.zh-CN.md](SEA_EAGLE_BUILD_SYSTEM_GUIDE.zh-CN.md)
+
 This directory archives the Sea-Eagle build files that were reconstructed while
 integrating WaveTrace.  The snapshots are kept separate from the live WaveTrace
 source tree so their historical state and their optimized state can be compared
