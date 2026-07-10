@@ -26,12 +26,14 @@
 
 #include "reflect_macro.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <forward_list>
 #include <list>
+#include <limits>
 #include <map>
 #include <memory>
 #include <new>
@@ -55,6 +57,215 @@ struct reflected_visitor;
 
 template <typename T>
 struct is_reflected : std::false_type {};
+
+struct TopologyTypeEstimate {
+    std::size_t estimated_leaves;
+    bool fixed_extent;
+    bool dynamic_extent;
+
+    constexpr TopologyTypeEstimate(std::size_t leaves = 0,
+                                   bool fixed = false,
+                                   bool dynamic = false) noexcept
+        : estimated_leaves(leaves), fixed_extent(fixed), dynamic_extent(dynamic) {}
+};
+
+namespace detail {
+
+constexpr std::size_t saturating_leaf_add(std::size_t lhs, std::size_t rhs) noexcept {
+    return rhs > (std::numeric_limits<std::size_t>::max)() - lhs
+        ? (std::numeric_limits<std::size_t>::max)()
+        : lhs + rhs;
+}
+
+constexpr std::size_t saturating_leaf_multiply(std::size_t count, std::size_t value) noexcept {
+    return value != 0 && count > (std::numeric_limits<std::size_t>::max)() / value
+        ? (std::numeric_limits<std::size_t>::max)()
+        : count * value;
+}
+
+constexpr TopologyTypeEstimate combine_topology_estimates(TopologyTypeEstimate lhs,
+                                                           TopologyTypeEstimate rhs) noexcept {
+    return TopologyTypeEstimate(
+        saturating_leaf_add(lhs.estimated_leaves, rhs.estimated_leaves),
+        lhs.fixed_extent && rhs.fixed_extent,
+        lhs.dynamic_extent || rhs.dynamic_extent);
+}
+
+constexpr TopologyTypeEstimate repeat_topology_estimate(TopologyTypeEstimate value,
+                                                        std::size_t count) noexcept {
+    return TopologyTypeEstimate(
+        saturating_leaf_multiply(count, value.estimated_leaves),
+        value.fixed_extent,
+        value.dynamic_extent);
+}
+
+inline std::vector<const void*>& active_topology_estimate_types() {
+    static thread_local std::vector<const void*> active;
+    return active;
+}
+
+class TopologyEstimateRecursionGuard {
+public:
+    explicit TopologyEstimateRecursionGuard(const void* type_tag)
+        : type_tag_(type_tag), entered_(false) {
+        std::vector<const void*>& active = active_topology_estimate_types();
+        if (std::find(active.begin(), active.end(), type_tag_) == active.end()) {
+            active.push_back(type_tag_);
+            entered_ = true;
+        }
+    }
+
+    ~TopologyEstimateRecursionGuard() {
+        if (!entered_) return;
+        std::vector<const void*>& active = active_topology_estimate_types();
+        if (!active.empty() && active.back() == type_tag_) active.pop_back();
+    }
+
+    bool entered() const noexcept { return entered_; }
+
+private:
+    const void* type_tag_;
+    bool entered_;
+};
+
+} // namespace detail
+
+template <typename T, typename Enable = void>
+struct topology_type_estimate {
+    static constexpr bool generated = false;
+    static constexpr TopologyTypeEstimate get() noexcept {
+        return TopologyTypeEstimate(0, false, false);
+    }
+};
+
+template <typename T>
+struct topology_type_estimate<T, typename std::enable_if<
+    std::is_arithmetic<typename std::remove_cv<T>::type>::value ||
+    std::is_enum<typename std::remove_cv<T>::type>::value>::type> {
+    static constexpr bool generated = false;
+    static constexpr TopologyTypeEstimate get() noexcept {
+        return TopologyTypeEstimate(1, true, false);
+    }
+};
+
+template <typename T, std::size_t N>
+struct topology_type_estimate<T[N], void> {
+    static constexpr bool generated = false;
+    static constexpr TopologyTypeEstimate get() noexcept {
+        return detail::repeat_topology_estimate(topology_type_estimate<T>::get(), N);
+    }
+};
+
+template <typename T, std::size_t N>
+struct topology_type_estimate<std::array<T, N>, void> {
+    static constexpr bool generated = false;
+    static constexpr TopologyTypeEstimate get() noexcept {
+        return detail::repeat_topology_estimate(topology_type_estimate<T>::get(), N);
+    }
+};
+
+template <typename A, typename B>
+struct topology_type_estimate<std::pair<A, B>, void> {
+    static constexpr bool generated = false;
+    static constexpr TopologyTypeEstimate get() noexcept {
+        return detail::combine_topology_estimates(
+            topology_type_estimate<A>::get(), topology_type_estimate<B>::get());
+    }
+};
+
+template <typename T>
+struct topology_type_estimate< ::wave::WaveValue<T>, void> {
+    static constexpr bool generated = false;
+    static constexpr TopologyTypeEstimate get() noexcept {
+        return TopologyTypeEstimate(1, true, false);
+    }
+};
+
+template <typename T, std::size_t N>
+struct topology_type_estimate< ::wave::array<T, N>, void> {
+    static constexpr bool generated = false;
+    static constexpr TopologyTypeEstimate get() noexcept {
+        const TopologyTypeEstimate nested = topology_type_estimate<T>::get();
+        return TopologyTypeEstimate(
+            detail::saturating_leaf_multiply(N, nested.estimated_leaves),
+            nested.fixed_extent,
+            nested.dynamic_extent);
+    }
+};
+
+template <typename PtrT>
+struct topology_type_estimate< ::wave::WavePtr<PtrT>, void> {
+    static constexpr bool generated = false;
+    static TopologyTypeEstimate get() noexcept {
+        typedef typename ::wave::WavePtr<PtrT>::element_type Element;
+        const TopologyTypeEstimate nested = topology_type_estimate<
+            typename std::remove_cv<Element>::type>::get();
+        return TopologyTypeEstimate(nested.estimated_leaves, false, true);
+    }
+};
+
+template <typename T>
+struct topology_type_estimate<T*, void> {
+    static constexpr bool generated = false;
+    static constexpr TopologyTypeEstimate get() noexcept {
+        return TopologyTypeEstimate(0, true, false);
+    }
+};
+
+namespace detail {
+
+template <typename T, typename Enable = void>
+struct direct_pointer_target_topology_estimate {
+    static constexpr TopologyTypeEstimate get() noexcept {
+        return TopologyTypeEstimate(0, true, false);
+    }
+};
+
+template <typename T>
+struct direct_pointer_target_topology_estimate<T, typename std::enable_if<
+    (sizeof(T) != 0) &&
+    std::is_base_of< ::wave::DirectReflectPointerTarget,
+                    typename std::remove_cv<T>::type>::value>::type> {
+    static TopologyTypeEstimate get() noexcept {
+        const TopologyTypeEstimate nested = topology_type_estimate<
+            typename std::remove_cv<T>::type>::get();
+        return TopologyTypeEstimate(nested.estimated_leaves, false, true);
+    }
+};
+
+} // namespace detail
+
+template <typename T, typename D>
+struct topology_type_estimate<std::unique_ptr<T, D>, void> {
+    static constexpr bool generated = false;
+    static TopologyTypeEstimate get() noexcept {
+        return detail::direct_pointer_target_topology_estimate<T>::get();
+    }
+};
+
+template <typename T>
+struct topology_type_estimate<std::shared_ptr<T>, void> {
+    static constexpr bool generated = false;
+    static TopologyTypeEstimate get() noexcept {
+        return detail::direct_pointer_target_topology_estimate<T>::get();
+    }
+};
+
+template <typename T>
+struct topology_type_estimate<std::weak_ptr<T>, void> {
+    static constexpr bool generated = false;
+    static TopologyTypeEstimate get() noexcept {
+        return detail::direct_pointer_target_topology_estimate<T>::get();
+    }
+};
+
+template <>
+struct topology_type_estimate<std::string, void> {
+    static constexpr bool generated = false;
+    static constexpr TopologyTypeEstimate get() noexcept {
+        return TopologyTypeEstimate(0, true, false);
+    }
+};
 
 namespace detail {
 

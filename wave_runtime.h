@@ -316,13 +316,6 @@ public:
     }
 };
 
-// Explicit opt-in for reflected element types whose visitor is safe to execute
-// concurrently and whose reflected object graph is contained in the element.
-// Runtime validation still rejects pointer escape, dirty-source state, lazy
-// watches, and cross-fragment aliases before any fragment is merged.
-template <typename T>
-struct ParallelTopologyExpansionSafe : std::false_type {};
-
 struct BuildOptions {
     // Default to transition-style sampling.  This avoids sending unchanged
     // scalar leaves through the recorder/writer on every cycle.  Set false only
@@ -349,10 +342,11 @@ struct BuildOptions {
     // hash-table growth in the common "many objects of the same type" case.
     bool enable_wave_ptr_array_batch_reserve = true;
 
-    // Parallel topology expansion is restricted to large WavePtr<T[]> arrays
-    // whose element type explicitly specializes ParallelTopologyExpansionSafe.
-    // Workers build isolated fragments; the caller merges them in index order,
-    // preserving deterministic node/track ids and sink declaration order.
+    // ReflectGen estimates the recursive physical-leaf cost of each reflected
+    // type. Large WavePtr<T[]> arrays are partitioned into isolated fragments;
+    // the caller remaps and merges topology and dirty metadata in index order.
+    // Real cross-fragment aliases reject the speculative batch and rerun it
+    // serially so one physical storage still has exactly one owner.
     bool enable_parallel_topology_expansion = true;
     std::size_t topology_expansion_threads = 16;
     std::size_t parallel_topology_min_elements = 8192;
@@ -1566,8 +1560,21 @@ struct ThreadTraceLocal {
         if (wave_value_local_epoch.size() < dirty_group_count) wave_value_local_epoch.resize(dirty_group_count, 0);
     }
 
-    void attach(Tracer* tracer, std::size_t dirty_group_count, std::uint32_t epoch) {
+    void switch_owner(Tracer* tracer) {
+        if (owner == tracer) return;
         owner = tracer;
+        std::fill(local_epoch.begin(), local_epoch.end(), 0);
+        std::fill(wave_value_local_epoch.begin(), wave_value_local_epoch.end(), 0);
+        std::fill(wave_array_bulk_range_local_epoch.begin(),
+                  wave_array_bulk_range_local_epoch.end(),
+                  0);
+        dirty_count = 0;
+        wave_value_dirty_count = 0;
+        wave_array_bulk_range_count = 0;
+    }
+
+    void attach(Tracer* tracer, std::size_t dirty_group_count, std::uint32_t epoch) {
+        switch_owner(tracer);
         ensure_capacity(dirty_group_count);
 
         // attach() is not a per-cycle hot path.  Reset the TLS epoch cache every
@@ -1581,7 +1588,7 @@ struct ThreadTraceLocal {
     }
 
     void attach_wave_values(Tracer* tracer, std::size_t dirty_group_count, std::uint32_t epoch) {
-        owner = tracer;
+        switch_owner(tracer);
         ensure_wave_value_capacity(dirty_group_count);
         std::fill(wave_value_local_epoch.begin(), wave_value_local_epoch.end(), 0);
         wave_value_dirty_count = 0;
@@ -1594,7 +1601,7 @@ struct ThreadTraceLocal {
     }
 
     void attach_wave_arrays(Tracer* tracer, std::size_t bulk_range_count, std::uint32_t epoch) {
-        owner = tracer;
+        switch_owner(tracer);
         ensure_wave_array_capacity(bulk_range_count);
         std::fill(wave_array_bulk_range_local_epoch.begin(), wave_array_bulk_range_local_epoch.end(), 0);
         wave_array_bulk_range_count = 0;
@@ -2251,14 +2258,29 @@ public:
 
     static void wave_array_index_notify_bridge_(std::size_t index, const void* element_address, const void* element_type_tag, std::size_t element_size) noexcept {
         ThreadTraceLocal& tls = current_thread_trace_local();
-        if (tls.owner &&
-            element_size <= static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)()) &&
-            tls.owner->lookup_dirty_wave_array_slice_by_address_(
+        if (tls.owner && element_size <= static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())) {
+            const std::uint32_t range_id = tls.owner->lookup_dirty_wave_array_slice_by_address_(
                 element_address,
                 element_type_tag,
-                static_cast<std::uint32_t>(element_size)) != kInvalidIndex &&
-            tls.owner->try_mark_dirty_wave_array_element_address(index, element_address, element_type_tag, element_size)) {
-            return;
+                static_cast<std::uint32_t>(element_size));
+            if (range_id != kInvalidIndex &&
+                tls.owner->try_mark_dirty_wave_array_element_address(
+                    index, element_address, element_type_tag, element_size)) {
+                if (tls.owner->options_.debug_log_dirty_wave_array_marks) {
+                    tls.owner->debug_log_msg(
+                        std::string("dirty_wave_array index mark range=") + detail::to_string_unsigned(range_id) +
+                        " index=" + detail::to_string_unsigned(index) +
+                        " address=" + detail::pointer_to_string(element_address));
+                }
+                return;
+            }
+            if (tls.owner->options_.debug_log_dirty_wave_array_marks) {
+                tls.owner->debug_log_msg(
+                    std::string("dirty_wave_array index lookup miss index=") + detail::to_string_unsigned(index) +
+                    " address=" + detail::pointer_to_string(element_address) +
+                    " type_tag=" + detail::pointer_to_string(element_type_tag) +
+                    " bytes=" + detail::to_string_unsigned(element_size));
+            }
         }
 
         Tracer* owner = resolve_wave_array_owner_for_address_(element_address, element_type_tag, element_size);
@@ -10680,6 +10702,22 @@ private:
         std::uint64_t node_base;
         std::uint64_t track_base;
         std::uint64_t object_base;
+        std::size_t dirty_peek_group_base;
+        std::size_t dirty_peek_range_base;
+        std::size_t dirty_peek_leaf_base;
+        std::size_t dirty_peek_block_base;
+        std::size_t dirty_peek_storage_ref_base;
+        std::size_t dirty_peek_byte_map_base;
+        std::size_t dirty_peek_shadow_base;
+        std::size_t dirty_wave_value_group_base;
+        std::size_t dirty_wave_value_range_base;
+        std::size_t dirty_wave_value_leaf_base;
+        std::size_t dirty_wave_array_range_base;
+        std::size_t dirty_wave_array_leaf_base;
+        std::size_t dirty_wave_array_block_base;
+        std::size_t dirty_wave_array_leaf_ref_base;
+        std::size_t dirty_wave_array_byte_map_base;
+        std::size_t dirty_wave_array_shadow_base;
         std::vector<NodeId> root_node_ids;
         std::vector<std::uint32_t> node_name_remap;
         std::exception_ptr error;
@@ -10689,7 +10727,38 @@ private:
             : begin_index(0), end_index(0), expanded_roots(0),
               reserve_nodes_per_element(0), reserve_tracks_per_element(0),
               reserve_objects_per_element(0),
-              node_base(0), track_base(0), object_base(0), mergeable(false) {}
+              node_base(0), track_base(0), object_base(0),
+              dirty_peek_group_base(0), dirty_peek_range_base(0),
+              dirty_peek_leaf_base(0), dirty_peek_block_base(0),
+              dirty_peek_storage_ref_base(0), dirty_peek_byte_map_base(0),
+              dirty_peek_shadow_base(0), dirty_wave_value_group_base(0),
+              dirty_wave_value_range_base(0), dirty_wave_value_leaf_base(0),
+              dirty_wave_array_range_base(0), dirty_wave_array_leaf_base(0),
+              dirty_wave_array_block_base(0), dirty_wave_array_leaf_ref_base(0),
+              dirty_wave_array_byte_map_base(0), dirty_wave_array_shadow_base(0),
+              mergeable(false) {}
+    };
+
+    struct ParallelTopologyMergeCursor {
+        std::uint64_t node;
+        std::uint64_t track;
+        std::uint64_t object;
+        std::size_t dirty_peek_group;
+        std::size_t dirty_peek_range;
+        std::size_t dirty_peek_leaf;
+        std::size_t dirty_peek_block;
+        std::size_t dirty_peek_storage_ref;
+        std::size_t dirty_peek_byte_map;
+        std::size_t dirty_peek_shadow;
+        std::size_t dirty_wave_value_group;
+        std::size_t dirty_wave_value_range;
+        std::size_t dirty_wave_value_leaf;
+        std::size_t dirty_wave_array_range;
+        std::size_t dirty_wave_array_leaf;
+        std::size_t dirty_wave_array_block;
+        std::size_t dirty_wave_array_leaf_ref;
+        std::size_t dirty_wave_array_byte_map;
+        std::size_t dirty_wave_array_shadow;
     };
 
     BuildOptions parallel_topology_fragment_options_() const {
@@ -10713,59 +10782,22 @@ private:
         return out;
     }
 
-    static bool pointer_in_half_open_range_(const void* address,
-                                            const unsigned char* begin,
-                                            const unsigned char* end) noexcept {
-        if (!address || !begin || !end || begin >= end) return false;
-        const std::uintptr_t p = reinterpret_cast<std::uintptr_t>(address);
-        return p >= reinterpret_cast<std::uintptr_t>(begin) &&
-               p < reinterpret_cast<std::uintptr_t>(end);
-    }
-
-    bool topology_fragment_is_mergeable_(const Tracer& fragment,
-                                          const unsigned char* object_begin,
-                                          const unsigned char* object_end) const {
+    bool topology_fragment_is_mergeable_(const Tracer& fragment) const {
         if (fragment.next_node_id_ != fragment.nodes_.size() ||
             fragment.next_track_id_ != fragment.tracks_.size() ||
             fragment.next_object_id_ != fragment.objects_.size() ||
             fragment.track_runtime_.size() != fragment.tracks_.size()) return false;
         if (fragment.root_watches_.size() != 1u || fragment.lazy_value_watches_.size() != 1u) return false;
-        if (!fragment.bound_dirty_hooks_.empty()) return false;
-        if (!fragment.dirty_peek_groups_.empty() ||
-            !fragment.dirty_peek_ranges_.empty() ||
-            !fragment.dirty_peek_leaves_.empty()) return false;
-        if (!fragment.dirty_wave_value_groups_.empty() ||
-            !fragment.dirty_wave_value_ranges_.empty() ||
-            !fragment.dirty_wave_value_leaves_.empty()) return false;
-        if (!fragment.dirty_wave_array_bulk_ranges_.empty() ||
-            !fragment.dirty_wave_array_leaves_.empty() ||
-            !fragment.dirty_wave_array_memory_blocks_.empty()) return false;
         if (!fragment.expanding_.empty() || !fragment.union_alias_context_stack_.empty()) return false;
 
         for (std::size_t i = 1; i < fragment.objects_.size(); ++i) {
             const ObjectEntry& object = fragment.objects_[i];
             if (object.id != i || !object.alive) return false;
-            if (!pointer_in_half_open_range_(object.key.address, object_begin, object_end)) return false;
         }
 
-        std::unordered_set<const void*> getter_addresses;
-        getter_addresses.reserve(fragment.scalar_getter_storage_.size());
-        for (std::size_t i = 0; i < fragment.scalar_getter_storage_.size(); ++i) {
-            if (fragment.scalar_getter_storage_[i]) {
-                getter_addresses.insert(fragment.scalar_getter_storage_[i].get());
-            }
-        }
         for (std::size_t i = 1; i < fragment.tracks_.size(); ++i) {
             const TrackDesc& track = fragment.tracks_[i];
             if (track.id != i) return false;
-            if (track.dirty_peek_group_id != kInvalidIndex ||
-                track.dirty_wave_value_group_id != kInvalidIndex ||
-                track.dirty_wave_array_managed) return false;
-            if (track.sample_ctx &&
-                !pointer_in_half_open_range_(track.sample_ctx, object_begin, object_end) &&
-                getter_addresses.find(track.sample_ctx) == getter_addresses.end()) return false;
-            if (track.memory_ctx &&
-                !pointer_in_half_open_range_(track.memory_ctx, object_begin, object_end)) return false;
         }
         for (std::size_t i = 1; i < fragment.nodes_.size(); ++i) {
             if (fragment.nodes_[i].id != i || !fragment.nodes_[i].alive) return false;
@@ -10779,23 +10811,133 @@ private:
                 return false;
             }
         }
+        for (std::size_t i = 0; i < fragment.bitfield_storage_created_keys_.size(); ++i) {
+            if (bitfield_storage_by_key_.find(fragment.bitfield_storage_created_keys_[i]) !=
+                bitfield_storage_by_key_.end()) return false;
+        }
+        for (std::size_t i = 0; i < fragment.dirty_peek_groups_.size(); ++i) {
+            if (dirty_peek_group_by_key_.find(fragment.dirty_peek_groups_[i].key) !=
+                dirty_peek_group_by_key_.end()) return false;
+        }
+        for (typename std::unordered_map<DirtyPeekStorageKey, TrackId, DirtyPeekStorageKeyHash>::const_iterator it =
+                 fragment.dirty_peek_storage_by_key_.begin();
+             it != fragment.dirty_peek_storage_by_key_.end(); ++it) {
+            if (dirty_peek_storage_by_key_.find(it->first) != dirty_peek_storage_by_key_.end()) return false;
+        }
+        for (std::size_t i = 0; i < fragment.dirty_wave_value_groups_.size(); ++i) {
+            if (dirty_wave_value_group_by_key_.find(fragment.dirty_wave_value_groups_[i].key) !=
+                dirty_wave_value_group_by_key_.end()) return false;
+        }
+        for (std::size_t i = 0; i < fragment.dirty_wave_array_bulk_ranges_.size(); ++i) {
+            const DirtyWaveArrayBulkRange& range = fragment.dirty_wave_array_bulk_ranges_[i];
+            if (range.bulk_key_valid &&
+                dirty_wave_array_bulk_range_by_key_.find(range.key) != dirty_wave_array_bulk_range_by_key_.end()) {
+                return false;
+            }
+            if (range.element_key.address != NULL && range.element_key.byte_width != 0 &&
+                dirty_wave_array_slice_by_key_.find(range.element_key) != dirty_wave_array_slice_by_key_.end()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool topology_fragment_batch_has_no_alias_(
+        const std::vector<std::unique_ptr<ParallelTopologyFragment> >& fragments) const {
+        std::unordered_set<ObjectKey, ObjectKeyHash> objects;
+        std::unordered_set<BitfieldStorageKey, BitfieldStorageKeyHash> bitfields;
+        std::unordered_set<DirtyPeekGroupKey, DirtyPeekGroupKeyHash> peek_groups;
+        std::unordered_set<DirtyPeekStorageKey, DirtyPeekStorageKeyHash> peek_storage;
+        std::unordered_set<DirtyWaveValueGroupKey, DirtyWaveValueGroupKeyHash> wave_values;
+        std::unordered_set<WaveArrayBulkMarkKey, WaveArrayBulkMarkKeyHash> array_bulk;
+        std::unordered_set<DirtyWaveArraySliceKey, DirtyWaveArraySliceKeyHash> array_slices;
+        for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+            const Tracer& fragment = *fragments[fi]->tracer;
+            for (std::size_t i = 0; i < fragment.object_created_keys_.size(); ++i) {
+                if (!objects.insert(fragment.object_created_keys_[i]).second) return false;
+            }
+            for (std::size_t i = 0; i < fragment.bitfield_storage_created_keys_.size(); ++i) {
+                if (!bitfields.insert(fragment.bitfield_storage_created_keys_[i]).second) return false;
+            }
+            for (std::size_t i = 0; i < fragment.dirty_peek_groups_.size(); ++i) {
+                if (!peek_groups.insert(fragment.dirty_peek_groups_[i].key).second) return false;
+            }
+            for (typename std::unordered_map<DirtyPeekStorageKey, TrackId, DirtyPeekStorageKeyHash>::const_iterator it =
+                     fragment.dirty_peek_storage_by_key_.begin();
+                 it != fragment.dirty_peek_storage_by_key_.end(); ++it) {
+                if (!peek_storage.insert(it->first).second) return false;
+            }
+            for (std::size_t i = 0; i < fragment.dirty_wave_value_groups_.size(); ++i) {
+                if (!wave_values.insert(fragment.dirty_wave_value_groups_[i].key).second) return false;
+            }
+            for (std::size_t i = 0; i < fragment.dirty_wave_array_bulk_ranges_.size(); ++i) {
+                const DirtyWaveArrayBulkRange& range = fragment.dirty_wave_array_bulk_ranges_[i];
+                if (range.bulk_key_valid && !array_bulk.insert(range.key).second) return false;
+                if (range.element_key.address != NULL && range.element_key.byte_width != 0 &&
+                    !array_slices.insert(range.element_key).second) return false;
+            }
+        }
         return true;
     }
 
     void prepare_topology_fragment_merge_(ParallelTopologyFragment& result,
-                                          std::uint64_t& node_cursor,
-                                          std::uint64_t& track_cursor,
-                                          std::uint64_t& object_cursor) {
+                                          ParallelTopologyMergeCursor& cursor) {
         Tracer& fragment = *result.tracer;
-        result.node_base = node_cursor;
-        result.track_base = track_cursor;
-        result.object_base = object_cursor;
-        node_cursor += fragment.next_node_id_ - 1u;
-        track_cursor += fragment.next_track_id_ - 1u;
-        object_cursor += fragment.next_object_id_ - 1u;
-        compact_topology_id_(node_cursor, "parallel node id");
-        compact_topology_id_(track_cursor, "parallel track id");
-        compact_topology_id_(object_cursor, "parallel object id");
+        result.node_base = cursor.node;
+        result.track_base = cursor.track;
+        result.object_base = cursor.object;
+        result.dirty_peek_group_base = cursor.dirty_peek_group;
+        result.dirty_peek_range_base = cursor.dirty_peek_range;
+        result.dirty_peek_leaf_base = cursor.dirty_peek_leaf;
+        result.dirty_peek_block_base = cursor.dirty_peek_block;
+        result.dirty_peek_storage_ref_base = cursor.dirty_peek_storage_ref;
+        result.dirty_peek_byte_map_base = cursor.dirty_peek_byte_map;
+        result.dirty_peek_shadow_base = cursor.dirty_peek_shadow;
+        result.dirty_wave_value_group_base = cursor.dirty_wave_value_group;
+        result.dirty_wave_value_range_base = cursor.dirty_wave_value_range;
+        result.dirty_wave_value_leaf_base = cursor.dirty_wave_value_leaf;
+        result.dirty_wave_array_range_base = cursor.dirty_wave_array_range;
+        result.dirty_wave_array_leaf_base = cursor.dirty_wave_array_leaf;
+        result.dirty_wave_array_block_base = cursor.dirty_wave_array_block;
+        result.dirty_wave_array_leaf_ref_base = cursor.dirty_wave_array_leaf_ref;
+        result.dirty_wave_array_byte_map_base = cursor.dirty_wave_array_byte_map;
+        result.dirty_wave_array_shadow_base = cursor.dirty_wave_array_shadow;
+
+        cursor.node += fragment.next_node_id_ - 1u;
+        cursor.track += fragment.next_track_id_ - 1u;
+        cursor.object += fragment.next_object_id_ - 1u;
+        cursor.dirty_peek_group += fragment.dirty_peek_groups_.size();
+        cursor.dirty_peek_range += fragment.dirty_peek_ranges_.size();
+        cursor.dirty_peek_leaf += fragment.dirty_peek_leaves_.size();
+        cursor.dirty_peek_block += fragment.dirty_peek_memory_blocks_.size();
+        cursor.dirty_peek_storage_ref += fragment.dirty_peek_memory_storage_refs_.size();
+        cursor.dirty_peek_byte_map += fragment.dirty_peek_memory_byte_to_storage_refs_.size();
+        cursor.dirty_peek_shadow += fragment.dirty_peek_memory_shadow_bytes_.size();
+        cursor.dirty_wave_value_group += fragment.dirty_wave_value_groups_.size();
+        cursor.dirty_wave_value_range += fragment.dirty_wave_value_ranges_.size();
+        cursor.dirty_wave_value_leaf += fragment.dirty_wave_value_leaves_.size();
+        cursor.dirty_wave_array_range += fragment.dirty_wave_array_bulk_ranges_.size();
+        cursor.dirty_wave_array_leaf += fragment.dirty_wave_array_leaves_.size();
+        cursor.dirty_wave_array_block += fragment.dirty_wave_array_memory_blocks_.size();
+        cursor.dirty_wave_array_leaf_ref += fragment.dirty_wave_array_memory_leaf_refs_.size();
+        cursor.dirty_wave_array_byte_map += fragment.dirty_wave_array_memory_byte_to_leaf_refs_.size();
+        cursor.dirty_wave_array_shadow += fragment.dirty_wave_array_memory_shadow_bytes_.size();
+
+        compact_topology_id_(cursor.node, "parallel node id");
+        compact_topology_id_(cursor.track, "parallel track id");
+        compact_topology_id_(cursor.object, "parallel object id");
+        compact_topology_id_(cursor.dirty_peek_group, "parallel dirty peek group id");
+        compact_topology_id_(cursor.dirty_peek_range, "parallel dirty peek range id");
+        compact_topology_id_(cursor.dirty_peek_leaf, "parallel dirty peek leaf id");
+        compact_topology_id_(cursor.dirty_peek_block, "parallel dirty peek block id");
+        compact_topology_id_(cursor.dirty_peek_storage_ref, "parallel dirty peek storage ref id");
+        compact_topology_id_(cursor.dirty_wave_value_group, "parallel wave value group id");
+        compact_topology_id_(cursor.dirty_wave_value_range, "parallel wave value range id");
+        compact_topology_id_(cursor.dirty_wave_value_leaf, "parallel wave value leaf id");
+        compact_topology_id_(cursor.dirty_wave_array_range, "parallel wave array range id");
+        compact_topology_id_(cursor.dirty_wave_array_leaf, "parallel wave array leaf id");
+        compact_topology_id_(cursor.dirty_wave_array_block, "parallel wave array block id");
+        compact_topology_id_(cursor.dirty_wave_array_leaf_ref, "parallel wave array leaf ref id");
 
         result.node_name_remap.assign(fragment.node_names_.size(), kInvalidIndex);
         for (std::size_t local_name_id = 0; local_name_id < fragment.node_names_.size(); ++local_name_id) {
@@ -10858,6 +11000,16 @@ private:
             const NodeId local_node_id = track.node_id;
             const TrackId local_next_in_node = track.next_in_node;
             const TrackId local_storage_id = track.storage_id;
+            if (track.dirty_peek_group_id != kInvalidIndex) {
+                track.dirty_peek_group_id = compact_topology_id_(
+                    result.dirty_peek_group_base + track.dirty_peek_group_id,
+                    "parallel dirty peek group id");
+            }
+            if (track.dirty_wave_value_group_id != kInvalidIndex) {
+                track.dirty_wave_value_group_id = compact_topology_id_(
+                    result.dirty_wave_value_group_base + track.dirty_wave_value_group_id,
+                    "parallel wave value group id");
+            }
             track.id = compact_topology_id_(result.track_base + local_track_id, "parallel track id");
             track.node_id = local_node_id != 0
                 ? compact_topology_id_(result.node_base + local_node_id, "parallel track node id")
@@ -10893,6 +11045,157 @@ private:
             it->second = compact_topology_id_(
                 result.track_base + it->second, "parallel bitfield storage id");
         }
+
+        for (std::size_t i = 0; i < fragment.dirty_peek_groups_.size(); ++i) {
+            const DirtyPeekGroupKey key = fragment.dirty_peek_groups_[i].key;
+            fragment.dirty_peek_groups_[i] = DirtyPeekGroup();
+            fragment.dirty_peek_groups_[i].key = key;
+        }
+        for (std::size_t i = 0; i < fragment.dirty_peek_ranges_.size(); ++i) {
+            DirtyPeekRange& range = fragment.dirty_peek_ranges_[i];
+            range.group_id = compact_topology_id_(
+                result.dirty_peek_group_base + range.group_id, "parallel dirty peek group id");
+            range.leaf_begin = compact_topology_id_(
+                result.dirty_peek_leaf_base + range.leaf_begin, "parallel dirty peek leaf id");
+            range.next_sibling = kInvalidIndex;
+            if (range.memory_cursor_valid) {
+                range.memory_begin.block_id = compact_topology_id_(
+                    result.dirty_peek_block_base + range.memory_begin.block_id,
+                    "parallel dirty peek block id");
+                range.memory_end.block_id = compact_topology_id_(
+                    result.dirty_peek_block_base + range.memory_end.block_id,
+                    "parallel dirty peek block id");
+            }
+        }
+        for (std::size_t i = 0; i < fragment.dirty_peek_leaves_.size(); ++i) {
+            DirtyPeekLeaf& leaf = fragment.dirty_peek_leaves_[i];
+            leaf.track_id = compact_topology_id_(result.track_base + leaf.track_id,
+                                                 "parallel dirty peek track id");
+            leaf.storage_id = compact_topology_id_(result.track_base + leaf.storage_id,
+                                                   "parallel dirty peek storage id");
+        }
+        for (std::size_t i = 0; i < fragment.dirty_peek_memory_blocks_.size(); ++i) {
+            DirtyPeekMemoryBlock& block = fragment.dirty_peek_memory_blocks_[i];
+            block.shadow_offset += result.dirty_peek_shadow_base;
+            block.first_storage_ref = compact_topology_id_(
+                result.dirty_peek_storage_ref_base + block.first_storage_ref,
+                "parallel dirty peek storage ref id");
+            if (block.has_byte_map) {
+                block.byte_map_begin = compact_topology_id_(
+                    result.dirty_peek_byte_map_base + block.byte_map_begin,
+                    "parallel dirty peek byte map id");
+            }
+        }
+        for (std::size_t i = 0; i < fragment.dirty_peek_memory_storage_refs_.size(); ++i) {
+            fragment.dirty_peek_memory_storage_refs_[i].storage_id = compact_topology_id_(
+                result.track_base + fragment.dirty_peek_memory_storage_refs_[i].storage_id,
+                "parallel dirty peek storage id");
+        }
+        for (std::size_t i = 0; i < fragment.dirty_peek_memory_byte_to_storage_refs_.size(); ++i) {
+            std::uint32_t& ref = fragment.dirty_peek_memory_byte_to_storage_refs_[i];
+            if (ref != kInvalidIndex) {
+                ref = compact_topology_id_(result.dirty_peek_storage_ref_base + ref,
+                                           "parallel dirty peek storage ref id");
+            }
+        }
+        for (std::size_t i = 0; i < fragment.dirty_peek_storage_cursor_ranges_.size(); ++i) {
+            DirtyPeekStorageCursorRange& range = fragment.dirty_peek_storage_cursor_ranges_[i];
+            if (!range.valid) continue;
+            range.begin.block_id = compact_topology_id_(
+                result.dirty_peek_block_base + range.begin.block_id,
+                "parallel dirty peek block id");
+            range.end.block_id = compact_topology_id_(
+                result.dirty_peek_block_base + range.end.block_id,
+                "parallel dirty peek block id");
+            range.storage_ref_index = compact_topology_id_(
+                result.dirty_peek_storage_ref_base + range.storage_ref_index,
+                "parallel dirty peek storage ref id");
+        }
+        for (typename std::unordered_map<DirtyPeekStorageKey, TrackId, DirtyPeekStorageKeyHash>::iterator it =
+                 fragment.dirty_peek_storage_by_key_.begin();
+             it != fragment.dirty_peek_storage_by_key_.end(); ++it) {
+            it->second = compact_topology_id_(result.track_base + it->second,
+                                              "parallel dirty peek storage id");
+        }
+        for (std::size_t i = 0; i < fragment.bound_dirty_hooks_.size(); ++i) {
+            WaveDirtyHook* hook = fragment.bound_dirty_hooks_[i];
+            if (hook && hook->group_id != kInvalidIndex) {
+                hook->group_id = compact_topology_id_(
+                    result.dirty_peek_group_base + hook->group_id,
+                    "parallel dirty peek hook group id");
+            }
+        }
+
+        for (std::size_t i = 0; i < fragment.dirty_wave_value_groups_.size(); ++i) {
+            const DirtyWaveValueGroupKey key = fragment.dirty_wave_value_groups_[i].key;
+            fragment.dirty_wave_value_groups_[i] = DirtyWaveValueGroup();
+            fragment.dirty_wave_value_groups_[i].key = key;
+        }
+        for (std::size_t i = 0; i < fragment.dirty_wave_value_ranges_.size(); ++i) {
+            DirtyWaveValueRange& range = fragment.dirty_wave_value_ranges_[i];
+            range.group_id = compact_topology_id_(
+                result.dirty_wave_value_group_base + range.group_id,
+                "parallel wave value group id");
+            range.leaf_begin = compact_topology_id_(
+                result.dirty_wave_value_leaf_base + range.leaf_begin,
+                "parallel wave value leaf id");
+            range.next_sibling = kInvalidIndex;
+        }
+        for (std::size_t i = 0; i < fragment.dirty_wave_value_leaves_.size(); ++i) {
+            DirtyWaveValueLeaf& leaf = fragment.dirty_wave_value_leaves_[i];
+            leaf.track_id = compact_topology_id_(result.track_base + leaf.track_id,
+                                                 "parallel wave value track id");
+            leaf.storage_id = compact_topology_id_(result.track_base + leaf.storage_id,
+                                                   "parallel wave value storage id");
+        }
+        for (std::size_t i = 0; i < fragment.dirty_wave_value_addr_table_.size(); ++i) {
+            fragment.dirty_wave_value_addr_table_[i].group_id = compact_topology_id_(
+                result.dirty_wave_value_group_base + fragment.dirty_wave_value_addr_table_[i].group_id,
+                "parallel wave value group id");
+        }
+
+        for (std::size_t i = 0; i < fragment.dirty_wave_array_bulk_ranges_.size(); ++i) {
+            DirtyWaveArrayBulkRange& range = fragment.dirty_wave_array_bulk_ranges_[i];
+            range.queued_epoch = 0;
+            range.begin.block_id = compact_topology_id_(
+                result.dirty_wave_array_block_base + range.begin.block_id,
+                "parallel wave array block id");
+            range.end.block_id = compact_topology_id_(
+                result.dirty_wave_array_block_base + range.end.block_id,
+                "parallel wave array block id");
+        }
+        for (std::size_t i = 0; i < fragment.dirty_wave_array_leaves_.size(); ++i) {
+            DirtyWaveArrayLeaf& leaf = fragment.dirty_wave_array_leaves_[i];
+            leaf.track_id = compact_topology_id_(result.track_base + leaf.track_id,
+                                                 "parallel wave array track id");
+            leaf.storage_id = compact_topology_id_(result.track_base + leaf.storage_id,
+                                                   "parallel wave array storage id");
+        }
+        for (std::size_t i = 0; i < fragment.dirty_wave_array_memory_blocks_.size(); ++i) {
+            DirtyWaveArrayMemoryBlock& block = fragment.dirty_wave_array_memory_blocks_[i];
+            block.shadow_offset += result.dirty_wave_array_shadow_base;
+            block.first_leaf_ref = compact_topology_id_(
+                result.dirty_wave_array_leaf_ref_base + block.first_leaf_ref,
+                "parallel wave array leaf ref id");
+            if (block.has_byte_map) {
+                block.byte_map_begin = compact_topology_id_(
+                    result.dirty_wave_array_byte_map_base + block.byte_map_begin,
+                    "parallel wave array byte map id");
+            }
+        }
+        for (std::size_t i = 0; i < fragment.dirty_wave_array_memory_leaf_refs_.size(); ++i) {
+            fragment.dirty_wave_array_memory_leaf_refs_[i].dirty_leaf_index = compact_topology_id_(
+                result.dirty_wave_array_leaf_base +
+                    fragment.dirty_wave_array_memory_leaf_refs_[i].dirty_leaf_index,
+                "parallel wave array leaf id");
+        }
+        for (std::size_t i = 0; i < fragment.dirty_wave_array_memory_byte_to_leaf_refs_.size(); ++i) {
+            std::uint32_t& ref = fragment.dirty_wave_array_memory_byte_to_leaf_refs_[i];
+            if (ref != kInvalidIndex) {
+                ref = compact_topology_id_(result.dirty_wave_array_leaf_ref_base + ref,
+                                           "parallel wave array leaf ref id");
+            }
+        }
     }
 
     template <typename T>
@@ -10904,6 +11207,107 @@ private:
                            std::make_move_iterator(source.end()));
     }
 
+    template <typename T>
+    static void append_fragment_vector_(std::vector<T>& destination,
+                                        std::vector<T>& source) {
+        destination.insert(destination.end(),
+                           std::make_move_iterator(source.begin()),
+                           std::make_move_iterator(source.end()));
+    }
+
+    void append_remapped_dirty_metadata_(ParallelTopologyFragment& result) {
+        Tracer& fragment = *result.tracer;
+
+        const bool had_dirty_peek_blocks = !dirty_peek_memory_blocks_.empty();
+        const bool has_fragment_dirty_peek_blocks = !fragment.dirty_peek_memory_blocks_.empty();
+        if (has_fragment_dirty_peek_blocks) {
+            dirty_peek_memory_blocks_valid_ =
+                (!had_dirty_peek_blocks || dirty_peek_memory_blocks_valid_) &&
+                fragment.dirty_peek_memory_blocks_valid_;
+            dirty_peek_memory_blocks_complete_ =
+                (!had_dirty_peek_blocks || dirty_peek_memory_blocks_complete_) &&
+                fragment.dirty_peek_memory_blocks_complete_;
+        }
+        for (std::size_t i = 0; i < fragment.dirty_peek_groups_.size(); ++i) {
+            dirty_peek_group_by_key_.insert(std::make_pair(
+                fragment.dirty_peek_groups_[i].key,
+                compact_topology_id_(result.dirty_peek_group_base + i,
+                                     "parallel dirty peek group id")));
+        }
+        for (typename std::unordered_map<DirtyPeekStorageKey, TrackId, DirtyPeekStorageKeyHash>::const_iterator it =
+                 fragment.dirty_peek_storage_by_key_.begin();
+             it != fragment.dirty_peek_storage_by_key_.end(); ++it) {
+            dirty_peek_storage_by_key_.insert(*it);
+        }
+        const std::size_t required_cursor_ranges = result.track_base +
+            fragment.dirty_peek_storage_cursor_ranges_.size();
+        if (dirty_peek_storage_cursor_ranges_.size() < required_cursor_ranges) {
+            dirty_peek_storage_cursor_ranges_.resize(required_cursor_ranges);
+        }
+        for (std::size_t local_id = 1; local_id < fragment.dirty_peek_storage_cursor_ranges_.size(); ++local_id) {
+            if (fragment.dirty_peek_storage_cursor_ranges_[local_id].valid) {
+                dirty_peek_storage_cursor_ranges_[result.track_base + local_id] =
+                    fragment.dirty_peek_storage_cursor_ranges_[local_id];
+            }
+        }
+        append_fragment_vector_(dirty_peek_groups_, fragment.dirty_peek_groups_);
+        append_fragment_vector_(dirty_peek_ranges_, fragment.dirty_peek_ranges_);
+        append_fragment_vector_(dirty_peek_leaves_, fragment.dirty_peek_leaves_);
+        append_fragment_vector_(dirty_peek_memory_blocks_, fragment.dirty_peek_memory_blocks_);
+        append_fragment_vector_(dirty_peek_memory_storage_refs_, fragment.dirty_peek_memory_storage_refs_);
+        append_fragment_vector_(dirty_peek_memory_byte_to_storage_refs_,
+                                fragment.dirty_peek_memory_byte_to_storage_refs_);
+        append_fragment_vector_(dirty_peek_memory_shadow_bytes_, fragment.dirty_peek_memory_shadow_bytes_);
+        for (std::size_t i = 0; i < fragment.bound_dirty_hooks_.size(); ++i) {
+            WaveDirtyHook* hook = fragment.bound_dirty_hooks_[i];
+            if (hook && hook->group_id != kInvalidIndex) bind_dirty_hook_to_group(hook, hook->group_id);
+        }
+
+        for (std::size_t i = 0; i < fragment.dirty_wave_value_groups_.size(); ++i) {
+            dirty_wave_value_group_by_key_.insert(std::make_pair(
+                fragment.dirty_wave_value_groups_[i].key,
+                compact_topology_id_(result.dirty_wave_value_group_base + i,
+                                     "parallel wave value group id")));
+        }
+        append_fragment_vector_(dirty_wave_value_groups_, fragment.dirty_wave_value_groups_);
+        append_fragment_vector_(dirty_wave_value_ranges_, fragment.dirty_wave_value_ranges_);
+        append_fragment_vector_(dirty_wave_value_leaves_, fragment.dirty_wave_value_leaves_);
+        append_fragment_vector_(dirty_wave_value_addr_table_, fragment.dirty_wave_value_addr_table_);
+
+        const bool had_dirty_wave_array_blocks = !dirty_wave_array_memory_blocks_.empty();
+        const bool has_fragment_dirty_wave_array_blocks =
+            !fragment.dirty_wave_array_memory_blocks_.empty();
+        if (has_fragment_dirty_wave_array_blocks) {
+            dirty_wave_array_memory_blocks_valid_ =
+                (!had_dirty_wave_array_blocks || dirty_wave_array_memory_blocks_valid_) &&
+                fragment.dirty_wave_array_memory_blocks_valid_;
+            dirty_wave_array_memory_blocks_complete_ =
+                (!had_dirty_wave_array_blocks || dirty_wave_array_memory_blocks_complete_) &&
+                fragment.dirty_wave_array_memory_blocks_complete_;
+        }
+        append_fragment_vector_(dirty_wave_array_bulk_ranges_, fragment.dirty_wave_array_bulk_ranges_);
+        append_fragment_vector_(dirty_wave_array_leaves_, fragment.dirty_wave_array_leaves_);
+        append_fragment_vector_(dirty_wave_array_memory_blocks_, fragment.dirty_wave_array_memory_blocks_);
+        append_fragment_vector_(dirty_wave_array_memory_leaf_refs_, fragment.dirty_wave_array_memory_leaf_refs_);
+        append_fragment_vector_(dirty_wave_array_memory_byte_to_leaf_refs_,
+                                fragment.dirty_wave_array_memory_byte_to_leaf_refs_);
+        append_fragment_vector_(dirty_wave_array_memory_shadow_bytes_,
+                                fragment.dirty_wave_array_memory_shadow_bytes_);
+
+        if (!fragment.dirty_peek_groups_.empty()) dirty_peek_initial_sample_done_ = false;
+        if (!fragment.dirty_wave_value_groups_.empty()) dirty_wave_value_initial_sample_done_ = false;
+        if (!fragment.dirty_wave_array_bulk_ranges_.empty()) dirty_wave_array_initial_sample_done_ = false;
+    }
+
+    void finalize_parallel_dirty_metadata_merge_() {
+        rebuild_dirty_peek_group_range_links();
+        rebuild_dirty_wave_value_group_range_links();
+        rebuild_dirty_wave_array_lookup_maps_();
+        global_dirty_group_ids_.resize(dirty_peek_groups_.size());
+        global_dirty_wave_value_group_ids_.resize(dirty_wave_value_groups_.size());
+        global_dirty_wave_array_bulk_range_ids_.resize(dirty_wave_array_bulk_ranges_.size());
+    }
+
     void reserve_topology_fragment_batch_append_(
         const std::vector<std::unique_ptr<ParallelTopologyFragment> >& fragments) {
         std::size_t add_nodes = 0;
@@ -10911,6 +11315,23 @@ private:
         std::size_t add_objects = 0;
         std::size_t add_getters = 0;
         std::size_t add_bitfield_keys = 0;
+        std::size_t add_dirty_peek_groups = 0;
+        std::size_t add_dirty_peek_ranges = 0;
+        std::size_t add_dirty_peek_leaves = 0;
+        std::size_t add_dirty_peek_blocks = 0;
+        std::size_t add_dirty_peek_storage_refs = 0;
+        std::size_t add_dirty_peek_byte_map = 0;
+        std::size_t add_dirty_peek_shadow = 0;
+        std::size_t add_dirty_wave_value_groups = 0;
+        std::size_t add_dirty_wave_value_ranges = 0;
+        std::size_t add_dirty_wave_value_leaves = 0;
+        std::size_t add_dirty_wave_value_addresses = 0;
+        std::size_t add_dirty_wave_array_ranges = 0;
+        std::size_t add_dirty_wave_array_leaves = 0;
+        std::size_t add_dirty_wave_array_blocks = 0;
+        std::size_t add_dirty_wave_array_leaf_refs = 0;
+        std::size_t add_dirty_wave_array_byte_map = 0;
+        std::size_t add_dirty_wave_array_shadow = 0;
         for (std::size_t i = 0; i < fragments.size(); ++i) {
             const Tracer& fragment = *fragments[i]->tracer;
             add_nodes += fragment.nodes_.size() - 1u;
@@ -10918,6 +11339,23 @@ private:
             add_objects += fragment.objects_.size() - 1u;
             add_getters += fragment.scalar_getter_storage_.size();
             add_bitfield_keys += fragment.bitfield_storage_created_keys_.size();
+            add_dirty_peek_groups += fragment.dirty_peek_groups_.size();
+            add_dirty_peek_ranges += fragment.dirty_peek_ranges_.size();
+            add_dirty_peek_leaves += fragment.dirty_peek_leaves_.size();
+            add_dirty_peek_blocks += fragment.dirty_peek_memory_blocks_.size();
+            add_dirty_peek_storage_refs += fragment.dirty_peek_memory_storage_refs_.size();
+            add_dirty_peek_byte_map += fragment.dirty_peek_memory_byte_to_storage_refs_.size();
+            add_dirty_peek_shadow += fragment.dirty_peek_memory_shadow_bytes_.size();
+            add_dirty_wave_value_groups += fragment.dirty_wave_value_groups_.size();
+            add_dirty_wave_value_ranges += fragment.dirty_wave_value_ranges_.size();
+            add_dirty_wave_value_leaves += fragment.dirty_wave_value_leaves_.size();
+            add_dirty_wave_value_addresses += fragment.dirty_wave_value_addr_table_.size();
+            add_dirty_wave_array_ranges += fragment.dirty_wave_array_bulk_ranges_.size();
+            add_dirty_wave_array_leaves += fragment.dirty_wave_array_leaves_.size();
+            add_dirty_wave_array_blocks += fragment.dirty_wave_array_memory_blocks_.size();
+            add_dirty_wave_array_leaf_refs += fragment.dirty_wave_array_memory_leaf_refs_.size();
+            add_dirty_wave_array_byte_map += fragment.dirty_wave_array_memory_byte_to_leaf_refs_.size();
+            add_dirty_wave_array_shadow += fragment.dirty_wave_array_memory_shadow_bytes_.size();
         }
         nodes_.reserve(checked_append_reserve_target_(nodes_.size(), add_nodes));
         tracks_.reserve(checked_append_reserve_target_(tracks_.size(), add_tracks));
@@ -10931,6 +11369,27 @@ private:
             checked_append_reserve_target_(scalar_getter_storage_.size(), add_getters));
         bitfield_storage_created_keys_.reserve(
             checked_append_reserve_target_(bitfield_storage_created_keys_.size(), add_bitfield_keys));
+        dirty_peek_groups_.reserve(checked_append_reserve_target_(dirty_peek_groups_.size(), add_dirty_peek_groups));
+        dirty_peek_ranges_.reserve(checked_append_reserve_target_(dirty_peek_ranges_.size(), add_dirty_peek_ranges));
+        dirty_peek_leaves_.reserve(checked_append_reserve_target_(dirty_peek_leaves_.size(), add_dirty_peek_leaves));
+        dirty_peek_memory_blocks_.reserve(checked_append_reserve_target_(dirty_peek_memory_blocks_.size(), add_dirty_peek_blocks));
+        dirty_peek_memory_storage_refs_.reserve(checked_append_reserve_target_(dirty_peek_memory_storage_refs_.size(), add_dirty_peek_storage_refs));
+        dirty_peek_memory_byte_to_storage_refs_.reserve(checked_append_reserve_target_(dirty_peek_memory_byte_to_storage_refs_.size(), add_dirty_peek_byte_map));
+        dirty_peek_memory_shadow_bytes_.reserve(checked_append_reserve_target_(dirty_peek_memory_shadow_bytes_.size(), add_dirty_peek_shadow));
+        dirty_peek_group_by_key_.reserve(checked_append_reserve_target_(dirty_peek_group_by_key_.size(), add_dirty_peek_groups));
+        dirty_peek_storage_by_key_.reserve(checked_append_reserve_target_(dirty_peek_storage_by_key_.size(), add_dirty_peek_storage_refs));
+        bound_dirty_hooks_.reserve(checked_append_reserve_target_(bound_dirty_hooks_.size(), add_dirty_peek_groups));
+        dirty_wave_value_groups_.reserve(checked_append_reserve_target_(dirty_wave_value_groups_.size(), add_dirty_wave_value_groups));
+        dirty_wave_value_ranges_.reserve(checked_append_reserve_target_(dirty_wave_value_ranges_.size(), add_dirty_wave_value_ranges));
+        dirty_wave_value_leaves_.reserve(checked_append_reserve_target_(dirty_wave_value_leaves_.size(), add_dirty_wave_value_leaves));
+        dirty_wave_value_addr_table_.reserve(checked_append_reserve_target_(dirty_wave_value_addr_table_.size(), add_dirty_wave_value_addresses));
+        dirty_wave_value_group_by_key_.reserve(checked_append_reserve_target_(dirty_wave_value_group_by_key_.size(), add_dirty_wave_value_groups));
+        dirty_wave_array_bulk_ranges_.reserve(checked_append_reserve_target_(dirty_wave_array_bulk_ranges_.size(), add_dirty_wave_array_ranges));
+        dirty_wave_array_leaves_.reserve(checked_append_reserve_target_(dirty_wave_array_leaves_.size(), add_dirty_wave_array_leaves));
+        dirty_wave_array_memory_blocks_.reserve(checked_append_reserve_target_(dirty_wave_array_memory_blocks_.size(), add_dirty_wave_array_blocks));
+        dirty_wave_array_memory_leaf_refs_.reserve(checked_append_reserve_target_(dirty_wave_array_memory_leaf_refs_.size(), add_dirty_wave_array_leaf_refs));
+        dirty_wave_array_memory_byte_to_leaf_refs_.reserve(checked_append_reserve_target_(dirty_wave_array_memory_byte_to_leaf_refs_.size(), add_dirty_wave_array_byte_map));
+        dirty_wave_array_memory_shadow_bytes_.reserve(checked_append_reserve_target_(dirty_wave_array_memory_shadow_bytes_.size(), add_dirty_wave_array_shadow));
     }
 
     void append_remapped_topology_fragment_(ParallelTopologyFragment& result, NodeId parent_id) {
@@ -10989,6 +11448,8 @@ private:
         scalar_getter_storage_.insert(scalar_getter_storage_.end(),
                                       std::make_move_iterator(fragment.scalar_getter_storage_.begin()),
                                       std::make_move_iterator(fragment.scalar_getter_storage_.end()));
+
+        append_remapped_dirty_metadata_(result);
 
         next_node_id_ = static_cast<NodeId>(result.node_base + fragment.next_node_id_);
         next_track_id_ = static_cast<TrackId>(result.track_base + fragment.next_track_id_);
@@ -13177,15 +13638,14 @@ private:
 
     template <typename CleanPointee>
     bool should_use_parallel_topology_expansion_(std::size_t declared_count,
-                                                 std::size_t first_element_work_items) const {
-        if (!ParallelTopologyExpansionSafe<CleanPointee>::value) return false;
+                                                 std::size_t estimated_work_items_per_element) const {
         if (!options_.enable_parallel_topology_expansion) return false;
         if (next_node_id_ != nodes_.size() ||
             next_track_id_ != tracks_.size() ||
             next_object_id_ != objects_.size() ||
             track_runtime_.size() != tracks_.size()) return false;
         if (declared_count < options_.parallel_topology_min_elements) return false;
-        if (first_element_work_items < options_.parallel_topology_min_work_items_per_element) return false;
+        if (estimated_work_items_per_element < options_.parallel_topology_min_work_items_per_element) return false;
         if (options_.topology_expansion_threads < 2u) return false;
         if (needs_full_topology_paths_() || trace_level_limit_enabled_) return false;
         if (options_.debug_log || options_.debug_log_root_expand_stats) return false;
@@ -13229,10 +13689,8 @@ private:
                     result.root_node_ids.push_back(root);
                 }
             }
-            const unsigned char* begin = reinterpret_cast<const unsigned char*>(target + result.begin_index);
-            const unsigned char* end = reinterpret_cast<const unsigned char*>(target + result.end_index);
             result.mergeable = result.expanded_roots == result.end_index - result.begin_index &&
-                               topology_fragment_is_mergeable_(*result.tracer, begin, end) &&
+                               topology_fragment_is_mergeable_(*result.tracer) &&
                                topology_fragment_has_no_global_alias_(*result.tracer);
         } catch (...) {
             result.error = std::current_exception();
@@ -13301,6 +13759,9 @@ private:
                     break;
                 }
             }
+            if (mergeable && !topology_fragment_batch_has_no_alias_(fragments)) {
+                mergeable = false;
+            }
             if (!mergeable) {
                 ++parallel_topology_fallback_batches_;
                 fragments.clear();
@@ -13308,16 +13769,30 @@ private:
                 return;
             }
 
+            ParallelTopologyMergeCursor cursor;
             try {
                 reserve_topology_fragment_batch_append_(fragments);
-                std::uint64_t node_cursor = next_node_id_ - 1u;
-                std::uint64_t track_cursor = next_track_id_ - 1u;
-                std::uint64_t object_cursor = next_object_id_ - 1u;
+                cursor.node = next_node_id_ - 1u;
+                cursor.track = next_track_id_ - 1u;
+                cursor.object = next_object_id_ - 1u;
+                cursor.dirty_peek_group = dirty_peek_groups_.size();
+                cursor.dirty_peek_range = dirty_peek_ranges_.size();
+                cursor.dirty_peek_leaf = dirty_peek_leaves_.size();
+                cursor.dirty_peek_block = dirty_peek_memory_blocks_.size();
+                cursor.dirty_peek_storage_ref = dirty_peek_memory_storage_refs_.size();
+                cursor.dirty_peek_byte_map = dirty_peek_memory_byte_to_storage_refs_.size();
+                cursor.dirty_peek_shadow = dirty_peek_memory_shadow_bytes_.size();
+                cursor.dirty_wave_value_group = dirty_wave_value_groups_.size();
+                cursor.dirty_wave_value_range = dirty_wave_value_ranges_.size();
+                cursor.dirty_wave_value_leaf = dirty_wave_value_leaves_.size();
+                cursor.dirty_wave_array_range = dirty_wave_array_bulk_ranges_.size();
+                cursor.dirty_wave_array_leaf = dirty_wave_array_leaves_.size();
+                cursor.dirty_wave_array_block = dirty_wave_array_memory_blocks_.size();
+                cursor.dirty_wave_array_leaf_ref = dirty_wave_array_memory_leaf_refs_.size();
+                cursor.dirty_wave_array_byte_map = dirty_wave_array_memory_byte_to_leaf_refs_.size();
+                cursor.dirty_wave_array_shadow = dirty_wave_array_memory_shadow_bytes_.size();
                 for (std::size_t t = 0; t < fragments.size(); ++t) {
-                    prepare_topology_fragment_merge_(*fragments[t],
-                                                     node_cursor,
-                                                     track_cursor,
-                                                     object_cursor);
+                    prepare_topology_fragment_merge_(*fragments[t], cursor);
                 }
             } catch (...) {
                 ++parallel_topology_fallback_batches_;
@@ -13368,6 +13843,7 @@ private:
                 append_remapped_topology_fragment_(*fragments[t], node_id);
                 parallel_topology_expanded_elements_ += fragments[t]->end_index - fragments[t]->begin_index;
             }
+            finalize_parallel_dirty_metadata_merge_();
             nodes_exported_ = false;
             invalidate_flat_leaf_fast_table();
             ++parallel_topology_batches_;
@@ -13376,35 +13852,29 @@ private:
     }
 
     template <typename CleanPointee>
-    typename std::enable_if<ParallelTopologyExpansionSafe<CleanPointee>::value, bool>::type
-    try_expand_reflected_wave_ptr_array_parallel_(NodeId node_id,
-                                                  const CleanPointee* target,
-                                                  std::size_t declared_count,
-                                                  std::size_t first_element_nodes,
-                                                  std::size_t first_element_tracks,
-                                                  std::size_t first_element_objects) {
+    bool try_expand_reflected_wave_ptr_array_parallel_(NodeId node_id,
+                                                       const CleanPointee* target,
+                                                       std::size_t declared_count,
+                                                       std::size_t first_element_nodes,
+                                                       std::size_t first_element_tracks,
+                                                       std::size_t first_element_objects) {
         const std::size_t first_element_work_items =
             first_element_nodes + first_element_tracks + first_element_objects;
+        const reflect::TopologyTypeEstimate generated_estimate =
+            reflect::topology_type_estimate<CleanPointee>::get();
+        const std::size_t estimated_work_items_per_element =
+            generated_estimate.estimated_leaves != 0
+                ? generated_estimate.estimated_leaves
+                : first_element_work_items;
         if (declared_count <= 1u ||
             !should_use_parallel_topology_expansion_<CleanPointee>(declared_count,
-                                                                   first_element_work_items)) {
+                                                                   estimated_work_items_per_element)) {
             return false;
         }
         expand_reflected_wave_ptr_array_parallel_range_<CleanPointee>(
             node_id, target, 1u, declared_count,
             first_element_nodes, first_element_tracks, first_element_objects);
         return true;
-    }
-
-    template <typename CleanPointee>
-    typename std::enable_if<!ParallelTopologyExpansionSafe<CleanPointee>::value, bool>::type
-    try_expand_reflected_wave_ptr_array_parallel_(NodeId,
-                                                  const CleanPointee*,
-                                                  std::size_t,
-                                                  std::size_t,
-                                                  std::size_t,
-                                                  std::size_t) {
-        return false;
     }
 
     template <typename CleanPointee>

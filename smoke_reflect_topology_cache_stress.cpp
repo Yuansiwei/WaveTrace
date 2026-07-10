@@ -66,6 +66,7 @@ struct Slot {
 
 struct GuardedDirtySlot {
     wave::WaveValue<std::uint32_t> value;
+    wave::array<std::uint32_t, 4> values;
 };
 
 struct GuardedDirtyTop {
@@ -112,14 +113,6 @@ struct WideTop {
         slots.declareSize(count);
     }
 };
-
-namespace wave {
-template<> struct ParallelTopologyExpansionSafe<Slot> : std::true_type {};
-// Intentionally opted in so the runtime validation/fallback path is exercised.
-template<> struct ParallelTopologyExpansionSafe<GuardedDirtySlot> : std::true_type {};
-template<> struct ParallelTopologyExpansionSafe<GuardedHookSlot> : std::true_type {};
-template<> struct ParallelTopologyExpansionSafe<WideSlot> : std::true_type {};
-}
 
 struct Top {
     wave::WavePtr<Slot*> slots;
@@ -173,6 +166,7 @@ template<> struct reflected_visitor<GuardedDirtySlot> {
     template<class P, class V, class G>
     static void visit(const GuardedDirtySlot* obj, P&& on_ptr, V&&, G&&) {
         on_ptr("value", std::addressof(obj->value));
+        on_ptr("values", std::addressof(obj->values));
     }
 };
 
@@ -566,11 +560,14 @@ static bool compare_results(const RunResult& a, const RunResult& b) {
     return true;
 }
 
-static RunResult run_guarded_dirty_fallback_case(bool enable_parallel) {
+static RunResult run_guarded_dirty_parallel_case(bool enable_parallel) {
     const std::size_t slot_count = 64;
     std::vector<GuardedDirtySlot> slots(slot_count);
     for (std::size_t i = 0; i < slots.size(); ++i) {
         slots[i].value.raw_unsafe_for_initialization_only() = static_cast<std::uint32_t>(i);
+        for (std::size_t j = 0; j < slots[i].values.size(); ++j) {
+            slots[i].values[j] = static_cast<std::uint32_t>(i * 10u + j);
+        }
     }
     GuardedDirtyTop top(&slots[0], slots.size());
 
@@ -591,6 +588,7 @@ static RunResult run_guarded_dirty_fallback_case(bool enable_parallel) {
         tracer.add_root("top", &top);
         tracer.sample(0);
         slots[7].value = 7007u;
+        slots[7].values[2] = 702u;
         tracer.sample(1);
         out.parallel_topology_elements = tracer.parallel_topology_expanded_elements();
         out.parallel_topology_batches = tracer.parallel_topology_batches();
@@ -609,17 +607,29 @@ static RunResult run_guarded_dirty_fallback_case(bool enable_parallel) {
     return out;
 }
 
-static bool verify_guarded_dirty_fallback() {
-    const RunResult serial = run_guarded_dirty_fallback_case(false);
-    const RunResult guarded = run_guarded_dirty_fallback_case(true);
+static bool verify_guarded_dirty_parallel_merge() {
+    const RunResult serial = run_guarded_dirty_parallel_case(false);
+    const RunResult guarded = run_guarded_dirty_parallel_case(true);
     if (!compare_results(serial, guarded)) {
-        std::cerr << "guarded dirty-source fallback changed topology or samples\n";
+        std::cerr << "parallel dirty-source merge changed topology or samples\n";
+        std::cerr << "serial events=" << serial.events.size()
+                  << " parallel events=" << guarded.events.size() << "\n";
+        const std::size_t serial_begin = serial.events.size() > 8 ? serial.events.size() - 8 : 0;
+        const std::size_t parallel_begin = guarded.events.size() > 8 ? guarded.events.size() - 8 : 0;
+        for (std::size_t i = serial_begin; i < serial.events.size(); ++i) {
+            std::cerr << "serial tail i=" << i << " cycle=" << serial.events[i].cycle
+                      << " track=" << serial.events[i].track_id << "\n";
+        }
+        for (std::size_t i = parallel_begin; i < guarded.events.size(); ++i) {
+            std::cerr << "parallel tail i=" << i << " cycle=" << guarded.events[i].cycle
+                      << " track=" << guarded.events[i].track_id << "\n";
+        }
         return false;
     }
-    if (guarded.parallel_topology_elements != 0 ||
-        guarded.parallel_topology_batches != 0 ||
-        guarded.parallel_topology_fallback_batches != 1) {
-        std::cerr << "guarded dirty-source fallback counters are wrong: elements="
+    if (guarded.parallel_topology_elements != 63 ||
+        guarded.parallel_topology_batches != 1 ||
+        guarded.parallel_topology_fallback_batches != 0) {
+        std::cerr << "guarded dirty-source parallel counters are wrong: elements="
                   << guarded.parallel_topology_elements
                   << " batches=" << guarded.parallel_topology_batches
                   << " fallbacks=" << guarded.parallel_topology_fallback_batches << "\n";
@@ -628,7 +638,7 @@ static bool verify_guarded_dirty_fallback() {
     return true;
 }
 
-static RunResult run_guarded_hook_fallback_case(bool enable_parallel, bool& hook_bound) {
+static RunResult run_guarded_hook_parallel_case(bool enable_parallel, bool& hook_bound) {
     const std::size_t slot_count = 64;
     std::vector<GuardedHookSlot> slots(slot_count);
     for (std::size_t i = 0; i < slots.size(); ++i) {
@@ -676,13 +686,13 @@ static RunResult run_guarded_hook_fallback_case(bool enable_parallel, bool& hook
     return out;
 }
 
-static bool verify_guarded_hook_fallback() {
+static bool verify_guarded_hook_parallel_merge() {
     bool serial_hook_bound = false;
     bool guarded_hook_bound = false;
-    const RunResult serial = run_guarded_hook_fallback_case(false, serial_hook_bound);
-    const RunResult guarded = run_guarded_hook_fallback_case(true, guarded_hook_bound);
+    const RunResult serial = run_guarded_hook_parallel_case(false, serial_hook_bound);
+    const RunResult guarded = run_guarded_hook_parallel_case(true, guarded_hook_bound);
     if (!serial_hook_bound || !guarded_hook_bound) {
-        std::cerr << "dynamic dirty hook was not bound after guarded fallback: serial="
+        std::cerr << "dynamic dirty hook was not bound after parallel merge: serial="
                   << (serial_hook_bound ? 1 : 0)
                   << " guarded=" << (guarded_hook_bound ? 1 : 0)
                   << " serial_tracks=" << serial.tracks.size()
@@ -691,7 +701,7 @@ static bool verify_guarded_hook_fallback() {
         return false;
     }
     if (!compare_results(serial, guarded)) {
-        std::cerr << "guarded dynamic-hook fallback changed topology or samples: elements="
+        std::cerr << "parallel dynamic-hook merge changed topology or samples: elements="
                   << guarded.parallel_topology_elements
                   << " batches=" << guarded.parallel_topology_batches
                   << " fallbacks=" << guarded.parallel_topology_fallback_batches
@@ -699,10 +709,10 @@ static bool verify_guarded_hook_fallback() {
                   << " guarded_events=" << guarded.events.size() << "\n";
         return false;
     }
-    if (guarded.parallel_topology_elements != 0 ||
-        guarded.parallel_topology_batches != 0 ||
-        guarded.parallel_topology_fallback_batches != 1) {
-        std::cerr << "guarded dynamic-hook fallback counters are wrong\n";
+    if (guarded.parallel_topology_elements != 63 ||
+        guarded.parallel_topology_batches != 1 ||
+        guarded.parallel_topology_fallback_batches != 0) {
+        std::cerr << "guarded dynamic-hook parallel counters are wrong\n";
         return false;
     }
     return true;
@@ -894,8 +904,8 @@ int main(int argc, char** argv) {
     const RunResult baseline = run_case(slot_count, cycles, false);
     const RunResult optimized = run_case(slot_count, cycles, true);
     if (!compare_results(baseline, optimized)) return 1;
-    if (!verify_guarded_dirty_fallback()) return 1;
-    if (!verify_guarded_hook_fallback()) return 1;
+    if (!verify_guarded_dirty_parallel_merge()) return 1;
+    if (!verify_guarded_hook_parallel_merge()) return 1;
     if (!verify_wide_parallel_topology()) return 1;
 
     const double speedup = optimized.elapsed_ms == 0

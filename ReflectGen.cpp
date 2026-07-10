@@ -6436,6 +6436,7 @@ namespace
             os << "struct ReflectAccess<" << recType << ">\n";
             os << "{\n";
             os << "    typedef " << recType << " Self;\n";
+            os << "    static ::reflect::TopologyTypeEstimate topology_type_estimate() noexcept;\n";
 
             const std::map<std::string, std::vector<const RecordInfo*> >::const_iterator ait = aliasChildrenByOwner.find(rec.qualifiedName);
             if (ait != aliasChildrenByOwner.end())
@@ -6578,6 +6579,21 @@ namespace
             const RecordInfo& rec = *emitOrder[oi];
             const std::string recType = emittedTypeByQName[rec.qualifiedName];
             os << BuildClassSpecializationPrefix(rec);
+            os << "struct topology_type_estimate<" << recType << ">\n";
+            os << "{\n";
+            os << "    static constexpr bool generated = true;\n";
+            os << "    static TopologyTypeEstimate get() noexcept\n";
+            os << "    {\n";
+            os << "        return ::wave::ReflectAccess<" << recType << ">::topology_type_estimate();\n";
+            os << "    }\n";
+            os << "};\n\n";
+        }
+
+        for (std::size_t oi = 0; oi < emitOrder.size(); ++oi)
+        {
+            const RecordInfo& rec = *emitOrder[oi];
+            const std::string recType = emittedTypeByQName[rec.qualifiedName];
+            os << BuildClassSpecializationPrefix(rec);
             os << "struct reflected_visitor<" << recType << ">\n";
             os << "{\n";
             os << "    template <typename PtrVisitor, typename ValueVisitor, typename GetterVisitor>\n";
@@ -6597,6 +6613,64 @@ namespace
             os << "    }\n";
             os << "};\n\n";
         }
+
+        os << "} // namespace reflect\n\n";
+        os << "namespace wave {\n\n";
+        for (std::size_t oi = 0; oi < emitOrder.size(); ++oi)
+        {
+            const RecordInfo& rec = *emitOrder[oi];
+            const std::string recType = emittedTypeByQName[rec.qualifiedName];
+            const std::vector<EmittedMember> members = BuildFlattenedMembers(opt, rec, byName);
+            bool isTypedPeekSource = false;
+            for (std::size_t bi = 0; bi < rec.bases.size(); ++bi)
+            {
+                const BaseInfo& base = rec.bases[bi];
+                const std::string baseText = base.typeName + " " + base.canonicalTypeName + " " + base.qualifiedTypeName;
+                if (baseText.find("PeekTraceSourceFor") != std::string::npos)
+                {
+                    isTypedPeekSource = true;
+                    break;
+                }
+            }
+
+            if (rec.templateKind == RecordTemplateKind::Primary) os << BuildTemplatePrefix(rec);
+            os << "inline ::reflect::TopologyTypeEstimate ReflectAccess<" << recType << ">::topology_type_estimate() noexcept\n";
+            os << "{\n";
+            os << "    ::reflect::detail::TopologyEstimateRecursionGuard recursion_guard(::reflect::type_tag_of<Self>());\n";
+            os << "    if (!recursion_guard.entered()) return ::reflect::TopologyTypeEstimate(0, false, true);\n";
+            os << "    ::reflect::TopologyTypeEstimate estimate(0, true, false);\n";
+            if (isTypedPeekSource)
+            {
+                os << "    typedef typename Self::wave_trace_peek_value_type EstimatePeekValue;\n";
+                os << "    estimate = ::reflect::detail::combine_topology_estimates(estimate, "
+                   << "::reflect::topology_type_estimate<EstimatePeekValue>::get());\n";
+            }
+            else
+            {
+                for (std::size_t mi = 0; mi < members.size(); ++mi)
+                {
+                    const EmittedMember& member = members[mi];
+                    const std::string objectPrefix = "obj->";
+                    std::string typeExpr;
+                    if (member.constExpr.compare(0, objectPrefix.size(), objectPrefix) == 0)
+                    {
+                        typeExpr = "decltype(std::declval<const Self&>()." + member.constExpr.substr(objectPrefix.size()) + ")";
+                    }
+                    else
+                    {
+                        typeExpr = member.typeName;
+                    }
+                    os << "    typedef typename std::remove_cv<typename std::remove_reference<"
+                       << typeExpr << ">::type>::type EstimateField" << mi << ";\n";
+                    os << "    estimate = ::reflect::detail::combine_topology_estimates(estimate, "
+                       << "::reflect::topology_type_estimate<EstimateField" << mi << ">::get());\n";
+                }
+            }
+            os << "    return estimate;\n";
+            os << "}\n\n";
+        }
+        os << "} // namespace wave\n\n";
+        os << "namespace reflect {\n\n";
 
         os << "#ifdef WAVE_RUNTIME_AVAILABLE\n";
         os << "inline void " << BuildWaveRegistrationFunctionName(opt) << "()\n";
