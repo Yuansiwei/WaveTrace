@@ -1,5 +1,8 @@
 # WaveTrace Release Package Build Notes
 
+构建完成后的 WaveTrace 接入与运行说明见：
+[`docs/WaveTrace_使用手册_20260711.md`](docs/WaveTrace_使用手册_20260711.md)。
+
 The formal package is intended to be copied into a business tree and consumed as
 prebuilt tooling plus source headers. It does not require business CMake or
 Visual Studio projects to build WaveTrace tools.

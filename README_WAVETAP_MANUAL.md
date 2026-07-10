@@ -1,5 +1,8 @@
 # Manual-cycle WaveTap
 
+中文完整接入、类型包装、性能配置、日志与 viewer 使用说明见：
+[`docs/WaveTrace_使用手册_20260711.md`](docs/WaveTrace_使用手册_20260711.md)。
+
 `wave::WaveTap` is now a clean non-owning wrapper for the workflow already used
 by the GPU simulator:
 
