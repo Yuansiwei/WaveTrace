@@ -95,5 +95,7 @@ if not exist "%~2" (
   echo [ERROR] Missing link target: "%~2"
   exit /b 1
 )
-mklink /d "%~1" "%~2"
+rem All three targets live below WORKDIR, so a junction is sufficient and does
+rem not require an elevated console or Windows Developer Mode.
+mklink /j "%~1" "%~2"
 exit /b %errorlevel%

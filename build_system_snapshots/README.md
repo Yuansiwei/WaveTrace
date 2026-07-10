@@ -55,8 +55,10 @@ The resulting build setup provides multi-configuration Visual Studio generation
 (`Debug`, `Release`, `RelWithDebInfo`, `MinSizeRel`, and `Profile`), profiler
 symbols for optimized configurations, `/MP32` compilation, optional 32-way
 command-line builds, flat SDK output paths, generate-only root BAT behavior, and
-incremental cmodel/gcDefine generation.  `cmodel_reggen` remains an explicit
-solution target and does not depend on WaveTrace's ReflectGen target.
+incremental cmodel/gcDefine generation.  The root BAT uses local directory
+junctions so a normal double-click run does not require administrator privileges
+or Windows Developer Mode.  `cmodel_reggen` remains an explicit solution target
+and does not depend on WaveTrace's ReflectGen target.
 
 ## Validation boundary
 
