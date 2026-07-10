@@ -1,5 +1,7 @@
 #include "wave_runtime.h"
 
+#include <atomic>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -18,9 +20,9 @@
 
 typedef unsigned char U01;
 
-static std::size_t g_top_visits = 0;
-static std::size_t g_slot_visits = 0;
-static std::size_t g_payload_visits = 0;
+static std::atomic<std::size_t> g_top_visits(0);
+static std::atomic<std::size_t> g_slot_visits(0);
+static std::atomic<std::size_t> g_payload_visits(0);
 
 static void dump_process_memory_phase(const char* phase,
                                       const wave::Tracer& tracer,
@@ -61,6 +63,63 @@ struct Slot {
 
     Slot() : active(0), counter(0), tag(0), payload() {}
 };
+
+struct GuardedDirtySlot {
+    wave::WaveValue<std::uint32_t> value;
+};
+
+struct GuardedDirtyTop {
+    wave::WavePtr<GuardedDirtySlot*> slots;
+
+    GuardedDirtyTop(GuardedDirtySlot* data, std::size_t count) : slots(data) {
+        slots.declareSize(count);
+    }
+};
+
+struct GuardedDynamicValue : wave::DynamicTraceTargetFor<GuardedDynamicValue> {
+    std::uint32_t value;
+
+    GuardedDynamicValue() : value(0) {}
+
+    void write(std::uint32_t next) {
+        value = next;
+        wave_dirty_hook()->mark_dirty();
+    }
+};
+
+struct GuardedHookSlot {
+    GuardedDynamicValue dynamic;
+};
+
+struct GuardedHookTop {
+    wave::WavePtr<GuardedHookSlot*> slots;
+
+    GuardedHookTop(GuardedHookSlot* data, std::size_t count) : slots(data) {
+        slots.declareSize(count);
+    }
+};
+
+struct WideSlot {
+    std::array<std::uint32_t, 64> values;
+
+    WideSlot() : values() {}
+};
+
+struct WideTop {
+    wave::WavePtr<WideSlot*> slots;
+
+    WideTop(WideSlot* data, std::size_t count) : slots(data) {
+        slots.declareSize(count);
+    }
+};
+
+namespace wave {
+template<> struct ParallelTopologyExpansionSafe<Slot> : std::true_type {};
+// Intentionally opted in so the runtime validation/fallback path is exercised.
+template<> struct ParallelTopologyExpansionSafe<GuardedDirtySlot> : std::true_type {};
+template<> struct ParallelTopologyExpansionSafe<GuardedHookSlot> : std::true_type {};
+template<> struct ParallelTopologyExpansionSafe<WideSlot> : std::true_type {};
+}
 
 struct Top {
     wave::WavePtr<Slot*> slots;
@@ -105,6 +164,62 @@ template<> struct reflected_visitor<Top> {
     template<class P, class V, class G>
     static void visit(const Top* obj, P&& on_ptr, V&&, G&&) {
         ++g_top_visits;
+        on_ptr("slots", std::addressof(obj->slots));
+    }
+};
+
+template<> struct is_reflected<GuardedDirtySlot> : std::true_type {};
+template<> struct reflected_visitor<GuardedDirtySlot> {
+    template<class P, class V, class G>
+    static void visit(const GuardedDirtySlot* obj, P&& on_ptr, V&&, G&&) {
+        on_ptr("value", std::addressof(obj->value));
+    }
+};
+
+template<> struct is_reflected<GuardedDirtyTop> : std::true_type {};
+template<> struct reflected_visitor<GuardedDirtyTop> {
+    template<class P, class V, class G>
+    static void visit(const GuardedDirtyTop* obj, P&& on_ptr, V&&, G&&) {
+        on_ptr("slots", std::addressof(obj->slots));
+    }
+};
+
+template<> struct is_reflected<GuardedDynamicValue> : std::true_type {};
+template<> struct reflected_visitor<GuardedDynamicValue> {
+    template<class P, class V, class G>
+    static void visit(const GuardedDynamicValue* obj, P&& on_ptr, V&&, G&&) {
+        on_ptr("value", std::addressof(obj->value));
+    }
+};
+
+template<> struct is_reflected<GuardedHookSlot> : std::true_type {};
+template<> struct reflected_visitor<GuardedHookSlot> {
+    template<class P, class V, class G>
+    static void visit(const GuardedHookSlot* obj, P&& on_ptr, V&&, G&&) {
+        on_ptr("dynamic", std::addressof(obj->dynamic));
+    }
+};
+
+template<> struct is_reflected<GuardedHookTop> : std::true_type {};
+template<> struct reflected_visitor<GuardedHookTop> {
+    template<class P, class V, class G>
+    static void visit(const GuardedHookTop* obj, P&& on_ptr, V&&, G&&) {
+        on_ptr("slots", std::addressof(obj->slots));
+    }
+};
+
+template<> struct is_reflected<WideSlot> : std::true_type {};
+template<> struct reflected_visitor<WideSlot> {
+    template<class P, class V, class G>
+    static void visit(const WideSlot* obj, P&& on_ptr, V&&, G&&) {
+        on_ptr("values", std::addressof(obj->values));
+    }
+};
+
+template<> struct is_reflected<WideTop> : std::true_type {};
+template<> struct reflected_visitor<WideTop> {
+    template<class P, class V, class G>
+    static void visit(const WideTop* obj, P&& on_ptr, V&&, G&&) {
         on_ptr("slots", std::addressof(obj->slots));
     }
 };
@@ -173,6 +288,9 @@ struct RunResult {
     std::size_t top_visits;
     std::size_t slot_visits;
     std::size_t payload_visits;
+    std::size_t parallel_topology_elements;
+    std::size_t parallel_topology_batches;
+    std::size_t parallel_topology_fallback_batches;
     std::uint64_t first_sample_ms;
     std::uint64_t elapsed_ms;
 };
@@ -184,6 +302,9 @@ struct CountRunResult {
     std::size_t top_visits;
     std::size_t slot_visits;
     std::size_t payload_visits;
+    std::size_t parallel_topology_elements;
+    std::size_t parallel_topology_batches;
+    std::size_t parallel_topology_fallback_batches;
     std::uint64_t first_sample_ms;
     std::uint64_t elapsed_ms;
 };
@@ -283,10 +404,16 @@ static RunResult run_case(std::size_t slot_count, std::uint32_t cycles, bool ena
     opt.enable_node_name_interning = enable_topology_fast_path;
     opt.enable_wave_ptr_array_batch_reserve = enable_topology_fast_path;
     opt.enable_flat_memory_block_precheck = enable_topology_fast_path;
+    opt.enable_parallel_topology_expansion = enable_topology_fast_path &&
+        std::getenv("WAVE_STRESS_DISABLE_PARALLEL_TOPOLOGY") == NULL;
+    opt.parallel_topology_min_work_items_per_element = 0;
     opt.dump_leaf_distribution_after_topology = false;
 
     const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     std::uint64_t first_sample_ms = 0;
+    std::size_t parallel_topology_elements = 0;
+    std::size_t parallel_topology_batches = 0;
+    std::size_t parallel_topology_fallback_batches = 0;
     {
         wave::Tracer tracer(sink, opt);
         tracer.add_root("top", &top);
@@ -299,6 +426,9 @@ static RunResult run_case(std::size_t slot_count, std::uint32_t cycles, bool ena
             update_slots(slots, c);
             tracer.sample(c);
         }
+        parallel_topology_elements = tracer.parallel_topology_expanded_elements();
+        parallel_topology_batches = tracer.parallel_topology_batches();
+        parallel_topology_fallback_batches = tracer.parallel_topology_fallback_batches();
     }
     const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
 
@@ -306,9 +436,12 @@ static RunResult run_case(std::size_t slot_count, std::uint32_t cycles, bool ena
     out.nodes = sink.node_declarations;
     out.tracks = sink.declarations;
     out.events = snapshot_events(sink.events);
-    out.top_visits = g_top_visits;
-    out.slot_visits = g_slot_visits;
-    out.payload_visits = g_payload_visits;
+    out.top_visits = g_top_visits.load(std::memory_order_relaxed);
+    out.slot_visits = g_slot_visits.load(std::memory_order_relaxed);
+    out.payload_visits = g_payload_visits.load(std::memory_order_relaxed);
+    out.parallel_topology_elements = parallel_topology_elements;
+    out.parallel_topology_batches = parallel_topology_batches;
+    out.parallel_topology_fallback_batches = parallel_topology_fallback_batches;
     out.first_sample_ms = first_sample_ms;
     out.elapsed_ms = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
@@ -337,6 +470,9 @@ static CountRunResult run_count_case(std::size_t slot_count,
     opt.enable_node_name_interning = enable_topology_fast_path;
     opt.enable_wave_ptr_array_batch_reserve = enable_topology_fast_path;
     opt.enable_flat_memory_block_precheck = enable_topology_fast_path;
+    opt.enable_parallel_topology_expansion = enable_topology_fast_path &&
+        std::getenv("WAVE_STRESS_DISABLE_PARALLEL_TOPOLOGY") == NULL;
+    opt.parallel_topology_min_work_items_per_element = 0;
     opt.enable_parallel_sampling = enable_parallel_sampling;
     opt.sampling_threads = sampling_threads;
     opt.dump_leaf_distribution_after_topology = false;
@@ -345,6 +481,9 @@ static CountRunResult run_count_case(std::size_t slot_count,
 
     const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     std::uint64_t first_sample_ms = 0;
+    std::size_t parallel_topology_elements = 0;
+    std::size_t parallel_topology_batches = 0;
+    std::size_t parallel_topology_fallback_batches = 0;
     {
         wave::Tracer tracer(sink, opt);
         tracer.add_root("top", &top);
@@ -367,6 +506,9 @@ static CountRunResult run_count_case(std::size_t slot_count,
                 dump_process_memory_phase("sample1_sparse", tracer, "phase_sample1_sparse_memory.txt");
             }
         }
+        parallel_topology_elements = tracer.parallel_topology_expanded_elements();
+        parallel_topology_batches = tracer.parallel_topology_batches();
+        parallel_topology_fallback_batches = tracer.parallel_topology_fallback_batches();
     }
     const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
 
@@ -374,9 +516,12 @@ static CountRunResult run_count_case(std::size_t slot_count,
     out.nodes = sink.node_count;
     out.tracks = sink.track_count;
     out.events = sink.event_count;
-    out.top_visits = g_top_visits;
-    out.slot_visits = g_slot_visits;
-    out.payload_visits = g_payload_visits;
+    out.top_visits = g_top_visits.load(std::memory_order_relaxed);
+    out.slot_visits = g_slot_visits.load(std::memory_order_relaxed);
+    out.payload_visits = g_payload_visits.load(std::memory_order_relaxed);
+    out.parallel_topology_elements = parallel_topology_elements;
+    out.parallel_topology_batches = parallel_topology_batches;
+    out.parallel_topology_fallback_batches = parallel_topology_fallback_batches;
     out.first_sample_ms = first_sample_ms;
     out.elapsed_ms = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
@@ -421,6 +566,245 @@ static bool compare_results(const RunResult& a, const RunResult& b) {
     return true;
 }
 
+static RunResult run_guarded_dirty_fallback_case(bool enable_parallel) {
+    const std::size_t slot_count = 64;
+    std::vector<GuardedDirtySlot> slots(slot_count);
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+        slots[i].value.raw_unsafe_for_initialization_only() = static_cast<std::uint32_t>(i);
+    }
+    GuardedDirtyTop top(&slots[0], slots.size());
+
+    wave::InMemoryWaveSink sink;
+    wave::BuildOptions opt;
+    opt.emit_track_decl_path = false;
+    opt.enable_parallel_topology_expansion = enable_parallel;
+    opt.topology_expansion_threads = 4;
+    opt.parallel_topology_min_elements = 2;
+    opt.parallel_topology_min_work_items_per_element = 0;
+    opt.parallel_topology_batch_elements = slot_count;
+    opt.dump_leaf_distribution_after_topology = false;
+
+    RunResult out;
+    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    {
+        wave::Tracer tracer(sink, opt);
+        tracer.add_root("top", &top);
+        tracer.sample(0);
+        slots[7].value = 7007u;
+        tracer.sample(1);
+        out.parallel_topology_elements = tracer.parallel_topology_expanded_elements();
+        out.parallel_topology_batches = tracer.parallel_topology_batches();
+        out.parallel_topology_fallback_batches = tracer.parallel_topology_fallback_batches();
+    }
+    const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+    out.nodes = sink.node_declarations;
+    out.tracks = sink.declarations;
+    out.events = snapshot_events(sink.events);
+    out.top_visits = 0;
+    out.slot_visits = 0;
+    out.payload_visits = 0;
+    out.first_sample_ms = 0;
+    out.elapsed_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+    return out;
+}
+
+static bool verify_guarded_dirty_fallback() {
+    const RunResult serial = run_guarded_dirty_fallback_case(false);
+    const RunResult guarded = run_guarded_dirty_fallback_case(true);
+    if (!compare_results(serial, guarded)) {
+        std::cerr << "guarded dirty-source fallback changed topology or samples\n";
+        return false;
+    }
+    if (guarded.parallel_topology_elements != 0 ||
+        guarded.parallel_topology_batches != 0 ||
+        guarded.parallel_topology_fallback_batches != 1) {
+        std::cerr << "guarded dirty-source fallback counters are wrong: elements="
+                  << guarded.parallel_topology_elements
+                  << " batches=" << guarded.parallel_topology_batches
+                  << " fallbacks=" << guarded.parallel_topology_fallback_batches << "\n";
+        return false;
+    }
+    return true;
+}
+
+static RunResult run_guarded_hook_fallback_case(bool enable_parallel, bool& hook_bound) {
+    const std::size_t slot_count = 64;
+    std::vector<GuardedHookSlot> slots(slot_count);
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+        slots[i].dynamic.value = static_cast<std::uint32_t>(i);
+    }
+    GuardedHookTop top(&slots[0], slots.size());
+
+    wave::InMemoryWaveSink sink;
+    wave::BuildOptions opt;
+    opt.emit_track_decl_path = false;
+    opt.enable_parallel_topology_expansion = enable_parallel;
+    opt.topology_expansion_threads = 4;
+    opt.parallel_topology_min_elements = 2;
+    opt.parallel_topology_min_work_items_per_element = 0;
+    opt.parallel_topology_batch_elements = slot_count;
+    opt.enable_dirty_peek_groups = true;
+    opt.dump_leaf_distribution_after_topology = false;
+
+    RunResult out;
+    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    {
+        wave::Tracer tracer(sink, opt);
+        tracer.add_root("top", &top);
+        tracer.sample(0);
+        tracer.attach_current_thread_for_dirty_peek();
+        const wave::WaveDirtyHook* hook = slots[7].dynamic.wave_dirty_hook();
+        hook_bound = hook && hook->tracer == static_cast<void*>(std::addressof(tracer)) &&
+                     hook->mark_fn != NULL;
+        slots[7].dynamic.write(7007u);
+        tracer.sample(1);
+        out.parallel_topology_elements = tracer.parallel_topology_expanded_elements();
+        out.parallel_topology_batches = tracer.parallel_topology_batches();
+        out.parallel_topology_fallback_batches = tracer.parallel_topology_fallback_batches();
+    }
+    const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+    out.nodes = sink.node_declarations;
+    out.tracks = sink.declarations;
+    out.events = snapshot_events(sink.events);
+    out.top_visits = 0;
+    out.slot_visits = 0;
+    out.payload_visits = 0;
+    out.first_sample_ms = 0;
+    out.elapsed_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+    return out;
+}
+
+static bool verify_guarded_hook_fallback() {
+    bool serial_hook_bound = false;
+    bool guarded_hook_bound = false;
+    const RunResult serial = run_guarded_hook_fallback_case(false, serial_hook_bound);
+    const RunResult guarded = run_guarded_hook_fallback_case(true, guarded_hook_bound);
+    if (!serial_hook_bound || !guarded_hook_bound) {
+        std::cerr << "dynamic dirty hook was not bound after guarded fallback: serial="
+                  << (serial_hook_bound ? 1 : 0)
+                  << " guarded=" << (guarded_hook_bound ? 1 : 0)
+                  << " serial_tracks=" << serial.tracks.size()
+                  << " guarded_tracks=" << guarded.tracks.size()
+                  << " guarded_fallbacks=" << guarded.parallel_topology_fallback_batches << "\n";
+        return false;
+    }
+    if (!compare_results(serial, guarded)) {
+        std::cerr << "guarded dynamic-hook fallback changed topology or samples: elements="
+                  << guarded.parallel_topology_elements
+                  << " batches=" << guarded.parallel_topology_batches
+                  << " fallbacks=" << guarded.parallel_topology_fallback_batches
+                  << " serial_events=" << serial.events.size()
+                  << " guarded_events=" << guarded.events.size() << "\n";
+        return false;
+    }
+    if (guarded.parallel_topology_elements != 0 ||
+        guarded.parallel_topology_batches != 0 ||
+        guarded.parallel_topology_fallback_batches != 1) {
+        std::cerr << "guarded dynamic-hook fallback counters are wrong\n";
+        return false;
+    }
+    return true;
+}
+
+static RunResult run_wide_parallel_case(bool enable_parallel) {
+    const std::size_t slot_count = 2048;
+    std::vector<WideSlot> slots(slot_count);
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+        for (std::size_t j = 0; j < slots[i].values.size(); ++j) {
+            slots[i].values[j] = static_cast<std::uint32_t>(i * 131u + j);
+        }
+    }
+    WideTop top(&slots[0], slots.size());
+
+    wave::InMemoryWaveSink sink;
+    wave::BuildOptions opt;
+    opt.emit_track_decl_path = false;
+    opt.enable_parallel_topology_expansion = enable_parallel;
+    opt.topology_expansion_threads = 8;
+    opt.parallel_topology_min_elements = 2;
+    opt.parallel_topology_batch_elements = slot_count;
+    opt.dump_leaf_distribution_after_topology = false;
+
+    RunResult out;
+    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    {
+        wave::Tracer tracer(sink, opt);
+        tracer.add_root("top", &top);
+        tracer.sample(0);
+        for (std::size_t i = 0; i < slots.size(); i += 97u) {
+            slots[i].values[(i / 97u) % slots[i].values.size()] ^= 0x5a5a5a5au;
+        }
+        tracer.sample(1);
+        out.parallel_topology_elements = tracer.parallel_topology_expanded_elements();
+        out.parallel_topology_batches = tracer.parallel_topology_batches();
+        out.parallel_topology_fallback_batches = tracer.parallel_topology_fallback_batches();
+    }
+    const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+    out.nodes = sink.node_declarations;
+    out.tracks = sink.declarations;
+    out.events = snapshot_events(sink.events);
+    out.top_visits = 0;
+    out.slot_visits = 0;
+    out.payload_visits = 0;
+    out.first_sample_ms = 0;
+    out.elapsed_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+    return out;
+}
+
+static bool verify_wide_parallel_topology() {
+    const RunResult serial = run_wide_parallel_case(false);
+    const RunResult parallel = run_wide_parallel_case(true);
+    if (!compare_results(serial, parallel)) {
+        std::cerr << "wide reflected array parallel expansion changed topology or samples\n";
+        return false;
+    }
+    if (parallel.parallel_topology_elements != 2047u ||
+        parallel.parallel_topology_batches != 1u ||
+        parallel.parallel_topology_fallback_batches != 0u) {
+        std::cerr << "wide reflected array did not use the expected parallel path\n";
+        return false;
+    }
+    return true;
+}
+
+static CountRunResult run_wide_topology_count(std::size_t slot_count,
+                                              bool enable_parallel,
+                                              std::size_t threads) {
+    std::vector<WideSlot> slots(slot_count);
+    WideTop top(slots.empty() ? static_cast<WideSlot*>(NULL) : &slots[0], slots.size());
+    CountingWaveSink sink;
+    wave::BuildOptions opt;
+    opt.emit_track_decl_path = false;
+    opt.enable_parallel_topology_expansion = enable_parallel;
+    opt.topology_expansion_threads = threads;
+    opt.dump_leaf_distribution_after_topology = false;
+
+    CountRunResult out;
+    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    {
+        wave::Tracer tracer(sink, opt);
+        tracer.add_root("top", &top);
+        tracer.prepare_topology(0);
+        out.parallel_topology_elements = tracer.parallel_topology_expanded_elements();
+        out.parallel_topology_batches = tracer.parallel_topology_batches();
+        out.parallel_topology_fallback_batches = tracer.parallel_topology_fallback_batches();
+    }
+    const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+    out.nodes = sink.node_count;
+    out.tracks = sink.track_count;
+    out.events = sink.event_count;
+    out.top_visits = 0;
+    out.slot_visits = 0;
+    out.payload_visits = 0;
+    out.first_sample_ms = 0;
+    out.elapsed_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+    return out;
+}
+
 int main(int argc, char** argv) {
     std::size_t slot_count = 20000;
     std::uint32_t cycles = 12;
@@ -430,8 +814,28 @@ int main(int argc, char** argv) {
     if (argc >= 4) mode = argv[3];
     if (slot_count == 0) {
         std::cerr << "usage: smoke_reflect_topology_cache_stress [slot_count] [cycles] "
-                     "[compare|baseline|optimized|baseline-count|optimized-count|optimized-parallel-count|phase-count] [threads]\n";
+                     "[compare|baseline|optimized|baseline-count|optimized-count|optimized-parallel-count|phase-count|wide-topology-count] [threads]\n";
         return 2;
+    }
+
+    if (mode == "wide-topology-count") {
+        const std::size_t threads = argc >= 5
+            ? static_cast<std::size_t>(std::strtoull(argv[4], NULL, 10))
+            : static_cast<std::size_t>(16);
+        const bool parallel = std::getenv("WAVE_STRESS_DISABLE_PARALLEL_TOPOLOGY") == NULL;
+        const CountRunResult result = run_wide_topology_count(slot_count, parallel, threads);
+        std::cout << "reflect_topology_wide_count"
+                  << " slots=" << slot_count
+                  << " threads=" << threads
+                  << " parallel=" << (parallel ? 1 : 0)
+                  << " nodes=" << result.nodes
+                  << " tracks=" << result.tracks
+                  << " elapsed_ms=" << result.elapsed_ms
+                  << " parallel_topology_elements=" << result.parallel_topology_elements
+                  << " parallel_topology_batches=" << result.parallel_topology_batches
+                  << " parallel_topology_fallback_batches=" << result.parallel_topology_fallback_batches
+                  << "\n";
+        return 0;
     }
 
     if (mode == "baseline-count" || mode == "optimized-count" || mode == "optimized-parallel-count" || mode == "phase-count") {
@@ -454,6 +858,9 @@ int main(int argc, char** argv) {
                   << " top_visits=" << result.top_visits
                   << " slot_visits=" << result.slot_visits
                   << " payload_visits=" << result.payload_visits
+                  << " parallel_topology_elements=" << result.parallel_topology_elements
+                  << " parallel_topology_batches=" << result.parallel_topology_batches
+                  << " parallel_topology_fallback_batches=" << result.parallel_topology_fallback_batches
                   << "\n";
         return 0;
     }
@@ -472,6 +879,9 @@ int main(int argc, char** argv) {
                   << " top_visits=" << result.top_visits
                   << " slot_visits=" << result.slot_visits
                   << " payload_visits=" << result.payload_visits
+                  << " parallel_topology_elements=" << result.parallel_topology_elements
+                  << " parallel_topology_batches=" << result.parallel_topology_batches
+                  << " parallel_topology_fallback_batches=" << result.parallel_topology_fallback_batches
                   << "\n";
         return 0;
     }
@@ -484,6 +894,9 @@ int main(int argc, char** argv) {
     const RunResult baseline = run_case(slot_count, cycles, false);
     const RunResult optimized = run_case(slot_count, cycles, true);
     if (!compare_results(baseline, optimized)) return 1;
+    if (!verify_guarded_dirty_fallback()) return 1;
+    if (!verify_guarded_hook_fallback()) return 1;
+    if (!verify_wide_parallel_topology()) return 1;
 
     const double speedup = optimized.elapsed_ms == 0
         ? 0.0
@@ -504,6 +917,9 @@ int main(int argc, char** argv) {
               << " optimized_slot_visits=" << optimized.slot_visits
               << " baseline_payload_visits=" << baseline.payload_visits
               << " optimized_payload_visits=" << optimized.payload_visits
+              << " parallel_topology_elements=" << optimized.parallel_topology_elements
+              << " parallel_topology_batches=" << optimized.parallel_topology_batches
+              << " parallel_topology_fallback_batches=" << optimized.parallel_topology_fallback_batches
               << "\n";
     return 0;
 }
