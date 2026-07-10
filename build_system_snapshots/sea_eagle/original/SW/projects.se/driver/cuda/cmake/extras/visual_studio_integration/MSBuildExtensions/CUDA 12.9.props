@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <PropertyGroup Condition="'$(CudaCompileBeforeTargets)' == '' and '$(CudaCompileAfterTargets)' == '' and '$(SelectedFiles)' == '' and '$(ConfigurationType)' != 'Makefile'">
+        <CudaCompileBeforeTargets>Midl</CudaCompileBeforeTargets>
+        <CudaCompileAfterTargets>CustomBuild</CudaCompileAfterTargets>
+
+        <CudaLinkBeforeTargets>Link;Lib</CudaLinkBeforeTargets>
+        <CudaLinkAfterTargets>ManifestResourceCompile</CudaLinkAfterTargets>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <CudaToolkitDir Condition="'$(CudaToolkitDir)' == ''">$(CudaToolkitCustomDir)</CudaToolkitDir>
+        <CudToolkitMajorVersion>12</CudToolkitMajorVersion>
+        <CudaToolkitMinorVersion>9</CudaToolkitMinorVersion>
+        <CudaToolkitVersionedPath>$(CUDA_PATH_V12_9)</CudaToolkitVersionedPath>
+
+        <CudaToolkitVersion>v$(CudToolkitMajorVersion).$(CudaToolkitMinorVersion)</CudaToolkitVersion>
+        <CudaToolkitFullVersion>$(CudToolkitMajorVersion).$(CudaToolkitMinorVersion).0000.0000</CudaToolkitFullVersion>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <!-- Check CUDA Toolkit versioned environment variable. -->
+        <CudaToolkitDir Condition="'$(CudaToolkitDir)' == ''">$(CudaToolkitVersionedPath)</CudaToolkitDir>
+
+        <!-- Ensure $(CudaToolkitDir) has a trailing backslash. -->
+        <CudaToolkitDir Condition="'$(CudaToolkitDir)' != '' AND !HasTrailingSlash('$(CudaToolkitDir)')">$(CudaToolkitDir)\</CudaToolkitDir>
+
+        <CudaToolkitIncludeDir Condition="'$(CudaToolkitIncludeDir)' == ''">$(CudaToolkitDir)include</CudaToolkitIncludeDir>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(Platform)' == 'Win32' or '$(Platform)' == 'x86'">
+        <CudaToolkitBinDir Condition="'$(CudaToolkitBinDir)' == ''">$(CudaToolkitDir)bin</CudaToolkitBinDir>
+        <CudaToolkitLibDir Condition="'$(CudaToolkitLibDir)' == ''">$(CudaToolkitDir)lib</CudaToolkitLibDir>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(Platform)' == 'x64'">
+        <CudaToolkitBinDir Condition="'$(CudaToolkitBinDir)' == ''">$(CudaToolkitDir)bin</CudaToolkitBinDir>
+        <CudaToolkitLibDir Condition="'$(CudaToolkitLibDir)' == ''">$(CudaToolkitDir)lib</CudaToolkitLibDir>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <CudaToolkitVccPath Condition="'$(CudaToolkitNvccPath)' == ''">$(LLVM_ROOT)\bin\vcc.exe</CudaToolkitVccPath>
+
+        <CudaContinueOnError>false</CudaContinueOnError>
+        <CudaLogStandardErrorAsError>false</CudaLogStandardErrorAsError>
+
+        <CudaIntDir>$(IntDir)</CudaIntDir>
+        <CudaIntDir Condition="HasTrailingSlash('$(CudaIntDir)')">$(CudaIntDir.Trim('\'))</CudaIntDir>
+
+        <!-- Newer versions of MSBuild can use [MSBuild]::NormalizePath, this emulates the same behavior -->
+        <CudaIntDirBasePath>$([System.IO.Path]::Combine('$(ProjectDir)', '$(CudaIntDir)'))</CudaIntDirBasePath>
+        <CudaIntDirFullPath>$(CudaIntDirBasePath.Replace('\\', '\'))</CudaIntDirFullPath>
+    </PropertyGroup>
+
+    <ItemDefinitionGroup>
+        <CudaCompile>
+            <!-- Project schema: Common properties -->
+            <CompileOut>$(CudaIntDirFullPath)\%(Filename)%(Extension).obj</CompileOut>
+            <Include></Include>
+            <UseHostInclude>true</UseHostInclude>
+            <Keep>false</Keep>
+            <KeepDir>$(CudaIntDir)</KeepDir>
+            <GenerateRelocatableDeviceCode>false</GenerateRelocatableDeviceCode>
+            <ExtensibleWholeProgramCompilation>false</ExtensibleWholeProgramCompilation>
+            <VccCompilation>compile</VccCompilation>
+            <CudaRuntime>Static</CudaRuntime>
+            <TargetMachinePlatform>64</TargetMachinePlatform>
+
+            <!-- Project schema: Device properties -->
+            <EnableVirtualArchInFatbin>true</EnableVirtualArchInFatbin>
+            <GPUDebugInfo Condition="'$(Configuration)' == 'Debug'">true</GPUDebugInfo>
+            <GPUDebugInfo Condition="'$(Configuration)' != 'Debug'">false</GPUDebugInfo>
+            <GenerateLineInfo>false</GenerateLineInfo>
+            <PtxAsOptionV>false</PtxAsOptionV>
+            <FastMath>false</FastMath>
+
+            <!-- Project schema: Host properties -->
+            <Defines></Defines>
+            <UseHostDefines>true</UseHostDefines>
+            <AdditionalCompilerOptions></AdditionalCompilerOptions>
+            <HostDebugInfo Condition="'$(Configuration)' == 'Debug'">true</HostDebugInfo>
+            <HostDebugInfo Condition="'$(Configuration)' != 'Debug'">false</HostDebugInfo>
+
+            <DebugInformationFormat Condition="'$(Configuration)' == 'Release'">None</DebugInformationFormat>
+            <DebugInformationFormat Condition="'$(Configuration)' != 'Release'">ProgramDatabase</DebugInformationFormat>
+            <Optimization>InheritFromHost</Optimization>
+            <Runtime>InheritFromHost</Runtime>
+            <RuntimeChecks>InheritFromHost</RuntimeChecks>
+            <TypeInfo>InheritFromHost</TypeInfo>
+            <Warning>InheritFromHost</Warning>
+
+            <!-- Project schema: Command line properties -->
+            <!-- <AdditionalOptions></AdditionalOptions> -->
+
+            <BaseCommandLineTemplate>-x cu [GenerateRelocatableDeviceCode] [ExtensibleWholeProgramCompilation] [Include] [RequiredIncludes] [GPUDebugInfo] [GenerateLineInfo] [Keep] [KeepDir] [FastMath] [PtxAsOptionV] [TargetMachinePlatform] [VccCompilation] [CudaRuntime] [AdditionalOptions]</BaseCommandLineTemplate>
+
+            <BuildCommandLineTemplate></BuildCommandLineTemplate>
+            <CleanCommandLineTemplate>-clean</CleanCommandLineTemplate>
+			
+			<HostCommandLineTemplate>-Xcompiler &quot;-fcxx-exceptions -fexceptions [Warning] [Optimization] [DebugInformationFormat] [Runtime] [TypeInfo]&quot;</HostCommandLineTemplate>
+
+            <DriverApiCommandLineTemplate>%(BaseCommandLineTemplate) [CompileOut] "%(FullPath)"</DriverApiCommandLineTemplate>
+            <RuntimeApiCommandLineTemplate>%(BaseCommandLineTemplate) [HostDebugInfo] [Defines] %(HostCommandLineTemplate) [CompileOut] "%(FullPath)"</RuntimeApiCommandLineTemplate>
+
+            <CommandLineTemplate>
+# (Approximate command-line.  Settings inherited from host are not visible below.)
+# (Please see the output window after a build for the full command-line)
+
+# Driver API (NVCC Compilation Type is .cubin, .gpu, or .ptx)
+set CUDAFE_FLAGS=--sdk_dir "$(WindowsSdkDir)"
+"$(CudaToolkitVccPath)" %(BuildCommandLineTemplate) %(DriverApiCommandLineTemplate)
+
+# Runtime API (NVCC Compilation Type is hybrid object or .c file)
+set CUDAFE_FLAGS=--sdk_dir "$(WindowsSdkDir)"
+"$(CudaToolkitVccPath)" %(BuildCommandLineTemplate) %(RuntimeApiCommandLineTemplate)
+            </CommandLineTemplate>
+            <ExecutionDescription>Compiling CUDA source file %(Identity)...</ExecutionDescription>
+            <ExclusionDescription>Skipping CUDA source file %(Identity) (excluded from build).</ExclusionDescription>
+
+            <!-- Miscellaneous -->
+            <PropsCacheOutputFile>%(Filename)%(Extension).cache</PropsCacheOutputFile>
+            <PropsCacheOutputPath>$(IntDir)%(PropsCacheOutputFile)</PropsCacheOutputPath>
+
+            <CudaCompileCoreProject>$(MSBuildProjectFullPath)</CudaCompileCoreProject>
+        </CudaCompile>
+
+        <CudaLink>
+            <PerformDeviceLink>true</PerformDeviceLink>
+            <PerformDeviceLinkTimeOptimization>false</PerformDeviceLinkTimeOptimization>
+            <LinkOut>$(IntDir)$(TargetName).device-link.obj</LinkOut>
+
+            <AdditionalLibraryDirectories>$(CudaToolkitBinDir)/crt</AdditionalLibraryDirectories>
+            <UseHostLibraryDirectories>true</UseHostLibraryDirectories>
+            <AdditionalDependencies></AdditionalDependencies>
+            <UseHostLibraryDependencies>true</UseHostLibraryDependencies>
+
+            <GPUDebugInfo>InheritFromProject</GPUDebugInfo>
+            <DebugInformationFormat Condition="'$(Configuration)' == 'Release'">None</DebugInformationFormat>
+            <DebugInformationFormat Condition="'$(Configuration)' != 'Release'">ProgramDatabase</DebugInformationFormat>
+            <Optimization>InheritFromProject</Optimization>
+
+            <!-- Implicitly inherited from the project via @(CudaCompile) -->
+            <RuntimeChecks></RuntimeChecks>
+            <Runtime></Runtime>
+            <TargetMachinePlatform></TargetMachinePlatform>
+            <TypeInfo></TypeInfo>
+            <Warning></Warning>
+
+            <Inputs></Inputs>
+
+            <HostCommandLineTemplate>-Xcompiler &quot;/EHsc [Warning] /nologo [Optimization] [DebugInformationFormat] [RuntimeChecks] [Runtime] [TypeInfo]&quot; -Xcompiler "/Fd[ProgramDataBaseFileName]"</HostCommandLineTemplate>
+            <LinkCommandLineTemplate>"$(CudaToolkitVccPath)" -dlink [PerformDeviceLinkTimeOptimization] [LinkOut] %(HostCommandLineTemplate) [AdditionalLibraryDirectories] [AdditionalDependencies] [AdditionalOptions] [GPUDebugInfo] [TargetMachinePlatform] [Inputs]</LinkCommandLineTemplate>
+            <CommandLineTemplate>
+# (Approximate command-line.  Settings inherited from host are not visible below.)
+# (Please see the output window after a build for the full command-line)
+
+%(LinkCommandLineTemplate)
+            </CommandLineTemplate>
+        </CudaLink>
+
+        <Link>
+            <AdditionalLibraryDirectories>%(AdditionalLibraryDirectories);$(CudaToolkitLibDir)</AdditionalLibraryDirectories>
+            <AdditionalDependencies>%(AdditionalDependencies);cudart.lib;cudadevrt.lib</AdditionalDependencies>
+        </Link>
+
+        <ClCompile>
+            <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(CudaToolkitIncludeDir)</AdditionalIncludeDirectories>
+        </ClCompile>
+    </ItemDefinitionGroup>
+</Project>

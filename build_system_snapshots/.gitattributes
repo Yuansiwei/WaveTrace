@@ -1,0 +1,4 @@
+# Preserve the reconstructed build-system archives byte-for-byte.  Some of the
+# original Makefiles and Visual Studio property files contain significant or
+# historical trailing whitespace.
+sea_eagle/** -text -whitespace

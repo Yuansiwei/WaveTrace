@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <WaveTraceRoot Condition="'$(WaveTraceRoot)'==''">$(MSBuildThisFileDirectory)..</WaveTraceRoot>
+    <WaveTraceReflectGenExe Condition="'$(WaveTraceReflectGenExe)'==''">$(WaveTraceRoot)\tools\bin\wavetrace_reflectgen.exe</WaveTraceReflectGenExe>
+    <WaveTraceBuildTopDir Condition="'$(WaveTraceBuildTopDir)'==''">$(IntDir)WaveTracer\</WaveTraceBuildTopDir>
+    <WaveTraceReflectGenDir Condition="'$(WaveTraceReflectGenDir)'==''">$(WaveTraceBuildTopDir)generated_reflect\</WaveTraceReflectGenDir>
+    <WaveTraceReflectTargetList Condition="'$(WaveTraceReflectTargetList)'==''">$(WaveTraceReflectGenDir)wavetrace_reflect_targets.txt</WaveTraceReflectTargetList>
+    <WaveTraceReflectProjectHeader Condition="'$(WaveTraceReflectProjectHeader)'==''">$(WaveTraceReflectGenDir)project_reflect_auto.h</WaveTraceReflectProjectHeader>
+    <WaveTraceReflectRootClosureHeader Condition="'$(WaveTraceReflectRootClosureHeader)'==''">$(WaveTraceReflectGenDir)root_class_closure_reflect_auto.h</WaveTraceReflectRootClosureHeader>
+    <WaveTraceReflectLogFile Condition="'$(WaveTraceReflectLogFile)'==''">$(WaveTraceReflectGenDir)reflectgen.log</WaveTraceReflectLogFile>
+    <WaveTraceReflectRootClass Condition="'$(WaveTraceReflectRootClass)'==''">cmoTopLevel</WaveTraceReflectRootClass>
+    <WaveTraceReflectBatchDir Condition="'$(WaveTraceReflectBatchDir)'==''">$(ProjectDir)</WaveTraceReflectBatchDir>
+    <WaveTraceReflectExtraArgs Condition="'$(WaveTraceReflectExtraArgs)'==''">--allow-errors</WaveTraceReflectExtraArgs>
+    <WaveTraceReflectClangArgs Condition="'$(WaveTraceReflectClangArgs)'==''">-std=c++14 -ferror-limit=0 -DANON(x)= -I&quot;$(ProjectDir)&quot; -I&quot;$(WaveTraceRoot)&quot; -resource-dir=&quot;$(WaveTraceRoot)\tools\lib\clang\22&quot; -include &quot;$(WaveTraceRoot)\reflect_macro.h&quot;</WaveTraceReflectClangArgs>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(WaveTraceReflectGenDir);$(WaveTraceRoot);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <ForcedIncludeFiles>$(WaveTraceRoot)\reflect_macro.h;%(ForcedIncludeFiles)</ForcedIncludeFiles>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <Target Name="CheckWaveTraceReflectGenPrebuilt" BeforeTargets="Build">
+    <Error Condition="!Exists('$(WaveTraceReflectGenExe)')" Text="WaveTrace ReflectGen executable not found: $(WaveTraceReflectGenExe)" />
+  </Target>
+
+  <Target Name="RunWaveTraceReflectGen"
+          BeforeTargets="ClCompile"
+          DependsOnTargets="CheckWaveTraceReflectGenPrebuilt"
+          Inputs="$(WaveTraceReflectGenExe);@(ClInclude);@(ClCompile)"
+          Outputs="$(WaveTraceReflectProjectHeader);$(WaveTraceReflectRootClosureHeader)">
+    <MakeDir Directories="$(WaveTraceReflectGenDir)" />
+    <WriteLinesToFile File="$(WaveTraceReflectTargetList)"
+                      Lines="&quot;$(WaveTraceReflectEntryHeader)&quot;"
+                      Overwrite="true"
+                      Encoding="UTF-8"
+                      Condition="'$(WaveTraceReflectEntryHeader)'!=''" />
+    <WriteLinesToFile File="$(WaveTraceReflectTargetList)"
+                      Lines="@(ClInclude->'&quot;%(FullPath)&quot;')"
+                      Overwrite="true"
+                      Encoding="UTF-8"
+                      Condition="'$(WaveTraceReflectEntryHeader)'==''" />
+    <Message Importance="High" Text="WaveTrace ReflectGen output: $(WaveTraceReflectGenDir)" />
+    <Message Importance="High" Text="WaveTrace ReflectGen target list: $(WaveTraceReflectTargetList)" />
+    <Message Importance="High" Text="WaveTrace ReflectGen log: $(WaveTraceReflectLogFile)" />
+    <Exec Command="&quot;$(WaveTraceReflectGenExe)&quot; --vcxproj &quot;$(MSBuildProjectFullPath)&quot; --config &quot;$(Configuration)&quot; --platform &quot;$(Platform)&quot; --reflect-root-class &quot;$(WaveTraceReflectRootClass)&quot; $(WaveTraceReflectExtraArgs) --batch-dir &quot;$(WaveTraceReflectBatchDir)&quot; --no-recursive --extra-target-list &quot;$(WaveTraceReflectTargetList)&quot; -o &quot;$(WaveTraceReflectGenDir)&quot; --aggregate-header project_reflect_auto.h --log-file &quot;$(WaveTraceReflectLogFile)&quot; -- $(WaveTraceReflectClangArgs)" />
+    <Exec Command="type &quot;$(WaveTraceReflectLogFile)&quot;" Condition="Exists('$(WaveTraceReflectLogFile)')" IgnoreExitCode="true" />
+  </Target>
+</Project>

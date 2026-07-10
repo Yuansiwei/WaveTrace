@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <PropertyGroup Label="Globals">
+        <!--   
+        <gcLatestTargetPlatformVersion>$([Microsoft.Build.Utilities.ToolLocationHelper]::GetLatestSDKTargetPlatformVersion('Windows', '10.0'))</gcLatestTargetPlatformVersion>
+        <gcLatestWdkPlatformVersion>$(gcLatestTargetPlatformVersion)</gcLatestWdkPlatformVersion>
+        <PlatformToolset>WindowsUserModeDriver10.0</PlatformToolset>
+        -->
+        <GcBuildType Condition="Exists('$(ProjectDir)..\..\gcUmd')">Windows Driver</GcBuildType>
+        <GcBuildType Condition="!Exists('$(ProjectDir)..\..\gcUmd')"></GcBuildType>
+        <GcBuildType Condition="'$(ConfigurationType)' == 'Utility'">Windows Driver</GcBuildType>
+        <GcBuildType Condition="'$(ConfigurationType)' == 'Makefile'"></GcBuildType>
+        <GcBuildType Condition="'$(ConfigurationType)' == 'Application'"></GcBuildType>
+        <TargetVersion>Windows10</TargetVersion>
+        <DriverTargetPlatform>Windows Driver</DriverTargetPlatform>
+        <DriverTargetPlatform Condition="'$(Platform)' == 'ARM'">Universal</DriverTargetPlatform>
+        <DriverTargetPlatform Condition="'$(ConfigurationType)' == 'Utility'">Desktop</DriverTargetPlatform> <!-- INF Project - Will need to remove for offical release with Driver Package Isolation -->
+        <DriverTargetPlatform Condition="'$(GcBuildType)' != 'Windows Driver' AND '$(DriverType)' != 'WDM'"></DriverTargetPlatform> 
+        <LatestTargetPlatformVersion Condition="'$(LatestTargetPlatformVersion)' == ''">$(Version_Number)</LatestTargetPlatformVersion> <!-- We are using the EWDK build environment -->
+        <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
+        <UMDF_VERSION_MAJOR></UMDF_VERSION_MAJOR>
+    </PropertyGroup>
+    <Choose>
+        <!-- Visual Studio 2022 - version 17.0 -->
+        <When Condition = "'$(VisualStudioVersion)' == '17.0'">
+            <PropertyGroup Label="Globals">
+                <PlatformToolset>v143</PlatformToolset>
+                <PlatformToolset Condition="'$(GcBuildType)' == 'Windows Driver'">WindowsUserModeDriver10.0</PlatformToolset>
+                <PlatformToolset Condition="'$(DriverType)' == 'WDM'">WindowsKernelModeDriver10.0</PlatformToolset>
+                <UMDF_VERSION_MAJOR Condition="'$(GcBuildType)' == 'Windows Driver'">2</UMDF_VERSION_MAJOR>
+            </PropertyGroup>
+        </When>
+        <!-- Visual Studio 2019 - version 16.0 -->
+        <When Condition = "'$(VisualStudioVersion)' == '16.0'">
+            <PropertyGroup Label="Globals">
+                <PlatformToolset>v142</PlatformToolset>
+                <PlatformToolset Condition="'$(GcBuildType)' == 'Windows Driver'">WindowsUserModeDriver10.0</PlatformToolset>
+                <PlatformToolset Condition="'$(DriverType)' == 'WDM'">WindowsKernelModeDriver10.0</PlatformToolset>
+                <UMDF_VERSION_MAJOR Condition="'$(GcBuildType)' == 'Windows Driver'">2</UMDF_VERSION_MAJOR>
+            </PropertyGroup>
+        </When>
+        <!-- Visual Studio 2017 and earlier unsupported - version 15.0 -->
+        <When Condition = "'$(VisualStudioVersion)' &lt;= '15.0'">
+            <PropertyGroup Label="Globals">
+                <PlatformToolset></PlatformToolset>     <!-- Leave undefined for unsupported Visual Studio versions. -->
+            </PropertyGroup>
+        </When>
+        <!-- Makefile projects should not set many of these macros -->
+        <When Condition= "'$(ConfigurationType)' == 'Makefile'">
+            <PropertyGroup Label="Globals">
+                <PlatformToolset></PlatformToolset>
+                <DriverTargetPlatform></DriverTargetPlatform>
+            </PropertyGroup>
+        </When>
+    </Choose>
+</Project>
+
+<!-- Visual Studio 2022 - version 17.0 -->
+<!-- Visual Studio 2019 - version 16.0 -->
+<!-- Visual Studio 2017 - version 15.0 -->
+<!-- Visual Studio 2015 - version 14.0 -->
+<!-- Visual Studio 2013 - version 12.0 -->
+<!-- Visual Studio 2012 - version 11.0 -->
+<!-- Current default VS 2022 - version 17.0 (WDDM Driver Solution & Projects need a minimum of VS 2019 installed)-->

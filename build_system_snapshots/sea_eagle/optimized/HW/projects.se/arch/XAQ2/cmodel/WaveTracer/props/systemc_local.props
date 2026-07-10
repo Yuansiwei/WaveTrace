@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="UserMacros">
+    <SystemCRoot Condition="'$(SystemCRoot)'=='' and '$(SYSTEMC_HOME)'!=''">$(SYSTEMC_HOME)</SystemCRoot>
+    <SystemCRoot Condition="'$(SystemCRoot)'=='' and Exists('$(MSBuildThisFileDirectory)..\third_party\systemc-2.3.4\src\systemc')">$(MSBuildThisFileDirectory)..\third_party\systemc-2.3.4</SystemCRoot>
+    <SystemCRoot Condition="'$(SystemCRoot)'=='' and Exists('C:\third_party\systemc-2.3.4\src\systemc')">C:\third_party\systemc-2.3.4</SystemCRoot>
+    <SystemCInclude>$(SystemCRoot)\src</SystemCInclude>
+    <SystemCLibDir>$(SystemCRoot)\msvc10\SystemC\x64\Release</SystemCLibDir>
+    <SystemCLib>SystemC.lib</SystemCLib>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(SystemCInclude);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN64;SC_INCLUDE_FX;SC_ENABLE_ASSERTIONS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <UndefinePreprocessorDefinitions>interface;%(UndefinePreprocessorDefinitions)</UndefinePreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <LanguageStandard>stdcpp14</LanguageStandard>
+      <AdditionalOptions>/vmg %(AdditionalOptions)</AdditionalOptions>
+      <DisableSpecificWarnings>4244;4267;4819;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(SystemCLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>$(SystemCLib);%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+</Project>
