@@ -4,15 +4,47 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#include <psapi.h>
+#pragma comment(lib, "Psapi.lib")
+#endif
 
 typedef unsigned char U01;
 
 static std::size_t g_top_visits = 0;
 static std::size_t g_slot_visits = 0;
 static std::size_t g_payload_visits = 0;
+
+static void dump_process_memory_phase(const char* phase,
+                                      const wave::Tracer& tracer,
+                                      const char* report_path) {
+    std::uint64_t private_bytes = 0;
+    std::uint64_t working_set_bytes = 0;
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS_EX counters;
+    std::memset(&counters, 0, sizeof(counters));
+    counters.cb = sizeof(counters);
+    if (GetProcessMemoryInfo(GetCurrentProcess(),
+                             reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                             sizeof(counters))) {
+        private_bytes = static_cast<std::uint64_t>(counters.PrivateUsage);
+        working_set_bytes = static_cast<std::uint64_t>(counters.WorkingSetSize);
+    }
+#endif
+    std::ofstream out(report_path, std::ios::out | std::ios::trunc);
+    if (out) out << tracer.memory_usage_debug_report();
+    std::cout << "phase=" << phase
+              << " private_bytes=" << private_bytes
+              << " working_set_bytes=" << working_set_bytes
+              << " report=" << report_path << "\n";
+}
 
 union Payload {
     std::uint32_t u32;
@@ -287,7 +319,8 @@ static CountRunResult run_count_case(std::size_t slot_count,
                                      std::uint32_t cycles,
                                      bool enable_topology_fast_path,
                                      bool enable_parallel_sampling,
-                                     std::size_t sampling_threads) {
+                                     std::size_t sampling_threads,
+                                     bool dump_phase_memory = false) {
     std::vector<Slot> slots(slot_count);
     initialize_slots(slots);
     Top top(slots.empty() ? static_cast<Slot*>(NULL) : &slots[0], slots.size());
@@ -307,20 +340,32 @@ static CountRunResult run_count_case(std::size_t slot_count,
     opt.enable_parallel_sampling = enable_parallel_sampling;
     opt.sampling_threads = sampling_threads;
     opt.dump_leaf_distribution_after_topology = false;
+    opt.trim_parallel_event_buffers_after_first_sample =
+        std::getenv("WAVE_STRESS_DISABLE_EVENT_TRIM") == NULL;
 
     const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     std::uint64_t first_sample_ms = 0;
     {
         wave::Tracer tracer(sink, opt);
         tracer.add_root("top", &top);
+        if (dump_phase_memory) {
+            tracer.prepare_topology(0);
+            dump_process_memory_phase("topology", tracer, "phase_topology_memory.txt");
+        }
         const std::chrono::steady_clock::time_point first0 = std::chrono::steady_clock::now();
         tracer.sample(0);
         const std::chrono::steady_clock::time_point first1 = std::chrono::steady_clock::now();
+        if (dump_phase_memory) {
+            dump_process_memory_phase("sample0", tracer, "phase_sample0_memory.txt");
+        }
         first_sample_ms = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(first1 - first0).count());
         for (std::uint32_t c = 1; c <= cycles; ++c) {
-            update_slots(slots, c);
+            if (!dump_phase_memory) update_slots(slots, c);
             tracer.sample(c);
+            if (dump_phase_memory && c == 1u) {
+                dump_process_memory_phase("sample1_sparse", tracer, "phase_sample1_sparse_memory.txt");
+            }
         }
     }
     const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
@@ -385,17 +430,18 @@ int main(int argc, char** argv) {
     if (argc >= 4) mode = argv[3];
     if (slot_count == 0) {
         std::cerr << "usage: smoke_reflect_topology_cache_stress [slot_count] [cycles] "
-                     "[compare|baseline|optimized|baseline-count|optimized-count|optimized-parallel-count] [threads]\n";
+                     "[compare|baseline|optimized|baseline-count|optimized-count|optimized-parallel-count|phase-count] [threads]\n";
         return 2;
     }
 
-    if (mode == "baseline-count" || mode == "optimized-count" || mode == "optimized-parallel-count") {
+    if (mode == "baseline-count" || mode == "optimized-count" || mode == "optimized-parallel-count" || mode == "phase-count") {
         const bool fast_path = (mode != "baseline-count");
-        const bool parallel_sampling = (mode == "optimized-parallel-count");
+        const bool parallel_sampling = (mode == "optimized-parallel-count" || mode == "phase-count");
+        const bool dump_phase_memory = (mode == "phase-count");
         const std::size_t sampling_threads = argc >= 5
             ? static_cast<std::size_t>(std::strtoull(argv[4], NULL, 10))
             : static_cast<std::size_t>(0);
-        const CountRunResult result = run_count_case(slot_count, cycles, fast_path, parallel_sampling, sampling_threads);
+        const CountRunResult result = run_count_case(slot_count, cycles, fast_path, parallel_sampling, sampling_threads, dump_phase_memory);
         std::cout << "reflect_topology_batch_stress " << mode
                   << " slots=" << slot_count
                   << " cycles=" << cycles

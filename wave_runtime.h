@@ -52,6 +52,7 @@
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <typeinfo>
@@ -141,7 +142,7 @@ using TrackId = std::uint64_t;
 using ObjectId = std::uint64_t;
 using WatchId = std::uint64_t;
 
-enum class NodeKind {
+enum class NodeKind : unsigned char {
     Aggregate,
     Leaf,
     PointerLink,
@@ -150,7 +151,7 @@ enum class NodeKind {
     Unsupported
 };
 
-enum class ValueKind {
+enum class ValueKind : unsigned char {
     Bool,
     SignedInt,
     UnsignedInt,
@@ -162,7 +163,7 @@ enum class ValueKind {
     Unknown
 };
 
-enum class InvalidKind {
+enum class InvalidKind : unsigned char {
     None,
     Z,
     Null,
@@ -202,30 +203,40 @@ struct TrackEvent {
     // Hot-path sample event.  Keep this POD-like: no std::string, no owning
     // allocations.  Worker buffers may contain millions of TrackEvent objects
     // per run; owning strings made vector::emplace_back()/clear() dominate CPU.
-    Cycle cycle = 0;
-    TrackId track_id = 0;
-    const char* path = NULL;   // optional debug pointer, owned by Tracer intern tables when set
-    const char* value = NULL;  // optional legacy debug string; normally NULL for typed WVZ4 output
-    InvalidKind invalid = InvalidKind::None;
+    Cycle cycle;
+    const char* path;   // optional debug pointer, owned by Tracer intern tables when set
+    const char* value;  // optional legacy debug string; normally NULL for typed WVZ4 output
+    // Typed scalar representations share the same 64-bit payload.  Producers
+    // already write the IEEE/integer bit pattern used by every enabled view.
+    union {
+        std::int64_t i64_value;
+        std::uint64_t u64_value;
+        double f64_value;
+    };
+    std::uint64_t change_bits;
+    std::uint32_t track_id;
+    InvalidKind invalid;
     // True means this event is a keep-alive for recorder active-set semantics.
     // The value is unchanged from the last emitted concrete sample, so a
     // recorder may keep the signal active without writing a new value update.
-    bool unchanged_keepalive = false;
+    bool unchanged_keepalive : 1;
 
     // Optional typed payload for binary/typed writers.
-    bool has_bool = false;
-    bool bool_value = false;
-    bool has_i64 = false;
-    std::int64_t i64_value = 0;
-    bool has_u64 = false;
-    std::uint64_t u64_value = 0;
-    bool has_f64 = false;
-    double f64_value = 0.0;
+    bool has_bool : 1;
+    bool bool_value : 1;
+    bool has_i64 : 1;
+    bool has_u64 : 1;
+    bool has_f64 : 1;
 
     // Compact comparison key for typed samples.  When this is true, the tracer
     // can detect unchanged values without formatting/copying legacy strings.
-    bool has_change_bits = false;
-    std::uint64_t change_bits = 0;
+    bool has_change_bits : 1;
+
+    TrackEvent()
+        : cycle(0), path(NULL), value(NULL), u64_value(0), change_bits(0), track_id(0),
+          invalid(InvalidKind::None), unchanged_keepalive(false), has_bool(false),
+          bool_value(false), has_i64(false), has_u64(false), has_f64(false),
+          has_change_bits(false) {}
 };
 
 struct NodeDecl {
@@ -432,17 +443,31 @@ struct BuildOptions {
     // Emits one begin/end stats line around root expansion. Does not print per-node logs.
     bool debug_log_root_expand_stats = false;
 
+    // One-shot capacity report for diagnosing large-topology resident memory.
+    // The report accounts vector capacity payloads exactly and labels hash/deque
+    // storage as estimates because their allocator overhead is implementation-defined.
+    bool dump_memory_usage_after_topology = false;
+    std::string memory_usage_dump_path = "wave_memory_usage.txt";
+
     // Parallel sampling: all declared tracks are assigned to worker slices when
     // enabled. This intentionally includes custom/string/SystemC/VSIP/value-source
     // samplers; use only when these reads are known to be safe in your simulation.
     bool enable_parallel_sampling = false;
-    std::size_t sampling_threads = 0;          // 0 = hardware_concurrency() - 1, minimum 1
+    // Background workers only; the caller also samples.  The default therefore
+    // uses 15 workers + 1 caller = 16 total scanning threads.  Set to 0 to use
+    // hardware_concurrency() - 1 workers, or set an explicit worker count.
+    std::size_t sampling_threads = 15;
     std::size_t parallel_sampling_threshold = 8192;
     // Flat-leaf fast path has its own parallel gate because it bypasses the
     // legacy sample_parallel() path. Set to 1 to force parallel flat-leaf
     // sampling whenever at least one leaf exists.
     std::size_t parallel_flat_leaf_threshold = 8192;
     std::size_t parallel_worker_event_reserve = 4096;
+    // Cycle 0 can emit every storage and temporarily needs large worker event
+    // buffers.  Retain only a bounded capacity after that initial flush so a
+    // one-time initialization burst does not become permanent resident memory.
+    bool trim_parallel_event_buffers_after_first_sample = true;
+    std::size_t parallel_event_buffer_retain_limit = 65536;
 
     // Diagnostic: log per-thread flat-leaf sampling load and time.  This is
     // intended for checking load imbalance; keep it disabled in production.
@@ -1510,9 +1535,7 @@ struct ThreadTraceLocal {
     // Dirty wave::array slices.
     std::vector<std::uint32_t> wave_array_bulk_range_ids;
     std::vector<std::uint32_t> wave_array_bulk_range_local_epoch;
-    std::vector<WaveArrayBulkMarkKey> wave_array_bulk_marks;
     std::uint32_t wave_array_bulk_range_count = 0;
-    std::uint32_t wave_array_bulk_epoch = 0;
 
     void ensure_capacity(std::size_t dirty_group_count) {
         if (dirty_ids.size() < dirty_group_count) dirty_ids.resize(dirty_group_count);
@@ -1556,8 +1579,6 @@ struct ThreadTraceLocal {
         ensure_wave_array_capacity(bulk_range_count);
         std::fill(wave_array_bulk_range_local_epoch.begin(), wave_array_bulk_range_local_epoch.end(), 0);
         wave_array_bulk_range_count = 0;
-        wave_array_bulk_marks.clear();
-        wave_array_bulk_epoch = 0;
         (void)epoch;
     }
 
@@ -1567,8 +1588,6 @@ struct ThreadTraceLocal {
             dirty_count = 0;
             wave_value_dirty_count = 0;
             wave_array_bulk_range_count = 0;
-            wave_array_bulk_marks.clear();
-            wave_array_bulk_epoch = 0;
         }
     }
 };
@@ -1637,7 +1656,7 @@ maybe_wave_dirty_hook(const T*) {
 
 struct TrackDesc;
 
-enum class TrackThreadClass {
+enum class TrackThreadClass : unsigned char {
     ParallelSafe,
     MainThreadOnly
 };
@@ -1674,62 +1693,56 @@ struct ScalarSnapshot {
 typedef bool (*ScalarReadFn)(const void*, ScalarSnapshot&);
 
 struct TrackDesc {
-    TrackId id;
-    NodeId node_id;
-    TrackId next_in_node;
-    std::uint32_t path_id;
-    ValueKind kind;
+    std::uint32_t id;
+    std::uint32_t node_id;
+    std::uint32_t next_in_node;
+    std::uint32_t storage_id;
     const void* sample_ctx;
     ScalarReadFn scalar_reader;
-    ScalarSampleKind scalar_kind;
-    std::uint32_t bit_width;
-    TrackThreadClass thread_class;
-    TrackId storage_id;
-    std::uint32_t bit_offset;
-    bool storage_only;
-    bool declaration_only;
     const void* memory_ctx;
+    std::uint32_t path_id;
+    std::uint32_t bit_width;
+    std::uint32_t bit_offset;
     std::uint32_t memory_byte_width;
     std::uint32_t dirty_peek_group_id;
     std::uint32_t dirty_wave_value_group_id;
+    ValueKind kind;
+    TrackThreadClass thread_class;
+    ScalarSampleKind scalar_kind;
+    bool storage_only;
+    bool declaration_only;
     bool dirty_wave_array_managed;
 
-    TrackDesc() : id(0), node_id(0), next_in_node(0), path_id(kInvalidIndex),
-                  kind(ValueKind::Unknown), sample_ctx(NULL), scalar_reader(NULL),
-                  scalar_kind(ScalarSampleKind::None), bit_width(0),
-                  thread_class(TrackThreadClass::MainThreadOnly), storage_id(0),
-                  bit_offset(0), storage_only(false), declaration_only(false),
-                  memory_ctx(NULL), memory_byte_width(0),
+    TrackDesc() : id(0), node_id(0), next_in_node(0), storage_id(0),
+                  sample_ctx(NULL), scalar_reader(NULL), memory_ctx(NULL),
+                  path_id(kInvalidIndex), bit_width(0), bit_offset(0), memory_byte_width(0),
                   dirty_peek_group_id(kInvalidIndex),
                   dirty_wave_value_group_id(kInvalidIndex),
+                  kind(ValueKind::Unknown), thread_class(TrackThreadClass::MainThreadOnly),
+                  scalar_kind(ScalarSampleKind::None), storage_only(false), declaration_only(false),
                   dirty_wave_array_managed(false) {}
 };
 
 struct TrackRuntimeState {
-    bool alive;
-    bool has_last_event;
-    InvalidKind last_invalid;
-    bool last_has_change_bits;
     std::uint64_t last_change_bits;
-    std::uint32_t last_value_id;
     // Per-sample dirty-peek physical-storage de-dup stamp.  This is separate
     // from logical track liveness: several live logical tracks may alias one
     // physical storage stream.
     std::uint32_t dirty_peek_storage_sample_epoch;
+    bool alive;
+    bool has_last_event;
 
-    TrackRuntimeState() : alive(true), has_last_event(false), last_invalid(InvalidKind::None),
-                          last_has_change_bits(false), last_change_bits(0),
-                          last_value_id(kInvalidIndex),
-                          dirty_peek_storage_sample_epoch(0) {}
+    TrackRuntimeState() : last_change_bits(0), dirty_peek_storage_sample_epoch(0),
+                          alive(true), has_last_event(false) {}
 };
 
 struct NodeDesc {
-    NodeId id;
-    NodeId parent_id;
-    NodeId first_child;
-    NodeId next_sibling;
-    TrackId first_track;
-    ObjectId object_id;
+    std::uint32_t id;
+    std::uint32_t parent_id;
+    std::uint32_t first_child;
+    std::uint32_t next_sibling;
+    std::uint32_t first_track;
+    std::uint32_t object_id;
     std::uint32_t name_id;
     std::uint32_t debug_path_id;
     NodeKind kind;
@@ -1837,6 +1850,9 @@ public:
         if (detail::env_flag_enabled("WaveTraceDirtyArrayMarks")) {
             options_.debug_log_dirty_wave_array_marks = true;
         }
+        if (detail::env_flag_enabled("WaveTraceMemoryUsage")) {
+            options_.dump_memory_usage_after_topology = true;
+        }
         register_active_tracer_(this);
         node_name_hot_cache_.reserve(128u);
         node_name_literal_cache_.reserve(64u);
@@ -1916,6 +1932,7 @@ public:
         root_paths_.insert(name);
         root_addresses_.insert(address);
         leaf_distribution_dumped_ = false;
+        memory_usage_dumped_ = false;
         // A previous lazy prepare may have exported an empty/no-root topology.
         // Adding a root must reopen the node-declaration export gate so the
         // next prepare_topology() can actually emit NodeDecl records.  WaveTap
@@ -1981,6 +1998,8 @@ public:
             }
         }
 
+        maybe_trim_parallel_event_buffers_after_sample_();
+
         if (options_.debug_log) debug_log_msg(std::string("sample end cycle=") + detail::to_string_unsigned(cycle));
     }
 
@@ -2009,6 +2028,7 @@ public:
             ensure_flat_leaf_fast_table();
         }
         maybe_dump_leaf_distribution_after_topology();
+        maybe_dump_memory_usage_after_topology_();
     }
 
     const std::vector<NodeDesc>& nodes() const { return nodes_; }
@@ -2074,6 +2094,94 @@ public:
         return os.str();
     }
 
+    std::string memory_usage_debug_report() const {
+        std::ostringstream os;
+        std::size_t total = 0;
+        os << "WaveTrace memory capacity report\n";
+        os << "name,size,capacity,element_bytes,capacity_bytes,accounting\n";
+
+        append_vector_memory_row_(os, "nodes", nodes_, total);
+        append_vector_memory_row_(os, "tracks", tracks_, total);
+        append_vector_memory_row_(os, "track_runtime", track_runtime_, total);
+        append_vector_memory_row_(os, "objects", objects_, total);
+        append_vector_memory_row_(os, "lazy_value_watches", lazy_value_watches_, total);
+        append_vector_memory_row_(os, "root_watches", root_watches_, total);
+        append_deque_memory_row_(os, "node_names", node_names_, total);
+        append_deque_memory_row_(os, "node_debug_paths", node_debug_paths_, total);
+        append_deque_memory_row_(os, "track_paths", track_paths_, total);
+        append_deque_memory_row_(os, "object_debug_names", object_debug_names_, total);
+        append_hash_memory_row_(os, "node_name_ids", node_name_ids_, total);
+        append_hash_memory_row_(os, "object_id_by_key", object_id_by_key_, total);
+        append_hash_memory_row_(os, "bitfield_storage_by_key", bitfield_storage_by_key_, total);
+        append_vector_memory_row_(os, "all_track_ids", all_track_ids_, total);
+        append_vector_memory_row_(os, "parallel_track_ids", parallel_track_ids_, total);
+        append_vector_memory_row_(os, "main_thread_track_ids", main_thread_track_ids_, total);
+
+        append_vector_memory_row_(os, "flat_leaf_fast_table", flat_leaf_fast_table_, total);
+        append_vector_memory_row_(os, "flat_memory_blocks", flat_memory_blocks_, total);
+        append_vector_memory_row_(os, "flat_memory_leaf_refs", flat_memory_leaf_refs_, total);
+        append_vector_memory_row_(os, "flat_memory_scalar_leaf_indices", flat_memory_scalar_leaf_indices_, total);
+        append_vector_memory_row_(os, "flat_memory_mixed_leaf_prefix", flat_memory_mixed_leaf_prefix_, total);
+        append_vector_memory_row_(os, "flat_memory_shadow_bytes", flat_memory_shadow_bytes_, total);
+        append_vector_memory_row_(os, "flat_memory_leaf_covered", flat_memory_leaf_covered_, total);
+
+        append_hash_memory_row_(os, "dirty_peek_group_by_key", dirty_peek_group_by_key_, total);
+        append_hash_memory_row_(os, "dirty_peek_storage_by_key", dirty_peek_storage_by_key_, total);
+        append_vector_memory_row_(os, "dirty_peek_groups", dirty_peek_groups_, total);
+        append_vector_memory_row_(os, "dirty_peek_ranges", dirty_peek_ranges_, total);
+        append_vector_memory_row_(os, "dirty_peek_leaves", dirty_peek_leaves_, total);
+        append_vector_memory_row_(os, "dirty_peek_memory_blocks", dirty_peek_memory_blocks_, total);
+        append_vector_memory_row_(os, "dirty_peek_memory_storage_refs", dirty_peek_memory_storage_refs_, total);
+        append_vector_memory_row_(os, "dirty_peek_memory_byte_to_storage_refs", dirty_peek_memory_byte_to_storage_refs_, total);
+        append_vector_memory_row_(os, "dirty_peek_storage_cursor_ranges", dirty_peek_storage_cursor_ranges_, total);
+        append_vector_memory_row_(os, "dirty_peek_memory_shadow_bytes", dirty_peek_memory_shadow_bytes_, total);
+        append_vector_memory_row_(os, "dirty_peek_work_items", dirty_peek_work_items_, total);
+        append_vector_memory_row_(os, "dirty_peek_rebalanced_work_items", dirty_peek_rebalanced_work_items_, total);
+
+        append_hash_memory_row_(os, "dirty_wave_value_group_by_key", dirty_wave_value_group_by_key_, total);
+        append_vector_memory_row_(os, "dirty_wave_value_groups", dirty_wave_value_groups_, total);
+        append_vector_memory_row_(os, "dirty_wave_value_ranges", dirty_wave_value_ranges_, total);
+        append_vector_memory_row_(os, "dirty_wave_value_leaves", dirty_wave_value_leaves_, total);
+        append_vector_memory_row_(os, "dirty_wave_value_addr_table", dirty_wave_value_addr_table_, total);
+        append_vector_memory_row_(os, "dirty_wave_value_addr_hash_table", dirty_wave_value_addr_hash_table_, total);
+
+        append_hash_memory_row_(os, "dirty_wave_array_slice_by_key", dirty_wave_array_slice_by_key_, total);
+        append_hash_memory_row_(os, "dirty_wave_array_slice_by_address_width", dirty_wave_array_slice_by_address_width_, total);
+        append_hash_memory_row_(os, "dirty_wave_array_bulk_range_by_key", dirty_wave_array_bulk_range_by_key_, total);
+        append_hash_memory_row_(os, "dirty_wave_array_bulk_range_by_address", dirty_wave_array_bulk_range_by_address_, total);
+        append_vector_memory_row_(os, "dirty_wave_array_bulk_ranges", dirty_wave_array_bulk_ranges_, total);
+        append_vector_memory_row_(os, "dirty_wave_array_leaves", dirty_wave_array_leaves_, total);
+        append_vector_memory_row_(os, "dirty_wave_array_memory_blocks", dirty_wave_array_memory_blocks_, total);
+        append_vector_memory_row_(os, "dirty_wave_array_memory_leaf_refs", dirty_wave_array_memory_leaf_refs_, total);
+        append_vector_memory_row_(os, "dirty_wave_array_memory_byte_to_leaf_refs", dirty_wave_array_memory_byte_to_leaf_refs_, total);
+        append_vector_memory_row_(os, "dirty_wave_array_memory_shadow_bytes", dirty_wave_array_memory_shadow_bytes_, total);
+        append_vector_memory_row_(os, "dirty_wave_array_work_items", dirty_wave_array_work_items_, total);
+        append_vector_memory_row_(os, "dirty_wave_array_work_weight_prefix", dirty_wave_array_work_weight_prefix_, total);
+        append_vector_memory_row_(os, "dirty_wave_array_rebalanced_work_items", dirty_wave_array_rebalanced_work_items_, total);
+        append_vector_memory_row_(os, "dirty_wave_array_submit_storage_epochs", dirty_wave_array_submit_storage_epochs_, total);
+
+        append_vector_memory_row_(os, "caller_parallel_events", caller_parallel_events_, total);
+        const std::size_t worker_event_capacity = parallel_worker_event_capacity_count_();
+        const std::size_t worker_event_bytes = worker_event_capacity * sizeof(TrackEvent);
+        total += worker_event_bytes;
+        os << "parallel_worker_event_buffers,"
+           << static_cast<unsigned long long>(parallel_workers_.size()) << ','
+           << static_cast<unsigned long long>(worker_event_capacity) << ','
+           << static_cast<unsigned long long>(sizeof(TrackEvent)) << ','
+           << static_cast<unsigned long long>(worker_event_bytes)
+           << ",exact-vector-payload\n";
+        append_vector_memory_row_(os, "submitted_storage_epochs", submitted_storage_epochs_, total);
+        append_vector_memory_row_(os, "submitted_storage_first_stacks", submitted_storage_first_stacks_, total);
+        append_vector_memory_row_(os, "submitted_storage_first_tracks", submitted_storage_first_tracks_, total);
+        append_vector_memory_row_(os, "submitted_storage_first_cycles", submitted_storage_first_cycles_, total);
+
+        os << "accounted_capacity_bytes=" << static_cast<unsigned long long>(total)
+           << " accounted_capacity_mib="
+           << static_cast<double>(total) / (1024.0 * 1024.0)
+           << "\n";
+        return os.str();
+    }
+
     void dump_leaf_distribution_by_depth(FILE* fp,
                                          std::uint32_t top_n = 50,
                                          bool dirty_safe_only = true) const {
@@ -2133,6 +2241,9 @@ public:
                << " tls_owner=" << tls_owner
                << " resolved_owner=" << resolved_owner
                << '\n';
+            os << "[wave] wave_array bulk notify caller"
+               << detail::capture_stack_trace_addresses(2, 16)
+               << '\n';
 
             std::lock_guard<std::mutex> lock(active_tracers_mutex_());
             std::vector<Tracer*>& tracers = active_tracers_();
@@ -2181,57 +2292,42 @@ public:
         }
     }
 
-    static bool has_active_wave_array_dirty_mapping_() noexcept {
-        try {
-            std::lock_guard<std::mutex> lock(active_tracers_mutex_());
-            std::vector<Tracer*>& tracers = active_tracers_();
-            for (std::size_t i = 0; i < tracers.size(); ++i) {
-                const Tracer* tracer = tracers[i];
-                if (!tracer || !tracer->options_.enable_wave_array_dirty) continue;
-                if (!tracer->dirty_wave_array_bulk_ranges_.empty() ||
-                    !tracer->dirty_wave_array_slice_by_key_.empty() ||
-                    !tracer->dirty_wave_array_slice_by_address_width_.empty()) {
-                    return true;
-                }
-            }
-        } catch (...) {
-        }
-        return false;
-    }
-
     static bool wave_array_bulk_notify_bridge_(const void* first_element_address, const void* element_type_tag, std::size_t element_size, std::size_t element_count) noexcept {
         ThreadTraceLocal& tls = current_thread_trace_local();
-        if (tls.owner &&
-            tls.owner->lookup_dirty_wave_array_bulk_range_(
+        if (tls.owner) {
+            const std::uint32_t range_id = tls.owner->lookup_dirty_wave_array_bulk_range_(
                 first_element_address,
                 element_type_tag,
                 element_size,
-                element_count) != kInvalidIndex &&
-            tls.owner->try_mark_dirty_wave_array_element_range(first_element_address, element_type_tag, element_size, element_count)) {
+                element_count);
+            if (range_id != kInvalidIndex) {
+                return tls.owner->try_mark_dirty_wave_array_bulk_range_id_(
+                    range_id,
+                    first_element_address,
+                    element_type_tag,
+                    element_size,
+                    element_count);
+            }
+            // One thread is attached to at most one tracer.  A missing exact
+            // key in that tracer means this array is local/untracked; do not
+            // rescan the global tracer list or any physical block table.
             return true;
         }
 
-        if (!has_active_wave_array_dirty_mapping_()) {
-            return true;
-        }
-
+        std::uint32_t range_id = kInvalidIndex;
         Tracer* owner = resolve_wave_array_owner_for_bulk_range_(
             first_element_address,
             element_type_tag,
             element_size,
-            element_count);
+            element_count,
+            &range_id);
         if (owner) {
-            if (owner->try_mark_dirty_wave_array_element_range(first_element_address, element_type_tag, element_size, element_count)) {
-                return true;
-            }
-            log_wave_array_bulk_notify_bridge_failure_("resolved owner returned false",
-                                                       first_element_address,
-                                                       element_type_tag,
-                                                       element_size,
-                                                       element_count,
-                                                       tls.owner,
-                                                       owner);
-            return false;
+            return owner->try_mark_dirty_wave_array_bulk_range_id_(
+                range_id,
+                first_element_address,
+                element_type_tag,
+                element_size,
+                element_count);
         }
         if (element_count == 1) {
             owner = resolve_wave_array_owner_for_address_(first_element_address, element_type_tag, element_size);
@@ -2249,14 +2345,12 @@ public:
                 return false;
             }
         }
-        log_wave_array_bulk_notify_bridge_failure_(tls.owner ? "explicit bulk/slice lookup miss after tls miss" : "explicit bulk/slice lookup miss",
-                                                   first_element_address,
-                                                   element_type_tag,
-                                                   element_size,
-                                                   element_count,
-                                                   tls.owner,
-                                                   owner);
-        return false;
+        // The callback is global to wave::array, so local variables and other
+        // arrays outside the reflected topology legitimately arrive here.  A
+        // traced array is registered atomically during topology expansion; a
+        // failed registration aborts there.  Therefore an absent exact key is
+        // authoritative and needs no physical-range fallback or scan.
+        return true;
     }
 
     static std::uint64_t wave_array_bulk_notify_epoch_bridge_() noexcept {
@@ -2307,8 +2401,6 @@ public:
             tls.dirty_count = 0;
             tls.wave_value_dirty_count = 0;
             tls.wave_array_bulk_range_count = 0;
-            tls.wave_array_bulk_marks.clear();
-            tls.wave_array_bulk_epoch = 0;
         } catch (...) {}
     }
 
@@ -2378,25 +2470,49 @@ public:
         return true;
     }
 
+    bool try_mark_dirty_wave_array_bulk_range_id_(std::uint32_t range_id,
+                                                   const void* first_element_address,
+                                                   const void* element_type_tag,
+                                                   std::size_t element_size,
+                                                   std::size_t element_count) noexcept {
+        if (!options_.enable_wave_array_dirty ||
+            range_id == kInvalidIndex ||
+            range_id >= dirty_wave_array_bulk_ranges_.size()) {
+            return false;
+        }
+        const DirtyWaveArrayBulkRange& bulk = dirty_wave_array_bulk_ranges_[range_id];
+        if (!dirty_wave_array_memory_blocks_valid_ ||
+            !dirty_wave_array_memory_blocks_complete_) {
+            fail_dirty_wave_array_bulk_notify_("memory block table unavailable",
+                                               first_element_address,
+                                               element_type_tag,
+                                               element_size,
+                                               element_count);
+        }
+        if (!dirty_wave_array_cursor_range_valid_(bulk.begin, bulk.end) ||
+            bulk.begin == bulk.end) {
+            fail_dirty_wave_array_bulk_notify_("bulk range cursor out of bounds",
+                                               first_element_address,
+                                               element_type_tag,
+                                               element_size,
+                                               element_count);
+        }
+        if (!mark_dirty_wave_array_bulk_range(range_id)) {
+            fail_dirty_wave_array_bulk_notify_("bulk range queue failed",
+                                               first_element_address,
+                                               element_type_tag,
+                                               element_size,
+                                               element_count);
+        }
+        return true;
+    }
+
     bool try_mark_dirty_wave_array_element_range(const void* first_element_address, const void* element_type_tag, std::size_t element_size, std::size_t element_count) noexcept {
         if (!options_.enable_wave_array_dirty || !first_element_address || !element_type_tag || element_size == 0 || element_count == 0) return false;
         if (element_size > static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())) {
             fail_dirty_wave_array_bulk_notify_("element_size too large", first_element_address, element_type_tag, element_size, element_count);
         }
         try {
-            if (!try_ensure_wave_array_tls_capacity_for_current_thread()) return false;
-            ThreadTraceLocal& tls = current_thread_trace_local();
-            if (tls.owner != this) return false;
-            if (tls.wave_array_bulk_epoch != dirty_epoch_) {
-                tls.wave_array_bulk_epoch = dirty_epoch_;
-                tls.wave_array_bulk_marks.clear();
-            }
-
-            const WaveArrayBulkMarkKey bulk_key(first_element_address, element_type_tag, element_size, element_count);
-            for (std::size_t i = 0; i < tls.wave_array_bulk_marks.size(); ++i) {
-                if (tls.wave_array_bulk_marks[i] == bulk_key) return true;
-            }
-
             const std::uint32_t bulk_range_id = lookup_dirty_wave_array_bulk_range_(
                 first_element_address,
                 element_type_tag,
@@ -2404,29 +2520,13 @@ public:
                 element_count);
             if (bulk_range_id == kInvalidIndex ||
                 bulk_range_id >= dirty_wave_array_bulk_ranges_.size()) {
-                fail_dirty_wave_array_bulk_notify_("bulk range not registered", first_element_address, element_type_tag, element_size, element_count);
+                return false;
             }
-            const DirtyWaveArrayBulkRange& bulk = dirty_wave_array_bulk_ranges_[bulk_range_id];
-            if (!dirty_wave_array_memory_blocks_valid_ ||
-                !dirty_wave_array_memory_blocks_complete_) {
-                fail_dirty_wave_array_bulk_notify_("memory block table unavailable", first_element_address, element_type_tag, element_size, element_count);
-            }
-            if (!dirty_wave_array_cursor_range_valid_(bulk.begin, bulk.end) ||
-                bulk.begin == bulk.end) {
-                fail_dirty_wave_array_bulk_notify_("bulk range cursor out of bounds", first_element_address, element_type_tag, element_size, element_count);
-            }
-            if (!mark_dirty_wave_array_bulk_range(bulk_range_id)) {
-                fail_dirty_wave_array_bulk_notify_("bulk range queue failed", first_element_address, element_type_tag, element_size, element_count);
-            }
-
-            try {
-                tls.wave_array_bulk_marks.push_back(bulk_key);
-            } catch (...) {
-                // The group-level epoch cache still prevents duplicate dirty ids;
-                // losing only this range-level memo is safe.
-            }
-
-            return true;
+            return try_mark_dirty_wave_array_bulk_range_id_(bulk_range_id,
+                                                            first_element_address,
+                                                            element_type_tag,
+                                                            element_size,
+                                                            element_count);
         } catch (...) {
             fail_dirty_wave_array_bulk_notify_("exception", first_element_address, element_type_tag, element_size, element_count);
         }
@@ -2438,6 +2538,60 @@ public:
     }
 
 private:
+    template <typename T, typename Alloc>
+    static void append_vector_memory_row_(std::ostringstream& os,
+                                          const char* name,
+                                          const std::vector<T, Alloc>& values,
+                                          std::size_t& total) {
+        const std::size_t bytes = values.capacity() * sizeof(T);
+        total += bytes;
+        os << name << ','
+           << static_cast<unsigned long long>(values.size()) << ','
+           << static_cast<unsigned long long>(values.capacity()) << ','
+           << static_cast<unsigned long long>(sizeof(T)) << ','
+           << static_cast<unsigned long long>(bytes) << ",exact-vector-payload\n";
+    }
+
+    template <typename T, typename Alloc>
+    static void append_deque_memory_row_(std::ostringstream& os,
+                                         const char* name,
+                                         const std::deque<T, Alloc>& values,
+                                         std::size_t& total) {
+        const std::size_t bytes = values.size() * sizeof(T);
+        total += bytes;
+        os << name << ','
+           << static_cast<unsigned long long>(values.size()) << ','
+           << static_cast<unsigned long long>(values.size()) << ','
+           << static_cast<unsigned long long>(sizeof(T)) << ','
+           << static_cast<unsigned long long>(bytes) << ",deque-object-lower-bound\n";
+    }
+
+    template <typename HashContainer>
+    static void append_hash_memory_row_(std::ostringstream& os,
+                                        const char* name,
+                                        const HashContainer& values,
+                                        std::size_t& total) {
+        const std::size_t bucket_bytes = values.bucket_count() * sizeof(void*);
+        const std::size_t node_bytes = values.size() *
+            (sizeof(typename HashContainer::value_type) + 2u * sizeof(void*));
+        const std::size_t bytes = bucket_bytes + node_bytes;
+        total += bytes;
+        os << name << ','
+           << static_cast<unsigned long long>(values.size()) << ','
+           << static_cast<unsigned long long>(values.bucket_count()) << ','
+           << static_cast<unsigned long long>(sizeof(typename HashContainer::value_type)) << ','
+           << static_cast<unsigned long long>(bytes) << ",estimated-hash-storage\n";
+    }
+
+    void maybe_dump_memory_usage_after_topology_() {
+        if (memory_usage_dumped_ || !options_.dump_memory_usage_after_topology) return;
+        if (nodes_.size() <= 1 || tracks_.size() <= 1) return;
+        memory_usage_dumped_ = true;
+        const std::string report = memory_usage_debug_report();
+        std::ofstream out(options_.memory_usage_dump_path.c_str(), std::ios::out | std::ios::trunc);
+        if (out) out << report;
+    }
+
     static std::mutex& active_tracers_mutex_() {
         static std::mutex* mu = new std::mutex();
         return *mu;
@@ -2504,7 +2658,9 @@ private:
     static Tracer* resolve_wave_array_owner_for_bulk_range_(const void* first_element_address,
                                                             const void* element_type_tag,
                                                             std::size_t element_size,
-                                                            std::size_t element_count) noexcept {
+                                                            std::size_t element_count,
+                                                            std::uint32_t* resolved_range_id = NULL) noexcept {
+        if (resolved_range_id) *resolved_range_id = kInvalidIndex;
         if (!first_element_address || !element_type_tag || element_size == 0 || element_count == 0) return NULL;
         try {
             std::lock_guard<std::mutex> lock(active_tracers_mutex_());
@@ -2512,11 +2668,13 @@ private:
             for (std::size_t i = 0; i < tracers.size(); ++i) {
                 Tracer* tracer = tracers[i];
                 if (!tracer || !tracer->options_.enable_wave_array_dirty) continue;
-                if (tracer->lookup_dirty_wave_array_bulk_range_(
+                const std::uint32_t range_id = tracer->lookup_dirty_wave_array_bulk_range_(
                         first_element_address,
                         element_type_tag,
                         element_size,
-                        element_count) != kInvalidIndex) {
+                        element_count);
+                if (range_id != kInvalidIndex) {
+                    if (resolved_range_id) *resolved_range_id = range_id;
                     return tracer;
                 }
             }
@@ -2638,7 +2796,6 @@ private:
     std::vector<TrackDesc> tracks_;
     std::deque<std::string> track_paths_;
     std::vector<TrackRuntimeState> track_runtime_;
-    std::deque<std::string> track_runtime_last_values_;
     std::vector<std::unique_ptr<ScalarGetterStorageBase> > scalar_getter_storage_;
     std::unordered_map<BitfieldStorageKey, TrackId, BitfieldStorageKeyHash> bitfield_storage_by_key_;
     std::vector<BitfieldStorageKey> bitfield_storage_created_keys_;
@@ -2665,21 +2822,21 @@ private:
     std::vector<TrackId> main_thread_track_ids_;
 
     struct FlatLeafFast {
-        TrackId track_id;
-        TrackId storage_id;
         const void* sample_ctx;
         const void* memory_ctx;
-        std::uint32_t memory_byte_width;
         ScalarReadFn scalar_reader;
+        std::uint64_t last_bits;
+        std::uint32_t track_id;
+        std::uint32_t storage_id;
+        std::uint32_t memory_byte_width;
         ScalarSampleKind scalar_kind;
         ValueKind value_kind;
         bool has_last;
-        std::uint64_t last_bits;
 
         FlatLeafFast()
-            : track_id(0), storage_id(0), sample_ctx(NULL), memory_ctx(NULL), memory_byte_width(0),
-              scalar_reader(NULL), scalar_kind(ScalarSampleKind::None), value_kind(ValueKind::Unknown),
-              has_last(false), last_bits(0) {}
+            : sample_ctx(NULL), memory_ctx(NULL), scalar_reader(NULL), last_bits(0),
+              track_id(0), storage_id(0), memory_byte_width(0), scalar_kind(ScalarSampleKind::None),
+              value_kind(ValueKind::Unknown), has_last(false) {}
     };
 
     std::vector<FlatLeafFast> flat_leaf_fast_table_;
@@ -2726,6 +2883,7 @@ private:
     bool flat_memory_block_summary_logged_ = false;
     std::uint32_t flat_memory_sample_epoch_ = 1;
     bool leaf_distribution_dumped_ = false;
+    bool memory_usage_dumped_ = false;
 
     struct DirtyPeekGroupKey {
         const void* address;
@@ -2801,22 +2959,11 @@ private:
     };
 
     struct DirtyPeekLeaf {
-        TrackId track_id;
-        TrackId storage_id;
-        const void* sample_ctx;
-        const void* memory_ctx;
-        std::uint32_t memory_byte_width;
-        ScalarReadFn scalar_reader;
-        ScalarSampleKind scalar_kind;
-        ValueKind value_kind;
-        bool has_last;
-        std::uint64_t last_bits;
+        std::uint32_t track_id;
+        std::uint32_t storage_id;
         std::uint32_t memory_last_sample_epoch;
 
-        DirtyPeekLeaf()
-            : track_id(0), storage_id(0), sample_ctx(NULL), memory_ctx(NULL), memory_byte_width(0),
-              scalar_reader(NULL), scalar_kind(ScalarSampleKind::None),
-              value_kind(ValueKind::Unknown), has_last(false), last_bits(0), memory_last_sample_epoch(0) {}
+        DirtyPeekLeaf() : track_id(0), storage_id(0), memory_last_sample_epoch(0) {}
     };
 
     struct DirtyPeekMemoryBlock {
@@ -2996,21 +3143,21 @@ private:
     };
 
     struct DirtyWaveValueLeaf {
-        TrackId track_id;
-        TrackId storage_id;
         const void* sample_ctx;
         const void* memory_ctx;
-        std::uint32_t memory_byte_width;
         ScalarReadFn scalar_reader;
+        std::uint64_t last_bits;
+        std::uint32_t track_id;
+        std::uint32_t storage_id;
+        std::uint32_t memory_byte_width;
         ScalarSampleKind scalar_kind;
         ValueKind value_kind;
         bool has_last;
-        std::uint64_t last_bits;
 
         DirtyWaveValueLeaf()
-            : track_id(0), storage_id(0), sample_ctx(NULL), memory_ctx(NULL), memory_byte_width(0),
-              scalar_reader(NULL), scalar_kind(ScalarSampleKind::None),
-              value_kind(ValueKind::Unknown), has_last(false), last_bits(0) {}
+            : sample_ctx(NULL), memory_ctx(NULL), scalar_reader(NULL), last_bits(0),
+              track_id(0), storage_id(0), memory_byte_width(0), scalar_kind(ScalarSampleKind::None),
+              value_kind(ValueKind::Unknown), has_last(false) {}
     };
 
     struct DirtyWaveValueAddressEntry {
@@ -3103,20 +3250,10 @@ private:
     };
 
     struct DirtyWaveArrayLeaf {
-        TrackId track_id;
-        TrackId storage_id;
-        const void* sample_ctx;
-        const void* memory_ctx;
-        std::uint32_t memory_byte_width;
-        ScalarReadFn scalar_reader;
-        ScalarSampleKind scalar_kind;
-        ValueKind value_kind;
-        bool has_last;
-        std::uint64_t last_bits;
+        std::uint32_t track_id;
+        std::uint32_t storage_id;
         std::uint32_t memory_last_sample_epoch;
-        DirtyWaveArrayLeaf() : track_id(0), storage_id(0), sample_ctx(NULL), memory_ctx(NULL), memory_byte_width(0),
-                               scalar_reader(NULL), scalar_kind(ScalarSampleKind::None),
-                               value_kind(ValueKind::Unknown), has_last(false), last_bits(0), memory_last_sample_epoch(0) {}
+        DirtyWaveArrayLeaf() : track_id(0), storage_id(0), memory_last_sample_epoch(0) {}
     };
 
     struct DirtyWaveArrayMemoryBlock {
@@ -3231,6 +3368,8 @@ private:
     std::vector<TrackId> submitted_storage_first_tracks_;
     std::vector<Cycle> submitted_storage_first_cycles_;
     std::uint32_t submitted_storage_epoch_ = 1;
+    bool initial_parallel_event_buffers_trimmed_ = false;
+    std::uint32_t parallel_event_buffer_samples_observed_ = 0;
 
     // Expansion stack is normally shallow; vector avoids hashing on every nested
     // reflected-object entry while still detecting recursion.
@@ -3325,6 +3464,18 @@ private:
             }
         }
     };
+
+    std::size_t parallel_worker_event_capacity_count_() const noexcept {
+        std::size_t total = 0;
+        // This diagnostic is called only at a quiescent topology/sample boundary.
+        // Avoid taking every worker mutex so enabling the report cannot perturb
+        // sampling measurements.
+        for (std::size_t i = 0; i < parallel_workers_.size(); ++i) {
+            const SampleWorker* worker = parallel_workers_[i].get();
+            if (worker) total += worker->event_buffer.capacity();
+        }
+        return total;
+    }
 
     bool should_use_parallel_sampling() const {
         if (!options_.enable_parallel_sampling) return false;
@@ -3732,14 +3883,11 @@ private:
         if (!read_scalar_snapshot(track, sample)) return false;
 
         if (options_.emit_only_on_change && runtime.has_last_event &&
-            runtime.last_invalid == InvalidKind::None && runtime.last_has_change_bits &&
             runtime.last_change_bits == sample.bits) {
             return false;
         }
 
         runtime.has_last_event = true;
-        runtime.last_invalid = InvalidKind::None;
-        runtime.last_has_change_bits = true;
         runtime.last_change_bits = sample.bits;
         if (track_out) *track_out = &track;
         return true;
@@ -3796,17 +3944,17 @@ private:
             }
 
             FlatLeafFast leaf;
-            leaf.track_id = tid;
-            leaf.storage_id = track.storage_id != 0 ? track.storage_id : tid;
+            leaf.track_id = compact_topology_id_(tid, "track id");
+            leaf.storage_id = track.storage_id != 0
+                ? track.storage_id
+                : compact_topology_id_(tid, "storage id");
             leaf.sample_ctx = track.sample_ctx;
             leaf.memory_ctx = track.memory_ctx;
             leaf.memory_byte_width = track.memory_byte_width;
             leaf.scalar_reader = track.scalar_reader;
             leaf.scalar_kind = track.scalar_kind;
             leaf.value_kind = track.kind;
-            leaf.has_last = runtime.has_last_event &&
-                            runtime.last_invalid == InvalidKind::None &&
-                            runtime.last_has_change_bits;
+            leaf.has_last = runtime.has_last_event;
             leaf.last_bits = leaf.has_last ? runtime.last_change_bits : 0;
             flat_leaf_fast_table_.push_back(leaf);
         }
@@ -3986,7 +4134,6 @@ private:
 
         if (!read_flat_leaf_snapshot(leaf, sample)) return false;
         if (options_.emit_only_on_change && runtime.has_last_event &&
-            runtime.last_invalid == InvalidKind::None && runtime.last_has_change_bits &&
             runtime.last_change_bits == sample.bits) {
             leaf.has_last = true;
             leaf.last_bits = sample.bits;
@@ -3999,8 +4146,6 @@ private:
         leaf.has_last = true;
         leaf.last_bits = sample.bits;
         runtime.has_last_event = true;
-        runtime.last_invalid = InvalidKind::None;
-        runtime.last_has_change_bits = true;
         runtime.last_change_bits = sample.bits;
         return true;
     }
@@ -4834,9 +4979,7 @@ private:
         const std::size_t caller_span = total - cursor;
         const std::size_t caller_event_capacity = flat_memory_mixed_slice_event_capacity(caller_begin, total);
         const std::size_t caller_scanned_leaf_count = caller_event_capacity;
-        if (caller_parallel_events_.capacity() < caller_event_capacity) {
-            caller_parallel_events_.reserve(caller_event_capacity);
-        }
+        reserve_event_buffer_capacity_(caller_parallel_events_, caller_event_capacity);
         caller_parallel_events_.clear();
         const std::chrono::high_resolution_clock::time_point caller_t0 = std::chrono::high_resolution_clock::now();
         sample_flat_memory_mixed_slice_to_buffer(cycle, caller_begin, total, caller_parallel_events_);
@@ -4955,10 +5098,60 @@ private:
         return desired_worker_count_for_items(flat_leaf_fast_table_.size()) > 0;
     }
 
+    std::size_t retained_event_reserve_target_(std::size_t requested) const noexcept {
+        if (!initial_parallel_event_buffers_trimmed_ ||
+            !options_.trim_parallel_event_buffers_after_first_sample) {
+            return requested;
+        }
+        const std::size_t limit = options_.parallel_event_buffer_retain_limit;
+        return requested < limit ? requested : limit;
+    }
+
+    void reserve_event_buffer_capacity_(std::vector<TrackEvent>& events, std::size_t requested) {
+        const std::size_t target = retained_event_reserve_target_(requested);
+        if (events.capacity() < target) events.reserve(target);
+    }
+
     void reserve_worker_event_capacity(SampleWorker* worker, std::size_t capacity) {
         if (!worker) return;
-        if (worker->event_buffer.capacity() < capacity) {
-            worker->event_buffer.reserve(capacity);
+        reserve_event_buffer_capacity_(worker->event_buffer, capacity);
+    }
+
+    void trim_one_initial_event_buffer_(std::vector<TrackEvent>& events) {
+        const std::size_t limit = options_.parallel_event_buffer_retain_limit;
+        if (events.capacity() <= limit) {
+            events.clear();
+            return;
+        }
+        std::vector<TrackEvent> retained;
+        if (limit != 0) retained.reserve(limit);
+        events.swap(retained);
+    }
+
+    void maybe_trim_parallel_event_buffers_after_sample_() {
+        if (initial_parallel_event_buffers_trimmed_) return;
+        if (!options_.trim_parallel_event_buffers_after_first_sample) return;
+
+        ++parallel_event_buffer_samples_observed_;
+        // Cycle 0 is normally a 100% initial-value emission.  Releasing its
+        // buffers immediately can force a costly grow/copy on the next dense
+        // cycle.  Wait for an actually sparse post-initial cycle instead.
+        if (parallel_event_buffer_samples_observed_ < 2u) return;
+        const std::size_t limit = options_.parallel_event_buffer_retain_limit;
+        if (caller_parallel_events_.size() > limit) return;
+        for (std::size_t i = 0; i < parallel_workers_.size(); ++i) {
+            const SampleWorker* worker = parallel_workers_[i].get();
+            if (worker && worker->event_buffer.size() > limit) return;
+        }
+
+        initial_parallel_event_buffers_trimmed_ = true;
+        trim_one_initial_event_buffer_(caller_parallel_events_);
+        for (std::size_t i = 0; i < parallel_workers_.size(); ++i) {
+            SampleWorker* worker = parallel_workers_[i].get();
+            if (!worker) continue;
+            std::lock_guard<std::mutex> lock(worker->mutex);
+            trim_one_initial_event_buffer_(worker->event_buffer);
+            worker->events = &worker->event_buffer;
         }
     }
 
@@ -5015,9 +5208,7 @@ private:
 
         const std::size_t caller_begin = cursor;
         const std::size_t caller_span = total - cursor;
-        if (caller_parallel_events_.capacity() < caller_span) {
-            caller_parallel_events_.reserve(caller_span);
-        }
+        reserve_event_buffer_capacity_(caller_parallel_events_, caller_span);
         caller_parallel_events_.clear();
         const std::chrono::high_resolution_clock::time_point caller_t0 = std::chrono::high_resolution_clock::now();
         sample_flat_leaf_slice_to_buffer(cycle, caller_begin, total, caller_parallel_events_);
@@ -5275,8 +5466,6 @@ private:
                 tls->wave_value_dirty_count = 0;
                 std::fill(tls->wave_array_bulk_range_local_epoch.begin(), tls->wave_array_bulk_range_local_epoch.end(), 0);
                 tls->wave_array_bulk_range_count = 0;
-                tls->wave_array_bulk_marks.clear();
-                tls->wave_array_bulk_epoch = 0;
             }
         });
     }
@@ -5610,6 +5799,180 @@ private:
         return checked_address_byte_range_(first_element_address, byte_count, begin, end);
     }
 
+    static std::uint64_t merged_address_coverage_bytes_(
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t> >& ranges) {
+        if (ranges.empty()) return 0;
+        std::sort(ranges.begin(), ranges.end());
+        std::uintptr_t begin = ranges[0].first;
+        std::uintptr_t end = ranges[0].second;
+        std::uint64_t bytes = 0;
+        for (std::size_t i = 1; i < ranges.size(); ++i) {
+            if (ranges[i].first <= end) {
+                if (ranges[i].second > end) end = ranges[i].second;
+                continue;
+            }
+            bytes += static_cast<std::uint64_t>(end - begin);
+            begin = ranges[i].first;
+            end = ranges[i].second;
+        }
+        bytes += static_cast<std::uint64_t>(end - begin);
+        return bytes;
+    }
+
+    void dump_wave_array_query_physical_ownership_(std::ostream& os,
+                                                    std::uintptr_t query_begin,
+                                                    std::uintptr_t query_end) const noexcept {
+        try {
+            std::unordered_set<TrackId> unique_storage_ids;
+            std::vector<std::pair<std::uintptr_t, std::uintptr_t> > physical_ranges;
+            std::size_t logical_track_hits = 0;
+            std::size_t dirty_array_track_hits = 0;
+            std::size_t dirty_peek_track_hits = 0;
+            std::size_t wave_value_track_hits = 0;
+            std::size_t other_track_hits = 0;
+            std::size_t dumped_tracks = 0;
+
+            for (TrackId track_id = 1; track_id < tracks_.size(); ++track_id) {
+                const TrackDesc& track = tracks_[track_id];
+                const void* memory = track.memory_ctx ? track.memory_ctx : track.sample_ctx;
+                const std::size_t byte_width = track.memory_byte_width != 0
+                    ? static_cast<std::size_t>(track.memory_byte_width)
+                    : scalar_sample_kind_byte_width(track.scalar_kind);
+                if (!memory || byte_width == 0) continue;
+                if (track.scalar_reader != NULL && track.memory_ctx == NULL) continue;
+
+                const std::uintptr_t storage_begin = reinterpret_cast<std::uintptr_t>(memory);
+                if (byte_width > static_cast<std::size_t>(
+                        (std::numeric_limits<std::uintptr_t>::max)() - storage_begin)) {
+                    continue;
+                }
+                const std::uintptr_t storage_end = storage_begin + byte_width;
+                const std::uintptr_t overlap_begin = storage_begin > query_begin ? storage_begin : query_begin;
+                const std::uintptr_t overlap_end = storage_end < query_end ? storage_end : query_end;
+                if (overlap_begin >= overlap_end) continue;
+
+                ++logical_track_hits;
+                if (track.dirty_wave_array_managed) ++dirty_array_track_hits;
+                else if (track.dirty_peek_group_id != kInvalidIndex) ++dirty_peek_track_hits;
+                else if (track.dirty_wave_value_group_id != kInvalidIndex) ++wave_value_track_hits;
+                else ++other_track_hits;
+
+                const TrackId storage_id = track.storage_id != 0 ? track.storage_id : track.id;
+                if (unique_storage_ids.insert(storage_id).second) {
+                    physical_ranges.push_back(std::make_pair(overlap_begin, overlap_end));
+                }
+
+                if (dumped_tracks < 24u) {
+                    os << "      physical_track track=" << static_cast<unsigned long long>(track.id)
+                       << " storage=" << static_cast<unsigned long long>(storage_id)
+                       << " address=" << memory
+                       << " bytes=" << static_cast<unsigned long long>(byte_width)
+                       << " overlap_begin=" << reinterpret_cast<const void*>(overlap_begin)
+                       << " overlap_end=" << reinterpret_cast<const void*>(overlap_end)
+                       << " dirty_array=" << (track.dirty_wave_array_managed ? 1 : 0)
+                       << " dirty_peek=" << (track.dirty_peek_group_id != kInvalidIndex ? 1 : 0)
+                       << " wave_value=" << (track.dirty_wave_value_group_id != kInvalidIndex ? 1 : 0)
+                       << " path=" << track_path_for_dump_(track.id)
+                       << '\n';
+                    ++dumped_tracks;
+                }
+            }
+
+            const std::uint64_t physical_bytes = merged_address_coverage_bytes_(physical_ranges);
+            const char* verdict = "not_in_current_topology";
+            if (dirty_array_track_hits != 0) {
+                verdict = "dirty_wave_array_bulk_or_slice_registration_missing";
+            } else if (logical_track_hits != 0) {
+                verdict = "tracked_physical_storage_has_wrong_sampling_class";
+            }
+            os << "    physical_ownership verdict=" << verdict
+               << " logical_track_hits=" << static_cast<unsigned long long>(logical_track_hits)
+               << " unique_storage_hits=" << static_cast<unsigned long long>(unique_storage_ids.size())
+               << " covered_query_bytes=" << static_cast<unsigned long long>(physical_bytes)
+               << " dirty_array_tracks=" << static_cast<unsigned long long>(dirty_array_track_hits)
+               << " dirty_peek_tracks=" << static_cast<unsigned long long>(dirty_peek_track_hits)
+               << " wave_value_tracks=" << static_cast<unsigned long long>(wave_value_track_hits)
+               << " other_tracks=" << static_cast<unsigned long long>(other_track_hits)
+               << '\n';
+            if (logical_track_hits == 0) {
+                os << "    physical_ownership_note=current bytes are not represented by any physical track; "
+                      "the object is untracked, was created after topology, or moved/reconstructed after topology\n";
+            }
+
+            std::vector<std::pair<std::uintptr_t, std::uintptr_t> > block_ranges;
+            std::vector<std::pair<std::uintptr_t, std::uintptr_t> > block_storage_ranges;
+            std::size_t overlapping_blocks = 0;
+            std::size_t overlapping_refs = 0;
+            std::size_t dumped_refs = 0;
+            for (std::size_t block_id = 0; block_id < dirty_wave_array_memory_blocks_.size(); ++block_id) {
+                const DirtyWaveArrayMemoryBlock& block = dirty_wave_array_memory_blocks_[block_id];
+                if (!block.base || block.byte_count == 0) continue;
+                const std::uintptr_t block_begin = reinterpret_cast<std::uintptr_t>(block.base);
+                if (block.byte_count > static_cast<std::size_t>(
+                        (std::numeric_limits<std::uintptr_t>::max)() - block_begin)) {
+                    continue;
+                }
+                const std::uintptr_t block_end = block_begin + block.byte_count;
+                const std::uintptr_t overlap_begin = block_begin > query_begin ? block_begin : query_begin;
+                const std::uintptr_t overlap_end = block_end < query_end ? block_end : query_end;
+                if (overlap_begin >= overlap_end) continue;
+                ++overlapping_blocks;
+                block_ranges.push_back(std::make_pair(overlap_begin, overlap_end));
+
+                const std::size_t ref_begin = static_cast<std::size_t>(block.first_leaf_ref);
+                std::size_t ref_end = ref_begin + static_cast<std::size_t>(block.leaf_count);
+                if (ref_end < ref_begin || ref_end > dirty_wave_array_memory_leaf_refs_.size()) {
+                    ref_end = dirty_wave_array_memory_leaf_refs_.size();
+                }
+                for (std::size_t ref_id = ref_begin; ref_id < ref_end; ++ref_id) {
+                    const DirtyWaveArrayMemoryLeafRef& ref = dirty_wave_array_memory_leaf_refs_[ref_id];
+                    const std::uintptr_t ref_begin_address = block_begin + static_cast<std::uintptr_t>(ref.offset);
+                    if (static_cast<std::uintptr_t>(ref.byte_count) >
+                        (std::numeric_limits<std::uintptr_t>::max)() - ref_begin_address) {
+                        continue;
+                    }
+                    const std::uintptr_t ref_end_address = ref_begin_address + ref.byte_count;
+                    const std::uintptr_t ref_overlap_begin = ref_begin_address > query_begin
+                        ? ref_begin_address : query_begin;
+                    const std::uintptr_t ref_overlap_end = ref_end_address < query_end
+                        ? ref_end_address : query_end;
+                    if (ref_overlap_begin >= ref_overlap_end) continue;
+                    ++overlapping_refs;
+                    block_storage_ranges.push_back(std::make_pair(ref_overlap_begin, ref_overlap_end));
+                    if (dumped_refs < 24u) {
+                        os << "      dirty_block_ref block=" << static_cast<unsigned long long>(block_id)
+                           << " ref=" << static_cast<unsigned long long>(ref_id)
+                           << " address=" << reinterpret_cast<const void*>(ref_begin_address)
+                           << " bytes=" << static_cast<unsigned long long>(ref.byte_count);
+                        if (ref.dirty_leaf_index < dirty_wave_array_leaves_.size()) {
+                            const DirtyWaveArrayLeaf& leaf = dirty_wave_array_leaves_[ref.dirty_leaf_index];
+                            os << " track=" << static_cast<unsigned long long>(leaf.track_id)
+                               << " storage=" << static_cast<unsigned long long>(leaf.storage_id)
+                               << " path=" << track_path_for_dump_(leaf.track_id);
+                        }
+                        os << '\n';
+                        ++dumped_refs;
+                    }
+                }
+            }
+            const std::uint64_t block_bytes = merged_address_coverage_bytes_(block_ranges);
+            const std::uint64_t block_storage_bytes = merged_address_coverage_bytes_(block_storage_ranges);
+            os << "    dirty_block_coverage overlapping_blocks="
+               << static_cast<unsigned long long>(overlapping_blocks)
+               << " overlapping_storage_refs=" << static_cast<unsigned long long>(overlapping_refs)
+               << " covered_block_bytes=" << static_cast<unsigned long long>(block_bytes)
+               << " covered_storage_bytes=" << static_cast<unsigned long long>(block_storage_bytes)
+               << " block_gap_only_bytes="
+               << static_cast<unsigned long long>(block_bytes >= block_storage_bytes
+                       ? block_bytes - block_storage_bytes : 0)
+               << '\n';
+        } catch (const std::exception& ex) {
+            os << "    physical_ownership=diagnostic_exception what=" << ex.what() << '\n';
+        } catch (...) {
+            os << "    physical_ownership=diagnostic_exception what=unknown\n";
+        }
+    }
+
     void dump_dirty_wave_array_block_leaf_context_(std::ostream& os,
                                                    std::uint32_t block_id,
                                                    std::size_t max_leaf_refs) const {
@@ -5675,8 +6038,56 @@ private:
             }
             os << " slice_address=" << range.element_key.address
                << " slice_type_tag=" << range.element_key.type_tag
-               << " slice_byte_width=" << static_cast<unsigned long long>(range.element_key.byte_width)
-               << '\n';
+               << " slice_byte_width=" << static_cast<unsigned long long>(range.element_key.byte_width);
+
+            TrackId first_track_id = 0;
+            if (cursor_valid && !(range.begin == range.end)) {
+                const std::size_t block_begin = static_cast<std::size_t>(range.begin.block_id);
+                std::size_t block_end = static_cast<std::size_t>(range.end.block_id);
+                if (block_end >= dirty_wave_array_memory_blocks_.size()) {
+                    block_end = dirty_wave_array_memory_blocks_.empty()
+                        ? 0
+                        : dirty_wave_array_memory_blocks_.size() - 1u;
+                }
+                for (std::size_t block_id = block_begin;
+                     block_id < dirty_wave_array_memory_blocks_.size() && block_id <= block_end && first_track_id == 0;
+                     ++block_id) {
+                    const DirtyWaveArrayMemoryBlock& block = dirty_wave_array_memory_blocks_[block_id];
+                    std::size_t byte_begin = block_id == block_begin
+                        ? static_cast<std::size_t>(range.begin.byte_offset)
+                        : 0u;
+                    std::size_t byte_end = block.byte_count;
+                    if (block_id == static_cast<std::size_t>(range.end.block_id)) {
+                        byte_end = static_cast<std::size_t>(range.end.byte_offset);
+                    }
+                    if (byte_begin > block.byte_count) byte_begin = block.byte_count;
+                    if (byte_end > block.byte_count) byte_end = block.byte_count;
+                    if (byte_begin >= byte_end) continue;
+
+                    const std::size_t ref_begin = static_cast<std::size_t>(block.first_leaf_ref);
+                    std::size_t ref_end = ref_begin + static_cast<std::size_t>(block.leaf_count);
+                    if (ref_end < ref_begin || ref_end > dirty_wave_array_memory_leaf_refs_.size()) {
+                        ref_end = dirty_wave_array_memory_leaf_refs_.size();
+                    }
+                    for (std::size_t ref_id = ref_begin; ref_id < ref_end; ++ref_id) {
+                        const DirtyWaveArrayMemoryLeafRef& ref = dirty_wave_array_memory_leaf_refs_[ref_id];
+                        const std::size_t ref_offset = static_cast<std::size_t>(ref.offset);
+                        const std::size_t ref_end_offset = ref_offset + static_cast<std::size_t>(ref.byte_count);
+                        if (ref_end_offset <= byte_begin || ref_offset >= byte_end) continue;
+                        if (ref.dirty_leaf_index < dirty_wave_array_leaves_.size()) {
+                            first_track_id = dirty_wave_array_leaves_[ref.dirty_leaf_index].track_id;
+                        }
+                        break;
+                    }
+                }
+            }
+            if (first_track_id != 0) {
+                os << " first_track=" << static_cast<unsigned long long>(first_track_id)
+                   << " first_path=" << track_path_for_dump_(first_track_id);
+            } else {
+                os << " first_track=0 first_path=(no physical track in cursor range)";
+            }
+            os << '\n';
         } catch (...) {
         }
     }
@@ -5716,6 +6127,8 @@ private:
                << " memory_complete=" << (dirty_wave_array_memory_blocks_complete_ ? 1 : 0)
                << " initial_sample_done=" << (dirty_wave_array_initial_sample_done_ ? 1 : 0)
                << '\n';
+
+            dump_wave_array_query_physical_ownership_(os, query_begin, query_end);
 
             const WaveArrayBulkMarkKey exact_bulk_key(first_element_address, element_type_tag, element_size, element_count);
             std::unordered_map<WaveArrayBulkMarkKey, std::uint32_t, WaveArrayBulkMarkKeyHash>::const_iterator exact_bulk_it =
@@ -5769,6 +6182,7 @@ private:
             std::size_t bulk_same_first_type = 0;
             std::size_t slice_same_address = 0;
             std::size_t dumped_candidates = 0;
+            std::vector<std::pair<std::uintptr_t, std::uint32_t> > nearest_same_shape_bulk;
             for (std::size_t i = 0;
                  i < dirty_wave_array_bulk_ranges_.size();
                  ++i) {
@@ -5782,6 +6196,18 @@ private:
                     if (same_first) ++bulk_same_first;
                     if (same_first && same_shape) ++bulk_same_first_shape;
                     if (same_first && same_type) ++bulk_same_first_type;
+                    if (same_shape && same_type && range.key.first_address != NULL) {
+                        const std::uintptr_t candidate_address =
+                            reinterpret_cast<std::uintptr_t>(range.key.first_address);
+                        const std::uintptr_t distance = candidate_address >= query_begin
+                            ? candidate_address - query_begin
+                            : query_begin - candidate_address;
+                        nearest_same_shape_bulk.push_back(std::make_pair(
+                            distance,
+                            static_cast<std::uint32_t>(i)));
+                        std::sort(nearest_same_shape_bulk.begin(), nearest_same_shape_bulk.end());
+                        if (nearest_same_shape_bulk.size() > 8u) nearest_same_shape_bulk.resize(8u);
+                    }
                     interesting = same_first || (same_shape && same_type);
                     if (interesting && dumped_candidates < 12) {
                         os << "    candidate_bulk[" << static_cast<unsigned long long>(i)
@@ -5813,6 +6239,19 @@ private:
                << " slice_same_address=" << static_cast<unsigned long long>(slice_same_address)
                << " dumped=" << static_cast<unsigned long long>(dumped_candidates)
                << '\n';
+            if (bulk_same_first == 0) {
+                os << "    registered_target_path=(none for queried address)\n";
+            }
+            for (std::size_t i = 0; i < nearest_same_shape_bulk.size(); ++i) {
+                os << "    nearest_same_shape_bulk[" << static_cast<unsigned long long>(i)
+                   << "] address_distance="
+                   << static_cast<unsigned long long>(nearest_same_shape_bulk[i].first)
+                   << '\n';
+                dump_dirty_wave_array_range_summary_(
+                    os,
+                    "nearest_same_shape_range",
+                    nearest_same_shape_bulk[i].second);
+            }
         } catch (...) {
         }
     }
@@ -5902,20 +6341,34 @@ private:
         dirty_wave_array_initial_sample_done_ = true;
     }
 
+    const TrackDesc* compact_dirty_leaf_track_(std::uint32_t track_id) const noexcept {
+        if (track_id == 0 || static_cast<std::size_t>(track_id) >= tracks_.size()) return NULL;
+        const TrackDesc& track = tracks_[static_cast<std::size_t>(track_id)];
+        return track.id != 0 ? &track : NULL;
+    }
+
+    bool compact_dirty_leaf_memory_candidate_(std::uint32_t track_id,
+                                              const unsigned char*& begin,
+                                              std::size_t& byte_count) const noexcept {
+        begin = NULL;
+        byte_count = 0;
+        const TrackDesc* track = compact_dirty_leaf_track_(track_id);
+        if (!track) return false;
+        const void* memory = track->memory_ctx ? track->memory_ctx : track->sample_ctx;
+        if (memory == NULL) return false;
+        byte_count = track->memory_byte_width != 0
+            ? static_cast<std::size_t>(track->memory_byte_width)
+            : scalar_sample_kind_byte_width(track->scalar_kind);
+        if (byte_count == 0) return false;
+        if (track->scalar_reader != NULL && track->memory_ctx == NULL) return false;
+        begin = static_cast<const unsigned char*>(memory);
+        return true;
+    }
+
     bool dirty_peek_leaf_memory_candidate_(const DirtyPeekLeaf& leaf,
                                            const unsigned char*& begin,
                                            std::size_t& byte_count) const noexcept {
-        begin = NULL;
-        byte_count = 0;
-        const void* memory = leaf.memory_ctx ? leaf.memory_ctx : leaf.sample_ctx;
-        if (memory == NULL) return false;
-        byte_count = leaf.memory_byte_width != 0
-            ? static_cast<std::size_t>(leaf.memory_byte_width)
-            : scalar_sample_kind_byte_width(leaf.scalar_kind);
-        if (byte_count == 0) return false;
-        if (leaf.scalar_reader != NULL && leaf.memory_ctx == NULL) return false;
-        begin = static_cast<const unsigned char*>(memory);
-        return true;
+        return compact_dirty_leaf_memory_candidate_(leaf.track_id, begin, byte_count);
     }
 
     void fail_dirty_peek_memory_cursor_(const char* reason,
@@ -6094,17 +6547,11 @@ private:
     bool fill_dirty_peek_leaf_from_track_(const TrackDesc& track,
                                           TrackId storage_id,
                                           DirtyPeekLeaf& leaf) const {
-        if (track.scalar_kind == ScalarSampleKind::None) return false;
-        leaf.track_id = track.id;
-        leaf.storage_id = storage_id;
-        leaf.sample_ctx = track.sample_ctx;
-        leaf.memory_ctx = track.memory_ctx;
-        leaf.memory_byte_width = track.memory_byte_width;
-        leaf.scalar_reader = track.scalar_reader;
-        leaf.scalar_kind = track.scalar_kind;
-        leaf.value_kind = track.kind;
-        leaf.has_last = false;
-        leaf.last_bits = 0;
+        if (track.scalar_kind == ScalarSampleKind::None ||
+            track.id > static_cast<TrackId>((std::numeric_limits<std::uint32_t>::max)()) ||
+            storage_id > static_cast<TrackId>((std::numeric_limits<std::uint32_t>::max)())) return false;
+        leaf.track_id = static_cast<std::uint32_t>(track.id);
+        leaf.storage_id = static_cast<std::uint32_t>(storage_id);
         leaf.memory_last_sample_epoch = 0;
         return true;
     }
@@ -6122,12 +6569,13 @@ private:
             dirty_peek_leaves_.push_back(leaf);
             active_dirty_peek_storage_ids_.push_back(storage_id);
         } catch (...) {
+            const TrackDesc* leaf_track = compact_dirty_leaf_track_(leaf.track_id);
             fail_dirty_peek_memory_cursor_("dirty_peek alias leaf allocation failed",
                                            active_dirty_peek_group_id_,
                                            leaf.track_id,
                                            storage_id,
-                                           leaf.memory_ctx ? leaf.memory_ctx : leaf.sample_ctx,
-                                           leaf.memory_byte_width);
+                                           leaf_track ? (leaf_track->memory_ctx ? leaf_track->memory_ctx : leaf_track->sample_ctx) : NULL,
+                                           leaf_track ? leaf_track->memory_byte_width : 0);
             return false;
         }
         const std::uint32_t range_id = register_dirty_peek_cursor_range_(
@@ -6137,12 +6585,13 @@ private:
             leaf_begin,
             1);
         if (range_id == kInvalidIndex) {
+            const TrackDesc* leaf_track = compact_dirty_leaf_track_(leaf.track_id);
             fail_dirty_peek_memory_cursor_("dirty_peek alias storage cursor range registration failed",
                                            active_dirty_peek_group_id_,
                                            leaf.track_id,
                                            storage_id,
-                                           leaf.memory_ctx ? leaf.memory_ctx : leaf.sample_ctx,
-                                           leaf.memory_byte_width);
+                                           leaf_track ? (leaf_track->memory_ctx ? leaf_track->memory_ctx : leaf_track->sample_ctx) : NULL,
+                                           leaf_track ? leaf_track->memory_byte_width : 0);
             return false;
         }
         return true;
@@ -6157,7 +6606,14 @@ private:
         if (dirty_peek_storage_seen_in_current_capture_(storage_id)) return true;
 
         DirtyPeekLeaf leaf;
-        if (!fill_dirty_peek_leaf_from_track_(track, storage_id, leaf)) return true;
+        if (!fill_dirty_peek_leaf_from_track_(track, storage_id, leaf)) {
+            fail_dirty_peek_memory_cursor_("dirty_peek compact leaf track id overflow",
+                                           active_dirty_peek_group_id_,
+                                           track.id,
+                                           storage_id,
+                                           track.memory_ctx ? track.memory_ctx : track.sample_ctx,
+                                           track.memory_byte_width);
+        }
 
         if (storage_id != track.id) {
             DirtyPeekStorageCursorRange existing_range;
@@ -6348,32 +6804,15 @@ private:
     }
 
     bool read_dirty_peek_leaf_snapshot(const DirtyPeekLeaf& leaf, ScalarSnapshot& sample) const {
-        if (leaf.scalar_reader) return leaf.scalar_reader(leaf.sample_ctx, sample);
-        FlatLeafFast tmp;
-        tmp.track_id = leaf.track_id;
-        tmp.storage_id = leaf.storage_id != 0 ? leaf.storage_id : leaf.track_id;
-        tmp.sample_ctx = leaf.sample_ctx;
-        tmp.memory_ctx = leaf.memory_ctx;
-        tmp.memory_byte_width = leaf.memory_byte_width;
-        tmp.scalar_reader = leaf.scalar_reader;
-        tmp.scalar_kind = leaf.scalar_kind;
-        tmp.value_kind = leaf.value_kind;
-        return read_flat_leaf_snapshot(tmp, sample);
+        const TrackDesc* track = compact_dirty_leaf_track_(leaf.track_id);
+        return track ? read_scalar_snapshot(*track, sample) : false;
     }
 
     void fill_dirty_peek_leaf_event(const DirtyPeekLeaf& leaf, const ScalarSnapshot& sample, Cycle cycle, TrackEvent& ev) const {
-        FlatLeafFast tmp;
-        tmp.track_id = leaf.track_id;
-        tmp.storage_id = leaf.storage_id != 0 ? leaf.storage_id : leaf.track_id;
-        tmp.sample_ctx = leaf.sample_ctx;
-        tmp.memory_ctx = leaf.memory_ctx;
-        tmp.memory_byte_width = leaf.memory_byte_width;
-        tmp.scalar_reader = leaf.scalar_reader;
-        tmp.scalar_kind = leaf.scalar_kind;
-        tmp.value_kind = leaf.value_kind;
-        tmp.has_last = leaf.has_last;
-        tmp.last_bits = leaf.last_bits;
-        fill_flat_leaf_event(tmp, sample, cycle, ev);
+        const TrackDesc* track = compact_dirty_leaf_track_(leaf.track_id);
+        if (!track) return;
+        fill_scalar_event(*track, sample, cycle, ev);
+        ev.track_id = leaf.storage_id != 0 ? leaf.storage_id : leaf.track_id;
     }
 
     void begin_dirty_peek_storage_sample_epoch_() {
@@ -6483,18 +6922,10 @@ private:
         storage_runtime.dirty_peek_storage_sample_epoch = dirty_peek_storage_sample_epoch_;
 
         if (options_.emit_only_on_change && storage_runtime.has_last_event &&
-            storage_runtime.last_invalid == InvalidKind::None && storage_runtime.last_has_change_bits &&
             storage_runtime.last_change_bits == sample.bits) {
-            leaf.has_last = true;
-            leaf.last_bits = sample.bits;
             return false;
         }
-        if (options_.emit_only_on_change && leaf.has_last && leaf.last_bits == sample.bits) return false;
-        leaf.has_last = true;
-        leaf.last_bits = sample.bits;
         storage_runtime.has_last_event = true;
-        storage_runtime.last_invalid = InvalidKind::None;
-        storage_runtime.last_has_change_bits = true;
         storage_runtime.last_change_bits = sample.bits;
         return true;
     }
@@ -6774,7 +7205,6 @@ private:
         if (!runtime.alive) return false;
         if (!read_dirty_wave_value_leaf_snapshot(leaf, sample)) return false;
         if (options_.emit_only_on_change && runtime.has_last_event &&
-            runtime.last_invalid == InvalidKind::None && runtime.last_has_change_bits &&
             runtime.last_change_bits == sample.bits) {
             leaf.has_last = true;
             leaf.last_bits = sample.bits;
@@ -6784,8 +7214,6 @@ private:
         leaf.has_last = true;
         leaf.last_bits = sample.bits;
         runtime.has_last_event = true;
-        runtime.last_invalid = InvalidKind::None;
-        runtime.last_has_change_bits = true;
         runtime.last_change_bits = sample.bits;
         return true;
     }
@@ -6813,7 +7241,7 @@ private:
         append_initial_dirty_wave_value_groups();
         if (global_dirty_wave_value_group_count_ == 0) return;
         const std::size_t expected = dirty_wave_value_leaves_.size();
-        if (caller_parallel_events_.capacity() < expected) caller_parallel_events_.reserve(expected);
+        reserve_event_buffer_capacity_(caller_parallel_events_, expected);
         caller_parallel_events_.clear();
         for (std::uint32_t i = 0; i < global_dirty_wave_value_group_count_; ++i) {
             sample_dirty_wave_value_group_to_buffer(global_dirty_wave_value_group_ids_[i], cycle, caller_parallel_events_);
@@ -6823,32 +7251,15 @@ private:
     }
 
     bool read_dirty_wave_array_leaf_snapshot(const DirtyWaveArrayLeaf& leaf, ScalarSnapshot& sample) const {
-        if (leaf.scalar_reader) return leaf.scalar_reader(leaf.sample_ctx, sample);
-        FlatLeafFast tmp;
-        tmp.track_id = leaf.track_id;
-        tmp.storage_id = leaf.storage_id != 0 ? leaf.storage_id : leaf.track_id;
-        tmp.sample_ctx = leaf.sample_ctx;
-        tmp.memory_ctx = leaf.memory_ctx;
-        tmp.memory_byte_width = leaf.memory_byte_width;
-        tmp.scalar_reader = leaf.scalar_reader;
-        tmp.scalar_kind = leaf.scalar_kind;
-        tmp.value_kind = leaf.value_kind;
-        return read_flat_leaf_snapshot(tmp, sample);
+        const TrackDesc* track = compact_dirty_leaf_track_(leaf.track_id);
+        return track ? read_scalar_snapshot(*track, sample) : false;
     }
 
     void fill_dirty_wave_array_leaf_event(const DirtyWaveArrayLeaf& leaf, const ScalarSnapshot& sample, Cycle cycle, TrackEvent& ev) const {
-        FlatLeafFast tmp;
-        tmp.track_id = leaf.track_id;
-        tmp.storage_id = leaf.storage_id != 0 ? leaf.storage_id : leaf.track_id;
-        tmp.sample_ctx = leaf.sample_ctx;
-        tmp.memory_ctx = leaf.memory_ctx;
-        tmp.memory_byte_width = leaf.memory_byte_width;
-        tmp.scalar_reader = leaf.scalar_reader;
-        tmp.scalar_kind = leaf.scalar_kind;
-        tmp.value_kind = leaf.value_kind;
-        tmp.has_last = leaf.has_last;
-        tmp.last_bits = leaf.last_bits;
-        fill_flat_leaf_event(tmp, sample, cycle, ev);
+        const TrackDesc* track = compact_dirty_leaf_track_(leaf.track_id);
+        if (!track) return;
+        fill_scalar_event(*track, sample, cycle, ev);
+        ev.track_id = leaf.storage_id != 0 ? leaf.storage_id : leaf.track_id;
     }
 
     bool sample_one_dirty_wave_array_leaf_changed(DirtyWaveArrayLeaf& leaf, ScalarSnapshot& sample) {
@@ -6863,19 +7274,10 @@ private:
         // the authoritative per-track last value; if it is already current, do
         // not emit a duplicate event.
         if (options_.emit_only_on_change && runtime.has_last_event &&
-            runtime.last_invalid == InvalidKind::None && runtime.last_has_change_bits &&
             runtime.last_change_bits == sample.bits) {
-            leaf.has_last = true;
-            leaf.last_bits = sample.bits;
             return false;
         }
-
-        if (options_.emit_only_on_change && leaf.has_last && leaf.last_bits == sample.bits) return false;
-        leaf.has_last = true;
-        leaf.last_bits = sample.bits;
         runtime.has_last_event = true;
-        runtime.last_invalid = InvalidKind::None;
-        runtime.last_has_change_bits = true;
         runtime.last_change_bits = sample.bits;
         return true;
     }
@@ -6883,19 +7285,7 @@ private:
     bool dirty_wave_array_leaf_memory_candidate_(const DirtyWaveArrayLeaf& leaf,
                                                  const unsigned char*& begin,
                                                  std::size_t& byte_count) const noexcept {
-        begin = NULL;
-        byte_count = 0;
-        const void* memory = leaf.memory_ctx ? leaf.memory_ctx : leaf.sample_ctx;
-        if (memory == NULL) return false;
-        byte_count = leaf.memory_byte_width != 0
-            ? static_cast<std::size_t>(leaf.memory_byte_width)
-            : scalar_sample_kind_byte_width(leaf.scalar_kind);
-        if (byte_count == 0) return false;
-        // Volatile/custom getter leaves must keep their typed reader path unless
-        // reflection provided a real physical storage address to compare.
-        if (leaf.scalar_reader != NULL && leaf.memory_ctx == NULL) return false;
-        begin = static_cast<const unsigned char*>(memory);
-        return true;
+        return compact_dirty_leaf_memory_candidate_(leaf.track_id, begin, byte_count);
     }
 
     bool build_dirty_wave_array_memory_block_byte_map_(DirtyWaveArrayMemoryBlock& block) {
@@ -7018,16 +7408,12 @@ private:
         if (dirty_wave_array_storage_seen_in_current_capture_(storage_id)) return true;
 
         DirtyWaveArrayLeaf leaf;
-        leaf.track_id = track.id;
-        leaf.storage_id = storage_id;
-        leaf.sample_ctx = track.sample_ctx;
-        leaf.memory_ctx = track.memory_ctx;
-        leaf.memory_byte_width = track.memory_byte_width;
-        leaf.scalar_reader = track.scalar_reader;
-        leaf.scalar_kind = track.scalar_kind;
-        leaf.value_kind = track.kind;
-        leaf.has_last = false;
-        leaf.last_bits = 0;
+        if (track.id > static_cast<TrackId>((std::numeric_limits<std::uint32_t>::max)()) ||
+            storage_id > static_cast<TrackId>((std::numeric_limits<std::uint32_t>::max)())) {
+            fail_dirty_wave_array_bulk_notify_("wave::array compact leaf track id overflow", NULL, NULL, 0, 0);
+        }
+        leaf.track_id = static_cast<std::uint32_t>(track.id);
+        leaf.storage_id = static_cast<std::uint32_t>(storage_id);
 
         const unsigned char* leaf_begin = NULL;
         std::size_t leaf_bytes = 0;
@@ -7653,7 +8039,7 @@ private:
                                                      std::size_t begin_pos,
                                                      std::size_t end_pos) {
         const std::size_t expected = dirty_wave_array_work_slice_event_capacity_(begin_pos, end_pos);
-        if (caller_parallel_events_.capacity() < expected) caller_parallel_events_.reserve(expected);
+        reserve_event_buffer_capacity_(caller_parallel_events_, expected);
         caller_parallel_events_.clear();
         sample_dirty_wave_array_work_slice_to_buffer_(cycle, begin_pos, end_pos, caller_parallel_events_);
         (void)submit_dirty_wave_array_events_once_(caller_parallel_events_);
@@ -7770,7 +8156,7 @@ private:
 
         if (!should_use_dirty_wave_array_parallel_sampling(work_count)) {
             const std::size_t cap = dirty_wave_array_work_slice_event_capacity_(0, work_count);
-            if (caller_parallel_events_.capacity() < cap) caller_parallel_events_.reserve(cap);
+            reserve_event_buffer_capacity_(caller_parallel_events_, cap);
             caller_parallel_events_.clear();
             sample_dirty_wave_array_work_slice_to_buffer_(cycle, 0, work_count, caller_parallel_events_);
             const std::size_t emitted_count = submit_dirty_wave_array_events_once_(caller_parallel_events_);
@@ -7782,7 +8168,7 @@ private:
         const std::size_t worker_count = desired_worker_count_for_items(work_count);
         if (worker_count == 0) {
             const std::size_t cap = dirty_wave_array_work_slice_event_capacity_(0, work_count);
-            if (caller_parallel_events_.capacity() < cap) caller_parallel_events_.reserve(cap);
+            reserve_event_buffer_capacity_(caller_parallel_events_, cap);
             caller_parallel_events_.clear();
             sample_dirty_wave_array_work_slice_to_buffer_(cycle, 0, work_count, caller_parallel_events_);
             const std::size_t emitted_count = submit_dirty_wave_array_events_once_(caller_parallel_events_);
@@ -7821,7 +8207,7 @@ private:
         const std::size_t caller_begin = dirty_worker_plan_begin_[worker_count];
         const std::size_t caller_end = dirty_worker_plan_end_[worker_count];
         const std::size_t caller_expected = dirty_wave_array_work_slice_event_capacity_(caller_begin, caller_end);
-        if (caller_parallel_events_.capacity() < caller_expected) caller_parallel_events_.reserve(caller_expected);
+        reserve_event_buffer_capacity_(caller_parallel_events_, caller_expected);
         caller_parallel_events_.clear();
         sample_dirty_wave_array_work_slice_to_buffer_(cycle, caller_begin, caller_end, caller_parallel_events_);
 
@@ -7961,7 +8347,7 @@ private:
 
     void sample_dirty_peek_work_slice_to_sink_(Cycle cycle, std::size_t begin_pos, std::size_t end_pos) {
         const std::size_t expected = dirty_peek_work_slice_event_capacity_(begin_pos, end_pos);
-        if (caller_parallel_events_.capacity() < expected) caller_parallel_events_.reserve(expected);
+        reserve_event_buffer_capacity_(caller_parallel_events_, expected);
         caller_parallel_events_.clear();
         sample_dirty_peek_work_slice_to_buffer_(cycle, begin_pos, end_pos, caller_parallel_events_);
         (void)submit_sample_events_once_(caller_parallel_events_);
@@ -8128,9 +8514,7 @@ private:
         {
             const std::size_t expected = dirty_peek_work_slice_event_capacity_(dirty_worker_plan_begin_[worker_count],
                                                                                dirty_worker_plan_end_[worker_count]);
-            if (caller_parallel_events_.capacity() < expected) {
-                caller_parallel_events_.reserve(expected);
-            }
+            reserve_event_buffer_capacity_(caller_parallel_events_, expected);
         }
         caller_parallel_events_.clear();
         sample_dirty_peek_work_slice_to_buffer_(cycle,
@@ -8249,26 +8633,6 @@ private:
         case InvalidKind::Unsupported: return "Unsupported";
         case InvalidKind::RecursiveCut: return "RecursiveCut";
         default: return "UnknownInvalid";
-        }
-    }
-
-    bool same_event_payload(const TrackRuntimeState& state, const TrackEvent& ev) const {
-        if (state.last_has_change_bits || ev.has_change_bits) {
-            return state.last_has_change_bits && ev.has_change_bits &&
-                   state.last_change_bits == ev.change_bits;
-        }
-        return runtime_last_value_ref(state) == (ev.value ? std::string(ev.value) : std::string());
-    }
-
-    void cache_last_event(TrackRuntimeState& state, const TrackEvent& ev) {
-        state.has_last_event = true;
-        state.last_invalid = ev.invalid;
-        state.last_has_change_bits = ev.has_change_bits;
-        state.last_change_bits = ev.change_bits;
-        if (ev.has_change_bits) {
-            clear_runtime_last_value(state);
-        } else {
-            set_runtime_last_value(state, ev.value ? std::string(ev.value) : std::string());
         }
     }
 
@@ -8410,6 +8774,15 @@ private:
         return ensure_id_slot(items, id);
     }
 
+    template <typename IdT>
+    static std::uint32_t compact_topology_id_(IdT id, const char* kind) {
+        const std::uint64_t value = static_cast<std::uint64_t>(id);
+        if (value > static_cast<std::uint64_t>((std::numeric_limits<std::uint32_t>::max)())) {
+            throw std::overflow_error(std::string("WaveTrace ") + kind + " exceeds 32-bit topology limit");
+        }
+        return static_cast<std::uint32_t>(value);
+    }
+
     NodeDesc* find_node(NodeId id) { return id_lookup(nodes_, id); }
     const NodeDesc* find_node(NodeId id) const { return id_lookup_const(nodes_, id); }
     TrackDesc* find_track(TrackId id) { return id_lookup(tracks_, id); }
@@ -8436,7 +8809,6 @@ private:
         std::size_t tracks_size;
         std::size_t track_paths_size;
         std::size_t track_runtime_size;
-        std::size_t track_runtime_last_values_size;
         std::size_t scalar_getter_storage_size;
         std::size_t bitfield_storage_created_keys_size;
         std::size_t objects_size;
@@ -8479,7 +8851,7 @@ private:
         std::size_t active_dirty_wave_array_storage_id_marks_size;
         std::size_t bound_dirty_hooks_size;
         NodeId parent_id;
-        NodeId parent_first_child;
+        std::uint32_t parent_first_child;
     };
 
     TopologyCheckpoint make_topology_checkpoint(NodeId parent_id) const {
@@ -8494,7 +8866,6 @@ private:
         cp.tracks_size = tracks_.size();
         cp.track_paths_size = track_paths_.size();
         cp.track_runtime_size = track_runtime_.size();
-        cp.track_runtime_last_values_size = track_runtime_last_values_.size();
         cp.scalar_getter_storage_size = scalar_getter_storage_.size();
         cp.bitfield_storage_created_keys_size = bitfield_storage_created_keys_.size();
         cp.objects_size = objects_.size();
@@ -8562,7 +8933,6 @@ private:
         tracks_.resize(cp.tracks_size);
         track_paths_.resize(cp.track_paths_size);
         track_runtime_.resize(cp.track_runtime_size);
-        track_runtime_last_values_.resize(cp.track_runtime_last_values_size);
         scalar_getter_storage_.resize(cp.scalar_getter_storage_size);
         objects_.resize(cp.objects_size);
         object_debug_names_.resize(cp.object_debug_names_size);
@@ -9312,28 +9682,6 @@ private:
         return intern_node_name_(detail::path_last_segment(path));
     }
 
-    const std::string& runtime_last_value_ref(const TrackRuntimeState& state) const {
-        const std::uint32_t id = state.last_value_id;
-        if (id == kInvalidIndex || static_cast<std::size_t>(id) >= track_runtime_last_values_.size()) {
-            return empty_node_string();
-        }
-        return track_runtime_last_values_[static_cast<std::size_t>(id)];
-    }
-
-    void clear_runtime_last_value(TrackRuntimeState& state) {
-        state.last_value_id = kInvalidIndex;
-    }
-
-    void set_runtime_last_value(TrackRuntimeState& state, const std::string& value) {
-        if (state.last_value_id == kInvalidIndex ||
-            static_cast<std::size_t>(state.last_value_id) >= track_runtime_last_values_.size()) {
-            state.last_value_id = static_cast<std::uint32_t>(track_runtime_last_values_.size());
-            track_runtime_last_values_.push_back(value);
-        } else {
-            track_runtime_last_values_[static_cast<std::size_t>(state.last_value_id)] = value;
-        }
-    }
-
     bool node_has_signal_subtree(NodeId node_id) const {
         const NodeDesc* node = find_node(node_id);
         return node && node->alive && (node->first_track != 0 || node->first_child != 0);
@@ -9446,9 +9794,9 @@ private:
         const NodeId id = next_node_id_++;
         NodeDesc& node = ensure_id_slot_reserved(nodes_, id, options_.id_slot_node_growth_chunk);
         node = NodeDesc();
-        node.id = id;
-        node.parent_id = parent_id;
-        node.object_id = object_id;
+        node.id = compact_topology_id_(id, "node id");
+        node.parent_id = compact_topology_id_(parent_id, "parent node id");
+        node.object_id = compact_topology_id_(object_id, "object id");
         node.name_id = node_name_id_for_path_(path);
         if (options_.debug_log) {
             node.debug_path_id = static_cast<std::uint32_t>(node_debug_paths_.size());
@@ -9461,7 +9809,7 @@ private:
             NodeDesc* parent = find_node(parent_id);
             if (parent) {
                 node.next_sibling = parent->first_child;
-                parent->first_child = id;
+                parent->first_child = compact_topology_id_(id, "child node id");
             }
         }
 
@@ -9485,9 +9833,9 @@ private:
         const NodeId id = next_node_id_++;
         NodeDesc& node = ensure_id_slot_reserved(nodes_, id, options_.id_slot_node_growth_chunk);
         node = NodeDesc();
-        node.id = id;
-        node.parent_id = parent_id;
-        node.object_id = object_id;
+        node.id = compact_topology_id_(id, "node id");
+        node.parent_id = compact_topology_id_(parent_id, "parent node id");
+        node.object_id = compact_topology_id_(object_id, "object id");
         node.name_id = name_id;
         node.kind = kind;
         node.alive = true;
@@ -9496,7 +9844,7 @@ private:
             NodeDesc* parent = find_node(parent_id);
             if (parent) {
                 node.next_sibling = parent->first_child;
-                parent->first_child = id;
+                parent->first_child = compact_topology_id_(id, "child node id");
             }
         }
 
@@ -9517,9 +9865,9 @@ private:
         const NodeId id = next_node_id_++;
         NodeDesc& node = ensure_id_slot_reserved(nodes_, id, options_.id_slot_node_growth_chunk);
         node = NodeDesc();
-        node.id = id;
-        node.parent_id = parent_id;
-        node.object_id = object_id;
+        node.id = compact_topology_id_(id, "node id");
+        node.parent_id = compact_topology_id_(parent_id, "parent node id");
+        node.object_id = compact_topology_id_(object_id, "object id");
         node.name_id = append_generated_index_node_name_(index);
         node.kind = kind;
         node.alive = true;
@@ -9528,7 +9876,7 @@ private:
             NodeDesc* parent = find_node(parent_id);
             if (parent) {
                 node.next_sibling = parent->first_child;
-                parent->first_child = id;
+                parent->first_child = compact_topology_id_(id, "child node id");
             }
         }
 
@@ -9614,7 +9962,7 @@ private:
                 typename std::unordered_map<DirtyPeekStorageKey, TrackId, DirtyPeekStorageKeyHash>::const_iterator it =
                     dirty_peek_storage_by_key_.find(key);
                 if (it != dirty_peek_storage_by_key_.end() && it->second != 0) {
-                    track.storage_id = it->second;
+                    track.storage_id = compact_topology_id_(it->second, "storage id");
                     return;
                 }
                 dirty_peek_storage_by_key_[key] = track.id;
@@ -10051,8 +10399,8 @@ private:
         const TrackId id = next_track_id_++;
         TrackDesc& track = ensure_id_slot_reserved(tracks_, id, options_.id_slot_track_growth_chunk);
         track = TrackDesc();
-        track.id = id;
-        track.node_id = node_id;
+        track.id = compact_topology_id_(id, "track id");
+        track.node_id = compact_topology_id_(node_id, "track node id");
         track.kind = detail::classify_value_kind<T>();
         TrackRuntimeState& runtime = ensure_id_slot_reserved(track_runtime_, id, options_.id_slot_track_growth_chunk);
         runtime = TrackRuntimeState();
@@ -10093,8 +10441,8 @@ private:
         const TrackId id = next_track_id_++;
         TrackDesc& track = ensure_id_slot_reserved(tracks_, id, options_.id_slot_track_growth_chunk);
         track = TrackDesc();
-        track.id = id;
-        track.node_id = node_id;
+        track.id = compact_topology_id_(id, "track id");
+        track.node_id = compact_topology_id_(node_id, "track node id");
         track.kind = ValueKind::Bool;
         TrackRuntimeState& runtime = ensure_id_slot_reserved(track_runtime_, id, options_.id_slot_track_growth_chunk);
         runtime = TrackRuntimeState();
@@ -10126,8 +10474,8 @@ private:
         const TrackId id = next_track_id_++;
         TrackDesc& track = ensure_id_slot_reserved(tracks_, id, options_.id_slot_track_growth_chunk);
         track = TrackDesc();
-        track.id = id;
-        track.node_id = node_id;
+        track.id = compact_topology_id_(id, "track id");
+        track.node_id = compact_topology_id_(node_id, "track node id");
         track.kind = kind;
         TrackRuntimeState& runtime = ensure_id_slot_reserved(track_runtime_, id, options_.id_slot_track_growth_chunk);
         runtime = TrackRuntimeState();
@@ -10166,8 +10514,8 @@ private:
         const TrackId id = next_track_id_++;
         TrackDesc& track = ensure_id_slot_reserved(tracks_, id, options_.id_slot_track_growth_chunk);
         track = TrackDesc();
-        track.id = id;
-        track.node_id = node_id;
+        track.id = compact_topology_id_(id, "track id");
+        track.node_id = compact_topology_id_(node_id, "track node id");
         track.kind = kind;
         TrackRuntimeState& runtime = ensure_id_slot_reserved(track_runtime_, id, options_.id_slot_track_growth_chunk);
         runtime = TrackRuntimeState();
@@ -10191,7 +10539,7 @@ private:
         if (!track || track->id == 0) return;
         TrackEvent ev;
         ev.cycle = cycle;
-        ev.track_id = track_id;
+        ev.track_id = compact_topology_id_(track_id, "event track id");
         ev.path = track_path_ref(*track).c_str();
         ev.value = NULL;
         ev.invalid = invalid;
@@ -10270,6 +10618,133 @@ private:
         return count * per_item;
     }
 
+    struct RepeatedTopologyCapacitySnapshot {
+        std::size_t nodes;
+        std::size_t tracks;
+        std::size_t track_runtime;
+        std::size_t scalar_getter_storage;
+        std::size_t bitfield_storage_created_keys;
+        std::size_t objects;
+        std::size_t object_created_keys;
+        std::size_t lazy_value_watches;
+        std::size_t all_track_ids;
+        std::size_t parallel_track_ids;
+        std::size_t main_thread_track_ids;
+        std::size_t dirty_peek_groups;
+        std::size_t dirty_peek_ranges;
+        std::size_t dirty_peek_leaves;
+        std::size_t dirty_wave_value_groups;
+        std::size_t dirty_wave_value_ranges;
+        std::size_t dirty_wave_value_leaves;
+        std::size_t dirty_wave_value_addr_table;
+        std::size_t dirty_wave_array_bulk_ranges;
+        std::size_t dirty_wave_array_leaves;
+        std::size_t object_id_by_key;
+        std::size_t bitfield_storage_by_key;
+        std::size_t dirty_peek_group_by_key;
+        std::size_t dirty_peek_storage_by_key;
+        std::size_t dirty_wave_value_group_by_key;
+        std::size_t dirty_wave_array_slice_by_key;
+        std::size_t dirty_wave_array_slice_by_address_width;
+        std::size_t dirty_wave_array_bulk_range_by_key;
+        std::size_t dirty_wave_array_bulk_range_by_address;
+    };
+
+    RepeatedTopologyCapacitySnapshot repeated_topology_capacity_snapshot_() const {
+        RepeatedTopologyCapacitySnapshot out;
+        out.nodes = nodes_.size();
+        out.tracks = tracks_.size();
+        out.track_runtime = track_runtime_.size();
+        out.scalar_getter_storage = scalar_getter_storage_.size();
+        out.bitfield_storage_created_keys = bitfield_storage_created_keys_.size();
+        out.objects = objects_.size();
+        out.object_created_keys = object_created_keys_.size();
+        out.lazy_value_watches = lazy_value_watches_.size();
+        out.all_track_ids = all_track_ids_.size();
+        out.parallel_track_ids = parallel_track_ids_.size();
+        out.main_thread_track_ids = main_thread_track_ids_.size();
+        out.dirty_peek_groups = dirty_peek_groups_.size();
+        out.dirty_peek_ranges = dirty_peek_ranges_.size();
+        out.dirty_peek_leaves = dirty_peek_leaves_.size();
+        out.dirty_wave_value_groups = dirty_wave_value_groups_.size();
+        out.dirty_wave_value_ranges = dirty_wave_value_ranges_.size();
+        out.dirty_wave_value_leaves = dirty_wave_value_leaves_.size();
+        out.dirty_wave_value_addr_table = dirty_wave_value_addr_table_.size();
+        out.dirty_wave_array_bulk_ranges = dirty_wave_array_bulk_ranges_.size();
+        out.dirty_wave_array_leaves = dirty_wave_array_leaves_.size();
+        out.object_id_by_key = object_id_by_key_.size();
+        out.bitfield_storage_by_key = bitfield_storage_by_key_.size();
+        out.dirty_peek_group_by_key = dirty_peek_group_by_key_.size();
+        out.dirty_peek_storage_by_key = dirty_peek_storage_by_key_.size();
+        out.dirty_wave_value_group_by_key = dirty_wave_value_group_by_key_.size();
+        out.dirty_wave_array_slice_by_key = dirty_wave_array_slice_by_key_.size();
+        out.dirty_wave_array_slice_by_address_width = dirty_wave_array_slice_by_address_width_.size();
+        out.dirty_wave_array_bulk_range_by_key = dirty_wave_array_bulk_range_by_key_.size();
+        out.dirty_wave_array_bulk_range_by_address = dirty_wave_array_bulk_range_by_address_.size();
+        return out;
+    }
+
+    template <typename T>
+    void reserve_repeated_vector_delta_(std::vector<T>& values,
+                                        std::size_t before,
+                                        std::size_t repetitions) {
+        if (repetitions == 0 || values.size() <= before) return;
+        const std::size_t per_element = values.size() - before;
+        values.reserve(checked_append_reserve_target_(
+            values.size(), checked_mul_for_reserve_(repetitions, per_element)));
+    }
+
+    template <typename HashContainer>
+    void reserve_repeated_hash_delta_(HashContainer& values,
+                                      std::size_t before,
+                                      std::size_t repetitions,
+                                      std::size_t headroom_multiplier) {
+        if (repetitions == 0 || values.size() <= before) return;
+        const std::size_t per_element = values.size() - before;
+        const std::size_t expected_add = checked_mul_for_reserve_(repetitions, per_element);
+        values.reserve(checked_append_reserve_target_(
+            values.size(), checked_mul_for_reserve_(expected_add, headroom_multiplier)));
+    }
+
+    void reserve_repeated_topology_from_first_(const RepeatedTopologyCapacitySnapshot& before,
+                                               std::size_t remaining_elements) {
+        if (!options_.enable_wave_ptr_array_batch_reserve || remaining_elements == 0) return;
+
+        reserve_repeated_vector_delta_(nodes_, before.nodes, remaining_elements);
+        reserve_repeated_vector_delta_(tracks_, before.tracks, remaining_elements);
+        reserve_repeated_vector_delta_(track_runtime_, before.track_runtime, remaining_elements);
+        reserve_repeated_vector_delta_(scalar_getter_storage_, before.scalar_getter_storage, remaining_elements);
+        reserve_repeated_vector_delta_(bitfield_storage_created_keys_, before.bitfield_storage_created_keys, remaining_elements);
+        reserve_repeated_vector_delta_(objects_, before.objects, remaining_elements);
+        reserve_repeated_vector_delta_(object_created_keys_, before.object_created_keys, remaining_elements);
+        reserve_repeated_vector_delta_(lazy_value_watches_, before.lazy_value_watches, remaining_elements);
+        reserve_repeated_vector_delta_(all_track_ids_, before.all_track_ids, remaining_elements);
+        reserve_repeated_vector_delta_(parallel_track_ids_, before.parallel_track_ids, remaining_elements);
+        reserve_repeated_vector_delta_(main_thread_track_ids_, before.main_thread_track_ids, remaining_elements);
+        reserve_repeated_vector_delta_(dirty_peek_groups_, before.dirty_peek_groups, remaining_elements);
+        reserve_repeated_vector_delta_(dirty_peek_ranges_, before.dirty_peek_ranges, remaining_elements);
+        reserve_repeated_vector_delta_(dirty_peek_leaves_, before.dirty_peek_leaves, remaining_elements);
+        reserve_repeated_vector_delta_(dirty_wave_value_groups_, before.dirty_wave_value_groups, remaining_elements);
+        reserve_repeated_vector_delta_(dirty_wave_value_ranges_, before.dirty_wave_value_ranges, remaining_elements);
+        reserve_repeated_vector_delta_(dirty_wave_value_leaves_, before.dirty_wave_value_leaves, remaining_elements);
+        reserve_repeated_vector_delta_(dirty_wave_value_addr_table_, before.dirty_wave_value_addr_table, remaining_elements);
+        reserve_repeated_vector_delta_(dirty_wave_array_bulk_ranges_, before.dirty_wave_array_bulk_ranges, remaining_elements);
+        reserve_repeated_vector_delta_(dirty_wave_array_leaves_, before.dirty_wave_array_leaves, remaining_elements);
+
+        // Match the old proven lookup load: object keys were one-per-reserved
+        // object, while storage and dirty hot maps kept two buckets of demand
+        // per observed element.
+        reserve_repeated_hash_delta_(object_id_by_key_, before.object_id_by_key, remaining_elements, 1u);
+        reserve_repeated_hash_delta_(bitfield_storage_by_key_, before.bitfield_storage_by_key, remaining_elements, 2u);
+        reserve_repeated_hash_delta_(dirty_peek_group_by_key_, before.dirty_peek_group_by_key, remaining_elements, 2u);
+        reserve_repeated_hash_delta_(dirty_peek_storage_by_key_, before.dirty_peek_storage_by_key, remaining_elements, 2u);
+        reserve_repeated_hash_delta_(dirty_wave_value_group_by_key_, before.dirty_wave_value_group_by_key, remaining_elements, 2u);
+        reserve_repeated_hash_delta_(dirty_wave_array_slice_by_key_, before.dirty_wave_array_slice_by_key, remaining_elements, 2u);
+        reserve_repeated_hash_delta_(dirty_wave_array_slice_by_address_width_, before.dirty_wave_array_slice_by_address_width, remaining_elements, 2u);
+        reserve_repeated_hash_delta_(dirty_wave_array_bulk_range_by_key_, before.dirty_wave_array_bulk_range_by_key, remaining_elements, 2u);
+        reserve_repeated_hash_delta_(dirty_wave_array_bulk_range_by_address_, before.dirty_wave_array_bulk_range_by_address, remaining_elements, 2u);
+    }
+
     void reserve_topology_append_(std::size_t nodes,
                                   std::size_t tracks,
                                   std::size_t objects,
@@ -10301,13 +10776,24 @@ private:
     void reserve_wave_ptr_array_expansion_(std::size_t declared_count) {
         if (!options_.enable_wave_ptr_array_batch_reserve || declared_count < 2) return;
         typedef typename detail::remove_cvref<Pointee>::type CleanPointee;
+#if defined(WAVE_RUNTIME_BENCH_LEGACY_WAVE_PTR_ARRAY_RESERVE)
         if (reflect::is_reflected<CleanPointee>::value) {
             reserve_topology_append_(
                 checked_add_for_reserve_(checked_mul_for_reserve_(declared_count, 8u), 1u),
                 checked_mul_for_reserve_(declared_count, 8u),
                 checked_mul_for_reserve_(declared_count, 2u),
                 checked_mul_for_reserve_(declared_count, 2u));
-        } else if (detail::is_leaf_scalar<CleanPointee>::value) {
+            return;
+        }
+#else
+        // Reflected arrays reserve from the first real element after it has
+        // expanded. A fixed tracks-per-element guess caused large persistent
+        // vector over-capacity on homogeneous model arrays.
+        if (reflect::is_reflected<CleanPointee>::value) {
+            return;
+        }
+#endif
+        if (detail::is_leaf_scalar<CleanPointee>::value) {
             reserve_topology_append_(checked_add_for_reserve_(declared_count, 1u), declared_count, 0, 0);
         } else {
             reserve_topology_append_(
@@ -11031,7 +11517,7 @@ private:
         const TrackId id = next_track_id_++;
         TrackDesc& track = ensure_id_slot_reserved(tracks_, id, options_.id_slot_track_growth_chunk);
         track = TrackDesc();
-        track.id = id;
+        track.id = compact_topology_id_(id, "track id");
         track.node_id = 0;
         track.kind = ValueKind::UnsignedInt;
         TrackRuntimeState& runtime = ensure_id_slot_reserved(track_runtime_, id, options_.id_slot_track_growth_chunk);
@@ -11044,7 +11530,7 @@ private:
         track.scalar_kind = scalar_kind;
         track.bit_width = byte_count * 8u;
         track.thread_class = TrackThreadClass::ParallelSafe;
-        track.storage_id = id;
+        track.storage_id = compact_topology_id_(id, "storage id");
         track.storage_only = true;
         track.memory_ctx = static_cast<const void*>(address);
         track.memory_byte_width = byte_count;
@@ -11113,12 +11599,12 @@ private:
         const TrackId id = next_track_id_++;
         TrackDesc& track = ensure_id_slot_reserved(tracks_, id, options_.id_slot_track_growth_chunk);
         track = TrackDesc();
-        track.id = id;
-        track.node_id = node_id;
+        track.id = compact_topology_id_(id, "track id");
+        track.node_id = compact_topology_id_(node_id, "track node id");
         track.kind = kind;
         track.scalar_kind = ScalarSampleKind::None;
         track.bit_width = bit_width;
-        track.storage_id = storage_id;
+        track.storage_id = compact_topology_id_(storage_id, "storage id");
         track.bit_offset = bit_offset;
         track.declaration_only = true;
         TrackRuntimeState& runtime = ensure_id_slot_reserved(track_runtime_, id, options_.id_slot_track_growth_chunk);
@@ -12270,6 +12756,10 @@ private:
                                            std::size_t declared_count) {
         if (needs_full_topology_paths_() || trace_level_limit_enabled_) return false;
         for (std::size_t i = 0; i < declared_count; ++i) {
+#if !defined(WAVE_RUNTIME_BENCH_LEGACY_WAVE_PTR_ARRAY_RESERVE)
+            RepeatedTopologyCapacitySnapshot capacity_before;
+            if (i == 0) capacity_before = repeated_topology_capacity_snapshot_();
+#endif
             TopologyCheckpoint elem_cp = make_topology_checkpoint(node_id);
             const CleanPointee* elem = static_cast<const CleanPointee*>(target + i);
             const NodeId child_node = expand_reflected_wave_ptr_array_element_fast_<CleanPointee>(
@@ -12278,6 +12768,10 @@ private:
                 elem);
             if (child_node == 0) {
                 rollback_topology_to(elem_cp);
+#if !defined(WAVE_RUNTIME_BENCH_LEGACY_WAVE_PTR_ARRAY_RESERVE)
+            } else if (i == 0 && declared_count > 1) {
+                reserve_repeated_topology_from_first_(capacity_before, declared_count - 1u);
+#endif
             }
         }
         return true;
@@ -12333,6 +12827,10 @@ private:
         }
 
         for (std::size_t i = 0; i < declared_count; ++i) {
+#if !defined(WAVE_RUNTIME_BENCH_LEGACY_WAVE_PTR_ARRAY_RESERVE)
+            RepeatedTopologyCapacitySnapshot capacity_before;
+            if (i == 0) capacity_before = repeated_topology_capacity_snapshot_();
+#endif
             const std::string child_path = make_index_child_path_(path, i);
             TopologyCheckpoint elem_cp = make_topology_checkpoint(node_id);
             const CleanPointee* elem = static_cast<const CleanPointee*>(target + i);
@@ -12342,6 +12840,10 @@ private:
                 elem);
             if (child_node == 0) {
                 rollback_topology_to(elem_cp);
+#if !defined(WAVE_RUNTIME_BENCH_LEGACY_WAVE_PTR_ARRAY_RESERVE)
+            } else if (i == 0 && declared_count > 1 && reflect::is_reflected<CleanPointee>::value) {
+                reserve_repeated_topology_from_first_(capacity_before, declared_count - 1u);
+#endif
             }
         }
 
