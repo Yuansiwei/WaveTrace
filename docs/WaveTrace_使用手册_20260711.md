@@ -286,7 +286,27 @@ wave::ensure_dynamic_type_registered<Payload>();
 | `enable_flat_leaf_fast_table` | `true` | 稳定拓扑 flat 快路径 |
 | `enable_node_name_interning` | `true` | 重复局部节点名驻留 |
 | `enable_parallel_topology_expansion` | `true` | 大型 `WavePtr<T[]>` 并行展开 |
-| `topology_expansion_threads` | `16` | 拓扑展开线程数 |
+| `topology_expansion_threads` | `16` | 拓扑展开线程数；实测通常在 8 到 16 线程趋于内存带宽饱和 |
+| `parallel_topology_min_work_items_per_element` | `32` | 单元素至少包含的物理叶子数；手写 visitor 以首元素实际 track 数估算 |
+| `parallel_topology_batch_elements` | `131072` | 每轮 fragment 展开的最大元素数 |
+
+ReflectGen 为每个生成类输出成员名表，并在 visitor 中传递 `class_id + member_id`。
+运行时按类一次性注册整张表，节点直接使用整数 name id，不再为每个对象实例
+重复执行字段名字符串比较、哈希或 intern。同一个类的所有实例复用成员 ID；
+不同类即使成员同名也保持不同身份。并行 topology fragment 合并同样按这组
+整数身份映射，成员名字符串只用于最终显示。
+
+固定大小、无实例相关 alias/getter/dynamic 元数据的生成类型会使用 repeated-topology
+direct path：首元素正常反射并作为可执行模板，运行时预分配最终 node/track/object
+区间，各线程直接写自己的最终区间，不创建临时 Tracer fragment，也不执行二次
+remap/append。`wave::array` 支持该路径；其 bulk/slice key、memory block cursor、
+storage id、leaf-ref、byte-map 和 shadow 会随外层元素一起重定位。
+
+存在 `DynamicTraceTarget`、dirty peek hook、getter storage、union/storage alias 或对象外
+采样地址时，运行时会拒绝 direct path 并保留通用 fragment/串行路径。可用
+`tracer.direct_topology_cloned_elements()` 确认实际进入 direct path 的元素数；不能只看
+`parallel_topology_expanded_elements()`。
+
 | `enable_parallel_sampling` | `false` | 通用并行采样开关 |
 | `sampling_threads` | `15` | 后台 worker 数；加 caller 共 16 线程 |
 | `parallel_sampling_threshold` | `8192` | 通用并行门槛 |

@@ -6437,6 +6437,27 @@ namespace
             os << "{\n";
             os << "    typedef " << recType << " Self;\n";
             os << "    static ::reflect::TopologyTypeEstimate topology_type_estimate() noexcept;\n";
+            os << "    static const void* generated_class_id() noexcept { return ::reflect::type_tag_of<Self>(); }\n";
+            os << "    static const char* const* generated_member_names() noexcept\n";
+            os << "    {\n";
+            if (members.empty())
+            {
+                os << "        return NULL;\n";
+            }
+            else
+            {
+                os << "        static const char* const names[] = {\n";
+                for (std::size_t i = 0; i < members.size(); ++i)
+                {
+                    os << "            \"" << EscapeString(members[i].displayName) << "\"";
+                    if (i + 1u != members.size()) os << ",";
+                    os << "\n";
+                }
+                os << "        };\n";
+                os << "        return names;\n";
+            }
+            os << "    }\n";
+            os << "    static std::size_t generated_member_count() noexcept { return " << members.size() << "u; }\n";
 
             const std::map<std::string, std::vector<const RecordInfo*> >::const_iterator ait = aliasChildrenByOwner.find(rec.qualifiedName);
             if (ait != aliasChildrenByOwner.end())
@@ -6479,32 +6500,32 @@ namespace
                 {
                     usedGetterConst = true;
                     const std::string getterName = BuildBitGetterName(m.displayName);
-                    os << "        on_getter(\"" << EscapeString(m.displayName) << "\", &::wave::ReflectAccess<" << recType << ">::" << getterName << ", " << m.bitWidth << ", " << m.bitOffset << ");\n";
+                    os << "        ::wave::detail::invoke_getter_visitor(on_getter, \"" << EscapeString(m.displayName) << "\", &::wave::ReflectAccess<" << recType << ">::" << getterName << ", " << m.bitWidth << ", " << m.bitOffset << ", ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                 }
                 else
                 {
                     if (m.asBoolStorage)
                     {
-                        os << "        on_ptr(\"" << EscapeString(m.displayName) << "\", ::wave::as_bool_storage_ptr(std::addressof(" << m.constExpr << ")));\n";
+                        os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", ::wave::as_bool_storage_ptr(std::addressof(" << m.constExpr << ")), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
                     else if (m.isUnionField)
                     {
                         if (m.unionStorageBytes > 0)
                         {
-                            os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.constExpr << "), ::wave::detail::UnionFieldTag(), " << m.unionStorageBytes << ", ::wave::detail::UnionFieldBase(std::addressof(" << m.constExpr << ")));\n";
+                            os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.constExpr << "), ::wave::detail::UnionFieldTag(), " << m.unionStorageBytes << ", ::wave::detail::UnionFieldBase(std::addressof(" << m.constExpr << ")), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                         }
                         else
                         {
-                            os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.constExpr << "), ::wave::detail::UnionFieldTag(), sizeof(Self));\n";
+                            os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.constExpr << "), ::wave::detail::UnionFieldTag(), sizeof(Self), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                         }
                     }
                     else if (m.exprIsPointerAlready)
                     {
-                        os << "        on_ptr(\"" << EscapeString(m.displayName) << "\", " << m.constExpr << ");\n";
+                        os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.constExpr << ", ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
                     else
                     {
-                        os << "        on_ptr(\"" << EscapeString(m.displayName) << "\", std::addressof(" << m.constExpr << "));\n";
+                        os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.constExpr << "), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
                 }
             }
@@ -6529,38 +6550,46 @@ namespace
                 {
                     usedGetterMut = true;
                     const std::string getterName = BuildBitGetterName(m.displayName);
-                    os << "        on_getter(\"" << EscapeString(m.displayName) << "\", &::wave::ReflectAccess<" << recType << ">::" << getterName << ", " << m.bitWidth << ", " << m.bitOffset << ");\n";
+                    os << "        ::wave::detail::invoke_getter_visitor(on_getter, \"" << EscapeString(m.displayName) << "\", &::wave::ReflectAccess<" << recType << ">::" << getterName << ", " << m.bitWidth << ", " << m.bitOffset << ", ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                 }
                 else
                 {
                     if (m.asBoolStorage)
                     {
-                        os << "        on_ptr(\"" << EscapeString(m.displayName) << "\", ::wave::as_bool_storage_ptr(std::addressof(" << m.mutExpr << ")));\n";
+                        os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", ::wave::as_bool_storage_ptr(std::addressof(" << m.mutExpr << ")), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
                     else if (m.isUnionField)
                     {
                         if (m.unionStorageBytes > 0)
                         {
-                            os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.mutExpr << "), ::wave::detail::UnionFieldTag(), " << m.unionStorageBytes << ", ::wave::detail::UnionFieldBase(std::addressof(" << m.mutExpr << ")));\n";
+                            os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.mutExpr << "), ::wave::detail::UnionFieldTag(), " << m.unionStorageBytes << ", ::wave::detail::UnionFieldBase(std::addressof(" << m.mutExpr << ")), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                         }
                         else
                         {
-                            os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.mutExpr << "), ::wave::detail::UnionFieldTag(), sizeof(Self));\n";
+                            os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.mutExpr << "), ::wave::detail::UnionFieldTag(), sizeof(Self), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                         }
                     }
                     else if (m.exprIsPointerAlready)
                     {
-                        os << "        on_ptr(\"" << EscapeString(m.displayName) << "\", " << m.mutExpr << ");\n";
+                        os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.mutExpr << ", ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
                     else
                     {
-                        os << "        on_ptr(\"" << EscapeString(m.displayName) << "\", std::addressof(" << m.mutExpr << "));\n";
+                        os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.mutExpr << "), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
                 }
             }
             os << "        (void)on_value;\n";
             if (!usedGetterMut) os << "        (void)on_getter;\n";
             os << "    }\n";
+            os << "};\n\n";
+            os << BuildClassSpecializationPrefix(rec);
+            os << "struct GeneratedMemberNameTable<" << recType << ">\n";
+            os << "{\n";
+            os << "    static constexpr bool generated = true;\n";
+            os << "    static const void* class_id() noexcept { return ReflectAccess<" << recType << ">::generated_class_id(); }\n";
+            os << "    static const char* const* names() noexcept { return ReflectAccess<" << recType << ">::generated_member_names(); }\n";
+            os << "    static std::size_t count() noexcept { return ReflectAccess<" << recType << ">::generated_member_count(); }\n";
             os << "};\n\n";
         }
         os << "} // namespace wave\n\n";

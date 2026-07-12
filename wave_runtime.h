@@ -351,7 +351,7 @@ struct BuildOptions {
     std::size_t topology_expansion_threads = 16;
     std::size_t parallel_topology_min_elements = 8192;
     std::size_t parallel_topology_min_work_items_per_element = 32;
-    std::size_t parallel_topology_batch_elements = 65536;
+    std::size_t parallel_topology_batch_elements = 131072;
 
 
     // Dirty-peek optimization.  When enabled, value sources that expose a
@@ -1787,6 +1787,19 @@ struct ObjectEntry {
     ObjectEntry() : id(0), alive(true), debug_name_id(kInvalidIndex) {}
 };
 
+struct ObjectArrayRange {
+    const unsigned char* base;
+    const void* type_tag;
+    std::size_t element_size;
+    std::size_t element_count;
+    ObjectId first_object_id;
+    std::size_t objects_per_element;
+
+    ObjectArrayRange()
+        : base(NULL), type_tag(NULL), element_size(0), element_count(0),
+          first_object_id(0), objects_per_element(0) {}
+};
+
 
 // Lazy value watch for non-scalar port-like objects.
 // add_root()/tree construction must not call sc_port::operator->(), read(), or
@@ -1871,7 +1884,9 @@ class Tracer {
           trace_level_limit_enabled_(detail::wave_trace_level_limit().enabled),
           trace_level_limit_max_dot_count_(detail::wave_trace_level_limit().max_dot_count),
           next_node_id_(1), next_track_id_(1), next_object_id_(1), next_watch_id_(1),
-          nodes_exported_(false), nodes_(1), tracks_(1), track_runtime_(1), objects_(1), lazy_value_watches_(1), root_watches_(1),
+          nodes_exported_(false), nodes_(1), generated_name_owner_id_(next_generated_name_owner_id_()),
+          active_generated_member_name_id_(kInvalidIndex), tracks_(1), track_runtime_(1), objects_(1),
+          active_object_array_range_(static_cast<std::size_t>(-1)), lazy_value_watches_(1), root_watches_(1),
           flat_leaf_fast_table_valid_(false), flat_leaf_fast_table_complete_(false) {
         if (active_tracer_registered_) {
             ::wave::detail::set_wave_value_notify_fn(&Tracer::wave_value_notify_bridge_);
@@ -1892,11 +1907,6 @@ class Tracer {
             }
         }
         node_name_hot_cache_.reserve(128u);
-        // Direct-mapped pointer cache.  Visitors normally pass stable string
-        // literals, while generated visitors may reuse one stack buffer with
-        // changing contents.  Fixed storage keeps both cases O(1) without
-        // retaining an unbounded list of transient pointer values.
-        node_name_literal_cache_.resize(64u);
         open_debug_log();
         open_parallel_flat_leaf_load_log_();
         if (options_.debug_log) debug_log_msg(std::string("construct tracer"));
@@ -2087,6 +2097,9 @@ public:
     std::size_t parallel_topology_fallback_batches() const noexcept {
         return parallel_topology_fallback_batches_;
     }
+    std::size_t direct_topology_cloned_elements() const noexcept {
+        return direct_topology_cloned_elements_;
+    }
     const std::vector<ObjectEntry>& objects() const { return objects_; }
 
     std::size_t root_watch_count() const noexcept {
@@ -2158,13 +2171,16 @@ public:
         append_vector_memory_row_(os, "tracks", tracks_, total);
         append_vector_memory_row_(os, "track_runtime", track_runtime_, total);
         append_vector_memory_row_(os, "objects", objects_, total);
+        append_vector_memory_row_(os, "object_array_ranges", object_array_ranges_, total);
         append_vector_memory_row_(os, "lazy_value_watches", lazy_value_watches_, total);
         append_vector_memory_row_(os, "root_watches", root_watches_, total);
         append_deque_memory_row_(os, "node_names", node_names_, total);
         append_deque_memory_row_(os, "node_debug_paths", node_debug_paths_, total);
         append_deque_memory_row_(os, "track_paths", track_paths_, total);
         append_deque_memory_row_(os, "object_debug_names", object_debug_names_, total);
+        append_vector_memory_row_(os, "node_name_generated_keys", node_name_generated_keys_, total);
         append_hash_memory_row_(os, "node_name_ids", node_name_ids_, total);
+        append_hash_memory_row_(os, "generated_member_name_ids", generated_member_name_ids_, total);
         append_hash_memory_row_(os, "object_id_by_key", object_id_by_key_, total);
         append_hash_memory_row_(os, "bitfield_storage_by_key", bitfield_storage_by_key_, total);
         append_vector_memory_row_(os, "all_track_ids", all_track_ids_, total);
@@ -2370,6 +2386,15 @@ public:
                 element_size,
                 element_count);
             if (range_id != kInvalidIndex) {
+                if (tls.owner->options_.debug_log_dirty_wave_array_marks) {
+                    tls.owner->debug_log_msg(
+                        std::string("dirty_wave_array bulk lookup range=") +
+                        detail::to_string_unsigned(range_id) +
+                        " query=" + detail::pointer_to_string(first_element_address) +
+                        " type_tag=" + detail::pointer_to_string(element_type_tag) +
+                        " element_size=" + detail::to_string_unsigned(element_size) +
+                        " element_count=" + detail::to_string_unsigned(element_count));
+                }
                 return tls.owner->try_mark_dirty_wave_array_bulk_range_id_(
                     range_id,
                     first_element_address,
@@ -2426,12 +2451,14 @@ public:
         ThreadTraceLocal& tls = current_thread_trace_local();
         Tracer* owner = tls.owner;
         if (!owner) return 0;
-        const std::uintptr_t owner_bits = reinterpret_cast<std::uintptr_t>(owner);
-        std::uint64_t owner_hash = static_cast<std::uint64_t>(owner_bits >> 4);
-        owner_hash ^= static_cast<std::uint64_t>(owner_bits >> 32);
-        owner_hash &= 0xffffffffULL;
-        if (owner_hash == 0) owner_hash = 1;
-        return (owner_hash << 32) | static_cast<std::uint64_t>(owner->dirty_epoch_);
+        // A stack-allocated Tracer may be destroyed and reconstructed at the
+        // same address while allocator-backed wave arrays also reuse their old
+        // addresses.  Pointer hashing would then preserve a stale TLS de-dup
+        // key across two independent traces.  The monotonically assigned
+        // instance id makes the epoch token lifecycle-safe.
+        std::uint64_t instance = owner->generated_name_owner_id_ & 0xffffffffULL;
+        if (instance == 0u) instance = 1u;
+        return (instance << 32) | static_cast<std::uint64_t>(owner->dirty_epoch_);
     }
 
     void attach_current_thread_for_dirty_peek() {
@@ -2858,14 +2885,26 @@ private:
         NodeNameHotCacheEntry(const std::string& n, std::uint32_t i) : name(n), id(i) {}
     };
 
-    struct NodeNameLiteralCacheEntry {
-        const char* literal;
-        std::string name;
-        std::uint32_t id;
+    struct GeneratedMemberNameKey {
+        const void* class_id;
+        std::uint32_t member_id;
 
-        NodeNameLiteralCacheEntry() : literal(NULL), id(kInvalidIndex) {}
-        NodeNameLiteralCacheEntry(const char* n, std::uint32_t i)
-            : literal(n), name(n ? n : ""), id(i) {}
+        GeneratedMemberNameKey() : class_id(NULL), member_id(kInvalidIndex) {}
+        GeneratedMemberNameKey(const void* class_id_in, std::uint32_t member_id_in)
+            : class_id(class_id_in), member_id(member_id_in) {}
+
+        bool valid() const { return class_id != NULL && member_id != kInvalidIndex; }
+        bool operator==(const GeneratedMemberNameKey& other) const {
+            return class_id == other.class_id && member_id == other.member_id;
+        }
+    };
+
+    struct GeneratedMemberNameKeyHash {
+        std::size_t operator()(const GeneratedMemberNameKey& key) const {
+            const std::size_t a = std::hash<const void*>()(key.class_id);
+            const std::size_t b = std::hash<std::uint32_t>()(key.member_id);
+            return a ^ (b + static_cast<std::size_t>(0x9e3779b9u) + (a << 6u) + (a >> 2u));
+        }
     };
 
     NodeId next_node_id_;
@@ -2875,17 +2914,21 @@ private:
     std::size_t parallel_topology_expanded_elements_ = 0;
     std::size_t parallel_topology_batches_ = 0;
     std::size_t parallel_topology_fallback_batches_ = 0;
+    std::size_t direct_topology_cloned_elements_ = 0;
 
     // Id-indexed storage. Id 0 is unused, so NodeId/TrackId/WatchId can be used
     // as a direct vector index. This removes per-cycle unordered_map iteration and
     // lookup overhead after the reflection tree has been built.
     std::vector<NodeDesc> nodes_;
     std::deque<std::string> node_names_;
+    mutable std::string generated_index_name_scratch_;
+    std::vector<GeneratedMemberNameKey> node_name_generated_keys_;
     std::unordered_map<std::string, std::uint32_t> node_name_ids_;
-    std::unordered_map<std::size_t, std::uint32_t> generated_index_node_name_ids_;
+    std::unordered_map<GeneratedMemberNameKey, std::uint32_t, GeneratedMemberNameKeyHash> generated_member_name_ids_;
     std::vector<NodeNameHotCacheEntry> node_name_hot_cache_;
     std::size_t node_name_hot_cache_next_ = 0;
-    std::vector<NodeNameLiteralCacheEntry> node_name_literal_cache_;
+    std::uint64_t generated_name_owner_id_;
+    std::uint32_t active_generated_member_name_id_;
     std::deque<std::string> node_debug_paths_;
     std::vector<TrackDesc> tracks_;
     std::deque<std::string> track_paths_;
@@ -2895,6 +2938,8 @@ private:
     std::vector<BitfieldStorageKey> bitfield_storage_created_keys_;
     std::vector<UnionAliasContext> union_alias_context_stack_;
     std::vector<ObjectEntry> objects_;
+    std::vector<ObjectArrayRange> object_array_ranges_;
+    std::size_t active_object_array_range_;
     std::deque<std::string> object_debug_names_;
     std::vector<LazyValueWatch> lazy_value_watches_;
     std::vector<RootWatch> root_watches_;
@@ -6354,6 +6399,17 @@ private:
         if (range_id == kInvalidIndex || range_id >= dirty_wave_array_bulk_ranges_.size()) return;
         DirtyWaveArrayBulkRange& range = dirty_wave_array_bulk_ranges_[range_id];
         if (range.queued_epoch == dirty_epoch_) return;
+        if (options_.debug_log_dirty_wave_array_marks) {
+            debug_log_msg(
+                std::string("dirty_wave_array bulk mark range=") +
+                detail::to_string_unsigned(range_id) +
+                " begin_block=" + detail::to_string_unsigned(range.begin.block_id) +
+                " begin_byte=" + detail::to_string_unsigned(range.begin.byte_offset) +
+                " end_block=" + detail::to_string_unsigned(range.end.block_id) +
+                " end_byte=" + detail::to_string_unsigned(range.end.byte_offset) +
+                " registered=" + detail::pointer_to_string(
+                    range.bulk_key_valid ? range.key.first_address : range.element_key.address));
+        }
         range.queued_epoch = dirty_epoch_;
         if (global_dirty_wave_array_bulk_range_ids_.size() < dirty_wave_array_bulk_ranges_.size()) {
             try { global_dirty_wave_array_bulk_range_ids_.resize(dirty_wave_array_bulk_ranges_.size()); }
@@ -8906,6 +8962,7 @@ private:
         std::size_t scalar_getter_storage_size;
         std::size_t bitfield_storage_created_keys_size;
         std::size_t objects_size;
+        std::size_t object_array_ranges_size;
         std::size_t object_debug_names_size;
         std::size_t object_created_keys_size;
         std::size_t lazy_value_watches_size;
@@ -8963,6 +9020,7 @@ private:
         cp.scalar_getter_storage_size = scalar_getter_storage_.size();
         cp.bitfield_storage_created_keys_size = bitfield_storage_created_keys_.size();
         cp.objects_size = objects_.size();
+        cp.object_array_ranges_size = object_array_ranges_.size();
         cp.object_debug_names_size = object_debug_names_.size();
         cp.object_created_keys_size = object_created_keys_.size();
         cp.lazy_value_watches_size = lazy_value_watches_.size();
@@ -9029,6 +9087,10 @@ private:
         track_runtime_.resize(cp.track_runtime_size);
         scalar_getter_storage_.resize(cp.scalar_getter_storage_size);
         objects_.resize(cp.objects_size);
+        object_array_ranges_.resize(cp.object_array_ranges_size);
+        if (active_object_array_range_ >= object_array_ranges_.size()) {
+            active_object_array_range_ = static_cast<std::size_t>(-1);
+        }
         object_debug_names_.resize(cp.object_debug_names_size);
         lazy_value_watches_.resize(cp.lazy_value_watches_size);
         all_track_ids_.resize(cp.all_track_ids_size);
@@ -9637,8 +9699,29 @@ private:
         return empty;
     }
 
+    static const std::uint32_t kGeneratedIndexNameMarker_ = 0x80000000u;
+    static const std::uint32_t kGeneratedIndexNamePayloadMask_ = 0x7fffffffu;
+
+    static bool is_generated_index_name_id_(std::uint32_t id) {
+        return id != kInvalidIndex && (id & kGeneratedIndexNameMarker_) != 0u;
+    }
+
+    static std::uint32_t generated_index_name_id_(std::size_t index) {
+        return index < static_cast<std::size_t>(kGeneratedIndexNamePayloadMask_)
+            ? kGeneratedIndexNameMarker_ | static_cast<std::uint32_t>(index)
+            : kInvalidIndex;
+    }
+
     const std::string& node_name_ref(const NodeDesc& node) const {
         const std::uint32_t id = node.name_id;
+        if (is_generated_index_name_id_(id)) {
+            generated_index_name_scratch_.clear();
+            generated_index_name_scratch_.push_back('[');
+            generated_index_name_scratch_ += detail::to_string_unsigned(
+                static_cast<std::uint64_t>(id & kGeneratedIndexNamePayloadMask_));
+            generated_index_name_scratch_.push_back(']');
+            return generated_index_name_scratch_;
+        }
         if (id == kInvalidIndex || static_cast<std::size_t>(id) >= node_names_.size()) {
             return empty_node_string();
         }
@@ -9668,35 +9751,18 @@ private:
     std::uint32_t append_node_name_(const std::string& name) {
         const std::uint32_t id = static_cast<std::uint32_t>(node_names_.size());
         node_names_.push_back(name);
+        node_name_generated_keys_.push_back(GeneratedMemberNameKey());
         return id;
     }
 
-    std::uint32_t append_generated_index_node_name_(std::size_t index) {
-        if (!active_tracer_registered_) {
-            const std::unordered_map<std::size_t, std::uint32_t>::const_iterator cached =
-                generated_index_node_name_ids_.find(index);
-            if (cached != generated_index_node_name_ids_.end()) return cached->second;
-        }
-        char text[32];
-        char digits[24];
-        std::size_t digit_count = 0;
-        std::size_t value = index;
-        do {
-            digits[digit_count++] = static_cast<char>('0' + (value % 10u));
-            value /= 10u;
-        } while (value != 0u && digit_count < sizeof(digits));
-
+    std::uint32_t append_generated_member_name_(const std::string& name,
+                                                const void* class_id,
+                                                std::uint32_t member_id) {
         const std::uint32_t id = static_cast<std::uint32_t>(node_names_.size());
-        node_names_.push_back(std::string());
-        std::string& name = node_names_.back();
-        std::size_t out = 0;
-        text[out++] = '[';
-        while (digit_count > 0u) text[out++] = digits[--digit_count];
-        text[out++] = ']';
-        name.assign(text, out);
-        if (!active_tracer_registered_) {
-            generated_index_node_name_ids_.insert(std::make_pair(index, id));
-        }
+        const GeneratedMemberNameKey key(class_id, member_id);
+        node_names_.push_back(name);
+        node_name_generated_keys_.push_back(key);
+        generated_member_name_ids_.insert(std::make_pair(key, id));
         return id;
     }
 
@@ -9753,38 +9819,54 @@ private:
         return id;
     }
 
+    static std::uint64_t next_generated_name_owner_id_() {
+        static std::atomic<std::uint64_t> next_id(1u);
+        return next_id.fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    template <typename T>
+    std::uint32_t generated_member_name_base_impl_(std::true_type) {
+        struct ThreadLocalBase {
+            std::uint64_t owner_id;
+            std::uint32_t base;
+            ThreadLocalBase() : owner_id(0), base(kInvalidIndex) {}
+        };
+        static thread_local ThreadLocalBase local;
+        if (local.owner_id == generated_name_owner_id_) return local.base;
+
+        const char* const* names = GeneratedMemberNameTable<T>::names();
+        const std::size_t count = GeneratedMemberNameTable<T>::count();
+        if ((count != 0u && names == NULL) ||
+            node_names_.size() + count > static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())) {
+            return kInvalidIndex;
+        }
+        const std::uint32_t base = static_cast<std::uint32_t>(node_names_.size());
+        const void* class_id = GeneratedMemberNameTable<T>::class_id();
+        for (std::size_t i = 0; i < count; ++i) {
+            append_generated_member_name_(
+                std::string(names[i] ? names[i] : ""),
+                class_id,
+                static_cast<std::uint32_t>(i));
+        }
+        local.owner_id = generated_name_owner_id_;
+        local.base = base;
+        return base;
+    }
+
+    template <typename T>
+    std::uint32_t generated_member_name_base_impl_(std::false_type) {
+        return kInvalidIndex;
+    }
+
+    template <typename T>
+    std::uint32_t generated_member_name_base_() {
+        return generated_member_name_base_impl_<T>(
+            std::integral_constant<bool, GeneratedMemberNameTable<T>::generated>());
+    }
+
     std::uint32_t node_name_id_for_literal_(const char* literal) {
         if (!literal) literal = "";
-        if (!options_.enable_node_name_interning) {
-            return append_node_name_(std::string(literal));
-        }
-        const std::size_t cache_index =
-            (reinterpret_cast<std::uintptr_t>(literal) >> 4u) &
-            (node_name_literal_cache_.size() - 1u);
-        NodeNameLiteralCacheEntry& cache_entry = node_name_literal_cache_[cache_index];
-        // Reflect visitors receive const char* for compatibility, but the
-        // caller may reuse a stack buffer for generated member names.  A
-        // pointer-only cache hit would collapse every name to the first value
-        // observed at that address, so validate the owned content snapshot.
-        if (cache_entry.id != kInvalidIndex &&
-            cache_entry.literal == literal &&
-            cache_entry.name == literal) {
-            return cache_entry.id;
-        }
-
-        const std::string name(literal);
-        std::unordered_map<std::string, std::uint32_t>::const_iterator it = node_name_ids_.find(name);
-        if (it != node_name_ids_.end()) {
-            cache_entry = NodeNameLiteralCacheEntry(literal, it->second);
-            remember_hot_node_name_id_(name, it->second);
-            return it->second;
-        }
-
-        const std::uint32_t id = append_node_name_(name);
-        node_name_ids_.insert(std::make_pair(name, id));
-        cache_entry = NodeNameLiteralCacheEntry(literal, id);
-        remember_hot_node_name_id_(name, id);
-        return id;
+        return intern_node_name_(std::string(literal));
     }
 
     std::uint32_t node_name_id_for_path_(const std::string& path) {
@@ -9965,7 +10047,10 @@ private:
                                      const char* name,
                                      NodeKind kind,
                                      ObjectId object_id) {
-        return create_node_with_name_id_(parent_id, node_name_id_for_literal_(name), kind, object_id);
+        const std::uint32_t name_id = active_generated_member_name_id_ != kInvalidIndex
+            ? active_generated_member_name_id_
+            : node_name_id_for_literal_(name);
+        return create_node_with_name_id_(parent_id, name_id, kind, object_id);
     }
 
     NodeId create_generated_index_node_(NodeId parent_id,
@@ -9978,7 +10063,10 @@ private:
         node.id = compact_topology_id_(id, "node id");
         node.parent_id = compact_topology_id_(parent_id, "parent node id");
         node.object_id = compact_topology_id_(object_id, "object id");
-        node.name_id = append_generated_index_node_name_(index);
+        node.name_id = generated_index_name_id_(index);
+        if (node.name_id == kInvalidIndex) {
+            throw std::overflow_error("wave::array generated index exceeds compact topology limit");
+        }
         node.kind = kind;
         node.alive = true;
 
@@ -9993,9 +10081,85 @@ private:
         return id;
     }
 
+    bool object_id_from_array_range_(const ObjectArrayRange& range,
+                                     const ObjectKey& key,
+                                     ObjectId& id) const {
+        if (!range.base || !key.address || key.type_tag != range.type_tag ||
+            range.element_size == 0u || range.objects_per_element == 0u) {
+            return false;
+        }
+        const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(range.base);
+        const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(key.address);
+        if (address < base) return false;
+        const std::uintptr_t delta = address - base;
+        if (delta % range.element_size != 0u) return false;
+        const std::size_t index = static_cast<std::size_t>(delta / range.element_size);
+        if (index >= range.element_count) return false;
+        id = range.first_object_id + static_cast<ObjectId>(index * range.objects_per_element);
+        return true;
+    }
+
+    bool find_object_array_range_id_(const ObjectKey& key, ObjectId& id) const {
+        if (active_object_array_range_ < object_array_ranges_.size() &&
+            object_id_from_array_range_(object_array_ranges_[active_object_array_range_], key, id)) {
+            return true;
+        }
+        for (std::size_t i = 0; i < object_array_ranges_.size(); ++i) {
+            if (i == active_object_array_range_) continue;
+            if (object_id_from_array_range_(object_array_ranges_[i], key, id)) return true;
+        }
+        return false;
+    }
+
+    std::size_t register_object_array_range_(const void* base,
+                                             const void* type_tag,
+                                             std::size_t element_size,
+                                             std::size_t element_count,
+                                             ObjectId first_object_id,
+                                             std::size_t objects_per_element) {
+        if (!base || !type_tag || element_size == 0u || element_count == 0u ||
+            first_object_id == 0u || objects_per_element == 0u) {
+            return static_cast<std::size_t>(-1);
+        }
+        ObjectArrayRange range;
+        range.base = static_cast<const unsigned char*>(base);
+        range.type_tag = type_tag;
+        range.element_size = element_size;
+        range.element_count = element_count;
+        range.first_object_id = first_object_id;
+        range.objects_per_element = objects_per_element;
+        object_array_ranges_.push_back(range);
+        return object_array_ranges_.size() - 1u;
+    }
+
     ObjectId ensure_object(const ObjectKey& key, const std::string& debug_name) {
         if (!key.address) return 0;
         ObjectId id = 0;
+        if (find_object_array_range_id_(key, id)) {
+            ObjectEntry* existing = id_lookup(objects_, id);
+            if (existing && existing->alive && existing->key == key) return existing->id;
+            if (id == next_object_id_) {
+                ++next_object_id_;
+                ObjectEntry& entry = ensure_id_slot_reserved(objects_, id, options_.id_slot_object_growth_chunk);
+                entry.id = id;
+                entry.key = key;
+                entry.alive = true;
+                if (!active_tracer_registered_) {
+                    // Isolated fragments still report their keys so the main
+                    // tracer can reject a real cross-fragment/global alias.
+                    // The fragment itself does not need a hash entry for this
+                    // fixed-stride root object.
+                    object_created_keys_.push_back(key);
+                }
+                if (options_.debug_log) {
+                    entry.debug_name_id = static_cast<std::uint32_t>(object_debug_names_.size());
+                    object_debug_names_.push_back(debug_name);
+                } else {
+                    entry.debug_name_id = kInvalidIndex;
+                }
+                return entry.id;
+            }
+        }
         std::unordered_map<ObjectKey, ObjectId, ObjectKeyHash>::iterator it = object_id_by_key_.find(key);
         if (it != object_id_by_key_.end()) {
             id = it->second;
@@ -10954,11 +11118,27 @@ private:
         result.node_name_remap.assign(fragment.node_names_.size(), kInvalidIndex);
         for (std::size_t local_name_id = 0; local_name_id < fragment.node_names_.size(); ++local_name_id) {
             std::string& name = fragment.node_names_[local_name_id];
-            if (options_.enable_node_name_interning && !is_generated_index_node_name_(name)) {
+            const GeneratedMemberNameKey generated_key =
+                local_name_id < fragment.node_name_generated_keys_.size()
+                    ? fragment.node_name_generated_keys_[local_name_id]
+                    : GeneratedMemberNameKey();
+            if (generated_key.valid()) {
+                const std::unordered_map<GeneratedMemberNameKey, std::uint32_t, GeneratedMemberNameKeyHash>::const_iterator found =
+                    generated_member_name_ids_.find(generated_key);
+                if (found != generated_member_name_ids_.end()) {
+                    result.node_name_remap[local_name_id] = found->second;
+                } else {
+                    result.node_name_remap[local_name_id] = append_generated_member_name_(
+                        name,
+                        generated_key.class_id,
+                        generated_key.member_id);
+                }
+            } else if (options_.enable_node_name_interning && !is_generated_index_node_name_(name)) {
                 result.node_name_remap[local_name_id] = intern_node_name_(name);
             } else {
                 const std::uint32_t global_name_id = static_cast<std::uint32_t>(node_names_.size());
                 node_names_.push_back(std::move(name));
+                node_name_generated_keys_.push_back(GeneratedMemberNameKey());
                 result.node_name_remap[local_name_id] = global_name_id;
             }
         }
@@ -10998,10 +11178,12 @@ private:
             node.object_id = local_object_id != 0
                 ? compact_topology_id_(result.object_base + local_object_id, "parallel object id")
                 : 0;
-            node.name_id = node.name_id != kInvalidIndex &&
-                           static_cast<std::size_t>(node.name_id) < result.node_name_remap.size()
-                ? result.node_name_remap[static_cast<std::size_t>(node.name_id)]
-                : kInvalidIndex;
+            if (!is_generated_index_name_id_(node.name_id)) {
+                node.name_id = node.name_id != kInvalidIndex &&
+                               static_cast<std::size_t>(node.name_id) < result.node_name_remap.size()
+                    ? result.node_name_remap[static_cast<std::size_t>(node.name_id)]
+                    : kInvalidIndex;
+            }
             node.debug_path_id = kInvalidIndex;
         }
 
@@ -11409,6 +11591,11 @@ private:
         const std::size_t object_begin = objects_.size();
         append_fragment_vector_without_sentinel_(objects_, fragment.objects_);
         for (std::size_t i = object_begin; i < objects_.size(); ++i) {
+            ObjectId ranged_id = 0;
+            if (find_object_array_range_id_(objects_[i].key, ranged_id) &&
+                ranged_id == objects_[i].id) {
+                continue;
+            }
             object_id_by_key_.insert(std::make_pair(objects_[i].key, objects_[i].id));
             object_created_keys_.push_back(objects_[i].key);
         }
@@ -12294,6 +12481,50 @@ private:
         return union_field_base_or_null(rest...);
     }
 
+    static detail::GeneratedMemberId generated_member_or_invalid() {
+        return detail::GeneratedMemberId();
+    }
+
+    template <typename... Rest>
+    static detail::GeneratedMemberId generated_member_or_invalid(detail::GeneratedMemberId member, Rest...) {
+        return member;
+    }
+
+    template <typename First, typename... Rest>
+    static detail::GeneratedMemberId generated_member_or_invalid(First, Rest... rest) {
+        return generated_member_or_invalid(rest...);
+    }
+
+    class ScopedGeneratedMemberNameId {
+    public:
+        ScopedGeneratedMemberNameId(Tracer* tracer, std::uint32_t name_id)
+            : tracer_(tracer), previous_(tracer ? tracer->active_generated_member_name_id_ : kInvalidIndex) {
+            if (tracer_) tracer_->active_generated_member_name_id_ = name_id;
+        }
+
+        ~ScopedGeneratedMemberNameId() {
+            if (tracer_) tracer_->active_generated_member_name_id_ = previous_;
+        }
+
+    private:
+        Tracer* tracer_;
+        std::uint32_t previous_;
+    };
+
+    class ScopedObjectArrayRange {
+    public:
+        ScopedObjectArrayRange(Tracer* tracer, std::size_t range_index)
+            : tracer_(tracer), previous_(tracer ? tracer->active_object_array_range_ : static_cast<std::size_t>(-1)) {
+            if (tracer_) tracer_->active_object_array_range_ = range_index;
+        }
+        ~ScopedObjectArrayRange() {
+            if (tracer_) tracer_->active_object_array_range_ = previous_;
+        }
+    private:
+        Tracer* tracer_;
+        std::size_t previous_;
+    };
+
     struct BitfieldStorageRange {
         std::uint32_t byte_offset;
         std::uint32_t byte_count;
@@ -12777,6 +13008,46 @@ private:
             return 0;
         }
         if (options_.debug_log) debug_log_msg(std::string("non-scalar/string getter skipped path=") + path);
+        return 0;
+    }
+
+    template <typename Obj, typename T>
+    typename std::enable_if<detail::is_leaf_scalar<T>::value && !detail::is_std_string<T>::value, NodeId>::type
+    add_bitfield_range_signal_named_(const char* name,
+                                     NodeId parent_id,
+                                     const Obj* obj,
+                                     T (*getter)(const Obj*),
+                                     std::uint32_t explicit_bit_width,
+                                     long long field_bit_offset) {
+        if (!options_.enable_bitfield_fields || !obj || !getter) return 0;
+        BitfieldStorageRange range;
+        if (!choose_bitfield_storage_range<Obj>(field_bit_offset, explicit_bit_width, range)) return 0;
+        const TrackId storage_id = get_or_create_bitfield_storage_track_<Obj>(empty_node_string(), obj, range);
+        if (storage_id == 0) return 0;
+
+        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
+        const NodeId node_id = create_node_from_literal_(parent_id, name, NodeKind::Leaf, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        const TrackId tid = create_bitfield_alias_track_(
+            node_id,
+            empty_node_string(),
+            detail::classify_value_kind<T>(),
+            storage_id,
+            range.bit_offset,
+            explicit_bit_width);
+        if (tid == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        return node_id;
+    }
+
+    template <typename Obj, typename T>
+    typename std::enable_if<!detail::is_leaf_scalar<T>::value || detail::is_std_string<T>::value, NodeId>::type
+    add_bitfield_range_signal_named_(const char*, NodeId, const Obj*, T (*)(const Obj*), std::uint32_t, long long) {
         return 0;
     }
 
@@ -13529,12 +13800,24 @@ private:
     template <typename T>
     void expand_reflected_children_uncached_(const std::string& path, NodeId node_id, const T* ptr) {
         if (can_use_reflected_segment_fast_path_()) {
+            const std::uint32_t generated_name_base = generated_member_name_base_<T>();
+            const std::size_t generated_name_count = GeneratedMemberNameTable<T>::generated
+                ? GeneratedMemberNameTable<T>::count()
+                : 0u;
             detail::call_reflected_visit<T>(
                 ptr,
-                [this, node_id, ptr](const char* name, auto child_field_ptr, auto... meta) {
+                [this, node_id, ptr, generated_name_base, generated_name_count](const char* name, auto child_field_ptr, auto... meta) {
                     const std::size_t union_bytes = union_field_storage_bytes_or_zero(meta...);
                     if (union_bytes != 0 && !options_.enable_union_fields) return;
                     const void* union_base = union_field_base_or_null(meta...);
+                    const detail::GeneratedMemberId member = generated_member_or_invalid(meta...);
+                    const std::uint32_t generated_name_id =
+                        generated_name_base != kInvalidIndex &&
+                        member.class_id == GeneratedMemberNameTable<T>::class_id() &&
+                        member.member_id < generated_name_count
+                            ? generated_name_base + member.member_id
+                            : kInvalidIndex;
+                    ScopedGeneratedMemberNameId generated_name_scope(this, generated_name_id);
                     expand_reflected_child_ptr_with_union_meta_named_(name, node_id, child_field_ptr, ptr, union_bytes, union_base);
                 },
                 [this, node_id](const char* name, const auto&) {
@@ -13542,12 +13825,19 @@ private:
                     const std::string bit_path(name ? name : "");
                     debug_log_unsupported_raw(bit_path, node_id, "bitfield/getter value not directly addressable", std::string(), "$bitfield_getter_missing");
                 },
-                [this, node_id, ptr](const char* name, auto getter, auto... meta) {
+                [this, node_id, ptr, generated_name_base, generated_name_count](const char* name, auto getter, auto... meta) {
                     if (!options_.enable_bitfield_fields) return;
                     typedef typename detail::remove_cvref<decltype(getter(ptr))>::type GetterValueT;
-                    const std::string bit_path(name ? name : "");
-                    add_bitfield_range_signal<T, GetterValueT>(
-                        bit_path,
+                    const detail::GeneratedMemberId member = generated_member_or_invalid(meta...);
+                    const std::uint32_t generated_name_id =
+                        generated_name_base != kInvalidIndex &&
+                        member.class_id == GeneratedMemberNameTable<T>::class_id() &&
+                        member.member_id < generated_name_count
+                            ? generated_name_base + member.member_id
+                            : kInvalidIndex;
+                    ScopedGeneratedMemberNameId generated_name_scope(this, generated_name_id);
+                    add_bitfield_range_signal_named_<T, GetterValueT>(
+                        name,
                         node_id,
                         ptr,
                         getter,
@@ -13639,13 +13929,396 @@ private:
     void expand_reflected_wave_ptr_array_serial_range_(NodeId node_id,
                                                        const CleanPointee* target,
                                                        std::size_t begin,
-                                                       std::size_t end) {
+                                                       std::size_t end,
+                                                       std::size_t object_range_index = static_cast<std::size_t>(-1)) {
+        ScopedObjectArrayRange object_range_scope(this, object_range_index);
         for (std::size_t i = begin; i < end; ++i) {
             TopologyCheckpoint elem_cp = make_topology_checkpoint(node_id);
             const NodeId child_node = expand_reflected_wave_ptr_array_element_fast_<CleanPointee>(
                 node_id, i, target + i);
             if (child_node == 0) rollback_topology_to(elem_cp);
         }
+    }
+
+    static bool address_is_within_object_(const void* address,
+                                          const void* object,
+                                          std::size_t object_size) {
+        if (!address) return true;
+        const std::uintptr_t a = reinterpret_cast<std::uintptr_t>(address);
+        const std::uintptr_t b = reinterpret_cast<std::uintptr_t>(object);
+        return a >= b && a - b < object_size;
+    }
+
+    static std::uint32_t shift_compact_id_in_range_(std::uint32_t value,
+                                                     std::size_t first,
+                                                     std::size_t count,
+                                                     std::size_t delta) {
+        return value >= first && static_cast<std::size_t>(value - first) < count
+            ? static_cast<std::uint32_t>(static_cast<std::size_t>(value) + delta)
+            : value;
+    }
+
+    template <typename CleanPointee>
+    bool try_clone_fixed_repeated_topology_(NodeId parent_id,
+                                            const CleanPointee* target,
+                                            std::size_t declared_count,
+                                            const TopologyCheckpoint& before,
+                                            std::size_t nodes_per_element,
+                                            std::size_t tracks_per_element,
+                                            std::size_t objects_per_element) {
+        if (declared_count <= 1u || !options_.enable_parallel_topology_expansion ||
+            options_.topology_expansion_threads < 2u || nodes_per_element == 0u ||
+            tracks_per_element == 0u || objects_per_element == 0u) return false;
+        const reflect::TopologyTypeEstimate estimate =
+            reflect::topology_type_estimate<CleanPointee>::get();
+        if (!estimate.fixed_extent || estimate.dynamic_extent ||
+            !should_use_parallel_topology_expansion_<CleanPointee>(
+                declared_count,
+                estimate.estimated_leaves != 0u ? estimate.estimated_leaves : tracks_per_element)) {
+            return false;
+        }
+
+        // The first element is the executable proof for this generated type.
+        // Direct cloning is allowed only when every address-bearing descriptor
+        // is inline and no side metadata needs element-specific construction.
+        if (scalar_getter_storage_.size() != before.scalar_getter_storage_size ||
+            bitfield_storage_created_keys_.size() != before.bitfield_storage_created_keys_size ||
+            lazy_value_watches_.size() != before.lazy_value_watches_size ||
+            dirty_peek_groups_.size() != before.dirty_peek_groups_size ||
+            dirty_peek_ranges_.size() != before.dirty_peek_ranges_size ||
+            dirty_peek_leaves_.size() != before.dirty_peek_leaves_size ||
+            dirty_wave_value_groups_.size() != before.dirty_wave_value_groups_size ||
+            dirty_wave_value_ranges_.size() != before.dirty_wave_value_ranges_size ||
+            dirty_wave_value_leaves_.size() != before.dirty_wave_value_leaves_size ||
+            bound_dirty_hooks_.size() != before.bound_dirty_hooks_size ||
+            track_paths_.size() != before.track_paths_size) {
+            return false;
+        }
+        const std::size_t dirty_array_ranges_per_element =
+            dirty_wave_array_bulk_ranges_.size() - before.dirty_wave_array_bulk_ranges_size;
+        const std::size_t dirty_array_leaves_per_element =
+            dirty_wave_array_leaves_.size() - before.dirty_wave_array_leaves_size;
+        const std::size_t dirty_array_blocks_per_element =
+            dirty_wave_array_memory_blocks_.size() - before.dirty_wave_array_memory_blocks_size;
+        const std::size_t dirty_array_leaf_refs_per_element =
+            dirty_wave_array_memory_leaf_refs_.size() - before.dirty_wave_array_memory_leaf_refs_size;
+        const std::size_t dirty_array_byte_map_per_element =
+            dirty_wave_array_memory_byte_to_leaf_refs_.size() -
+            before.dirty_wave_array_memory_byte_to_leaf_refs_size;
+        const std::size_t dirty_array_shadow_per_element =
+            dirty_wave_array_memory_shadow_bytes_.size() -
+            before.dirty_wave_array_memory_shadow_bytes_size;
+        const bool has_dirty_array = dirty_array_ranges_per_element != 0u ||
+                                     dirty_array_leaves_per_element != 0u ||
+                                     dirty_array_blocks_per_element != 0u;
+        if (has_dirty_array &&
+            (!dirty_wave_array_memory_blocks_valid_ ||
+             !dirty_wave_array_memory_blocks_complete_ ||
+             dirty_array_ranges_per_element == 0u ||
+             dirty_array_leaves_per_element == 0u ||
+             dirty_array_blocks_per_element == 0u ||
+             dirty_array_leaf_refs_per_element == 0u ||
+             dirty_array_shadow_per_element == 0u)) {
+            return false;
+        }
+        const std::size_t size_max = (std::numeric_limits<std::size_t>::max)();
+        const std::size_t compact_max =
+            static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)());
+        const auto repeated_total_valid = [declared_count, size_max, compact_max](
+            std::size_t prefix, std::size_t per_element) {
+            if (per_element != 0u && declared_count > (size_max - prefix) / per_element) return false;
+            return prefix + declared_count * per_element <= compact_max;
+        };
+        if (!repeated_total_valid(before.nodes_size, nodes_per_element) ||
+            !repeated_total_valid(before.tracks_size, tracks_per_element) ||
+            !repeated_total_valid(before.objects_size, objects_per_element) ||
+            !repeated_total_valid(before.dirty_wave_array_bulk_ranges_size,
+                                  dirty_array_ranges_per_element) ||
+            !repeated_total_valid(before.dirty_wave_array_leaves_size,
+                                  dirty_array_leaves_per_element) ||
+            !repeated_total_valid(before.dirty_wave_array_memory_blocks_size,
+                                  dirty_array_blocks_per_element) ||
+            !repeated_total_valid(before.dirty_wave_array_memory_leaf_refs_size,
+                                  dirty_array_leaf_refs_per_element) ||
+            !repeated_total_valid(before.dirty_wave_array_memory_byte_to_leaf_refs_size,
+                                  dirty_array_byte_map_per_element) ||
+            (dirty_array_shadow_per_element != 0u &&
+             declared_count > (size_max - before.dirty_wave_array_memory_shadow_bytes_size) /
+                                  dirty_array_shadow_per_element)) {
+            return false;
+        }
+        const std::size_t first_node = before.nodes_size;
+        const std::size_t first_track = before.tracks_size;
+        const std::size_t first_object = before.objects_size;
+        if (nodes_.size() != first_node + nodes_per_element ||
+            tracks_.size() != first_track + tracks_per_element ||
+            track_runtime_.size() != first_track + tracks_per_element ||
+            objects_.size() != first_object + objects_per_element) return false;
+
+        for (std::size_t i = first_object; i < objects_.size(); ++i) {
+            if (!objects_[i].alive ||
+                !address_is_within_object_(objects_[i].key.address, target, sizeof(CleanPointee))) return false;
+        }
+        for (std::size_t i = first_track; i < tracks_.size(); ++i) {
+            const TrackDesc& track = tracks_[i];
+            if (track.id != i || track.storage_id != track.id ||
+                track.dirty_peek_group_id != kInvalidIndex ||
+                track.dirty_wave_value_group_id != kInvalidIndex ||
+                !address_is_within_object_(track.sample_ctx, target, sizeof(CleanPointee)) ||
+                !address_is_within_object_(track.memory_ctx, target, sizeof(CleanPointee))) return false;
+        }
+        const NodeId first_root_id = nodes_[first_node].id;
+        if (first_root_id == 0u || nodes_[first_node].parent_id != parent_id) return false;
+
+        const std::vector<NodeDesc> node_template(nodes_.begin() + first_node, nodes_.end());
+        const std::vector<TrackDesc> track_template(tracks_.begin() + first_track, tracks_.end());
+        const std::vector<TrackRuntimeState> runtime_template(
+            track_runtime_.begin() + first_track, track_runtime_.end());
+        const std::vector<ObjectEntry> object_template(objects_.begin() + first_object, objects_.end());
+        const std::vector<DirtyWaveArrayBulkRange> dirty_array_range_template(
+            dirty_wave_array_bulk_ranges_.begin() + before.dirty_wave_array_bulk_ranges_size,
+            dirty_wave_array_bulk_ranges_.end());
+        const std::vector<DirtyWaveArrayLeaf> dirty_array_leaf_template(
+            dirty_wave_array_leaves_.begin() + before.dirty_wave_array_leaves_size,
+            dirty_wave_array_leaves_.end());
+        const std::vector<DirtyWaveArrayMemoryBlock> dirty_array_block_template(
+            dirty_wave_array_memory_blocks_.begin() + before.dirty_wave_array_memory_blocks_size,
+            dirty_wave_array_memory_blocks_.end());
+        const std::vector<DirtyWaveArrayMemoryLeafRef> dirty_array_leaf_ref_template(
+            dirty_wave_array_memory_leaf_refs_.begin() + before.dirty_wave_array_memory_leaf_refs_size,
+            dirty_wave_array_memory_leaf_refs_.end());
+        const std::vector<std::uint32_t> dirty_array_byte_map_template(
+            dirty_wave_array_memory_byte_to_leaf_refs_.begin() +
+                before.dirty_wave_array_memory_byte_to_leaf_refs_size,
+            dirty_wave_array_memory_byte_to_leaf_refs_.end());
+        const std::vector<TrackId> all_ids_template(
+            all_track_ids_.begin() + before.all_track_ids_size, all_track_ids_.end());
+        const std::vector<TrackId> parallel_ids_template(
+            parallel_track_ids_.begin() + before.parallel_track_ids_size, parallel_track_ids_.end());
+        const std::vector<TrackId> main_ids_template(
+            main_thread_track_ids_.begin() + before.main_thread_track_ids_size,
+            main_thread_track_ids_.end());
+
+        nodes_.resize(first_node + declared_count * nodes_per_element);
+        tracks_.resize(first_track + declared_count * tracks_per_element);
+        track_runtime_.resize(first_track + declared_count * tracks_per_element);
+        objects_.resize(first_object + declared_count * objects_per_element);
+        dirty_wave_array_bulk_ranges_.resize(
+            before.dirty_wave_array_bulk_ranges_size +
+            declared_count * dirty_array_ranges_per_element);
+        dirty_wave_array_leaves_.resize(
+            before.dirty_wave_array_leaves_size +
+            declared_count * dirty_array_leaves_per_element);
+        dirty_wave_array_memory_blocks_.resize(
+            before.dirty_wave_array_memory_blocks_size +
+            declared_count * dirty_array_blocks_per_element);
+        dirty_wave_array_memory_leaf_refs_.resize(
+            before.dirty_wave_array_memory_leaf_refs_size +
+            declared_count * dirty_array_leaf_refs_per_element);
+        dirty_wave_array_memory_byte_to_leaf_refs_.resize(
+            before.dirty_wave_array_memory_byte_to_leaf_refs_size +
+            declared_count * dirty_array_byte_map_per_element);
+        dirty_wave_array_memory_shadow_bytes_.resize(
+            before.dirty_wave_array_memory_shadow_bytes_size +
+            declared_count * dirty_array_shadow_per_element);
+        all_track_ids_.resize(before.all_track_ids_size + declared_count * all_ids_template.size());
+        parallel_track_ids_.resize(
+            before.parallel_track_ids_size + declared_count * parallel_ids_template.size());
+        main_thread_track_ids_.resize(
+            before.main_thread_track_ids_size + declared_count * main_ids_template.size());
+
+        const auto fill_elements = [&](std::size_t begin, std::size_t end) {
+            for (std::size_t element = begin; element < end; ++element) {
+                const std::size_t node_delta = element * nodes_per_element;
+                const std::size_t track_delta = element * tracks_per_element;
+                const std::size_t object_delta = element * objects_per_element;
+                const std::uintptr_t byte_delta = element * sizeof(CleanPointee);
+                for (std::size_t j = 0; j < nodes_per_element; ++j) {
+                    NodeDesc node = node_template[j];
+                    node.id = static_cast<std::uint32_t>(node.id + node_delta);
+                    node.parent_id = shift_compact_id_in_range_(
+                        node.parent_id, first_node, nodes_per_element, node_delta);
+                    node.first_child = shift_compact_id_in_range_(
+                        node.first_child, first_node, nodes_per_element, node_delta);
+                    node.next_sibling = shift_compact_id_in_range_(
+                        node.next_sibling, first_node, nodes_per_element, node_delta);
+                    node.first_track = shift_compact_id_in_range_(
+                        node.first_track, first_track, tracks_per_element, track_delta);
+                    node.object_id = shift_compact_id_in_range_(
+                        node.object_id, first_object, objects_per_element, object_delta);
+                    if (j == 0u) {
+                        node.name_id = generated_index_name_id_(element);
+                        node.next_sibling = static_cast<std::uint32_t>(
+                            first_root_id + (element - 1u) * nodes_per_element);
+                    }
+                    nodes_[first_node + node_delta + j] = node;
+                }
+                for (std::size_t j = 0; j < tracks_per_element; ++j) {
+                    TrackDesc track = track_template[j];
+                    track.id = static_cast<std::uint32_t>(track.id + track_delta);
+                    track.node_id = shift_compact_id_in_range_(
+                        track.node_id, first_node, nodes_per_element, node_delta);
+                    track.next_in_node = shift_compact_id_in_range_(
+                        track.next_in_node, first_track, tracks_per_element, track_delta);
+                    track.storage_id = shift_compact_id_in_range_(
+                        track.storage_id, first_track, tracks_per_element, track_delta);
+                    if (track.sample_ctx) {
+                        track.sample_ctx = reinterpret_cast<const void*>(
+                            reinterpret_cast<std::uintptr_t>(track.sample_ctx) + byte_delta);
+                    }
+                    if (track.memory_ctx) {
+                        track.memory_ctx = reinterpret_cast<const void*>(
+                            reinterpret_cast<std::uintptr_t>(track.memory_ctx) + byte_delta);
+                    }
+                    tracks_[first_track + track_delta + j] = track;
+                    track_runtime_[first_track + track_delta + j] = runtime_template[j];
+                }
+                for (std::size_t j = 0; j < objects_per_element; ++j) {
+                    ObjectEntry object = object_template[j];
+                    object.id += object_delta;
+                    object.key.address = reinterpret_cast<const void*>(
+                        reinterpret_cast<std::uintptr_t>(object.key.address) + byte_delta);
+                    objects_[first_object + object_delta + j] = object;
+                }
+                const std::size_t dirty_range_delta = element * dirty_array_ranges_per_element;
+                const std::size_t dirty_leaf_delta = element * dirty_array_leaves_per_element;
+                const std::size_t dirty_block_delta = element * dirty_array_blocks_per_element;
+                const std::size_t dirty_leaf_ref_delta = element * dirty_array_leaf_refs_per_element;
+                const std::size_t dirty_byte_map_delta = element * dirty_array_byte_map_per_element;
+                const std::size_t dirty_shadow_delta = element * dirty_array_shadow_per_element;
+                for (std::size_t j = 0; j < dirty_array_ranges_per_element; ++j) {
+                    DirtyWaveArrayBulkRange range = dirty_array_range_template[j];
+                    if (range.bulk_key_valid && range.key.first_address) {
+                        range.key.first_address = reinterpret_cast<const void*>(
+                            reinterpret_cast<std::uintptr_t>(range.key.first_address) + byte_delta);
+                    }
+                    if (range.element_key.address) {
+                        range.element_key.address = reinterpret_cast<const void*>(
+                            reinterpret_cast<std::uintptr_t>(range.element_key.address) + byte_delta);
+                    }
+                    range.queued_epoch = 0;
+                    range.begin.block_id = static_cast<std::uint32_t>(
+                        range.begin.block_id + dirty_block_delta);
+                    range.end.block_id = static_cast<std::uint32_t>(
+                        range.end.block_id + dirty_block_delta);
+                    dirty_wave_array_bulk_ranges_[
+                        before.dirty_wave_array_bulk_ranges_size + dirty_range_delta + j] = range;
+                }
+                for (std::size_t j = 0; j < dirty_array_leaves_per_element; ++j) {
+                    DirtyWaveArrayLeaf leaf = dirty_array_leaf_template[j];
+                    leaf.track_id = static_cast<std::uint32_t>(leaf.track_id + track_delta);
+                    leaf.storage_id = static_cast<std::uint32_t>(leaf.storage_id + track_delta);
+                    leaf.memory_last_sample_epoch = 0;
+                    dirty_wave_array_leaves_[
+                        before.dirty_wave_array_leaves_size + dirty_leaf_delta + j] = leaf;
+                }
+                for (std::size_t j = 0; j < dirty_array_blocks_per_element; ++j) {
+                    DirtyWaveArrayMemoryBlock block = dirty_array_block_template[j];
+                    block.base = reinterpret_cast<const unsigned char*>(
+                        reinterpret_cast<std::uintptr_t>(block.base) + byte_delta);
+                    block.shadow_offset += dirty_shadow_delta;
+                    block.first_leaf_ref = static_cast<std::uint32_t>(
+                        block.first_leaf_ref + dirty_leaf_ref_delta);
+                    if (block.has_byte_map) {
+                        block.byte_map_begin = static_cast<std::uint32_t>(
+                            block.byte_map_begin + dirty_byte_map_delta);
+                    }
+                    block.needs_initial_scan = true;
+                    dirty_wave_array_memory_blocks_[
+                        before.dirty_wave_array_memory_blocks_size + dirty_block_delta + j] = block;
+                    if (block.byte_count != 0u) {
+                        std::memcpy(
+                            &dirty_wave_array_memory_shadow_bytes_[block.shadow_offset],
+                            block.base,
+                            block.byte_count);
+                    }
+                }
+                for (std::size_t j = 0; j < dirty_array_leaf_refs_per_element; ++j) {
+                    DirtyWaveArrayMemoryLeafRef ref = dirty_array_leaf_ref_template[j];
+                    ref.dirty_leaf_index = static_cast<std::uint32_t>(
+                        ref.dirty_leaf_index + dirty_leaf_delta);
+                    ref.last_sample_epoch = 0;
+                    dirty_wave_array_memory_leaf_refs_[
+                        before.dirty_wave_array_memory_leaf_refs_size + dirty_leaf_ref_delta + j] = ref;
+                }
+                for (std::size_t j = 0; j < dirty_array_byte_map_per_element; ++j) {
+                    std::uint32_t ref = dirty_array_byte_map_template[j];
+                    if (ref != kInvalidIndex) {
+                        ref = static_cast<std::uint32_t>(ref + dirty_leaf_ref_delta);
+                    }
+                    dirty_wave_array_memory_byte_to_leaf_refs_[
+                        before.dirty_wave_array_memory_byte_to_leaf_refs_size + dirty_byte_map_delta + j] = ref;
+                }
+                for (std::size_t j = 0; j < all_ids_template.size(); ++j) {
+                    all_track_ids_[before.all_track_ids_size + element * all_ids_template.size() + j] =
+                        all_ids_template[j] + track_delta;
+                }
+                for (std::size_t j = 0; j < parallel_ids_template.size(); ++j) {
+                    parallel_track_ids_[before.parallel_track_ids_size +
+                                        element * parallel_ids_template.size() + j] =
+                        parallel_ids_template[j] + track_delta;
+                }
+                for (std::size_t j = 0; j < main_ids_template.size(); ++j) {
+                    main_thread_track_ids_[before.main_thread_track_ids_size +
+                                           element * main_ids_template.size() + j] =
+                        main_ids_template[j] + track_delta;
+                }
+            }
+        };
+
+        const std::size_t worker_count = (std::min)(
+            options_.topology_expansion_threads, declared_count - 1u);
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count > 0u ? worker_count - 1u : 0u);
+        std::size_t launched = 1u;
+        try {
+            for (; launched < worker_count; ++launched) {
+                const std::size_t begin = 1u + ((declared_count - 1u) * launched) / worker_count;
+                const std::size_t end = 1u + ((declared_count - 1u) * (launched + 1u)) / worker_count;
+                workers.push_back(std::thread(fill_elements, begin, end));
+            }
+        } catch (...) {
+            // Every unlaunched disjoint range is completed synchronously.
+        }
+        const std::size_t main_end = 1u + (declared_count - 1u) / worker_count;
+        fill_elements(1u, main_end);
+        for (std::size_t i = launched; i < worker_count; ++i) {
+            const std::size_t begin = 1u + ((declared_count - 1u) * i) / worker_count;
+            const std::size_t end = 1u + ((declared_count - 1u) * (i + 1u)) / worker_count;
+            fill_elements(begin, end);
+        }
+        for (std::size_t i = 0; i < workers.size(); ++i) workers[i].join();
+
+        NodeDesc* parent = find_node(parent_id);
+        if (parent) {
+            parent->first_child = static_cast<std::uint32_t>(
+                first_root_id + (declared_count - 1u) * nodes_per_element);
+        }
+        next_node_id_ = nodes_.size();
+        next_track_id_ = tracks_.size();
+        next_object_id_ = objects_.size();
+        for (std::size_t i = first_track + tracks_per_element; i < tracks_.size(); ++i) {
+            const TrackDesc& track = tracks_[i];
+            sink_.on_track_declared_fast(
+                track.id, track.storage_id, track.node_id, track.kind,
+                track.bit_width != 0 ? track.bit_width : scalar_bit_width(track.scalar_kind),
+                track.bit_offset, track.storage_only, empty_node_string());
+        }
+        if (has_dirty_array) {
+            rebuild_dirty_wave_array_lookup_maps_();
+            dirty_wave_array_initial_sample_done_ = false;
+            dirty_wave_array_work_items_.clear();
+            dirty_wave_array_rebalanced_work_items_.clear();
+            dirty_wave_array_work_weight_prefix_.clear();
+            dirty_wave_array_memory_blocks_valid_ = true;
+            dirty_wave_array_memory_blocks_complete_ = true;
+        }
+        parallel_topology_expanded_elements_ += declared_count - 1u;
+        direct_topology_cloned_elements_ += declared_count - 1u;
+        ++parallel_topology_batches_;
+        nodes_exported_ = false;
+        invalidate_flat_leaf_fast_table();
+        return true;
     }
 
     template <typename CleanPointee>
@@ -13690,9 +14363,15 @@ private:
             result.tracer->objects_.reserve(checked_add_for_reserve_(1u, reserve_objects));
             result.tracer->object_created_keys_.reserve(reserve_objects);
             result.tracer->object_id_by_key_.reserve(reserve_objects);
-            result.tracer->generated_index_node_name_ids_.reserve(
-                checked_add_for_reserve_(element_count, 256u));
             result.root_node_ids.reserve(result.end_index - result.begin_index);
+            const std::size_t object_range_index = result.tracer->register_object_array_range_(
+                target + result.begin_index,
+                reflect::type_tag_of<CleanPointee>(),
+                sizeof(CleanPointee),
+                element_count,
+                1u,
+                result.reserve_objects_per_element);
+            ScopedObjectArrayRange object_range_scope(result.tracer.get(), object_range_index);
             for (std::size_t i = result.begin_index; i < result.end_index; ++i) {
                 const NodeId root = result.tracer->template expand_reflected_wave_ptr_array_element_fast_<CleanPointee>(
                     0, i, target + i);
@@ -13720,7 +14399,7 @@ private:
                                                          std::size_t objects_per_element) {
         const std::size_t configured_batch = options_.parallel_topology_batch_elements != 0
             ? options_.parallel_topology_batch_elements
-            : static_cast<std::size_t>(65536u);
+            : static_cast<std::size_t>(131072u);
         const std::size_t configured_threads = options_.topology_expansion_threads;
 
         for (std::size_t batch_begin = begin; batch_begin < end; ) {
@@ -13870,14 +14549,17 @@ private:
                                                        std::size_t first_element_nodes,
                                                        std::size_t first_element_tracks,
                                                        std::size_t first_element_objects) {
-        const std::size_t first_element_work_items =
-            first_element_nodes + first_element_tracks + first_element_objects;
         const reflect::TopologyTypeEstimate generated_estimate =
             reflect::topology_type_estimate<CleanPointee>::get();
+        // Generated estimates count physical leaves.  For hand-written
+        // visitors, use the first element's track count as the same unit.
+        // Nodes and object-table entries are bookkeeping, and including them
+        // made shallow types look expensive enough to parallelize even when
+        // fragment allocation and merge cost more than their leaf expansion.
         const std::size_t estimated_work_items_per_element =
             generated_estimate.estimated_leaves != 0
                 ? generated_estimate.estimated_leaves
-                : first_element_work_items;
+                : first_element_tracks;
         if (declared_count <= 1u ||
             !should_use_parallel_topology_expansion_<CleanPointee>(declared_count,
                                                                    estimated_work_items_per_element)) {
@@ -13921,11 +14603,39 @@ private:
         const std::size_t first_element_tracks = tracks_.size() - first_tracks_before;
         const std::size_t first_element_objects = objects_.size() - first_objects_before;
 
+        std::size_t object_range_index = static_cast<std::size_t>(-1);
+        const reflect::TopologyTypeEstimate generated_estimate =
+            reflect::topology_type_estimate<CleanPointee>::get();
+        if (generated_estimate.fixed_extent && !generated_estimate.dynamic_extent &&
+            first_element_objects != 0u && first_objects_before < objects_.size()) {
+            const void* pointee_type_tag = reflect::type_tag_of<CleanPointee>();
+            for (std::size_t i = 0; i < first_element_objects; ++i) {
+                const ObjectEntry& object = objects_[first_objects_before + i];
+                if (!object.alive ||
+                    !address_is_within_object_(object.key.address, target, sizeof(CleanPointee))) {
+                    continue;
+                }
+                const std::size_t range_index = register_object_array_range_(
+                    object.key.address, object.key.type_tag, sizeof(CleanPointee), declared_count,
+                    object.id, first_element_objects);
+                if (object.key.address == detail::pointer_address(target) &&
+                    object.key.type_tag == pointee_type_tag) {
+                    object_range_index = range_index;
+                }
+            }
+        }
+
+        if (try_clone_fixed_repeated_topology_<CleanPointee>(
+                node_id, target, declared_count, first_cp,
+                first_element_nodes, first_element_tracks, first_element_objects)) {
+            return true;
+        }
+
         if (!try_expand_reflected_wave_ptr_array_parallel_<CleanPointee>(
                 node_id, target, declared_count,
                 first_element_nodes, first_element_tracks, first_element_objects)) {
             expand_reflected_wave_ptr_array_serial_range_<CleanPointee>(
-                node_id, target, 1u, declared_count);
+                node_id, target, 1u, declared_count, object_range_index);
         }
         return true;
     }

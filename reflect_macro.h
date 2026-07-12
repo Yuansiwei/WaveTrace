@@ -66,6 +66,14 @@ NodeId dynamic_expand_bridge(Tracer& tracer, const std::string& path, NodeId par
 
 static constexpr std::uint32_t kInvalidIndex = 0xFFFFFFFFu;
 
+template <typename T>
+struct GeneratedMemberNameTable {
+    static constexpr bool generated = false;
+    static const void* class_id() noexcept { return NULL; }
+    static const char* const* names() noexcept { return NULL; }
+    static std::size_t count() noexcept { return 0; }
+};
+
 struct WaveDirtyHook {
     typedef void (*MarkFn)(void*, std::uint32_t);
 
@@ -231,6 +239,14 @@ namespace detail {
 
 struct UnionFieldTag {};
 
+struct GeneratedMemberId {
+    GeneratedMemberId() : class_id(NULL), member_id(kInvalidIndex) {}
+    GeneratedMemberId(const void* class_id_in, std::uint32_t member_id_in)
+        : class_id(class_id_in), member_id(member_id_in) {}
+    const void* class_id;
+    std::uint32_t member_id;
+};
+
 struct UnionFieldBase {
     UnionFieldBase() : ptr(nullptr) {}
     explicit UnionFieldBase(const void* p) : ptr(p) {}
@@ -255,6 +271,26 @@ void invoke_ptr_visitor(Visitor&& visitor, const char* name, Ptr ptr, Meta&&... 
                             name,
                             ptr,
                             std::forward<Meta>(meta)...);
+}
+
+template <typename Visitor, typename Getter, typename... Meta>
+auto invoke_getter_visitor_impl(int, Visitor&& visitor, const char* name, Getter getter, Meta&&... meta)
+    -> decltype(visitor(name, getter, std::forward<Meta>(meta)...), void()) {
+    visitor(name, getter, std::forward<Meta>(meta)...);
+}
+
+template <typename Visitor, typename Getter, typename... Meta>
+void invoke_getter_visitor_impl(long, Visitor&& visitor, const char* name, Getter getter, Meta&&...) {
+    visitor(name, getter);
+}
+
+template <typename Visitor, typename Getter, typename... Meta>
+void invoke_getter_visitor(Visitor&& visitor, const char* name, Getter getter, Meta&&... meta) {
+    invoke_getter_visitor_impl(0,
+                               std::forward<Visitor>(visitor),
+                               name,
+                               getter,
+                               std::forward<Meta>(meta)...);
 }
 
 template <typename T>
