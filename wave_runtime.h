@@ -33,6 +33,7 @@
 
 
 #include "reflect_runtime.h"
+#include "wavetrace_config.h"
 
 #include <array>
 #include <algorithm>
@@ -263,6 +264,17 @@ class IWaveSink {
 public:
     virtual ~IWaveSink() {}
     virtual void on_node_declared(const NodeDecl&) {}
+    // The tracer owns a stable intern table for reflected member names. Export
+    // it once so sinks can map runtime name ids without per-node string hashes.
+    virtual void on_node_name_table_begin_fast(std::size_t) {}
+    virtual void on_node_name_table_entry_fast(std::uint32_t,
+                                               const std::string&) {}
+    virtual void on_node_name_table_end_fast() {}
+    virtual bool accepts_node_name_table_fast() const { return false; }
+    virtual void on_node_declared_name_ref_fast(NodeId,
+                                                NodeId,
+                                                std::uint32_t,
+                                                NodeKind) {}
     virtual void on_node_declared_fast(NodeId node_id,
                                        NodeId parent_id,
                                        const std::string& name,
@@ -273,6 +285,32 @@ public:
         decl.name = name;
         decl.kind = kind;
         on_node_declared(decl);
+    }
+    // Stable-topology fast path. Tracer name ids already refer to its shared
+    // reflected-member table, so sinks that maintain their own NAME table can
+    // map the id once instead of hashing the same member string for every node.
+    virtual void on_node_declared_name_id_fast(NodeId node_id,
+                                               NodeId parent_id,
+                                               std::uint32_t runtime_name_id,
+                                               const std::string& name,
+                                               NodeKind kind) {
+        (void)runtime_name_id;
+        on_node_declared_fast(node_id, parent_id, name, kind);
+    }
+    // Generated array element names are numeric inside Tracer. Keep the index
+    // numeric across the sink boundary; legacy sinks still see the conventional
+    // "[N]" segment through this fallback.
+    virtual void on_node_declared_array_index_fast(NodeId node_id,
+                                                   NodeId parent_id,
+                                                   std::uint32_t array_index,
+                                                   NodeKind kind) {
+        std::string name;
+        const std::string index_text = std::to_string(array_index);
+        name.reserve(index_text.size() + 2u);
+        name.push_back('[');
+        name.append(index_text);
+        name.push_back(']');
+        on_node_declared_fast(node_id, parent_id, name, kind);
     }
     virtual void on_track_declared(const TrackDecl& decl) = 0;
     virtual void on_track_declared_fast(TrackId track_id,
@@ -542,35 +580,16 @@ struct WaveTraceLevelLimit {
     explicit WaveTraceLevelLimit(std::size_t n) : enabled(true), max_dot_count(n) {}
 };
 
-inline WaveTraceLevelLimit parse_wave_trace_level_env_() {
-    const char* env = std::getenv("WaveTraceLevel");
-    if (!env || !env[0]) return WaveTraceLevelLimit();
-
-    std::size_t value = 0;
-    for (const char* p = env; *p; ++p) {
-        if (*p < '0' || *p > '9') return WaveTraceLevelLimit();
-        const std::size_t digit = static_cast<std::size_t>(*p - '0');
-        const std::size_t max_value = (std::numeric_limits<std::size_t>::max)();
-        if (value > (max_value - digit) / 10u) {
-            value = max_value;
-        } else {
-            value = value * 10u + digit;
-        }
-    }
-    if (value == 0) return WaveTraceLevelLimit();
-    return WaveTraceLevelLimit(value);
+inline WaveTraceLevelLimit parse_wave_trace_level_config_() {
+    const ::wave::config::RuntimeConfig& cfg = ::wave::config::runtime_config();
+    return cfg.wave_trace_level_enabled
+        ? WaveTraceLevelLimit(cfg.wave_trace_level)
+        : WaveTraceLevelLimit();
 }
 
 inline const WaveTraceLevelLimit& wave_trace_level_limit() {
-    static const WaveTraceLevelLimit limit = parse_wave_trace_level_env_();
+    static const WaveTraceLevelLimit limit = parse_wave_trace_level_config_();
     return limit;
-}
-
-inline bool env_flag_enabled(const char* name) {
-    const char* env = std::getenv(name);
-    if (!env || !env[0]) return false;
-    return env[0] == '1' || env[0] == 'y' || env[0] == 'Y' ||
-           env[0] == 't' || env[0] == 'T' || env[0] == 'o' || env[0] == 'O';
 }
 
 inline std::size_t wave_trace_dot_count(const std::string& path) {
@@ -1896,13 +1915,18 @@ class Tracer {
             register_active_tracer_(this);
         }
         if (active_tracer_registered_) {
-            if (detail::env_flag_enabled("WaveTraceDirtyArrayStats")) {
+            const ::wave::config::RuntimeConfig& config = ::wave::config::runtime_config();
+            if (!config.valid) {
+                std::fprintf(stderr, "[wave] invalid config '%s': %s\n",
+                             config.path.c_str(), config.error.c_str());
+            }
+            if (config.dirty_array_stats) {
                 options_.debug_log_dirty_wave_array_stats = true;
             }
-            if (detail::env_flag_enabled("WaveTraceDirtyArrayMarks")) {
+            if (config.dirty_array_marks) {
                 options_.debug_log_dirty_wave_array_marks = true;
             }
-            if (detail::env_flag_enabled("WaveTraceMemoryUsage")) {
+            if (config.memory_usage) {
                 options_.dump_memory_usage_after_topology = true;
             }
         }
@@ -1928,6 +1952,7 @@ public:
 
     template <typename T>
     NodeId add_root(const std::string& name, T* root) {
+        if (!::wave::config::enabled()) return 0;
         // add_root() must not recursively expand the object immediately. In a
         // SystemC model, ports may be syntactically bound but not yet safe to
         // dereference before sc_start()/initialization. Store a lazy root and
@@ -2009,6 +2034,7 @@ public:
     }
 
     void sample(Cycle cycle) {
+        if (!::wave::config::cycle_in_range(static_cast<std::uint64_t>(cycle))) return;
         maybe_print_cycle_progress(cycle);
         if (options_.debug_log) debug_log_msg(std::string("sample begin cycle=") + detail::to_string_unsigned(cycle));
         prepare_topology(cycle);
@@ -2062,6 +2088,7 @@ public:
     // node tree and declares tracks before the first sampled cycle, allowing the
     // WVZ4 recorder to open the writer/layout before cycle-0 value updates.
     void prepare_topology(Cycle cycle = 0) {
+        if (!::wave::config::cycle_in_range(static_cast<std::uint64_t>(cycle))) return;
         refresh_root_watches(cycle);
         // Allocation tracking and per-cycle pointer validity/rebuild checks are intentionally disabled.
         // Pointer fields are expanded only once, and only when their pointee type opts in via
@@ -9748,6 +9775,22 @@ private:
         return name.size() >= 3u && name.front() == '[' && name.back() == ']';
     }
 
+    static bool parse_generated_index_node_name_(const std::string& name, std::size_t& index) {
+        if (!is_generated_index_node_name_(name)) return false;
+        std::uint64_t value = 0;
+        for (std::size_t i = 1u; i + 1u < name.size(); ++i) {
+            const char c = name[i];
+            if (c < '0' || c > '9') return false;
+            const std::uint32_t digit = static_cast<std::uint32_t>(c - '0');
+            if (value > (static_cast<std::uint64_t>(kGeneratedIndexNamePayloadMask_) - digit) / 10u) {
+                return false;
+            }
+            value = value * 10u + digit;
+        }
+        index = static_cast<std::size_t>(value);
+        return true;
+    }
+
     std::uint32_t append_node_name_(const std::string& name) {
         const std::uint32_t id = static_cast<std::uint32_t>(node_names_.size());
         node_names_.push_back(name);
@@ -9870,7 +9913,13 @@ private:
     }
 
     std::uint32_t node_name_id_for_path_(const std::string& path) {
-        if (!needs_full_topology_paths_()) return intern_node_name_(path);
+        if (!needs_full_topology_paths_()) {
+            std::size_t generated_index = 0;
+            if (parse_generated_index_node_name_(path, generated_index)) {
+                return generated_index_name_id_(generated_index);
+            }
+            return intern_node_name_(path);
+        }
         return intern_node_name_(detail::path_last_segment(path));
     }
 
@@ -9934,16 +9983,39 @@ private:
 
     void export_node_declarations_once() {
         if (nodes_exported_) return;
+        const bool direct_name_refs = sink_.accepts_node_name_table_fast();
+        if (direct_name_refs) {
+            sink_.on_node_name_table_begin_fast(node_names_.size());
+            for (std::size_t i = 0; i < node_names_.size(); ++i) {
+                sink_.on_node_name_table_entry_fast(
+                    static_cast<std::uint32_t>(i), node_names_[i]);
+            }
+            sink_.on_node_name_table_end_fast();
+        }
         std::size_t exported_count = 0;
         for (std::size_t i = 1; i < nodes_.size(); ++i) {
             const NodeDesc& node = nodes_[i];
             if (node.id == 0 || !node.alive) continue;
             if (!node_has_signal_subtree(node.id) && node.kind != NodeKind::Leaf) continue;
-            sink_.on_node_declared_fast(
-                node.id,
-                node.parent_id,
-                node_name_ref(node),
-                node.kind);
+            if (is_generated_index_name_id_(node.name_id)) {
+                sink_.on_node_declared_array_index_fast(
+                    node.id,
+                    node.parent_id,
+                    node.name_id & kGeneratedIndexNamePayloadMask_,
+                    node.kind);
+            } else {
+                if (direct_name_refs) {
+                    sink_.on_node_declared_name_ref_fast(
+                        node.id, node.parent_id, node.name_id, node.kind);
+                } else {
+                    sink_.on_node_declared_name_id_fast(
+                        node.id,
+                        node.parent_id,
+                        node.name_id,
+                        node_name_ref(node),
+                        node.kind);
+                }
+            }
             ++exported_count;
         }
 
@@ -14973,6 +15045,22 @@ private:
     template <typename FieldT>
     NodeId expand_member_clean_dispatch_selected(const std::string& path,
                                                  NodeId parent_id,
+                                                 const FieldT* clean_ptr,
+                                                 std::integral_constant<int, 1>) {
+        typedef typename detail::remove_cvref<FieldT>::type CleanFieldT;
+        DynamicExpandFn fn = find_dynamic_expander(reflect::type_tag_of<CleanFieldT>());
+        if (!fn) {
+            debug_log_unsupported_type<CleanFieldT>(path, parent_id,
+                "class/union has no compiled reflection shard", "$dynamic_reflection_unregistered", clean_ptr);
+            return 0;
+        }
+        if (options_.debug_log) debug_log_msg(std::string("member dispatch branch=compiled_reflection_shard path=") + path);
+        return fn(*this, path, parent_id, clean_ptr);
+    }
+
+    template <typename FieldT>
+    NodeId expand_member_clean_dispatch_selected(const std::string& path,
+                                                 NodeId parent_id,
                                                  const FieldT*,
                                                  std::integral_constant<int, 0>) {
         debug_log_unsupported_type<FieldT>(path, parent_id, "member dispatch: no matching branch", "$type_unsupported");
@@ -15021,7 +15109,12 @@ private:
                     is_pointer_or_smart ? 5 :
                     is_systemc_whitelist ? 4 :
                     detail::is_sc_namespace_blacklisted<FieldT>::value ? 3 :
+#if defined(WAVETRACE_COMPILED_SHARDS)
+                    (std::is_class<FieldT>::value || std::is_union<FieldT>::value) ? 1 :
+#else
                     reflect::is_reflected<FieldT>::value ? 2 :
+                    (std::is_class<FieldT>::value || std::is_union<FieldT>::value) ? 1 :
+#endif
                     0
         };
     };

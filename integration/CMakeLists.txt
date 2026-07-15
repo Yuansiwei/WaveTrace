@@ -115,7 +115,13 @@ if(ENABLE_WAVETRACE)
 	endif()
 
 	set(WAVETRACE_BUILD_TOP_DIR "${CMAKE_BINARY_DIR}/WaveTracer")
-	set(WAVETRACE_GEN_DIR "${WAVETRACE_BUILD_TOP_DIR}/generated_reflect")
+	set(WAVETRACE_GEN_DIR "${WAVETRACE_ROOT}/generated_reflect")
+	set(WAVETRACE_CONFIG_FILE "${WAVETRACE_ROOT}/wavetrace_config.json" CACHE FILEPATH "WaveTrace reflection/runtime configuration and WavePtr switches")
+	if(NOT EXISTS "${WAVETRACE_CONFIG_FILE}")
+		get_filename_component(_wavetrace_config_dir "${WAVETRACE_CONFIG_FILE}" DIRECTORY)
+		file(MAKE_DIRECTORY "${_wavetrace_config_dir}")
+		file(WRITE "${WAVETRACE_CONFIG_FILE}" "{\n  \"WaveTrace\": true,\n  \"WaveTraceFileName\": \"wave.wvz4\",\n  \"WaveTraceStart\": \"\",\n  \"WaveTraceEnd\": \"\",\n  \"WaveTraceLevel\": \"\",\n  \"wave_ptr_members\": []\n}\n")
+	endif()
 	set(WAVETRACE_TOOL_DIR "${WAVETRACE_ROOT}/tools/bin")
 	set(WAVETRACE_ZSTD_INCLUDE_DIR "${WAVETRACE_ROOT}/third_party/zstd/include" CACHE PATH "Prebuilt zstd include directory")
 	set(WAVETRACE_CLANG_RESOURCE_DIR "${WAVETRACE_ROOT}/tools/lib/clang/22" CACHE PATH "Clang resource directory used by WaveTrace ReflectGen")
@@ -220,6 +226,12 @@ set(GENERATED_CPP "${CMAKE_CURRENT_SOURCE_DIR}/GenSource/vsiRegisterList.cpp")
 list(APPEND ALL_SOURCES ${GENERATED_CPP})
 
 add_library(cmodel STATIC ${ALL_SOURCES} ${ALL_HEADERS} ${RT_CONFIG_FILES})
+
+if(ENABLE_WAVETRACE)
+	set_source_files_properties("${WAVETRACE_CONFIG_FILE}" PROPERTIES HEADER_FILE_ONLY TRUE)
+	target_sources(cmodel PRIVATE "${WAVETRACE_CONFIG_FILE}")
+	source_group("WaveTrace" FILES "${WAVETRACE_CONFIG_FILE}")
+endif()
 
 target_precompile_headers(cmodel PUBLIC inc/vsiPrecomp.h)
 if(MSVC)
@@ -473,6 +485,7 @@ if(ENABLE_WAVETRACE)
 		-I${AQTOOLS}/GcTest/mathlib/templ
 		-I${AQTOOLS}/GcTest/mathlib
 		-I${WAVETRACE_ROOT}
+		-I${WAVETRACE_ZSTD_INCLUDE_DIR}
 		-resource-dir=${WAVETRACE_CLANG_RESOURCE_DIR}
 		"-DANON(x)="
 		-include
@@ -637,6 +650,7 @@ if(ENABLE_WAVETRACE)
 	endforeach()
 
 	set(WAVETRACE_REFLECT_DEPENDS ${WAVETRACE_REFLECTGEN_DEPENDS} "${WAVETRACE_REFLECT_TARGET_LIST}" ${ALL_HEADERS})
+	list(APPEND WAVETRACE_REFLECT_DEPENDS "${WAVETRACE_CONFIG_FILE}")
 	if(DEFINED CMODEL_REGGEN_STAMP)
 		list(APPEND WAVETRACE_REFLECT_DEPENDS "${CMODEL_REGGEN_STAMP}")
 	endif()
@@ -669,6 +683,7 @@ if(ENABLE_WAVETRACE)
 			"-DWAVETRACE_REFLECT_OUTPUT_DIR=${WAVETRACE_GEN_DIR}"
 			"-DWAVETRACE_REFLECT_AGGREGATE_HEADER=project_reflect_auto.h"
 			"-DWAVETRACE_REFLECT_LOG_FILE=${WAVETRACE_GEN_DIR}/reflectgen.log"
+			"-DWAVETRACE_CONFIG_FILE=${WAVETRACE_CONFIG_FILE}"
 			"-DWAVETRACE_REFLECT_CLANG_ARGS=${WAVETRACE_REFLECT_CLANG_ARGS}"
 			"-DWAVETRACE_REFLECT_VERBOSE=${WAVETRACE_REFLECT_VERBOSE}"
 			-P "${WAVETRACE_RUN_REFLECTGEN_SCRIPT}"
@@ -683,6 +698,7 @@ if(ENABLE_WAVETRACE)
 	)
 	target_compile_definitions(cmodel PUBLIC
 		WAVE_RUNTIME_AVAILABLE=1
+		"WAVETRACE_CONFIG_PATH=\"${WAVETRACE_CONFIG_FILE}\""
 		NOMINMAX
 	)
 	if(WIN32)

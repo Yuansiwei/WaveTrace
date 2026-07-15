@@ -222,6 +222,7 @@ namespace {
     }
 
     void logLodUse(const char* phase,
+                   const WaveFile* wave,
                    const WaveSignal& sig,
                    int signalIndex,
                    int row,
@@ -240,7 +241,7 @@ namespace {
             .arg(QString::fromLatin1(phase ? phase : "lod"))
             .arg(signalIndex)
             .arg(row)
-            .arg(csvEscape(sig.name))
+            .arg(csvEscape(wave ? waveSignalFullPath(*wave, signalIndex) : sig.name))
             .arg(sig.kind == SignalKind::Bit ? QStringLiteral("bit") : QStringLiteral("bus"))
             .arg(sig.width)
             .arg(viewportStart)
@@ -256,7 +257,8 @@ namespace {
         appendLodRenderLogLine(line);
     }
 
-    void logLodRawFallback(const WaveSignal& sig,
+    void logLodRawFallback(const WaveFile* wave,
+                           const WaveSignal& sig,
                            int signalIndex,
                            int row,
                            qint64 viewportStart,
@@ -267,7 +269,7 @@ namespace {
         const QString line = QStringLiteral("raw-fallback,signal=%1,row=%2,name=%3,kind=%4,width=%5,viewport=%6..%7,draw=%8..%9")
             .arg(signalIndex)
             .arg(row)
-            .arg(csvEscape(sig.name))
+            .arg(csvEscape(wave ? waveSignalFullPath(*wave, signalIndex) : sig.name))
             .arg(sig.kind == SignalKind::Bit ? QStringLiteral("bit") : QStringLiteral("bus"))
             .arg(sig.width)
             .arg(viewportStart)
@@ -1853,7 +1855,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                 }
             }
             if (selectedLodIndex < 0) selectedLodIndex = 0;
-            logLodUse("select", sig, entry.signalIndex, absoluteRow,
+            logLodUse("select", m_wave, sig, entry.signalIndex, absoluteRow,
                       m_viewStart, m_viewEnd, rowViewStart, rowViewEnd,
                       selectedLodIndex, *lodLevel);
 
@@ -1867,7 +1869,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
 
                 auto drawRawLastResortRange = [&](qint64 start, qint64 end) {
                     if (!waveSignalRawSamplesCoverRange(sig, start, end) || sig.samples.isEmpty() || end <= start) return;
-                    logLodRawFallback(sig, entry.signalIndex, absoluteRow,
+                    logLodRawFallback(m_wave, sig, entry.signalIndex, absoluteRow,
                                       m_viewStart, m_viewEnd, start, end);
                     const int x1 = fastX(start);
                     const int x2 = fastX(end);
@@ -1924,7 +1926,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                 auto drawLodSampleRange = [&](const WaveLodLevel& level, qint64 visibleStart, qint64 visibleEnd) {
                     if (level.samples.isEmpty() || visibleEnd <= visibleStart) return;
                     const int drawLevelIndex = lodLevelIndexFor(level);
-                    logLodUse("draw-samples", sig, entry.signalIndex, absoluteRow,
+                    logLodUse("draw-samples", m_wave, sig, entry.signalIndex, absoluteRow,
                               m_viewStart, m_viewEnd, visibleStart, visibleEnd,
                               drawLevelIndex, level);
 
@@ -2151,7 +2153,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
             }
 
             const QVector<WaveLodBucket>& buckets = lodLevel->buckets;
-            logLodUse("draw-buckets", sig, entry.signalIndex, absoluteRow,
+            logLodUse("draw-buckets", m_wave, sig, entry.signalIndex, absoluteRow,
                       m_viewStart, m_viewEnd, rowViewStart, rowViewEnd,
                       selectedLodIndex, *lodLevel);
             int lodIndex = lowerLodBucketByEnd(buckets, rowViewStart);

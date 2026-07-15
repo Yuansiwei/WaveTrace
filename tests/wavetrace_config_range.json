@@ -1,0 +1,8 @@
+{
+  "WaveTrace": true,
+  "WaveTraceFileName": "build_vs/wavetrace_config_range.wvz4",
+  "WaveTraceStart": 2,
+  "WaveTraceEnd": 3,
+  "WaveTraceLevel": "",
+  "wave_ptr_members": []
+}

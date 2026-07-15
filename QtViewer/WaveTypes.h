@@ -1,12 +1,33 @@
 #pragma once
 
+#include <QByteArray>
 #include <QString>
 #include <QVector>
 #include <QtGlobal>
 
+#include <algorithm>
 #include <cstring>
 #include <cmath>
 #include <limits>
+
+constexpr quint32 kWaveNameTokenArrayFlag = 0x80000000u;
+constexpr quint32 kWaveNameTokenValueMask = 0x7fffffffu;
+
+inline quint32 waveNameIdToken(quint32 nameId) {
+    return nameId & kWaveNameTokenValueMask;
+}
+
+inline quint32 waveArrayIndexToken(quint32 arrayIndex) {
+    return kWaveNameTokenArrayFlag | (arrayIndex & kWaveNameTokenValueMask);
+}
+
+inline bool waveNameTokenIsArrayIndex(quint32 token) {
+    return (token & kWaveNameTokenArrayFlag) != 0;
+}
+
+inline quint32 waveNameTokenValue(quint32 token) {
+    return token & kWaveNameTokenValueMask;
+}
 
 enum class SignalKind {
     Bit,
@@ -76,6 +97,8 @@ struct WaveSignal {
     // storage stream through WVZ4 aliases.
     int storageId = -1;
     int bitOffset = 0;
+    // Explicit name for synthetic/legacy signals. Normal WVZ4 file signals
+    // leave this empty and resolve their segment through WaveTreeInfo tokens.
     QString name;
     SignalKind kind = SignalKind::Bit;
     int width = 1;
@@ -123,12 +146,15 @@ struct WaveTreeNode {
     int nextSibling = 0;
     int signalIndex = -1;   // -1 means module/container node
     int signalId = -1;
-    QString name;           // segment name only, never full path
+    quint32 nameToken = 0;  // NAME id, or kWaveNameTokenArrayFlag | numeric array index
     bool valid = false;
 };
 
 struct WaveTreeInfo {
     bool valid = false;
+    // File NAME strings are stored once. Numeric v15 array segments never enter
+    // this table and are formatted only when a consumer actually needs text.
+    QVector<QByteArray> namesById;
     QVector<WaveTreeNode> nodesById;
     QVector<int> rootNodeIds;
     QVector<int> signalIndexToNodeId;
@@ -155,6 +181,61 @@ struct WaveFile {
     WaveTreeInfo tree;
     QVector<WaveSignal> signalList;
 };
+
+inline QString waveTreeNameTokenText(const WaveTreeInfo& tree, quint32 token) {
+    if (waveNameTokenIsArrayIndex(token)) {
+        return QStringLiteral("[%1]").arg(waveNameTokenValue(token));
+    }
+    const quint32 nameId = waveNameTokenValue(token);
+    if (nameId > 0 && nameId < quint32(tree.namesById.size())) {
+        return QString::fromUtf8(tree.namesById.at(int(nameId)));
+    }
+    return QString();
+}
+
+inline QString waveTreeNodeSegmentName(const WaveTreeInfo& tree, int nodeId) {
+    if (nodeId <= 0 || nodeId >= tree.nodesById.size()) return QString();
+    const WaveTreeNode& node = tree.nodesById.at(nodeId);
+    if (!node.valid) return QString();
+    return waveTreeNameTokenText(tree, node.nameToken);
+}
+
+inline QString waveSignalSegmentName(const WaveFile& wave, int signalIndex) {
+    if (signalIndex < 0 || signalIndex >= wave.signalList.size()) return QString();
+    if (wave.tree.valid && signalIndex < wave.tree.signalIndexToNodeId.size()) {
+        const QString segment = waveTreeNodeSegmentName(
+            wave.tree, wave.tree.signalIndexToNodeId.at(signalIndex));
+        if (!segment.isEmpty()) return segment;
+    }
+    return wave.signalList.at(signalIndex).name;
+}
+
+inline QString waveSignalFullPath(const WaveFile& wave, int signalIndex) {
+    if (signalIndex < 0 || signalIndex >= wave.signalList.size()) return QString();
+    if (wave.tree.valid && signalIndex < wave.tree.signalIndexToNodeId.size()) {
+        int nodeId = wave.tree.signalIndexToNodeId.at(signalIndex);
+        QVector<QString> parts;
+        int guard = 0;
+        while (nodeId > 0 && nodeId < wave.tree.nodesById.size() &&
+               guard++ < wave.tree.nodesById.size()) {
+            const WaveTreeNode& node = wave.tree.nodesById.at(nodeId);
+            if (!node.valid) break;
+            const QString segment = waveTreeNameTokenText(wave.tree, node.nameToken);
+            if (!segment.isEmpty()) parts.push_back(segment);
+            nodeId = node.parentId;
+        }
+        if (!parts.isEmpty()) {
+            std::reverse(parts.begin(), parts.end());
+            QString path;
+            for (int i = 0; i < parts.size(); ++i) {
+                if (i > 0) path += QLatin1Char('.');
+                path += parts.at(i);
+            }
+            return path;
+        }
+    }
+    return wave.signalList.at(signalIndex).name;
+}
 
 struct ActiveSignalRef {
     int signalIndex = -1;

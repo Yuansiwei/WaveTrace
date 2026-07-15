@@ -45,6 +45,8 @@
 #if defined(WAVE_TAP_HAS_SYSTEMC_)
 #include <iostream>
 #endif
+#include <cstdint>
+#include <limits>
 #include <sstream>
 #include <string>
 
@@ -119,6 +121,24 @@ private:
         }
 
         const Cycle cycle = next_cycle_;
+        const ::wave::config::RuntimeConfig& config = ::wave::config::runtime_config();
+        if (!config.valid) {
+            error = "WaveTap::sample_one_cycle failed: invalid WaveTrace config '";
+            error += config.path;
+            error += "': ";
+            error += config.error;
+            return false;
+        }
+        // The business loop keeps calling this once per cycle. Disabled and
+        // out-of-window cycles are successful no-ops so WaveTrace never changes
+        // business control flow or forces call-site conditionals.
+        if (!config.wave_trace ||
+            static_cast<std::uint64_t>(cycle) < config.wave_trace_start ||
+            static_cast<std::uint64_t>(cycle) > config.wave_trace_end) {
+            if (next_cycle_ != (std::numeric_limits<Cycle>::max)()) ++next_cycle_;
+            last_error_.clear();
+            return true;
+        }
         // Lazy topology freeze. User code does not call prepare_topology().
         // This is intentionally done before begin_cycle() so topology/layout
         // declaration failures cannot leave a partially-open cycle frame.

@@ -32,7 +32,6 @@ std::string error;
 
 PathStableWvz4Recorder recorder;
 PathStableWvz4Recorder::OpenConfig cfg;
-cfg.file_path = "out.wvz4";
 cfg.clk_period_ticks = 10;
 cfg.clk_fall_offset_ticks = 5;
 
@@ -72,6 +71,12 @@ for (wave::Cycle cycle = 0; cycle < max_cycle; ++cycle) {
 
 recorder.close(error);
 ```
+
+The integrated build reads `wavetrace_config.json` from the original
+`WaveTracer` directory. `WaveTraceFileName` is the authoritative output name;
+`WaveTraceStart`/`WaveTraceEnd` select the inclusive business-cycle window.
+`WaveTrace=false` makes every `sample_one_cycle()` a successful no-op and lets
+ReflectGen take its pre-AST placeholder-header path.
 
 ## Ownership
 

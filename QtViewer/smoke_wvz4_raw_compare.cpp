@@ -29,7 +29,7 @@ QString signal_key(const WaveFile& wave, int signalIndex) {
            wave.tree.nodesById.at(nodeId).valid &&
            guard < wave.tree.nodesById.size()) {
         const WaveTreeNode& node = wave.tree.nodesById.at(nodeId);
-        parts.prepend(node.name);
+        parts.prepend(waveTreeNodeSegmentName(wave.tree, nodeId));
         nodeId = node.parentId;
         ++guard;
     }

@@ -49,12 +49,13 @@ function Copy-ReleaseDir([string]$relativePath) {
 }
 
 $files = @(
-    "CMakeLists.txt",
     "README_BUILD_VS.md",
     "README_WAVETAP_MANUAL.md",
     "README_WVZ4_V3_MONITOR_CHUNKS.md",
     "reflect_macro.h",
     "reflect_runtime.h",
+    "wavetrace_config.h",
+    "wavetrace_config.json",
     "wave_path_wvz4_recorder.h",
     "wave_runtime.h",
     "wave_tap.h",

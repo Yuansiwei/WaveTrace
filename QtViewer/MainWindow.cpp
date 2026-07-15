@@ -648,7 +648,7 @@ struct SmallStr32 {
 
 struct FlatIntIntMap {
     struct Entry {
-        int key = -1;
+        quint32 key = 0;
         int value = -1;
     };
 
@@ -670,17 +670,17 @@ struct FlatIntIntMap {
         used = 0;
 
         for (const Entry& e : old) {
-            if (e.key >= 0) insert(e.key, e.value);
+            if (e.value >= 0) insert(e.key, e.value);
         }
     }
 
-    bool find(int key, int& outValue) const {
+    bool find(quint32 key, int& outValue) const {
         if (table.isEmpty()) return false;
         uint32_t h = uint32_t(key) * 2654435761u;
         int pos = int(h) & mask;
         for (;;) {
             const Entry& e = table[pos];
-            if (e.key < 0) return false;
+            if (e.value < 0) return false;
             if (e.key == key) {
                 outValue = e.value;
                 return true;
@@ -689,13 +689,13 @@ struct FlatIntIntMap {
         }
     }
 
-    void insert(int key, int value) {
+    void insert(quint32 key, int value) {
         if (table.isEmpty() || used * 2 >= table.size()) reserve(qMax(8, used + 1));
         uint32_t h = uint32_t(key) * 2654435761u;
         int pos = int(h) & mask;
         for (;;) {
             Entry& e = table[pos];
-            if (e.key < 0) {
+            if (e.value < 0) {
                 e.key = key;
                 e.value = value;
                 ++used;
@@ -827,7 +827,7 @@ struct SignalPathEntry {
 };
 
 struct LogicTreeNode {
-    int nameId = -1;
+    quint32 nameToken = 0;
     int parent = -1;
     int childListId = -1;
     int signalIndex = -1;
@@ -845,6 +845,8 @@ struct LogicChildList {
 
 struct SignalLogicTree {
     SmallStrPool names;
+    QVector<QByteArray> waveNamesById;
+    bool usesWaveNameTokens = false;
     QVector<SignalPathEntry> signalPaths;
     QVector<LogicTreeNode> nodes;
     QVector<LogicChildList> childLists;
@@ -854,6 +856,8 @@ struct SignalLogicTree {
 
     void clear() {
         names = SmallStrPool();
+        waveNamesById.clear();
+        usesWaveNameTokens = false;
         signalPaths.clear();
         nodes.clear();
         childLists.clear();
@@ -884,13 +888,13 @@ struct SignalLogicTree {
         return childLists[node.childListId];
     }
 
-    int findChildInList(const LogicChildList& list, int nameId) const {
+    int findChildInList(const LogicChildList& list, quint32 nameToken) const {
         if (list.lookupReady) {
             int nodeId = -1;
-            return list.lookup.find(nameId, nodeId) ? nodeId : -1;
+            return list.lookup.find(nameToken, nodeId) ? nodeId : -1;
         }
         for (int childNodeId : list.children) {
-            if (nodes[childNodeId].nameId == nameId) return childNodeId;
+            if (nodes[childNodeId].nameToken == nameToken) return childNodeId;
         }
         return -1;
     }
@@ -899,22 +903,22 @@ struct SignalLogicTree {
         if (list.lookupReady || list.children.size() <= 32) return;
         list.lookup.reserve(list.children.size() * 2);
         for (int childNodeId : list.children) {
-            list.lookup.insert(nodes[childNodeId].nameId, childNodeId);
+            list.lookup.insert(nodes[childNodeId].nameToken, childNodeId);
         }
         list.lookupReady = true;
     }
 
-    int findOrCreateChildByNameId(int parentNodeId,
-                                  int nameId,
+    int findOrCreateChildByNameToken(int parentNodeId,
+                                  quint32 nameToken,
                                   bool leaf,
                                   int signalIndex,
                                   int signalId,
                                   int width) {
-        if (nameId < 0) return parentNodeId;
+        if (nameToken == 0) return parentNodeId;
 
         if (parentNodeId < 0) {
             int existing = -1;
-            if (rootLookup.find(nameId, existing)) {
+            if (rootLookup.find(nameToken, existing)) {
                 if (leaf) {
                     nodes[existing].signalIndex = signalIndex;
                     nodes[existing].signalId = signalId;
@@ -924,7 +928,7 @@ struct SignalLogicTree {
             }
 
             LogicTreeNode node;
-            node.nameId = nameId;
+            node.nameToken = nameToken;
             node.parent = -1;
             node.signalIndex = leaf ? signalIndex : -1;
             node.signalId = leaf ? signalId : -1;
@@ -932,12 +936,12 @@ struct SignalLogicTree {
             const int nodeId = nodes.size();
             nodes.push_back(node);
             roots.push_back(nodeId);
-            rootLookup.insert(nameId, nodeId);
+            rootLookup.insert(nameToken, nodeId);
             return nodeId;
         }
 
         LogicChildList& list = ensureChildList(parentNodeId);
-        int existing = findChildInList(list, nameId);
+        int existing = findChildInList(list, nameToken);
         if (existing >= 0) {
             if (leaf) {
                 nodes[existing].signalIndex = signalIndex;
@@ -948,7 +952,7 @@ struct SignalLogicTree {
         }
 
         LogicTreeNode node;
-        node.nameId = nameId;
+        node.nameToken = nameToken;
         node.parent = parentNodeId;
         node.signalIndex = leaf ? signalIndex : -1;
         node.signalId = leaf ? signalId : -1;
@@ -956,7 +960,7 @@ struct SignalLogicTree {
         const int nodeId = nodes.size();
         nodes.push_back(node);
         list.children.push_back(nodeId);
-        if (list.lookupReady) list.lookup.insert(nameId, nodeId);
+        if (list.lookupReady) list.lookup.insert(nameToken, nodeId);
         else maybeBuildLookup(list);
         return nodeId;
     }
@@ -986,7 +990,7 @@ struct SignalLogicTree {
                 const bool isLeaf = (i == segViews.size() - 1);
                 const int nameId = names.intern(segViews[i]);
                 path.nameIds.push_back(nameId);
-                parent = findOrCreateChildByNameId(parent, nameId, isLeaf,
+                parent = findOrCreateChildByNameToken(parent, quint32(nameId) + 1u, isLeaf,
                                                    isLeaf ? signalIndex : -1,
                                                    sig.signalId,
                                                    sig.width);
@@ -1011,7 +1015,8 @@ struct SignalLogicTree {
         }
 
         const int fileNodeCount = tree.nodesById.size();
-        names.reserve(qMax(1024, fileNodeCount));
+        usesWaveNameTokens = true;
+        waveNamesById = tree.namesById;
         nodes.clear();
         nodes.resize(fileNodeCount); // WVZ4 path: logic node id == NODE table index.
         childLists.reserve(qMax(1, fileNodeCount / 2));
@@ -1023,14 +1028,8 @@ struct SignalLogicTree {
             const WaveTreeNode& src = tree.nodesById.at(nodeId);
             if (!src.valid) continue;
 
-            const QByteArray utf8 = src.name.toUtf8();
-            SmallStrView view;
-            view.data = utf8.constData();
-            view.len = utf8.size();
-            view.hash = fnv1aHash(view.data, view.len);
-
             LogicTreeNode& node = nodes[nodeId];
-            node.nameId = names.intern(view);
+            node.nameToken = src.nameToken;
             node.parent = (src.parentId > 0 && src.parentId < fileNodeCount) ? src.parentId : -1;
             node.signalIndex = src.signalIndex;
             node.signalId = src.signalId;
@@ -1047,9 +1046,9 @@ struct SignalLogicTree {
         for (int rootId : tree.rootNodeIds) {
             if (rootId <= 0 || rootId >= fileNodeCount) continue;
             const LogicTreeNode& rootNode = nodes.at(rootId);
-            if (rootNode.nameId < 0) continue;
+            if (rootNode.nameToken == 0) continue;
             roots.push_back(rootId);
-            rootLookup.insert(rootNode.nameId, rootId);
+            rootLookup.insert(rootNode.nameToken, rootId);
             nodes[rootId].parent = -1;
         }
 
@@ -1057,10 +1056,10 @@ struct SignalLogicTree {
         // Current WVZ4 parser supplies rootNodeIds, so this path should not run.
         if (roots.empty()) {
             for (int nodeId = 1; nodeId < fileNodeCount; ++nodeId) {
-                if (nodes.at(nodeId).nameId < 0) continue;
+                if (nodes.at(nodeId).nameToken == 0) continue;
                 if (tree.nodesById.at(nodeId).parentId != 0) continue;
                 roots.push_back(nodeId);
-                rootLookup.insert(nodes.at(nodeId).nameId, nodeId);
+                rootLookup.insert(nodes.at(nodeId).nameToken, nodeId);
                 nodes[nodeId].parent = -1;
             }
         }
@@ -1069,7 +1068,7 @@ struct SignalLogicTree {
         // chains. This is still direct-indexed: every child id is the original
         // WVZ4 node_id, not a newly assigned UI/model id.
         for (int parentNodeId = 1; parentNodeId < fileNodeCount; ++parentNodeId) {
-            if (nodes.at(parentNodeId).nameId < 0) continue;
+            if (nodes.at(parentNodeId).nameToken == 0) continue;
 
             int childNodeId = tree.nodesById.at(parentNodeId).firstChild;
             if (childNodeId == 0) continue;
@@ -1078,7 +1077,7 @@ struct SignalLogicTree {
             int guard = 0;
             while (childNodeId != 0 && guard++ < fileNodeCount) {
                 if (childNodeId <= 0 || childNodeId >= fileNodeCount) break;
-                if (nodes.at(childNodeId).nameId >= 0) {
+                if (nodes.at(childNodeId).nameToken != 0) {
                     nodes[childNodeId].parent = parentNodeId;
                     list.children.push_back(childNodeId);
                 }
@@ -1095,10 +1094,8 @@ struct SignalLogicTree {
         int cur = nodeId;
         int guard = 0;
         while (cur >= 0 && cur < nodes.size() && guard++ < nodes.size()) {
-            const int nameId = nodes.at(cur).nameId;
-            if (nameId >= 0 && nameId < names.strings.size()) {
-                parts.push_back(names.get(nameId).toQString());
-            }
+            const QString segment = nodeNameString(cur);
+            if (!segment.isEmpty()) parts.push_back(segment);
             cur = nodes.at(cur).parent;
         }
         std::reverse(parts.begin(), parts.end());
@@ -1118,9 +1115,19 @@ struct SignalLogicTree {
 
     QString nodeNameString(int nodeId) const {
         if (nodeId < 0 || nodeId >= nodes.size()) return QString();
-        const int nameId = nodes.at(nodeId).nameId;
-        if (nameId < 0 || nameId >= names.strings.size()) return QString();
-        return names.get(nameId).toQString();
+        const quint32 nameToken = nodes.at(nodeId).nameToken;
+        if (nameToken == 0) return QString();
+        if (usesWaveNameTokens) {
+            if (waveNameTokenIsArrayIndex(nameToken)) {
+                return QStringLiteral("[%1]").arg(waveNameTokenValue(nameToken));
+            }
+            const quint32 nameId = waveNameTokenValue(nameToken);
+            if (nameId >= quint32(waveNamesById.size())) return QString();
+            return QString::fromUtf8(waveNamesById.at(int(nameId)));
+        }
+        const quint32 localNameId = nameToken - 1u;
+        if (localNameId >= quint32(names.strings.size())) return QString();
+        return names.get(int(localNameId)).toQString();
     }
 
     static QStringList splitSearchPath(const QString& query) {
@@ -1303,34 +1310,7 @@ QList<int> decodeIntList(const QMimeData* mimeData, const char* format) {
 }
 
 QString fullSignalPathFromWave(const WaveFile& wave, int signalIndex) {
-    if (signalIndex < 0 || signalIndex >= wave.signalList.size()) return QString();
-
-    const WaveTreeInfo& tree = wave.tree;
-    if (tree.valid && signalIndex < tree.signalIndexToNodeId.size()) {
-        const int nodeId = tree.signalIndexToNodeId.at(signalIndex);
-        if (nodeId > 0 && nodeId < tree.nodesById.size()) {
-            QVector<QString> parts;
-            int cur = nodeId;
-            int guard = 0;
-            while (cur > 0 && cur < tree.nodesById.size() && guard++ < tree.nodesById.size()) {
-                const WaveTreeNode& node = tree.nodesById.at(cur);
-                if (!node.valid) break;
-                if (!node.name.isEmpty()) parts.push_back(node.name);
-                cur = node.parentId;
-            }
-            if (!parts.isEmpty()) {
-                std::reverse(parts.begin(), parts.end());
-                QString joined;
-                for (int i = 0; i < parts.size(); ++i) {
-                    if (i > 0) joined += QLatin1Char('.');
-                    joined += parts.at(i);
-                }
-                return joined;
-            }
-        }
-    }
-
-    return wave.signalList.at(signalIndex).name.trimmed();
+    return waveSignalFullPath(wave, signalIndex).trimmed();
 }
 
 bool waveDirectoriesEquivalentForRawBlockCompare(const WaveFile& leftWave,
@@ -2369,7 +2349,7 @@ private:
     }
 
     bool isValidNode(int nodeId) const {
-        return m_tree && nodeId >= 0 && nodeId < m_tree->nodes.size() && m_tree->nodes.at(nodeId).nameId >= 0;
+        return m_tree && nodeId >= 0 && nodeId < m_tree->nodes.size() && m_tree->nodes.at(nodeId).nameToken != 0;
     }
 
     bool isSearchVisibleNode(int nodeId) const {
@@ -4081,7 +4061,7 @@ QString MainWindow::signalDisplayName(int signalIndex) const {
         if (!full.isEmpty()) return full;
     }
 
-    return m_wave.signalList.at(signalIndex).name;
+    return waveSignalFullPath(m_wave, signalIndex);
 }
 
 QString MainWindow::formatNameWithRange(int signalIndex) const {
@@ -5184,7 +5164,7 @@ bool MainWindow::createDerivedSignal(const QString& name, const QString& express
 
     for (int i = 0; i < m_wave.signalList.size(); ++i) {
         const QString fullName = signalDisplayName(i);
-        const QString rawName = m_wave.signalList.at(i).name;
+        const QString rawName = waveSignalSegmentName(m_wave, i);
         addExact(fullName, i);
         addExact(rawName, i);
         addLeaf(fullName, i);

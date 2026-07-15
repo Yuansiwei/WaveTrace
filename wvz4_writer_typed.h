@@ -63,7 +63,7 @@ using u64 = std::uint64_t;
 using u32 = std::uint32_t;
 using u8  = std::uint8_t;
 
-static const u32 kFormatVersion = 13;
+static const u32 kFormatVersion = 15;
 static const u8 kSignalFlagStorageOnly = 1u << 0;
 static const u32 kMaxScalarBytes = 8;
 static const u64 kLodBaseBucketCycles = 256;
@@ -72,7 +72,8 @@ static const u64 kLodResidualLevelMultiplier = 10;
 static const u32 kLodLevelCount = 7;
 static const u64 kLodMinRawTransitionsForTable = 4096;
 static const u64 kLodMaxRecordsToSourceRatio = 5; // one LOD level may keep at most 20% of its source records.
-static const u32 kWriterProcessProtocolVersion = 2;
+// v4 adds numeric array-index node names to layout frames.
+static const u32 kWriterProcessProtocolVersion = 4;
 
 // Raw WDAT payload encoding flags. The outer WDAT section and block index remain
 // unchanged; these flags describe the uncompressed raw_payload inside each block.
@@ -233,7 +234,10 @@ struct NameRecord {
 struct NodeRecord {
     u32 node_id = 0;       // positive, unique
     u32 parent_id = 0;     // 0 only for root-level nodes
+    // name_id == 0 marks a numeric array element. Its array_index is encoded
+    // directly in WVZ4 v15 NODE instead of materializing "[N]" in NAME.
     u32 name_id = 0;
+    u32 array_index = 0;
     NodeKind kind = NodeKind::Object;
 
     // Stored child table. first_child points to first child node; siblings form a chain.
@@ -315,6 +319,9 @@ inline void add_layout_name_blob_ref_record(Layout& layout, u32 name_id, u32 off
 
 struct WriterOptions {
     u64 target_block_span = 100000; // writer-cycle span; must be > 0
+    // First cycle represented by this file. This lets a trace window begin at
+    // an absolute business cycle without manufacturing empty blocks from zero.
+    u64 initial_cycle = 0;
     Compression compression = Compression::Zstd;
     int zstd_level = 3;
 
@@ -725,6 +732,14 @@ inline void append_varuint(std::vector<u8>& out, u64 v) {
     append_varuint_slow(out, v);
 }
 
+inline u64 zigzag_encode_i64(i64 value) {
+    return (static_cast<u64>(value) << 1u) ^ static_cast<u64>(-(value < 0));
+}
+
+inline void append_varint(std::vector<u8>& out, i64 value) {
+    append_varuint(out, zigzag_encode_i64(value));
+}
+
 inline void append_string(std::vector<u8>& out, const std::string& s) {
     append_varuint(out, static_cast<u64>(s.size()));
     if (!s.empty()) append_bytes(out, s.data(), s.size());
@@ -874,6 +889,10 @@ public:
             error = "WVZ4 WriterOptions.target_block_span exceeds int64 cycle range";
             return false;
         }
+        if (options_.initial_cycle > static_cast<u64>(std::numeric_limits<i64>::max())) {
+            error = "WVZ4 WriterOptions.initial_cycle exceeds int64 cycle range";
+            return false;
+        }
         if (!detail::is_valid_compression(options_.compression)) {
             error = "invalid WVZ4 compression option";
             return false;
@@ -890,7 +909,8 @@ public:
                << " nodes=" << static_cast<unsigned long long>(layout_.nodes.size())
                << " signals=" << static_cast<unsigned long long>(layout_.signals.size())
                << " clocks=" << static_cast<unsigned long long>(layout_.clocks.size())
-               << " max_signal_id=" << static_cast<unsigned long long>(max_signal_id_);
+               << " max_signal_id=" << static_cast<unsigned long long>(max_signal_id_)
+               << " initial_cycle=" << static_cast<unsigned long long>(options_.initial_cycle);
             writer_init_diag_log_("writer-validate-layout", phase_start, os.str());
         }
 
@@ -903,8 +923,8 @@ public:
         }
         writer_init_diag_log_("writer-open-file", phase_start);
         opened_ = true;
-        current_block_start_ = 0;
-        current_cycle_ = 0;
+        current_block_start_ = options_.initial_cycle;
+        current_cycle_ = static_cast<i64>(options_.initial_cycle);
         next_block_id_ = 0;
         footer_offset_ = 0;
 
@@ -1883,7 +1903,7 @@ private:
         for (std::size_t i = 0; i < layout_.nodes.size(); ++i) {
             const NodeRecord& r = layout_.nodes[i];
             if (r.node_id != static_cast<u32>(i + 1u)) return false;
-            if (r.name_id == 0 || r.name_id > name_count) {
+            if (r.name_id != 0 && r.name_id > name_count) {
                 error = detail::make_error("NodeRecord references missing name_id: ", r.name_id);
                 return false;
             }
@@ -2108,7 +2128,8 @@ private:
         for (std::size_t i = 0; i < layout_.nodes.size(); ++i) {
             const NodeRecord& r = layout_.nodes[i];
             if (r.node_id == 0) { error = "NodeRecord.node_id must be positive"; return false; }
-            if (r.name_id == 0 || r.name_id >= seen_names.size() || !seen_names[r.name_id]) {
+            if (r.name_id != 0 &&
+                (r.name_id >= seen_names.size() || !seen_names[r.name_id])) {
                 error = detail::make_error("NodeRecord references missing name_id: ", r.name_id); return false;
             }
             if (!detail::is_valid_node_kind(r.kind)) { error = detail::make_error("invalid NodeKind for node_id: ", r.node_id); return false; }
@@ -2353,7 +2374,9 @@ private:
         if (key == "WDAT") stats_.wdat_section_bytes += section_bytes;
         else if (key == "FOOT") stats_.foot_section_bytes += section_bytes;
         else if (key == "NAME" || key == "NAMZ" || key == "NODE" || key == "NODZ" ||
-                 key == "SIGT" || key == "SIGZ" || key == "CLKD" || key == "CLKZ") {
+                 key == "NODD" || key == "NDZ2" || key == "NREF" || key == "NRFZ" ||
+                 key == "NODI" || key == "NIZ2" || key == "SIGT" || key == "SIGZ" ||
+                 key == "SIGD" || key == "SGZ2" || key == "CLKD" || key == "CLKZ") {
             stats_.layout_section_bytes += section_bytes;
         } else {
             stats_.other_section_bytes += section_bytes;
@@ -2677,11 +2700,18 @@ private:
             std::sort(sorted_nodes.begin(), sorted_nodes.end(), [](const NodeRecord& a, const NodeRecord& b) { return a.node_id < b.node_id; });
             nodes = &sorted_nodes;
         }
+        u32 previous_array_index = 0;
         for (std::size_t i = 0; i < nodes->size(); ++i) {
             const NodeRecord& n = (*nodes)[i];
             detail::append_varuint(payload, n.node_id);
             detail::append_varuint(payload, n.parent_id);
-            detail::append_varuint(payload, n.name_id);
+            u64 name_ref = static_cast<u64>(n.name_id) << 1u;
+            if (n.name_id == 0) {
+                const i64 delta = static_cast<i64>(n.array_index) - static_cast<i64>(previous_array_index);
+                name_ref = (detail::zigzag_encode_i64(delta) << 1u) | 1u;
+                previous_array_index = n.array_index;
+            }
+            detail::append_varuint(payload, name_ref);
             detail::append_u8(payload, static_cast<u8>(n.kind));
             detail::append_varuint(payload, n.first_child);
             detail::append_varuint(payload, n.next_sibling);
@@ -2709,6 +2739,108 @@ private:
             detail::append_u8(payload, static_cast<u8>(s.radix));
             detail::append_varuint(payload, s.bit_offset);
             detail::append_u8(payload, s.storage_only ? kSignalFlagStorageOnly : 0u);
+        }
+    }
+
+    static bool can_build_compact_node_layout_payload(const Layout& layout) {
+        if (!nodes_sorted_by_id(layout.nodes)) return false;
+        for (std::size_t i = 0; i < layout.nodes.size(); ++i) {
+            const NodeRecord& n = layout.nodes[i];
+            const u32 id = static_cast<u32>(i + 1u);
+            if (n.node_id != id ||
+                (n.parent_id != 0 && n.parent_id >= id) ||
+                (n.first_child != 0 && n.first_child <= id) ||
+                (n.next_sibling != 0 && n.next_sibling <= id)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static void build_compact_node_layout_payload(const Layout& layout, std::vector<u8>& payload) {
+        payload.clear();
+        payload.reserve(layout.nodes.size() * 8u + 16u);
+        detail::append_varuint(payload, static_cast<u64>(layout.nodes.size()));
+        u32 previous_name_id = 0;
+        u32 previous_array_index = 0;
+        for (std::size_t i = 0; i < layout.nodes.size(); ++i) {
+            const NodeRecord& n = layout.nodes[i];
+            const u32 id = static_cast<u32>(i + 1u);
+            detail::append_varuint(payload, n.parent_id == 0 ? 0u : static_cast<u64>(id - n.parent_id));
+            u64 name_ref = 0;
+            if (n.name_id == 0) {
+                const i64 index_delta = static_cast<i64>(n.array_index) - static_cast<i64>(previous_array_index);
+                name_ref = (detail::zigzag_encode_i64(index_delta) << 1u) | 1u;
+                previous_array_index = n.array_index;
+            } else {
+                const i64 name_delta = static_cast<i64>(n.name_id) - static_cast<i64>(previous_name_id);
+                name_ref = detail::zigzag_encode_i64(name_delta) << 1u;
+                previous_name_id = n.name_id;
+            }
+            detail::append_varuint(payload, name_ref);
+            detail::append_u8(payload, static_cast<u8>(n.kind));
+            detail::append_varuint(payload, n.first_child == 0 ? 0u : static_cast<u64>(n.first_child - id));
+            detail::append_varuint(payload, n.next_sibling == 0 ? 0u : static_cast<u64>(n.next_sibling - id));
+        }
+    }
+
+    static u32 natural_signal_bit_width(ValueType type) {
+        switch (type) {
+        case ValueType::Bool: return 1u;
+        case ValueType::I8:
+        case ValueType::U8: return 8u;
+        case ValueType::I16:
+        case ValueType::U16: return 16u;
+        case ValueType::I32:
+        case ValueType::U32:
+        case ValueType::F32: return 32u;
+        case ValueType::I64:
+        case ValueType::U64:
+        case ValueType::F64: return 64u;
+        default: return 0u;
+        }
+    }
+
+    static bool can_build_compact_signal_layout_payload(const Layout& layout) {
+        if (!signals_sorted_by_id(layout.signals)) return false;
+        for (std::size_t i = 0; i < layout.signals.size(); ++i) {
+            const SignalDefinition& s = layout.signals[i];
+            const u32 id = static_cast<u32>(i + 1u);
+            const u32 storage_id = s.storage_id != 0 ? s.storage_id : id;
+            if (s.signal_id != id || storage_id == 0 || storage_id > id ||
+                natural_signal_bit_width(s.type) == 0u) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static void build_compact_signal_layout_payload(const Layout& layout, std::vector<u8>& payload) {
+        static const u8 kStorageBackPresent = 1u << 4;
+        static const u8 kBitOffsetPresent = 1u << 5;
+        static const u8 kNonNaturalWidth = 1u << 6;
+        static const u8 kExplicitRadix = 1u << 7;
+
+        payload.clear();
+        payload.reserve(layout.signals.size() * 5u + 16u);
+        detail::append_varuint(payload, static_cast<u64>(layout.signals.size()));
+        u32 previous_node_id = 0;
+        for (std::size_t i = 0; i < layout.signals.size(); ++i) {
+            const SignalDefinition& s = layout.signals[i];
+            const u32 id = static_cast<u32>(i + 1u);
+            const u32 storage_id = s.storage_id != 0 ? s.storage_id : id;
+            u8 meta = static_cast<u8>(s.type);
+            if (storage_id != id) meta = static_cast<u8>(meta | kStorageBackPresent);
+            if (s.bit_offset != 0) meta = static_cast<u8>(meta | kBitOffsetPresent);
+            if (s.bit_width != natural_signal_bit_width(s.type)) meta = static_cast<u8>(meta | kNonNaturalWidth);
+            if (s.radix != Radix::Auto) meta = static_cast<u8>(meta | kExplicitRadix);
+            detail::append_u8(payload, meta);
+            detail::append_varint(payload, static_cast<i64>(s.node_id) - static_cast<i64>(previous_node_id));
+            if (storage_id != id) detail::append_varuint(payload, static_cast<u64>(id - storage_id));
+            if (s.bit_width != natural_signal_bit_width(s.type)) detail::append_varuint(payload, s.bit_width);
+            if (s.radix != Radix::Auto) detail::append_u8(payload, static_cast<u8>(s.radix));
+            if (s.bit_offset != 0) detail::append_varuint(payload, s.bit_offset);
+            previous_node_id = s.node_id;
         }
     }
 
@@ -2760,14 +2892,21 @@ private:
     }
 
     bool stream_node_layout_section_(const Layout& layout, std::string& error) {
-        return write_streamed_layout_section("NODE", "writer-layout-stream-NODE",
+        return write_streamed_layout_section("NREF", "writer-layout-stream-NREF",
             [&](BufferedSectionWriter& writer, std::string& local_error) -> bool {
                 if (!writer.append_varuint(static_cast<u64>(layout.nodes.size()), local_error)) return false;
+                u32 previous_array_index = 0;
                 for (std::size_t i = 0; i < layout.nodes.size(); ++i) {
                     const NodeRecord& n = layout.nodes[i];
                     if (!writer.append_varuint(n.node_id, local_error)) return false;
                     if (!writer.append_varuint(n.parent_id, local_error)) return false;
-                    if (!writer.append_varuint(n.name_id, local_error)) return false;
+                    u64 name_ref = static_cast<u64>(n.name_id) << 1u;
+                    if (n.name_id == 0) {
+                        const i64 delta = static_cast<i64>(n.array_index) - static_cast<i64>(previous_array_index);
+                        name_ref = (detail::zigzag_encode_i64(delta) << 1u) | 1u;
+                        previous_array_index = n.array_index;
+                    }
+                    if (!writer.append_varuint(name_ref, local_error)) return false;
                     if (!writer.append_u8(static_cast<u8>(n.kind), local_error)) return false;
                     if (!writer.append_varuint(n.first_child, local_error)) return false;
                     if (!writer.append_varuint(n.next_sibling, local_error)) return false;
@@ -2922,7 +3061,7 @@ private:
         name_payload.clear();
         name_payload.shrink_to_fit();
         phase_start = std::chrono::steady_clock::now();
-        if (!write_layout_section("NODE", "NODZ", node_payload, error)) return false;
+        if (!write_layout_section("NREF", "NRFZ", node_payload, error)) return false;
         writer_init_diag_log_bytes_("writer-layout-write-NODE", phase_start, static_cast<u64>(node_payload.size()));
         node_payload.clear();
         node_payload.shrink_to_fit();
@@ -3018,12 +3157,14 @@ private:
         name_work.zstd_tag = "NAMZ";
         LayoutSectionWork node_work;
         node_work.name = "NODE";
-        node_work.raw_tag = "NODE";
-        node_work.zstd_tag = "NODZ";
+        const bool compact_nodes = can_build_compact_node_layout_payload(layout);
+        node_work.raw_tag = compact_nodes ? "NODI" : "NREF";
+        node_work.zstd_tag = compact_nodes ? "NIZ2" : "NRFZ";
         LayoutSectionWork signal_work;
         signal_work.name = "SIGT";
-        signal_work.raw_tag = "SIGT";
-        signal_work.zstd_tag = "SIGZ";
+        const bool compact_signals = can_build_compact_signal_layout_payload(layout);
+        signal_work.raw_tag = compact_signals ? "SIGD" : "SIGT";
+        signal_work.zstd_tag = compact_signals ? "SGZ2" : "SIGZ";
 
         std::mutex thread_error_mutex;
         std::string thread_error;
@@ -3040,9 +3181,15 @@ private:
             }
         };
 
+        const LayoutPayloadBuildFn node_build = compact_nodes
+            ? &Writer::build_compact_node_layout_payload
+            : &Writer::build_node_layout_payload;
+        const LayoutPayloadBuildFn signal_build = compact_signals
+            ? &Writer::build_compact_signal_layout_payload
+            : &Writer::build_signal_layout_payload;
         std::thread name_thread(run_work, &Writer::build_name_layout_payload, std::ref(name_work));
-        std::thread node_thread(run_work, &Writer::build_node_layout_payload, std::ref(node_work));
-        std::thread signal_thread(run_work, &Writer::build_signal_layout_payload, std::ref(signal_work));
+        std::thread node_thread(run_work, node_build, std::ref(node_work));
+        std::thread signal_thread(run_work, signal_build, std::ref(signal_work));
 
         if (name_thread.joinable()) name_thread.join();
         if (node_thread.joinable()) node_thread.join();
@@ -3101,17 +3248,21 @@ private:
         writer_init_diag_log_bytes_("writer-layout-write-NAME", phase_start, static_cast<u64>(payload.size()));
 
         phase_start = std::chrono::steady_clock::now();
-        build_node_layout_payload(layout, payload);
+        const bool compact_nodes = can_build_compact_node_layout_payload(layout);
+        if (compact_nodes) build_compact_node_layout_payload(layout, payload);
+        else build_node_layout_payload(layout, payload);
         writer_init_diag_log_bytes_("writer-layout-build-NODE", phase_start, static_cast<u64>(payload.size()));
         phase_start = std::chrono::steady_clock::now();
-        if (!write_layout_section("NODE", "NODZ", payload, error)) return false;
+        if (!write_layout_section(compact_nodes ? "NODI" : "NREF", compact_nodes ? "NIZ2" : "NRFZ", payload, error)) return false;
         writer_init_diag_log_bytes_("writer-layout-write-NODE", phase_start, static_cast<u64>(payload.size()));
 
         phase_start = std::chrono::steady_clock::now();
-        build_signal_layout_payload(layout, payload);
+        const bool compact_signals = can_build_compact_signal_layout_payload(layout);
+        if (compact_signals) build_compact_signal_layout_payload(layout, payload);
+        else build_signal_layout_payload(layout, payload);
         writer_init_diag_log_bytes_("writer-layout-build-SIGT", phase_start, static_cast<u64>(payload.size()));
         phase_start = std::chrono::steady_clock::now();
-        if (!write_layout_section("SIGT", "SIGZ", payload, error)) return false;
+        if (!write_layout_section(compact_signals ? "SIGD" : "SIGT", compact_signals ? "SGZ2" : "SIGZ", payload, error)) return false;
         writer_init_diag_log_bytes_("writer-layout-write-SIGT", phase_start, static_cast<u64>(payload.size()));
 
         phase_start = std::chrono::steady_clock::now();
@@ -3253,7 +3404,7 @@ private:
         if (jobs.empty() && max_signal_id_ > 0) {
             BlockJob job;
             job.block_id = next_block_id_++;
-            job.start_cycle = block_index_.empty() ? 0 : static_cast<i64>(current_block_start_);
+            job.start_cycle = static_cast<i64>(current_block_start_);
             job.end_cycle = end_cycle;
             job.signal_chunk_id = 0;
             job.first_signal_id = 1;
@@ -6324,6 +6475,7 @@ private:
 
 inline void serialize_options(std::vector<u8>& out, const WriterOptions& o) {
     append_varuint(out, o.target_block_span);
+    append_varuint(out, o.initial_cycle);
     append_u8(out, static_cast<u8>(o.compression));
     append_i64(out, static_cast<i64>(o.zstd_level));
     append_u8(out, o.enable_block_pipeline ? 1 : 0);
@@ -6348,6 +6500,7 @@ inline void serialize_options(std::vector<u8>& out, const WriterOptions& o) {
 inline bool deserialize_options(PayloadReader& r, WriterOptions& o) {
     u64 v = 0; u8 b = 0; i64 si = 0;
     if (!r.read_varuint(v)) return false; o.target_block_span = v;
+    if (!r.read_varuint(v)) return false; o.initial_cycle = v;
     if (!r.read_u8(b)) return false; o.compression = static_cast<Compression>(b);
     if (!r.read_i64(si)) return false; o.zstd_level = static_cast<int>(si);
     if (!r.read_u8(b)) return false; o.enable_block_pipeline = (b != 0);
@@ -6413,6 +6566,7 @@ inline void serialize_layout(std::vector<u8>& out, const Layout& l) {
         append_varuint(out, n.node_id);
         append_varuint(out, n.parent_id);
         append_varuint(out, n.name_id);
+        append_varuint(out, n.array_index);
         append_u8(out, static_cast<u8>(n.kind));
         append_varuint(out, n.first_child);
         append_varuint(out, n.next_sibling);
@@ -6495,6 +6649,7 @@ inline bool deserialize_layout(PayloadReader& r, Layout& l) {
         if (!r.read_varuint(tmp)) return false; rec.node_id = static_cast<u32>(tmp);
         if (!r.read_varuint(tmp)) return false; rec.parent_id = static_cast<u32>(tmp);
         if (!r.read_varuint(tmp)) return false; rec.name_id = static_cast<u32>(tmp);
+        if (!r.read_varuint(tmp)) return false; rec.array_index = static_cast<u32>(tmp);
         if (!r.read_u8(b)) return false; rec.kind = static_cast<NodeKind>(b);
         if (!r.read_varuint(tmp)) return false; rec.first_child = static_cast<u32>(tmp);
         if (!r.read_varuint(tmp)) return false; rec.next_sibling = static_cast<u32>(tmp);
@@ -7060,14 +7215,31 @@ private:
         cmd += " --log ";
         cmd += detail::quote_process_arg(diag_log_path_);
 
-        std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
-        mutable_cmd.push_back('\0');
+        const auto utf8_to_wide = [](const std::string& text, std::wstring& wide) -> bool {
+            if (text.empty()) { wide.clear(); return true; }
+            const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                                   text.data(), static_cast<int>(text.size()),
+                                                   NULL, 0);
+            if (count <= 0) return false;
+            wide.resize(static_cast<std::size_t>(count));
+            return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                       text.data(), static_cast<int>(text.size()),
+                                       &wide[0], count) == count;
+        };
+        std::wstring wide_helper;
+        std::wstring wide_cmd;
+        if (!utf8_to_wide(helper, wide_helper) || !utf8_to_wide(cmd, wide_cmd)) {
+            error = "failed to convert WVZ4 writer helper command from UTF-8 to UTF-16";
+            return false;
+        }
+        std::vector<wchar_t> mutable_cmd(wide_cmd.begin(), wide_cmd.end());
+        mutable_cmd.push_back(L'\0');
 
-        STARTUPINFOA si;
+        STARTUPINFOW si;
         std::memset(&si, 0, sizeof(si));
         si.cb = sizeof(si);
         std::memset(&pi_, 0, sizeof(pi_));
-        if (!CreateProcessA(helper.c_str(), mutable_cmd.data(), NULL, NULL, FALSE,
+        if (!CreateProcessW(wide_helper.c_str(), mutable_cmd.data(), NULL, NULL, FALSE,
                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi_)) {
             error = detail::win32_error_message("failed to start WVZ4 writer helper");
             return false;
@@ -7249,7 +7421,7 @@ private:
         for (std::size_t start = 0; start < layout.nodes.size(); ) {
             const std::size_t count = (std::min)(kRecordChunkCount, layout.nodes.size() - start);
             payload.clear();
-            payload.reserve(16u + count * 21u);
+            payload.reserve(16u + count * 25u);
             detail::append_u64(payload, static_cast<u64>(start));
             detail::append_u64(payload, static_cast<u64>(count));
             for (std::size_t i = 0; i < count; ++i) {
@@ -7257,6 +7429,7 @@ private:
                 detail::append_u32(payload, n.node_id);
                 detail::append_u32(payload, n.parent_id);
                 detail::append_u32(payload, n.name_id);
+                detail::append_u32(payload, n.array_index);
                 detail::append_u8(payload, static_cast<u8>(n.kind));
                 detail::append_u32(payload, n.first_child);
                 detail::append_u32(payload, n.next_sibling);
@@ -7939,6 +8112,7 @@ public:
                     if (!r.read_u32(rec.node_id) ||
                         !r.read_u32(rec.parent_id) ||
                         !r.read_u32(rec.name_id) ||
+                        !r.read_u32(rec.array_index) ||
                         !r.read_u8(kind) ||
                         !r.read_u32(rec.first_child) ||
                         !r.read_u32(rec.next_sibling)) {

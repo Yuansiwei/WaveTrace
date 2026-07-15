@@ -59,9 +59,9 @@ private:
 典型生成位置：
 
 ```text
-<build-dir>/WaveTracer/generated_reflect/project_reflect_auto.h
-<build-dir>/WaveTracer/generated_reflect/root_class_closure_reflect_auto.h
-<build-dir>/WaveTracer/generated_reflect/reflectgen.log
+<original-WaveTracer-dir>/generated_reflect/project_reflect_auto.h
+<original-WaveTracer-dir>/generated_reflect/root_class_closure_reflect_auto.h
+<original-WaveTracer-dir>/generated_reflect/reflectgen.log
 ```
 
 不要手工修改生成头。源头头文件、编译宏或 include path 变化后，让构建系统重新运行 ReflectGen。

@@ -227,22 +227,7 @@ static QString benchmarkDisplayTime(qint64 internalTime) {
 }
 
 static QString benchmarkSignalName(const WaveFile& wave, int signalIndex) {
-    if (signalIndex < 0 || signalIndex >= wave.signalList.size()) return QString();
-    if (!wave.tree.valid ||
-        signalIndex >= wave.tree.signalIndexToNodeId.size()) {
-        return wave.signalList.at(signalIndex).name;
-    }
-
-    int nodeId = wave.tree.signalIndexToNodeId.at(signalIndex);
-    QStringList parts;
-    while (nodeId >= 0 && nodeId < wave.tree.nodesById.size()) {
-        const WaveTreeNode& node = wave.tree.nodesById.at(nodeId);
-        if (!node.valid) break;
-        if (!node.name.isEmpty()) parts.prepend(node.name);
-        if (node.parentId == nodeId) break;
-        nodeId = node.parentId;
-    }
-    return parts.isEmpty() ? wave.signalList.at(signalIndex).name : parts.join(QLatin1Char('.'));
+    return waveSignalFullPath(wave, signalIndex);
 }
 
 static bool loadWaveForCaptureTool(const QString& wavePath,
@@ -424,7 +409,7 @@ static int runDumpSignalHead(const QStringList& args) {
         << " end=" << wave.meta.end << "\n";
     for (int i = 0; i < wave.signalList.size() && i < requestedSignals; ++i) {
         const WaveSignal& sig = wave.signalList.at(i);
-        out << "signal[" << i << "] name=" << sig.name
+        out << "signal[" << i << "] name=" << waveSignalFullPath(wave, i)
             << " kind=" << (sig.kind == SignalKind::Bit ? "bit" : "bus")
             << " width=" << sig.width
             << " samplesLoaded=" << (sig.samplesLoaded ? 1 : 0)

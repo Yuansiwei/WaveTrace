@@ -21,11 +21,23 @@ endif()
 
 file(MAKE_DIRECTORY "${WAVETRACE_REFLECT_OUTPUT_DIR}")
 
+if(DEFINED WAVETRACE_REFLECT_CLANG_ARGS_FILE AND
+        NOT "${WAVETRACE_REFLECT_CLANG_ARGS_FILE}" STREQUAL "")
+    if(NOT EXISTS "${WAVETRACE_REFLECT_CLANG_ARGS_FILE}")
+        message(FATAL_ERROR
+            "WaveTrace ReflectGen clang argument file not found: ${WAVETRACE_REFLECT_CLANG_ARGS_FILE}")
+    endif()
+    include("${WAVETRACE_REFLECT_CLANG_ARGS_FILE}")
+endif()
+
 set(_cmd
     "${WAVETRACE_REFLECTGEN_EXE}"
     --reflect-root-class "${WAVETRACE_REFLECT_ROOT_CLASS}"
-    --allow-errors
 )
+
+if(DEFINED WAVETRACE_REFLECT_COMPILE_SHARDS AND WAVETRACE_REFLECT_COMPILE_SHARDS GREATER 0)
+    list(APPEND _cmd --compile-shards "${WAVETRACE_REFLECT_COMPILE_SHARDS}")
+endif()
 
 if(DEFINED WAVETRACE_REFLECT_TARGET_LIST AND NOT "${WAVETRACE_REFLECT_TARGET_LIST}" STREQUAL "")
     if(NOT EXISTS "${WAVETRACE_REFLECT_TARGET_LIST}")
@@ -55,6 +67,10 @@ foreach(_arg IN LISTS WAVETRACE_REFLECT_EXTRA_ARGS)
     endif()
 endforeach()
 
+if(DEFINED WAVETRACE_CONFIG_FILE AND NOT "${WAVETRACE_CONFIG_FILE}" STREQUAL "")
+    list(APPEND _cmd --wavetrace-config "${WAVETRACE_CONFIG_FILE}")
+endif()
+
 list(APPEND _cmd
     -o "${WAVETRACE_REFLECT_OUTPUT_DIR}"
     --aggregate-header "${WAVETRACE_REFLECT_AGGREGATE_HEADER}"
@@ -70,6 +86,9 @@ endforeach()
 
 set(_wavetrace_reflect_aggregate_output "${WAVETRACE_REFLECT_OUTPUT_DIR}/${WAVETRACE_REFLECT_AGGREGATE_HEADER}")
 set(_wavetrace_reflect_inputs "${WAVETRACE_REFLECTGEN_EXE}")
+if(DEFINED WAVETRACE_CONFIG_FILE AND EXISTS "${WAVETRACE_CONFIG_FILE}")
+    list(APPEND _wavetrace_reflect_inputs "${WAVETRACE_CONFIG_FILE}")
+endif()
 foreach(_wavetrace_reflect_list_file WAVETRACE_REFLECT_TARGET_LIST WAVETRACE_REFLECT_INPUT_LIST)
     if(DEFINED ${_wavetrace_reflect_list_file} AND EXISTS "${${_wavetrace_reflect_list_file}}")
         list(APPEND _wavetrace_reflect_inputs "${${_wavetrace_reflect_list_file}}")
@@ -114,31 +133,102 @@ execute_process(
     ERROR_VARIABLE _stderr
 )
 
+set(_wavetrace_reflect_failed OFF)
+set(_wavetrace_reflect_failure_reason "")
+if(NOT _result EQUAL 0)
+    set(_wavetrace_reflect_failed ON)
+    set(_wavetrace_reflect_failure_reason "ReflectGen exited with code ${_result}")
+elseif(NOT EXISTS "${_wavetrace_reflect_aggregate_output}")
+    set(_wavetrace_reflect_failed ON)
+    set(_wavetrace_reflect_failure_reason
+        "ReflectGen exited successfully but did not create ${_wavetrace_reflect_aggregate_output}")
+endif()
+
+# ReflectGen atomically updates wavetrace_config.json after emitting headers.
+# Keep the declared output newest so that this generated input does not cause one
+# redundant build immediately after a successful discovery/update pass.
+if(NOT _wavetrace_reflect_failed)
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E touch "${_wavetrace_reflect_aggregate_output}"
+        RESULT_VARIABLE _wavetrace_reflect_touch_result
+    )
+    if(NOT _wavetrace_reflect_touch_result EQUAL 0)
+        set(_wavetrace_reflect_failed ON)
+        set(_wavetrace_reflect_failure_reason
+            "failed to finalize aggregate output timestamp: ${_wavetrace_reflect_aggregate_output}")
+    endif()
+endif()
+
 set(_wavetrace_reflect_dump_output OFF)
-if(WAVETRACE_REFLECT_VERBOSE OR NOT _result EQUAL 0)
+if(WAVETRACE_REFLECT_VERBOSE OR _wavetrace_reflect_failed)
     set(_wavetrace_reflect_dump_output ON)
 endif()
 
-if(_wavetrace_reflect_dump_output AND NOT "${_stdout}" STREQUAL "")
-    message("${_stdout}")
-endif()
-if(_wavetrace_reflect_dump_output AND NOT "${_stderr}" STREQUAL "")
-    message("${_stderr}")
+set(_log "")
+if(EXISTS "${WAVETRACE_REFLECT_LOG_FILE}")
+    file(READ "${WAVETRACE_REFLECT_LOG_FILE}" _log)
 endif()
 
-if(EXISTS "${WAVETRACE_REFLECT_LOG_FILE}")
-    if(_wavetrace_reflect_dump_output)
-        file(READ "${WAVETRACE_REFLECT_LOG_FILE}" _log)
-        if(NOT "${_log}" STREQUAL "")
-            message(STATUS "===== WaveTrace ReflectGen log: ${WAVETRACE_REFLECT_LOG_FILE} =====")
-            message("${_log}")
-            message(STATUS "===== End WaveTrace ReflectGen log =====")
+if(_wavetrace_reflect_dump_output)
+    if(NOT "${_log}" STREQUAL "")
+        message(STATUS "===== WaveTrace ReflectGen log: ${WAVETRACE_REFLECT_LOG_FILE} =====")
+        message("${_log}")
+        message(STATUS "===== End WaveTrace ReflectGen log =====")
+    else()
+        if(NOT "${_stdout}" STREQUAL "")
+            message("${_stdout}")
+        endif()
+        if(NOT "${_stderr}" STREQUAL "")
+            message("${_stderr}")
+        endif()
+        message(STATUS "WaveTrace ReflectGen did not create a log file: ${WAVETRACE_REFLECT_LOG_FILE}")
+    endif()
+endif()
+
+if(_wavetrace_reflect_failed)
+    # Convert Clang's path:line:column diagnostics to MSBuild's native format so
+    # Visual Studio shows the real source locations as clickable Error List rows.
+    if(EXISTS "${WAVETRACE_REFLECT_LOG_FILE}")
+        file(STRINGS "${WAVETRACE_REFLECT_LOG_FILE}" _wavetrace_reflect_diagnostic_lines)
+    else()
+        set(_wavetrace_reflect_diagnostic_text "${_stderr}")
+        string(REPLACE ";" "\\;" _wavetrace_reflect_diagnostic_text "${_wavetrace_reflect_diagnostic_text}")
+        string(REPLACE "\r\n" "\n" _wavetrace_reflect_diagnostic_text "${_wavetrace_reflect_diagnostic_text}")
+        string(REPLACE "\r" "\n" _wavetrace_reflect_diagnostic_text "${_wavetrace_reflect_diagnostic_text}")
+        string(REPLACE "\n" ";" _wavetrace_reflect_diagnostic_lines "${_wavetrace_reflect_diagnostic_text}")
+    endif()
+    if(NOT DEFINED _wavetrace_reflect_diagnostic_lines)
+        set(_wavetrace_reflect_diagnostic_text "${_stderr}")
+        set(_wavetrace_reflect_diagnostic_lines "${_wavetrace_reflect_diagnostic_text}")
+    endif()
+    set(_wavetrace_reflect_emitted_diagnostics)
+    foreach(_wavetrace_reflect_diagnostic_line IN LISTS _wavetrace_reflect_diagnostic_lines)
+        if(_wavetrace_reflect_diagnostic_line MATCHES "^(.+):([0-9]+):([0-9]+):[ ]*(fatal error|error|warning):[ ]*(.*)$")
+            set(_wavetrace_reflect_diagnostic_kind "${CMAKE_MATCH_4}")
+            if(_wavetrace_reflect_diagnostic_kind STREQUAL "fatal error")
+                set(_wavetrace_reflect_diagnostic_kind "error")
+            endif()
+            set(_wavetrace_reflect_vs_diagnostic
+                "${CMAKE_MATCH_1}(${CMAKE_MATCH_2},${CMAKE_MATCH_3}): ${_wavetrace_reflect_diagnostic_kind} WTR1002: ${CMAKE_MATCH_5}")
+            if(NOT _wavetrace_reflect_vs_diagnostic IN_LIST _wavetrace_reflect_emitted_diagnostics)
+                list(APPEND _wavetrace_reflect_emitted_diagnostics "${_wavetrace_reflect_vs_diagnostic}")
+                message("${_wavetrace_reflect_vs_diagnostic}")
+            endif()
+        endif()
+    endforeach()
+
+    set(_wavetrace_reflect_error_source "${WAVETRACE_REFLECT_LOG_FILE}")
+    if(DEFINED WAVETRACE_REFLECT_TARGET_LIST AND EXISTS "${WAVETRACE_REFLECT_TARGET_LIST}")
+        file(STRINGS "${WAVETRACE_REFLECT_TARGET_LIST}" _wavetrace_reflect_error_sources LIMIT_COUNT 1)
+        if(_wavetrace_reflect_error_sources)
+            list(GET _wavetrace_reflect_error_sources 0 _wavetrace_reflect_error_source)
+            string(STRIP "${_wavetrace_reflect_error_source}" _wavetrace_reflect_error_source)
+            string(REGEX REPLACE "^\"(.*)\"$" "\\1" _wavetrace_reflect_error_source "${_wavetrace_reflect_error_source}")
         endif()
     endif()
-elseif(_wavetrace_reflect_dump_output)
-    message(STATUS "WaveTrace ReflectGen did not create a log file: ${WAVETRACE_REFLECT_LOG_FILE}")
-endif()
 
-if(NOT _result EQUAL 0)
-    message(FATAL_ERROR "WaveTrace ReflectGen failed with exit code ${_result}")
+    # MSBuild recognizes this form and adds a clickable entry to Visual Studio's
+    # Error List. The full stdout, stderr and ReflectGen log are printed above.
+    message("${_wavetrace_reflect_error_source}(1): error WTR1001: ${_wavetrace_reflect_failure_reason}. Full log: ${WAVETRACE_REFLECT_LOG_FILE}")
+    message(FATAL_ERROR "WaveTrace ReflectGen failed. See the WTR1001 diagnostic and full log above.")
 endif()
