@@ -24,7 +24,10 @@
 #include <QStringList>
 #include <QTextStream>
 #include <QThread>
+#include <QTimer>
 #include <QtGlobal>
+
+#include <memory>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -1088,6 +1091,305 @@ static int runZoomCaptureSequence(QApplication& app, const QStringList& args) {
     return 0;
 }
 
+static int runZoomBoundaryBenchmark(QApplication& app, const QStringList& args) {
+    if (args.size() < 3) return 2;
+    const int zoomSteps = (args.size() >= 4) ? qBound(1, args.at(3).toInt(), 64) : 24;
+    const int settleMs = (args.size() >= 5) ? qBound(20, args.at(4).toInt(), 2000) : 190;
+    const int activeSignals = (args.size() >= 7) ? qBound(1, args.at(6).toInt(), 4096) : 128;
+
+    MainWindow window;
+    window.resize(1600, 800);
+    window.show();
+    if (!window.openWaveFilePath(args.at(2), false)) return 3;
+    WaveCanvas* canvas = window.findChild<WaveCanvas*>();
+    if (!canvas) return 4;
+    processEventsFor(app, 250);
+
+    auto countWavePixels = [canvas]() -> qint64 {
+        QImage image(canvas->size(), QImage::Format_ARGB32);
+        image.fill(Qt::black);
+        QPainter painter(&image);
+        canvas->render(&painter);
+        painter.end();
+        qint64 count = 0;
+        for (int y = 38; y < qMin(image.height(), 300); ++y) {
+            const QRgb* row = reinterpret_cast<const QRgb*>(image.constScanLine(y));
+            for (int x = 0; x < image.width(); ++x) {
+                const QColor color(row[x]);
+                if (color.green() >= 110 &&
+                    color.green() > color.red() + 20 &&
+                    color.green() > color.blue() + 10) {
+                    ++count;
+                }
+            }
+        }
+        return count;
+    };
+
+    // Exercise the user sequence too: signals are already active at the wide
+    // view and then the viewport zooms into RAW territory.
+    window.activateFirstSignalsForBenchmark(activeSignals);
+    processEventsFor(app, 1500);
+
+    QElapsedTimer heartbeatClock;
+    heartbeatClock.start();
+    qint64 lastHeartbeatNs = heartbeatClock.nsecsElapsed();
+    qint64 maxEventLoopGapNs = 0;
+    QTimer heartbeat;
+    heartbeat.setTimerType(Qt::PreciseTimer);
+    heartbeat.setInterval(1);
+    QObject::connect(&heartbeat, &QTimer::timeout, [&]() {
+        const qint64 now = heartbeatClock.nsecsElapsed();
+        maxEventLoopGapNs = qMax(maxEventLoopGapNs, now - lastHeartbeatNs);
+        lastHeartbeatNs = now;
+    });
+    heartbeat.start();
+
+    QFile outputFile;
+    std::unique_ptr<QTextStream> fileStream;
+    QTextStream consoleStream(stdout);
+    QTextStream* out = &consoleStream;
+    if (args.size() >= 6) {
+        outputFile.setFileName(args.at(5));
+        if (!outputFile.open(QIODevice::WriteOnly | QIODevice::Text)) return 5;
+        fileStream.reset(new QTextStream(&outputFile));
+        out = fileStream.get();
+    }
+    *out << "phase,step,start,end,span,step_elapsed_ms,max_event_loop_gap_ms,wave_pixels,"
+            "anim_min_wave_pixels,anim_max_wave_pixels,anim_max_adjacent_pixel_delta\n";
+    int blankWaveSteps = 0;
+    auto runStep = [&](const char* phase, int step, double factor) {
+        const qint64 gapBefore = maxEventLoopGapNs;
+        QElapsedTimer stepTimer;
+        stepTimer.start();
+        canvas->zoomByFactor(factor);
+        qint64 animMinPixels = std::numeric_limits<qint64>::max();
+        qint64 animMaxPixels = 0;
+        qint64 animMaxAdjacentDelta = 0;
+        qint64 previousPixels = -1;
+        while (stepTimer.elapsed() < settleMs) {
+            processEventsFor(app, qMin(16, qMax(1, settleMs - int(stepTimer.elapsed()))));
+            const qint64 pixels = countWavePixels();
+            animMinPixels = qMin(animMinPixels, pixels);
+            animMaxPixels = qMax(animMaxPixels, pixels);
+            if (previousPixels >= 0) {
+                animMaxAdjacentDelta = qMax(animMaxAdjacentDelta,
+                                             qAbs(pixels - previousPixels));
+            }
+            previousPixels = pixels;
+        }
+        qint64 wavePixels = previousPixels >= 0 ? previousPixels : countWavePixels();
+        if (wavePixels == 0) {
+            processEventsFor(app, 1500);
+            wavePixels = countWavePixels();
+        }
+        if (wavePixels == 0) ++blankWaveSteps;
+        const double maxGapMs = double(qMax(gapBefore, maxEventLoopGapNs)) / 1000000.0;
+        *out << phase << ',' << step << ',' << canvas->viewStart() << ',' << canvas->viewEnd()
+            << ',' << (canvas->viewEnd() - canvas->viewStart()) << ',' << stepTimer.elapsed()
+            << ',' << QString::number(maxGapMs, 'f', 3) << ',' << wavePixels
+            << ',' << (animMinPixels == std::numeric_limits<qint64>::max() ? wavePixels : animMinPixels)
+            << ',' << animMaxPixels << ',' << animMaxAdjacentDelta << '\n';
+        out->flush();
+    };
+
+    for (int i = 1; i <= zoomSteps; ++i) runStep("in", i, 0.5);
+    // Reproduce the expensive real-world sequence: signals are expanded while
+    // deeply zoomed in, so their full-range LOD is not already warm when zooming out.
+    window.activateFirstSignalsForBenchmark(activeSignals);
+    processEventsFor(app, 80);
+    maxEventLoopGapNs = 0;
+    lastHeartbeatNs = heartbeatClock.nsecsElapsed();
+    for (int i = 1; i <= zoomSteps; ++i) runStep("out", i, 2.0);
+    processEventsFor(app, 1500);
+    heartbeat.stop();
+    int coveredSignals = 0;
+    int totalSignals = 0;
+    const bool coverageOk = window.benchmarkActiveViewportCoverage(&coveredSignals, &totalSignals);
+    QString rawValidationError;
+    const bool rawCacheOk = window.benchmarkValidateRawCaches(&rawValidationError);
+    *out << "summary,zoom_steps," << zoomSteps << ",settle_ms," << settleMs
+        << ",zoom_out_max_event_loop_gap_ms,"
+        << QString::number(double(maxEventLoopGapNs) / 1000000.0, 'f', 3)
+        << ",covered_signals," << coveredSignals << ",total_signals," << totalSignals
+        << ",blank_wave_steps," << blankWaveSteps
+        << ",raw_cache_correct," << (rawCacheOk ? 1 : 0)
+        << ",raw_cache_error," << csvField(rawValidationError) << '\n';
+    return (coverageOk && rawCacheOk && blankWaveSteps == 0) ? 0 : 6;
+}
+
+static int runRangeSelectionBenchmark(QApplication& app, const QStringList& args) {
+    if (args.size() < 5) return 2;
+    bool startOk = false;
+    bool endOk = false;
+    const qint64 targetStart = args.at(3).toLongLong(&startOk);
+    const qint64 targetEnd = args.at(4).toLongLong(&endOk);
+    if (!startOk || !endOk || targetEnd <= targetStart) return 2;
+    const int activeSignals = args.size() >= 6 ? qBound(1, args.at(5).toInt(), 4096) : 6;
+
+    MainWindow window;
+    window.resize(1600, 800);
+    window.show();
+    if (!window.openWaveFilePath(args.at(2), false)) return 3;
+    WaveCanvas* canvas = window.findChild<WaveCanvas*>();
+    if (!canvas) return 4;
+    window.activateFirstSignalsForBenchmark(activeSignals);
+    processEventsFor(app, 1500);
+
+    auto countWavePixels = [canvas]() -> qint64 {
+        QImage image(canvas->size(), QImage::Format_ARGB32);
+        image.fill(Qt::black);
+        QPainter painter(&image);
+        canvas->render(&painter);
+        painter.end();
+        qint64 count = 0;
+        for (int y = 38; y < qMin(image.height(), 300); ++y) {
+            const QRgb* row = reinterpret_cast<const QRgb*>(image.constScanLine(y));
+            for (int x = 0; x < image.width(); ++x) {
+                const QColor color(row[x]);
+                if (color.green() >= 110 && color.green() > color.red() + 20 &&
+                    color.green() > color.blue() + 10) ++count;
+            }
+        }
+        return count;
+    };
+
+    const qint64 originalStart = canvas->viewStart();
+    const qint64 originalEnd = canvas->viewEnd();
+    int committedViewportSignals = 0;
+    QObject::connect(canvas, &WaveCanvas::viewportChanged,
+                     [&](qint64 start, qint64 end) {
+        if (start != originalStart || end != originalEnd) ++committedViewportSignals;
+    });
+
+    QElapsedTimer timer;
+    timer.start();
+    window.selectViewportRangeForBenchmark(targetStart, targetEnd);
+    bool committed = false;
+    qint64 firstCommittedPixels = 0;
+    qint64 commitMs = -1;
+    while (timer.elapsed() < 5000) {
+        processEventsFor(app, 5);
+        if (canvas->viewStart() == targetStart && canvas->viewEnd() == targetEnd) {
+            committed = true;
+            commitMs = timer.elapsed();
+            firstCommittedPixels = countWavePixels();
+            break;
+        }
+        if (canvas->viewStart() != originalStart || canvas->viewEnd() != originalEnd) {
+            break;
+        }
+    }
+    processEventsFor(app, 150);
+    const qint64 settledPixels = countWavePixels();
+    int covered = 0;
+    int total = 0;
+    const bool coverageOk = window.benchmarkActiveViewportCoverage(&covered, &total);
+    QTextStream out(stdout);
+    out << "range_selection,committed," << (committed ? 1 : 0)
+        << ",commit_ms," << commitMs
+        << ",viewport_signals," << committedViewportSignals
+        << ",first_pixels," << firstCommittedPixels
+        << ",settled_pixels," << settledPixels
+        << ",covered," << covered << ",total," << total << '\n';
+    out.flush();
+    return (committed && committedViewportSignals == 1 && firstCommittedPixels > 0 &&
+            firstCommittedPixels == settledPixels && coverageOk) ? 0 : 6;
+}
+
+static int runGlobalReturnBenchmark(QApplication& app, const QStringList& args) {
+    if (args.size() < 5) return 2;
+    bool startOk = false;
+    bool endOk = false;
+    const qint64 smallStart = args.at(3).toLongLong(&startOk);
+    const qint64 smallEnd = args.at(4).toLongLong(&endOk);
+    if (!startOk || !endOk || smallEnd <= smallStart) return 2;
+    const int activeSignals = args.size() >= 6 ? qBound(1, args.at(5).toInt(), 4096) : 6;
+
+    MainWindow window;
+    window.resize(1600, 800);
+    window.show();
+    if (!window.openWaveFilePath(args.at(2), false)) return 3;
+    WaveCanvas* canvas = window.findChild<WaveCanvas*>();
+    if (!canvas) return 4;
+    window.activateFirstSignalsForBenchmark(activeSignals);
+    processEventsFor(app, 1500);
+
+    auto countWavePixels = [canvas]() -> qint64 {
+        QImage image(canvas->size(), QImage::Format_ARGB32);
+        image.fill(Qt::black);
+        QPainter painter(&image);
+        canvas->render(&painter);
+        painter.end();
+        qint64 count = 0;
+        for (int y = 38; y < qMin(image.height(), 300); ++y) {
+            const QRgb* row = reinterpret_cast<const QRgb*>(image.constScanLine(y));
+            for (int x = 0; x < image.width(); ++x) {
+                const QColor color(row[x]);
+                if (color.green() >= 110 && color.green() > color.red() + 20 &&
+                    color.green() > color.blue() + 10) ++count;
+            }
+        }
+        return count;
+    };
+
+    window.selectViewportRangeForBenchmark(smallStart, smallEnd);
+    QElapsedTimer enterTimer;
+    enterTimer.start();
+    while (enterTimer.elapsed() < 5000 &&
+           (canvas->viewStart() != smallStart || canvas->viewEnd() != smallEnd)) {
+        processEventsFor(app, 5);
+    }
+    if (canvas->viewStart() != smallStart || canvas->viewEnd() != smallEnd) return 5;
+
+    const qint64 fullStart = canvas->fullStartTime();
+    const qint64 fullEnd = canvas->fullEndTime();
+    int committedViewportSignals = 0;
+    QObject::connect(canvas, &WaveCanvas::viewportChanged,
+                     [&](qint64 start, qint64 end) {
+        if (start != smallStart || end != smallEnd) ++committedViewportSignals;
+    });
+
+    QElapsedTimer timer;
+    timer.start();
+    window.resetViewForBenchmark();
+    bool committed = false;
+    bool intermediateViewport = false;
+    qint64 firstCommittedPixels = 0;
+    qint64 commitMs = -1;
+    while (timer.elapsed() < 5000) {
+        processEventsFor(app, 5);
+        const qint64 start = canvas->viewStart();
+        const qint64 end = canvas->viewEnd();
+        if (start == fullStart && end == fullEnd) {
+            committed = true;
+            commitMs = timer.elapsed();
+            firstCommittedPixels = countWavePixels();
+            break;
+        }
+        if (start != smallStart || end != smallEnd) {
+            intermediateViewport = true;
+            break;
+        }
+    }
+    processEventsFor(app, 150);
+    const qint64 settledPixels = countWavePixels();
+    int covered = 0;
+    int total = 0;
+    const bool coverageOk = window.benchmarkActiveViewportCoverage(&covered, &total);
+    QTextStream out(stdout);
+    out << "global_return,committed," << (committed ? 1 : 0)
+        << ",commit_ms," << commitMs
+        << ",viewport_signals," << committedViewportSignals
+        << ",intermediate_viewport," << (intermediateViewport ? 1 : 0)
+        << ",first_pixels," << firstCommittedPixels
+        << ",settled_pixels," << settledPixels
+        << ",covered," << covered << ",total," << total << '\n';
+    out.flush();
+    return (committed && !intermediateViewport && committedViewportSignals == 1 &&
+            firstCommittedPixels > 0 && firstCommittedPixels == settledPixels && coverageOk) ? 0 : 6;
+}
+
 int main(int argc, char *argv[]) {
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
     QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
@@ -1105,6 +1407,16 @@ int main(int argc, char *argv[]) {
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--capture-zoom-sequence")) {
         qputenv("WV_VIEWER_STRICT_RENDER_CHECKS", QByteArray("1"));
         return runZoomCaptureSequence(a, args);
+    }
+
+    if (args.size() >= 2 && args.at(1) == QStringLiteral("--zoom-boundary-benchmark")) {
+        return runZoomBoundaryBenchmark(a, args);
+    }
+    if (args.size() >= 2 && args.at(1) == QStringLiteral("--range-selection-benchmark")) {
+        return runRangeSelectionBenchmark(a, args);
+    }
+    if (args.size() >= 2 && args.at(1) == QStringLiteral("--global-return-benchmark")) {
+        return runGlobalReturnBenchmark(a, args);
     }
 
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--value-find-benchmark")) {

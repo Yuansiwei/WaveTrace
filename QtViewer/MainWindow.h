@@ -7,7 +7,11 @@
 #include <QString>
 #include <QSet>
 #include <QVector>
+#include <atomic>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 class QLabel;
 class QDialog;
@@ -26,6 +30,8 @@ class QTreeView;
 class QTreeWidget;
 class QTreeWidgetItem;
 class WaveCanvas;
+class WaveParser4Reader;
+class WaveBlockCacheLoader;
 class ActiveSignalListWidget;
 struct SignalLogicTree;
 
@@ -35,6 +41,11 @@ public:
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override;
     bool openWaveFilePath(const QString& path, bool showError = true);
+    void activateFirstSignalsForBenchmark(int count);
+    void selectViewportRangeForBenchmark(qint64 start, qint64 end);
+    void resetViewForBenchmark();
+    bool benchmarkActiveViewportCoverage(int* covered, int* total) const;
+    bool benchmarkValidateRawCaches(QString* error);
     bool compareWaveFilePaths(const QString& leftPath,
                               const QString& rightPath,
                               bool showProgress = true,
@@ -78,6 +89,7 @@ private:
     void onCursorMoved(qint64 t);
     void onHoverMoved(qint64 t);
     void onViewportChanged(qint64 start, qint64 end);
+    void onViewportRangeSelected(qint64 start, qint64 end);
 
 private:
     enum ActiveItemRoles {
@@ -96,6 +108,9 @@ private:
     WaveFile m_wave;
     QString m_currentWaveFilePath;
     bool m_currentWaveSupportsOnDemand = false;
+    std::shared_ptr<WaveParser4Reader> m_waveReader;
+    std::shared_ptr<std::mutex> m_waveReaderMutex = std::make_shared<std::mutex>();
+    std::unique_ptr<WaveBlockCacheLoader> m_blockCacheLoader;
     QVector<int> m_signalIndexBySignalId;
 
     QWidget* m_central = nullptr;
@@ -116,6 +131,7 @@ private:
     QPushButton* m_clearActiveButton = nullptr;
     QSplitter* m_splitter = nullptr;
     QTimer* m_activeValueRefreshTimer = nullptr;
+    QTimer* m_viewportLoadTimer = nullptr;
     QDialog* m_valueFindDialog = nullptr;
     QLineEdit* m_valueFindEdit = nullptr;
     QLabel* m_valueFindSummaryLabel = nullptr;
@@ -127,6 +143,26 @@ private:
     QString m_valueFindSummaryBase;
     int m_valueFindCurrentHit = -1;
     std::unique_ptr<SignalLogicTree> m_signalTreeModel;
+    std::thread m_treeWarmupThread;
+    std::thread m_viewportLoadThread;
+    std::shared_ptr<std::atomic_bool> m_treeWarmupCancel;
+    quint64 m_treeWarmupGeneration = 0;
+    quint64 m_waveFileGeneration = 0;
+    quint64 m_viewportLoadSerial = 0;
+    qint64 m_pendingViewportStart = 0;
+    qint64 m_pendingViewportEnd = 0;
+    qint64 m_animationTargetStart = 0;
+    qint64 m_animationTargetEnd = 0;
+    bool m_viewportLoadPending = false;
+    bool m_viewportLoadInFlight = false;
+    bool m_animationTargetLoadScheduled = false;
+    bool m_guardedViewportCommitPending = false;
+    qint64 m_guardedViewportCommitStart = 0;
+    qint64 m_guardedViewportCommitEnd = 0;
+    quint64 m_guardedViewportCommitSerial = 0;
+    quint64 m_deferredViewportApplySerial = 0;
+    qint64 m_deferredViewportBucketCycles = 1;
+    std::function<void()> m_deferredViewportApply;
 
     void buildUi();
     void applyTheme();
@@ -136,6 +172,8 @@ private:
     void updateMetaLabel();
 
     void rebuildTree();
+    void scheduleTreeWarmup();
+    void stopTreeWarmup();
     void resetTreeViewModel();
     void collectSignalIndexesFromLogicNode(int nodeId, QSet<int>& seen, QList<int>& output) const;
     QList<int> selectedActiveSignalIndexesForJump() const;
@@ -152,6 +190,11 @@ private:
     void clampWindowToAvailableScreen();
     void refreshActiveValueLabels();
     void scheduleRefreshActiveValueLabels(int delayMs = 35);
+    void scheduleViewportDataLoad(qint64 start, qint64 end);
+    void scheduleAnimationTargetDataLoad(qint64 start, qint64 end);
+    bool applyDeferredViewportResultIfReady(bool force);
+    void completeGuardedViewportCommit(bool success);
+    void startPendingViewportDataLoad();
     bool handleWaveFileDropEvent(QEvent* event);
 
     void insertSignalIntoTree(const QString& fullName, int signalIndex);

@@ -207,9 +207,14 @@ public:
         }
         wvz4::Layout layout;
         if (!build_layout(layout, error)) return false;
+        wvz4::WriterOptions writer_options = cfg_.options;
+        // Writer timestamps are scaled by clk_period_ticks below. Scale the
+        // fixed LOD10/100/1000 buckets by the same amount so their names and
+        // behavior remain expressed in business cycles rather than raw ticks.
+        writer_options.lod_bucket_cycle_scale = cfg_.clk_period_ticks;
         if (!process_writer_.open(cfg_.file_path,
                                   layout,
-                                  cfg_.options,
+                                  writer_options,
                                   error,
                                   std::string(),
                                   cfg_.writer_process_connect_timeout_ms)) {

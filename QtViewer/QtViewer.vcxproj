@@ -51,7 +51,7 @@
   <PropertyGroup>
     <OutDir>$(ProjectDir)build\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(ProjectDir)build\obj\$(Platform)\$(Configuration)\</IntDir>
-    <TargetName>QtViewer</TargetName>
+    <TargetName>WaveViewer</TargetName>
     <QtGeneratedDir>$(IntDir)qt\</QtGeneratedDir>
     <QtMocDefines>-DWIN32 -D_WIN64 -D_WINDOWS -DUNICODE -D_UNICODE -DQT_WIDGETS_LIB -DQT_GUI_LIB -DQT_CORE_LIB</QtMocDefines>
     <QtMocIncludes>-I&quot;$(MSBuildProjectDirectory)&quot; -I&quot;$(QtGeneratedDir)&quot; -I&quot;$(QtLocalInclude)&quot; -I&quot;$(QtLocalInclude)QtCore&quot; -I&quot;$(QtLocalInclude)QtGui&quot; -I&quot;$(QtLocalInclude)QtWidgets&quot;</QtMocIncludes>
@@ -92,10 +92,11 @@
       <AdditionalOptions>/utf-8 /Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
@@ -109,6 +110,7 @@
     <ClCompile Include="ActiveSignalListWidget.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="MainWindow.cpp" />
+    <ClCompile Include="WaveBlockCacheLoader.cpp" />
     <ClCompile Include="WaveCanvas.cpp" />
     <ClCompile Include="WaveParser4.cpp" />
     <ClCompile Include="$(QtGeneratedDir)moc_ActiveSignalListWidget.cpp" />
@@ -122,6 +124,7 @@
     <ClInclude Include="ActiveSignalItemWidget.h" />
     <ClInclude Include="ActiveSignalListWidget.h" />
     <ClInclude Include="MainWindow.h" />
+    <ClInclude Include="WaveBlockCacheLoader.h" />
     <ClInclude Include="WaveCanvas.h" />
     <ClInclude Include="WaveParser4.h" />
     <ClInclude Include="WaveTypes.h" />

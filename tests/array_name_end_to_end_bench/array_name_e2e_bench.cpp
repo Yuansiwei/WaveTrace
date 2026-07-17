@@ -2,6 +2,7 @@
 #include <wave_tap.h>
 
 #include <chrono>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -48,6 +49,10 @@ struct FixedArrayTop {
     wave::array<wave::array<std::uint32_t, kFixedInner>, kFixedOuter> matrix;
 };
 
+struct StdFixedArrayTop {
+    std::array<std::array<std::uint32_t, kFixedInner>, kFixedOuter> matrix;
+};
+
 struct WavePtrElement {
     std::uint32_t valid;
     std::uint32_t state;
@@ -81,6 +86,13 @@ struct WavePtrTop {
 namespace wave {
 
 template<> struct GeneratedMemberNameTable<FixedArrayTop> {
+    static constexpr bool generated = true;
+    static const void* class_id() noexcept { static int id; return &id; }
+    static const char* const* names() noexcept { static const char* const n[] = {"matrix"}; return n; }
+    static std::size_t count() noexcept { return 1u; }
+};
+
+template<> struct GeneratedMemberNameTable<StdFixedArrayTop> {
     static constexpr bool generated = true;
     static const void* class_id() noexcept { static int id; return &id; }
     static const char* const* names() noexcept { static const char* const n[] = {"matrix"}; return n; }
@@ -121,6 +133,16 @@ template<> struct reflected_visitor<FixedArrayTop> {
     }
 };
 
+template<> struct is_reflected<StdFixedArrayTop> : std::true_type {};
+template<> struct reflected_visitor<StdFixedArrayTop> {
+    template<class P, class V, class G>
+    static void visit(const StdFixedArrayTop* obj, P&& on_ptr, V&&, G&&) {
+        ::wave::detail::invoke_ptr_visitor(
+            on_ptr, "matrix", std::addressof(obj->matrix),
+            ::wave::detail::GeneratedMemberId(::wave::GeneratedMemberNameTable<StdFixedArrayTop>::class_id(), 0u));
+    }
+};
+
 template<> struct is_reflected<WavePtrElement> : std::true_type {};
 template<> struct reflected_visitor<WavePtrElement> {
     template<class P, class V, class G>
@@ -147,24 +169,38 @@ template<> struct reflected_visitor<WavePtrTop> {
 
 } // namespace reflect
 
+struct SampleBreakdown {
+    double initial_ms = 0.0;
+    double sparse_ms = 0.0;
+    double idle_1000_ms = 0.0;
+    double single_write_1000_ms = 0.0;
+};
+
 template <typename Top>
 bool emit_pressure_samples(Top&,
                            wave::Tracer&,
                            PathStableWvz4Recorder&,
-                           std::string&) {
+                           std::string&,
+                           SampleBreakdown&) {
     return false;
 }
 
-template <>
-bool emit_pressure_samples<FixedArrayTop>(FixedArrayTop& top,
-                                          wave::Tracer& tracer,
-                                          PathStableWvz4Recorder& recorder,
-                                          std::string& error) {
+template <typename Top>
+bool emit_fixed_array_pressure_samples(Top& top,
+                                       wave::Tracer& tracer,
+                                       PathStableWvz4Recorder& recorder,
+                                       std::string& error,
+                                       SampleBreakdown& timing) {
     wave::WaveTap tap(tracer, recorder);
+    const Clock::time_point initial_begin = Clock::now();
     if (!tap.sample_one_cycle()) {
         error = tap.last_error();
         return false;
     }
+    const Clock::time_point initial_end = Clock::now();
+    timing.initial_ms = elapsed_ms(initial_begin, initial_end);
+
+    const Clock::time_point sparse_begin = Clock::now();
 
     top.matrix[0][0] = 0x11111111u;
     top.matrix[31][8192] = 0x31181920u;
@@ -186,7 +222,48 @@ bool emit_pressure_samples<FixedArrayTop>(FixedArrayTop& top,
         error = tap.last_error();
         return false;
     }
+    const Clock::time_point sparse_end = Clock::now();
+    timing.sparse_ms = elapsed_ms(sparse_begin, sparse_end);
+
+    const Clock::time_point idle_begin = Clock::now();
+    for (std::size_t i = 0; i < 1000u; ++i) {
+        if (!tap.sample_one_cycle()) {
+            error = tap.last_error();
+            return false;
+        }
+    }
+    const Clock::time_point idle_end = Clock::now();
+    timing.idle_1000_ms = elapsed_ms(idle_begin, idle_end);
+
+    const Clock::time_point single_write_begin = Clock::now();
+    for (std::size_t i = 0; i < 1000u; ++i) {
+        top.matrix[0][0] = static_cast<std::uint32_t>(0x40000000u + i);
+        if (!tap.sample_one_cycle()) {
+            error = tap.last_error();
+            return false;
+        }
+    }
+    const Clock::time_point single_write_end = Clock::now();
+    timing.single_write_1000_ms = elapsed_ms(single_write_begin, single_write_end);
     return true;
+}
+
+template <>
+bool emit_pressure_samples<FixedArrayTop>(FixedArrayTop& top,
+                                          wave::Tracer& tracer,
+                                          PathStableWvz4Recorder& recorder,
+                                          std::string& error,
+                                          SampleBreakdown& timing) {
+    return emit_fixed_array_pressure_samples(top, tracer, recorder, error, timing);
+}
+
+template <>
+bool emit_pressure_samples<StdFixedArrayTop>(StdFixedArrayTop& top,
+                                             wave::Tracer& tracer,
+                                             PathStableWvz4Recorder& recorder,
+                                             std::string& error,
+                                             SampleBreakdown& timing) {
+    return emit_fixed_array_pressure_samples(top, tracer, recorder, error, timing);
 }
 
 template <typename Top>
@@ -230,10 +307,14 @@ int run_benchmark(const char* mode,
     const std::size_t signals = recorder.declared_track_count();
     const std::string recorder_state = recorder.debug_state_summary();
 
-    if (capture_samples && !emit_pressure_samples(top, tracer, recorder, error)) {
+    SampleBreakdown sample_timing;
+    const Clock::time_point sample_begin = Clock::now();
+    if (capture_samples && !emit_pressure_samples(
+            top, tracer, recorder, error, sample_timing)) {
         std::cerr << "sample pressure failed for " << mode << ": " << error << "\n";
         return 6;
     }
+    const Clock::time_point sample_end = Clock::now();
 
     const Clock::time_point writer_begin = Clock::now();
     if (!recorder.open_writer_if_needed(error)) {
@@ -251,8 +332,13 @@ int run_benchmark(const char* mode,
     std::cout << "mode=" << mode
               << " nodes=" << nodes
               << " signals=" << signals
-              << " cycles=" << (capture_samples ? 4 : 0)
+              << " cycles=" << (capture_samples ? 2004 : 0)
               << " topology_ms=" << elapsed_ms(topology_begin, topology_end)
+              << " sample_ms=" << elapsed_ms(sample_begin, sample_end)
+              << " initial_sample_ms=" << sample_timing.initial_ms
+              << " sparse_sample_ms=" << sample_timing.sparse_ms
+              << " idle_1000_ms=" << sample_timing.idle_1000_ms
+              << " single_write_1000_ms=" << sample_timing.single_write_1000_ms
               << " writer_open_ms=" << elapsed_ms(writer_begin, writer_end)
               << " close_ms=" << elapsed_ms(close_begin, close_end)
               << " total_ms=" << elapsed_ms(total_begin, close_end)
@@ -265,7 +351,7 @@ int run_benchmark(const char* mode,
 
 int main(int argc, char** argv) {
     if (argc != 3 && argc != 4) {
-        std::cerr << "usage: array_name_e2e_bench <fixed|waveptr> <output.wvz4> [samples]\n";
+        std::cerr << "usage: array_name_e2e_bench <fixed|stdfixed|waveptr> <output.wvz4> [samples]\n";
         return 2;
     }
     const std::string mode = argv[1];
@@ -274,6 +360,10 @@ int main(int argc, char** argv) {
     if (mode == "fixed") {
         std::unique_ptr<FixedArrayTop> top(new FixedArrayTop());
         return run_benchmark("fixed", output_path, *top, capture_samples);
+    }
+    if (mode == "stdfixed") {
+        std::unique_ptr<StdFixedArrayTop> top(new StdFixedArrayTop());
+        return run_benchmark("stdfixed", output_path, *top, capture_samples);
     }
     if (mode == "waveptr") {
         std::vector<WavePtrElement> elements(kWavePtrArrayCount * kWavePtrElementsPerArray);

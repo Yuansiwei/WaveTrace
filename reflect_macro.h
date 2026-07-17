@@ -4,6 +4,8 @@
 // Include this header instead of wave_runtime.h when a business type only needs
 // reflection opt-in macros, WaveValue<T>, wave::array<T,N>, or WaveDirtyHook.
 
+#include "wavetrace_config.h"
+
 #if defined(min)
 #pragma push_macro("min")
 #undef min
@@ -60,9 +62,16 @@ namespace wave {
 class Tracer;
 typedef std::uint64_t NodeId;
 typedef NodeId (*DynamicExpandFn)(Tracer&, const std::string&, NodeId, const void*);
+typedef bool (*DynamicExpandArrayFn)(Tracer&, NodeId, const void*, std::size_t);
 
 template <typename T>
 NodeId dynamic_expand_bridge(Tracer& tracer, const std::string& path, NodeId parent_id, const void* obj);
+
+template <typename T>
+NodeId dynamic_expand_fallback_bridge(Tracer& tracer, const std::string& path, NodeId parent_id, const void* obj);
+
+template <typename T>
+bool dynamic_expand_array_bridge(Tracer& tracer, NodeId parent_id, const void* objects, std::size_t count);
 
 static constexpr std::uint32_t kInvalidIndex = 0xFFFFFFFFu;
 
@@ -356,6 +365,17 @@ struct WaveArrayBulkNotifyDedupeTls {
     WaveArrayBulkNotifyDedupeTls() : epoch_token(0) {}
 };
 
+inline bool wave_notifications_enabled() noexcept {
+    static const bool enabled = []() noexcept {
+        try {
+            return ::wave::config::enabled();
+        } catch (...) {
+            return false;
+        }
+    }();
+    return enabled;
+}
+
 inline WaveArrayBulkNotifyDedupeTls& wave_array_bulk_notify_dedupe_tls() {
     thread_local WaveArrayBulkNotifyDedupeTls tls;
     return tls;
@@ -567,6 +587,7 @@ template <typename T> struct is_wave_ptr : std::false_type {};
 } // namespace detail
 
 inline void notify_wave_value_write_address(const void* address) noexcept {
+    if (!detail::wave_notifications_enabled()) return;
     detail::WaveValueNotifyFn fn = detail::wave_value_notify_slot();
     if (fn) {
         fn(address);
@@ -580,8 +601,9 @@ inline void notify_wave_value_write_address(const void* address) noexcept {
 
 inline void notify_wave_array_index_access(std::size_t index,
                                            const void* element_address,
-                                            const void* element_type_tag,
-                                            std::size_t element_size) noexcept {
+                                             const void* element_type_tag,
+                                             std::size_t element_size) noexcept {
+    if (!detail::wave_notifications_enabled()) return;
     detail::WaveArrayIndexNotifyFn fn = detail::wave_array_index_notify_slot();
     if (fn) {
         fn(index, element_address, element_type_tag, element_size);
@@ -594,9 +616,10 @@ inline void notify_wave_array_index_access(std::size_t index,
 }
 
 inline bool notify_wave_array_all_elements_access(const void* first_element_address,
-                                                  const void* element_type_tag,
-                                                  std::size_t element_size,
-                                                  std::size_t element_count) noexcept {
+                                                   const void* element_type_tag,
+                                                   std::size_t element_size,
+                                                   std::size_t element_count) noexcept {
+    if (!detail::wave_notifications_enabled()) return true;
     detail::WaveArrayBulkNotifyFn fn = detail::wave_array_bulk_notify_slot();
     if (fn) {
         if (detail::wave_array_bulk_notify_seen_this_epoch(first_element_address, element_type_tag, element_size, element_count)) return true;

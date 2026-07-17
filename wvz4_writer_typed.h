@@ -66,14 +66,9 @@ using u8  = std::uint8_t;
 static const u32 kFormatVersion = 15;
 static const u8 kSignalFlagStorageOnly = 1u << 0;
 static const u32 kMaxScalarBytes = 8;
-static const u64 kLodBaseBucketCycles = 256;
-static const u64 kLodResidualBaseBucketCycles = 10;
-static const u64 kLodResidualLevelMultiplier = 10;
-static const u32 kLodLevelCount = 7;
-static const u64 kLodMinRawTransitionsForTable = 4096;
-static const u64 kLodMaxRecordsToSourceRatio = 5; // one LOD level may keep at most 20% of its source records.
+static const u32 kLodLevelCount = 3;
 // v4 adds numeric array-index node names to layout frames.
-static const u32 kWriterProcessProtocolVersion = 4;
+static const u32 kWriterProcessProtocolVersion = 5;
 
 // Raw WDAT payload encoding flags. The outer WDAT section and block index remain
 // unchanged; these flags describe the uncompressed raw_payload inside each block.
@@ -371,9 +366,13 @@ struct WriterOptions {
     // summaries in memory until FOOT is written. Disable for very large writer
     // stress runs when first-open/on-demand parser behavior is the target.
     bool enable_lod_tables = true;
-    // Experimental: residual LOD stores each transition in only one raw/LOD
-    // stream and asks the reader to merge them back. Keep the default on the
-    // mature independent LOD path where raw remains complete.
+    // Number of writer ticks in one logical cycle used by the fixed
+    // LOD10/LOD100/LOD1000 levels. Direct Writer users normally keep 1.
+    // PathStableWvz4Recorder sets this to clk_period_ticks so the public LOD
+    // names retain business-cycle semantics.
+    u64 lod_bucket_cycle_scale = 1;
+    // Legacy serialized option. v15 writers use RAW as level 1 and store three
+    // independent LOD streams (10/100/1000 cycles).
     bool enable_residual_lod_tables = false;
 
     // Emit a sidecar text report at close. Empty path means <wvz4-file>.log.
@@ -893,6 +892,15 @@ public:
             error = "WVZ4 WriterOptions.initial_cycle exceeds int64 cycle range";
             return false;
         }
+        if (options_.lod_bucket_cycle_scale == 0) {
+            error = "WVZ4 WriterOptions.lod_bucket_cycle_scale must be > 0";
+            return false;
+        }
+        if (options_.lod_bucket_cycle_scale >
+            static_cast<u64>(std::numeric_limits<i64>::max()) / 1000u) {
+            error = "WVZ4 WriterOptions.lod_bucket_cycle_scale exceeds LOD cycle range";
+            return false;
+        }
         if (!detail::is_valid_compression(options_.compression)) {
             error = "invalid WVZ4 compression option";
             return false;
@@ -1110,11 +1118,26 @@ public:
         bool ok = true;
         std::string local_error;
         if (have_submitted_cycle_) {
-            if (current_cycle_ == std::numeric_limits<i64>::max()) {
-                local_error = "WVZ4 writer close failed: final cycle exceeds int64 range";
-                ok = false;
-            } else {
-                const i64 final_cycle = last_submission_empty_ ? current_cycle_ : (current_cycle_ + 1);
+            i64 final_cycle = current_cycle_;
+            if (!last_submission_empty_) {
+                // lod_bucket_cycle_scale is also the number of writer ticks in
+                // one logical/business cycle.  A non-empty final submission may
+                // be at any tick inside that cycle (for example the rising or
+                // falling clock edge), so close the range at the next logical
+                // cycle boundary instead of blindly adding one writer tick.
+                const u64 scale = options_.lod_bucket_cycle_scale;
+                const u64 current = static_cast<u64>(current_cycle_);
+                const u64 remainder = current % scale;
+                const u64 advance = scale - remainder;
+                const u64 max_cycle = static_cast<u64>((std::numeric_limits<i64>::max)());
+                if (current > max_cycle - advance) {
+                    local_error = "WVZ4 writer close failed: aligned final cycle exceeds int64 range";
+                    ok = false;
+                } else {
+                    final_cycle = static_cast<i64>(current + advance);
+                }
+            }
+            if (ok) {
                 if (residual_lod_enabled()) {
                     flush_all_residual_lod_pending();
                 }
@@ -1491,7 +1514,7 @@ private:
     }
 
     bool residual_lod_enabled() const {
-        return options_.enable_lod_tables && options_.enable_residual_lod_tables;
+        return false;
     }
 
     u64 residual_lod_commit_lag_cycles() const {
@@ -1509,14 +1532,9 @@ private:
     void initialize_lod_bucket_cycles() {
         lod_bucket_cycles_.clear();
         lod_bucket_cycles_.reserve(kLodLevelCount);
-        u64 bucket_cycles = residual_lod_enabled() ? kLodResidualBaseBucketCycles : kLodBaseBucketCycles;
-        const u64 multiplier = residual_lod_enabled() ? kLodResidualLevelMultiplier : kLodMaxRecordsToSourceRatio;
-        for (u32 i = 0; i < kLodLevelCount; ++i) {
-            lod_bucket_cycles_.push_back(bucket_cycles);
-            if (bucket_cycles <= (std::numeric_limits<u64>::max)() / multiplier) {
-                bucket_cycles *= multiplier;
-            }
-        }
+        lod_bucket_cycles_.push_back(10u * options_.lod_bucket_cycle_scale);
+        lod_bucket_cycles_.push_back(100u * options_.lod_bucket_cycle_scale);
+        lod_bucket_cycles_.push_back(1000u * options_.lod_bucket_cycle_scale);
     }
 
     void initialize_lod_storage() {
@@ -1543,19 +1561,14 @@ private:
         }
     }
 
-    static bool append_lod_transition_if_useful(LodLevelState& lod_level,
-                                                const Transition& transition,
-                                                u64 source_record_count) {
-        const u64 max_useful_samples = source_record_count / kLodMaxRecordsToSourceRatio;
-        if (max_useful_samples == 0) return false;
+    static void append_lod_transition(LodLevelState& lod_level,
+                                      const Transition& transition) {
         if (!lod_level.transitions.empty() &&
             lod_level.transitions.back().cycle == transition.cycle) {
             lod_level.transitions.back() = transition;
-            return true;
+            return;
         }
-        if (static_cast<u64>(lod_level.transitions.size() + 1) > max_useful_samples) return false;
         lod_level.transitions.push_back(transition);
-        return true;
     }
 
     static i64 lod_sampling_window_start(i64 cycle, u64 span) {
@@ -1681,8 +1694,7 @@ private:
     }
 
     static void update_lod_level_window(LodLevelState& lod_level,
-                                        const Transition& transition,
-                                        u64 source_record_count) {
+                                        const Transition& transition) {
         const i64 window_start = lod_sampling_window_start(transition.cycle, lod_level.min_cycle_delta);
         if (!lod_level.has_pending_window) {
             lod_level.pending_window_start = window_start;
@@ -1694,12 +1706,8 @@ private:
             lod_level.pending_transition = transition;
             return;
         }
-        const bool appended = append_lod_transition_if_useful(lod_level, lod_level.pending_transition, source_record_count);
-        if (appended) {
-            extend_lod_valid_range(lod_level, lod_level.pending_window_start);
-        } else {
-            close_lod_valid_range(lod_level);
-        }
+        append_lod_transition(lod_level, lod_level.pending_transition);
+        extend_lod_valid_range(lod_level, lod_level.pending_window_start);
         lod_level.pending_window_start = window_start;
         lod_level.pending_transition = transition;
     }
@@ -1873,6 +1881,24 @@ private:
         }
     }
 
+    bool validate_latest_layout_encoding_(std::string& error) const {
+        for (std::size_t i = 0; i < layout_.names.size(); ++i) {
+            if (layout_.names[i].name_id != static_cast<u32>(i + 1u)) {
+                error = "WVZ4 v15 requires a dense NameTable ordered by name_id";
+                return false;
+            }
+        }
+        if (!can_build_compact_node_layout_payload(layout_)) {
+            error = "WVZ4 v15 requires dense preorder node_id values and forward child/sibling links";
+            return false;
+        }
+        if (!can_build_compact_signal_layout_payload(layout_)) {
+            error = "WVZ4 v15 requires dense signal_id values and backward storage_id references";
+            return false;
+        }
+        return true;
+    }
+
     bool try_validate_and_prepare_dense_self_storage_layout_(std::string& error) {
         error.clear();
         if (layout_.names.empty() || layout_.nodes.empty() || layout_.signals.empty()) return false;
@@ -1903,6 +1929,12 @@ private:
         for (std::size_t i = 0; i < layout_.nodes.size(); ++i) {
             const NodeRecord& r = layout_.nodes[i];
             if (r.node_id != static_cast<u32>(i + 1u)) return false;
+            if ((r.parent_id != 0 && r.parent_id >= r.node_id) ||
+                (r.first_child != 0 && r.first_child <= r.node_id) ||
+                (r.next_sibling != 0 && r.next_sibling <= r.node_id)) {
+                error = "WVZ4 v15 requires preorder nodes with forward child/sibling links";
+                return false;
+            }
             if (r.name_id != 0 && r.name_id > name_count) {
                 error = detail::make_error("NodeRecord references missing name_id: ", r.name_id);
                 return false;
@@ -2076,16 +2108,11 @@ private:
             set_residual_lod_pending(storage, tr);
             return;
         }
-        u64 source_record_count = storage.raw_transition_count;
         for (std::size_t level = 0; level < storage.levels.size(); ++level) {
             LodLevelState& lod_level = storage.levels[level];
             const u64 min_delta = lod_level.min_cycle_delta;
             if (lod_level.disabled || min_delta == 0) continue;
-            update_lod_level_window(lod_level, tr, source_record_count);
-            const u64 materialized_count = lod_level_materialized_count(lod_level);
-            if (!lod_level.disabled && materialized_count != 0) {
-                source_record_count = materialized_count;
-            }
+            update_lod_level_window(lod_level, tr);
         }
     }
 
@@ -2311,6 +2338,7 @@ private:
         // One shared-time vector per signal chunk for the current time block.
         // These vectors are maintained incrementally in submit_cycle(), so
         // commit_block() no longer needs to rescan all transitions and sort.
+        if (!validate_latest_layout_encoding_(error)) return false;
         finish_layout_validation_common_();
         return true;
     }
@@ -2373,9 +2401,7 @@ private:
         stats_.section_bytes_by_tag[key] += section_bytes;
         if (key == "WDAT") stats_.wdat_section_bytes += section_bytes;
         else if (key == "FOOT") stats_.foot_section_bytes += section_bytes;
-        else if (key == "NAME" || key == "NAMZ" || key == "NODE" || key == "NODZ" ||
-                 key == "NODD" || key == "NDZ2" || key == "NREF" || key == "NRFZ" ||
-                 key == "NODI" || key == "NIZ2" || key == "SIGT" || key == "SIGZ" ||
+        else if (key == "NAME" || key == "NAMZ" || key == "NODI" || key == "NIZ2" ||
                  key == "SIGD" || key == "SGZ2" || key == "CLKD" || key == "CLKZ") {
             stats_.layout_section_bytes += section_bytes;
         } else {
@@ -2689,59 +2715,6 @@ private:
         }
     }
 
-    static void build_node_layout_payload(const Layout& layout, std::vector<u8>& payload) {
-        payload.clear();
-        payload.reserve(layout.nodes.size() * 20);
-        detail::append_varuint(payload, static_cast<u64>(layout.nodes.size()));
-        std::vector<NodeRecord> sorted_nodes;
-        const std::vector<NodeRecord>* nodes = &layout.nodes;
-        if (!nodes_sorted_by_id(layout.nodes)) {
-            sorted_nodes = layout.nodes;
-            std::sort(sorted_nodes.begin(), sorted_nodes.end(), [](const NodeRecord& a, const NodeRecord& b) { return a.node_id < b.node_id; });
-            nodes = &sorted_nodes;
-        }
-        u32 previous_array_index = 0;
-        for (std::size_t i = 0; i < nodes->size(); ++i) {
-            const NodeRecord& n = (*nodes)[i];
-            detail::append_varuint(payload, n.node_id);
-            detail::append_varuint(payload, n.parent_id);
-            u64 name_ref = static_cast<u64>(n.name_id) << 1u;
-            if (n.name_id == 0) {
-                const i64 delta = static_cast<i64>(n.array_index) - static_cast<i64>(previous_array_index);
-                name_ref = (detail::zigzag_encode_i64(delta) << 1u) | 1u;
-                previous_array_index = n.array_index;
-            }
-            detail::append_varuint(payload, name_ref);
-            detail::append_u8(payload, static_cast<u8>(n.kind));
-            detail::append_varuint(payload, n.first_child);
-            detail::append_varuint(payload, n.next_sibling);
-        }
-    }
-
-    static void build_signal_layout_payload(const Layout& layout, std::vector<u8>& payload) {
-        payload.clear();
-        payload.reserve(layout.signals.size() * 20);
-        detail::append_varuint(payload, static_cast<u64>(layout.signals.size()));
-        std::vector<SignalDefinition> sorted_sigs;
-        const std::vector<SignalDefinition>* sigs = &layout.signals;
-        if (!signals_sorted_by_id(layout.signals)) {
-            sorted_sigs = layout.signals;
-            std::sort(sorted_sigs.begin(), sorted_sigs.end(), [](const SignalDefinition& a, const SignalDefinition& b) { return a.signal_id < b.signal_id; });
-            sigs = &sorted_sigs;
-        }
-        for (std::size_t i = 0; i < sigs->size(); ++i) {
-            const SignalDefinition& s = (*sigs)[i];
-            detail::append_varuint(payload, s.signal_id);
-            detail::append_varuint(payload, s.storage_id != 0 ? s.storage_id : s.signal_id);
-            detail::append_varuint(payload, s.node_id);
-            detail::append_u8(payload, static_cast<u8>(s.type));
-            detail::append_varuint(payload, s.bit_width);
-            detail::append_u8(payload, static_cast<u8>(s.radix));
-            detail::append_varuint(payload, s.bit_offset);
-            detail::append_u8(payload, s.storage_only ? kSignalFlagStorageOnly : 0u);
-        }
-    }
-
     static bool can_build_compact_node_layout_payload(const Layout& layout) {
         if (!nodes_sorted_by_id(layout.nodes)) return false;
         for (std::size_t i = 0; i < layout.nodes.size(); ++i) {
@@ -2892,43 +2865,59 @@ private:
     }
 
     bool stream_node_layout_section_(const Layout& layout, std::string& error) {
-        return write_streamed_layout_section("NREF", "writer-layout-stream-NREF",
+        return write_streamed_layout_section("NODI", "writer-layout-stream-NODI",
             [&](BufferedSectionWriter& writer, std::string& local_error) -> bool {
                 if (!writer.append_varuint(static_cast<u64>(layout.nodes.size()), local_error)) return false;
+                u32 previous_name_id = 0;
                 u32 previous_array_index = 0;
                 for (std::size_t i = 0; i < layout.nodes.size(); ++i) {
                     const NodeRecord& n = layout.nodes[i];
-                    if (!writer.append_varuint(n.node_id, local_error)) return false;
-                    if (!writer.append_varuint(n.parent_id, local_error)) return false;
-                    u64 name_ref = static_cast<u64>(n.name_id) << 1u;
+                    const u32 id = static_cast<u32>(i + 1u);
+                    if (!writer.append_varuint(n.parent_id == 0 ? 0u : static_cast<u64>(id - n.parent_id), local_error)) return false;
+                    u64 name_ref = 0;
                     if (n.name_id == 0) {
                         const i64 delta = static_cast<i64>(n.array_index) - static_cast<i64>(previous_array_index);
                         name_ref = (detail::zigzag_encode_i64(delta) << 1u) | 1u;
                         previous_array_index = n.array_index;
+                    } else {
+                        const i64 delta = static_cast<i64>(n.name_id) - static_cast<i64>(previous_name_id);
+                        name_ref = detail::zigzag_encode_i64(delta) << 1u;
+                        previous_name_id = n.name_id;
                     }
                     if (!writer.append_varuint(name_ref, local_error)) return false;
                     if (!writer.append_u8(static_cast<u8>(n.kind), local_error)) return false;
-                    if (!writer.append_varuint(n.first_child, local_error)) return false;
-                    if (!writer.append_varuint(n.next_sibling, local_error)) return false;
+                    if (!writer.append_varuint(n.first_child == 0 ? 0u : static_cast<u64>(n.first_child - id), local_error)) return false;
+                    if (!writer.append_varuint(n.next_sibling == 0 ? 0u : static_cast<u64>(n.next_sibling - id), local_error)) return false;
                 }
                 return true;
             }, error);
     }
 
     bool stream_signal_layout_section_(const Layout& layout, std::string& error) {
-        return write_streamed_layout_section("SIGT", "writer-layout-stream-SIGT",
+        return write_streamed_layout_section("SIGD", "writer-layout-stream-SIGD",
             [&](BufferedSectionWriter& writer, std::string& local_error) -> bool {
+                static const u8 kStorageBackPresent = 1u << 4;
+                static const u8 kBitOffsetPresent = 1u << 5;
+                static const u8 kNonNaturalWidth = 1u << 6;
+                static const u8 kExplicitRadix = 1u << 7;
                 if (!writer.append_varuint(static_cast<u64>(layout.signals.size()), local_error)) return false;
+                u32 previous_node_id = 0;
                 for (std::size_t i = 0; i < layout.signals.size(); ++i) {
                     const SignalDefinition& s = layout.signals[i];
-                    if (!writer.append_varuint(s.signal_id, local_error)) return false;
-                    if (!writer.append_varuint(s.storage_id != 0 ? s.storage_id : s.signal_id, local_error)) return false;
-                    if (!writer.append_varuint(s.node_id, local_error)) return false;
-                    if (!writer.append_u8(static_cast<u8>(s.type), local_error)) return false;
-                    if (!writer.append_varuint(s.bit_width, local_error)) return false;
-                    if (!writer.append_u8(static_cast<u8>(s.radix), local_error)) return false;
-                    if (!writer.append_varuint(s.bit_offset, local_error)) return false;
-                    if (!writer.append_u8(s.storage_only ? kSignalFlagStorageOnly : 0u, local_error)) return false;
+                    const u32 id = static_cast<u32>(i + 1u);
+                    const u32 storage_id = s.storage_id != 0 ? s.storage_id : id;
+                    u8 meta = static_cast<u8>(s.type);
+                    if (storage_id != id) meta = static_cast<u8>(meta | kStorageBackPresent);
+                    if (s.bit_offset != 0) meta = static_cast<u8>(meta | kBitOffsetPresent);
+                    if (s.bit_width != natural_signal_bit_width(s.type)) meta = static_cast<u8>(meta | kNonNaturalWidth);
+                    if (s.radix != Radix::Auto) meta = static_cast<u8>(meta | kExplicitRadix);
+                    if (!writer.append_u8(meta, local_error)) return false;
+                    if (!writer.append_varuint(detail::zigzag_encode_i64(static_cast<i64>(s.node_id) - static_cast<i64>(previous_node_id)), local_error)) return false;
+                    if (storage_id != id && !writer.append_varuint(static_cast<u64>(id - storage_id), local_error)) return false;
+                    if (s.bit_width != natural_signal_bit_width(s.type) && !writer.append_varuint(s.bit_width, local_error)) return false;
+                    if (s.radix != Radix::Auto && !writer.append_u8(static_cast<u8>(s.radix), local_error)) return false;
+                    if (s.bit_offset != 0 && !writer.append_varuint(s.bit_offset, local_error)) return false;
+                    previous_node_id = s.node_id;
                 }
                 return true;
             }, error);
@@ -3016,7 +3005,7 @@ private:
         auto phase_start = std::chrono::steady_clock::now();
         std::thread node_thread([&]() {
             try {
-                build_node_layout_payload(layout, node_payload);
+                build_compact_node_layout_payload(layout, node_payload);
             } catch (const std::exception& e) {
                 set_layout_thread_error_(thread_error_mutex, thread_error, "NODE", e.what());
             } catch (...) {
@@ -3025,11 +3014,11 @@ private:
         });
         std::thread signal_thread([&]() {
             try {
-                build_signal_layout_payload(layout, signal_payload);
+                build_compact_signal_layout_payload(layout, signal_payload);
             } catch (const std::exception& e) {
-                set_layout_thread_error_(thread_error_mutex, thread_error, "SIGT", e.what());
+                set_layout_thread_error_(thread_error_mutex, thread_error, "SIGD", e.what());
             } catch (...) {
-                set_layout_thread_error_(thread_error_mutex, thread_error, "SIGT", "unknown exception");
+                set_layout_thread_error_(thread_error_mutex, thread_error, "SIGD", "unknown exception");
             }
         });
 
@@ -3061,13 +3050,13 @@ private:
         name_payload.clear();
         name_payload.shrink_to_fit();
         phase_start = std::chrono::steady_clock::now();
-        if (!write_layout_section("NREF", "NRFZ", node_payload, error)) return false;
+        if (!write_layout_section("NODI", "NIZ2", node_payload, error)) return false;
         writer_init_diag_log_bytes_("writer-layout-write-NODE", phase_start, static_cast<u64>(node_payload.size()));
         node_payload.clear();
         node_payload.shrink_to_fit();
         phase_start = std::chrono::steady_clock::now();
-        if (!write_layout_section("SIGT", "SIGZ", signal_payload, error)) return false;
-        writer_init_diag_log_bytes_("writer-layout-write-SIGT", phase_start, static_cast<u64>(signal_payload.size()));
+        if (!write_layout_section("SIGD", "SGZ2", signal_payload, error)) return false;
+        writer_init_diag_log_bytes_("writer-layout-write-SIGD", phase_start, static_cast<u64>(signal_payload.size()));
         signal_payload.clear();
         signal_payload.shrink_to_fit();
 
@@ -3157,14 +3146,12 @@ private:
         name_work.zstd_tag = "NAMZ";
         LayoutSectionWork node_work;
         node_work.name = "NODE";
-        const bool compact_nodes = can_build_compact_node_layout_payload(layout);
-        node_work.raw_tag = compact_nodes ? "NODI" : "NREF";
-        node_work.zstd_tag = compact_nodes ? "NIZ2" : "NRFZ";
+        node_work.raw_tag = "NODI";
+        node_work.zstd_tag = "NIZ2";
         LayoutSectionWork signal_work;
-        signal_work.name = "SIGT";
-        const bool compact_signals = can_build_compact_signal_layout_payload(layout);
-        signal_work.raw_tag = compact_signals ? "SIGD" : "SIGT";
-        signal_work.zstd_tag = compact_signals ? "SGZ2" : "SIGZ";
+        signal_work.name = "SIGD";
+        signal_work.raw_tag = "SIGD";
+        signal_work.zstd_tag = "SGZ2";
 
         std::mutex thread_error_mutex;
         std::string thread_error;
@@ -3181,15 +3168,9 @@ private:
             }
         };
 
-        const LayoutPayloadBuildFn node_build = compact_nodes
-            ? &Writer::build_compact_node_layout_payload
-            : &Writer::build_node_layout_payload;
-        const LayoutPayloadBuildFn signal_build = compact_signals
-            ? &Writer::build_compact_signal_layout_payload
-            : &Writer::build_signal_layout_payload;
         std::thread name_thread(run_work, &Writer::build_name_layout_payload, std::ref(name_work));
-        std::thread node_thread(run_work, node_build, std::ref(node_work));
-        std::thread signal_thread(run_work, signal_build, std::ref(signal_work));
+        std::thread node_thread(run_work, &Writer::build_compact_node_layout_payload, std::ref(node_work));
+        std::thread signal_thread(run_work, &Writer::build_compact_signal_layout_payload, std::ref(signal_work));
 
         if (name_thread.joinable()) name_thread.join();
         if (node_thread.joinable()) node_thread.join();
@@ -3209,7 +3190,7 @@ private:
         if (!write_parallel_encoded_layout_section_("writer-layout-write-encoded-NODE", node_work, error)) return false;
         node_work.encoded.payload.clear();
         node_work.encoded.payload.shrink_to_fit();
-        if (!write_parallel_encoded_layout_section_("writer-layout-write-encoded-SIGT", signal_work, error)) return false;
+        if (!write_parallel_encoded_layout_section_("writer-layout-write-encoded-SIGD", signal_work, error)) return false;
         signal_work.encoded.payload.clear();
         signal_work.encoded.payload.shrink_to_fit();
 
@@ -3248,22 +3229,18 @@ private:
         writer_init_diag_log_bytes_("writer-layout-write-NAME", phase_start, static_cast<u64>(payload.size()));
 
         phase_start = std::chrono::steady_clock::now();
-        const bool compact_nodes = can_build_compact_node_layout_payload(layout);
-        if (compact_nodes) build_compact_node_layout_payload(layout, payload);
-        else build_node_layout_payload(layout, payload);
+        build_compact_node_layout_payload(layout, payload);
         writer_init_diag_log_bytes_("writer-layout-build-NODE", phase_start, static_cast<u64>(payload.size()));
         phase_start = std::chrono::steady_clock::now();
-        if (!write_layout_section(compact_nodes ? "NODI" : "NREF", compact_nodes ? "NIZ2" : "NRFZ", payload, error)) return false;
+        if (!write_layout_section("NODI", "NIZ2", payload, error)) return false;
         writer_init_diag_log_bytes_("writer-layout-write-NODE", phase_start, static_cast<u64>(payload.size()));
 
         phase_start = std::chrono::steady_clock::now();
-        const bool compact_signals = can_build_compact_signal_layout_payload(layout);
-        if (compact_signals) build_compact_signal_layout_payload(layout, payload);
-        else build_signal_layout_payload(layout, payload);
-        writer_init_diag_log_bytes_("writer-layout-build-SIGT", phase_start, static_cast<u64>(payload.size()));
+        build_compact_signal_layout_payload(layout, payload);
+        writer_init_diag_log_bytes_("writer-layout-build-SIGD", phase_start, static_cast<u64>(payload.size()));
         phase_start = std::chrono::steady_clock::now();
-        if (!write_layout_section(compact_signals ? "SIGD" : "SIGT", compact_signals ? "SGZ2" : "SIGZ", payload, error)) return false;
-        writer_init_diag_log_bytes_("writer-layout-write-SIGT", phase_start, static_cast<u64>(payload.size()));
+        if (!write_layout_section("SIGD", "SGZ2", payload, error)) return false;
+        writer_init_diag_log_bytes_("writer-layout-write-SIGD", phase_start, static_cast<u64>(payload.size()));
 
         phase_start = std::chrono::steady_clock::now();
         build_clock_layout_payload(layout, payload);
@@ -5590,36 +5567,15 @@ private:
 
     std::vector<LodSelectedLevel> select_lod_levels_to_store(const LodStorageState& storage) const {
         std::vector<LodSelectedLevel> selected;
-
-        if (residual_lod_enabled()) {
-            for (std::size_t level = 0; level < storage.levels.size(); ++level) {
-                const LodLevelState& lod_level = storage.levels[level];
-                if (lod_level.disabled) continue;
-                const u64 sampled_count = lod_level_materialized_count(lod_level);
-                if (sampled_count == 0) continue;
-                LodSelectedLevel s;
-                s.level = level;
-                s.source_record_count = storage.raw_transition_count;
-                selected.push_back(s);
-            }
-            return selected;
-        }
-
-        if (storage.raw_transition_count < kLodMinRawTransitionsForTable) return selected;
-
-        u64 previous_count = storage.raw_transition_count;
         for (std::size_t level = 0; level < storage.levels.size(); ++level) {
             const LodLevelState& lod_level = storage.levels[level];
             if (lod_level.disabled) continue;
             const u64 sampled_count = lod_level_materialized_count(lod_level);
             if (sampled_count == 0) continue;
-            if (sampled_count <= previous_count / kLodMaxRecordsToSourceRatio) {
-                LodSelectedLevel s;
-                s.level = level;
-                s.source_record_count = previous_count;
-                selected.push_back(s);
-                previous_count = sampled_count;
-            }
+            LodSelectedLevel s;
+            s.level = level;
+            s.source_record_count = storage.raw_transition_count;
+            selected.push_back(s);
         }
         return selected;
     }
@@ -5755,10 +5711,6 @@ private:
                         ref.transition_source = &lod_level.transitions;
                     } else {
                         std::vector<Transition> materialized = materialize_lod_level_transitions(lod_level);
-                        if (static_cast<u64>(materialized.size()) >
-                            selected.source_record_count / kLodMaxRecordsToSourceRatio) {
-                            materialized.clear();
-                        }
                         if (materialized.empty()) continue;
                         ref.transitions.swap(materialized);
                     }
@@ -6491,6 +6443,7 @@ inline void serialize_options(std::vector<u8>& out, const WriterOptions& o) {
     append_u8(out, o.enable_value_byte_mask_encoding ? 1 : 0);
     append_u8(out, o.enable_stride_time_record_encoding ? 1 : 0);
     append_u8(out, o.enable_lod_tables ? 1 : 0);
+    append_varuint(out, o.lod_bucket_cycle_scale);
     append_u8(out, o.enable_residual_lod_tables ? 1 : 0);
     append_u8(out, o.enable_stats_log ? 1 : 0);
     append_string(out, o.stats_log_path);
@@ -6516,6 +6469,7 @@ inline bool deserialize_options(PayloadReader& r, WriterOptions& o) {
     if (!r.read_u8(b)) return false; o.enable_value_byte_mask_encoding = (b != 0);
     if (!r.read_u8(b)) return false; o.enable_stride_time_record_encoding = (b != 0);
     if (!r.read_u8(b)) return false; o.enable_lod_tables = (b != 0);
+    if (!r.read_varuint(v)) return false; o.lod_bucket_cycle_scale = v;
     if (!r.read_u8(b)) return false; o.enable_residual_lod_tables = (b != 0);
     if (!r.read_u8(b)) return false; o.enable_stats_log = (b != 0);
     if (!r.read_string(o.stats_log_path)) return false;

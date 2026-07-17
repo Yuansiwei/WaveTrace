@@ -202,6 +202,12 @@ internal static class DiagSessionTop
         if (string.IsNullOrWhiteSpace(symbolPath)) return;
         using (var reader = new SymbolReader(TextWriter.Null, symbolPath))
         {
+            string[] trustedRoots = symbolPath.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
+                .Where(path => path.IndexOf('*') < 0 && Directory.Exists(path))
+                .Select(path => Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            reader.SecurityCheck = path => IsUnderTrustedRoot(path, trustedRoots);
             for (int i = 0; i < log.ModuleFiles.Count; ++i)
             {
                 TraceModuleFile module = log.ModuleFiles[(ModuleFileIndex)i];
@@ -215,6 +221,22 @@ internal static class DiagSessionTop
                 }
             }
         }
+    }
+
+    private static bool IsUnderTrustedRoot(string path, string[] trustedRoots)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        string fullPath;
+        try { fullPath = Path.GetFullPath(path); }
+        catch { return false; }
+
+        foreach (string root in trustedRoots)
+        {
+            if (string.Equals(fullPath, root, StringComparison.OrdinalIgnoreCase)) return true;
+            string prefix = root + Path.DirectorySeparatorChar;
+            if (fullPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        return false;
     }
 
     private static bool MatchesProcess(string filter, int pid, string name)

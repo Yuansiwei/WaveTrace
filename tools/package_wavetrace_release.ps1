@@ -49,6 +49,8 @@ function Copy-ReleaseDir([string]$relativePath) {
 }
 
 $files = @(
+    "WaveTrace_使用说明.md",
+    "WaveViewer_使用说明.md",
     "README_BUILD_VS.md",
     "README_WAVETAP_MANUAL.md",
     "README_WVZ4_V3_MONITOR_CHUNKS.md",
@@ -127,7 +129,7 @@ foreach ($file in $viewerFiles) {
 }
 
 $viewerRuntimeFiles = @(
-    "QtViewer\build\x64\Release\QtViewer.exe",
+    "QtViewer\build\x64\Release\WaveViewer.exe",
     "QtViewer\build\x64\Release\Qt5Core.dll",
     "QtViewer\build\x64\Release\Qt5Gui.dll",
     "QtViewer\build\x64\Release\Qt5Widgets.dll",

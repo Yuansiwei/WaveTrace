@@ -135,6 +135,12 @@ private:
         if (!config.wave_trace ||
             static_cast<std::uint64_t>(cycle) < config.wave_trace_start ||
             static_cast<std::uint64_t>(cycle) > config.wave_trace_end) {
+            // Tracer::sample() normally owns cycle progress reporting.  This
+            // no-op path intentionally bypasses sample(), so report here to
+            // keep the business-cycle counter visible even when waveform
+            // tracing is disabled (or the cycle is outside the trace window).
+            // The same BuildOptions enable/period controls are still honored.
+            tracer_->maybe_print_cycle_progress(cycle, false);
             if (next_cycle_ != (std::numeric_limits<Cycle>::max)()) ++next_cycle_;
             last_error_.clear();
             return true;

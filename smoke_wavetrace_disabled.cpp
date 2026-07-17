@@ -22,6 +22,8 @@ int main() {
     DisabledTop top;
     PathStableWvz4Recorder recorder;
     wave::BuildOptions options;
+    options.print_cycle_progress = true;
+    options.print_cycle_progress_period = 1;
     wave::Tracer tracer(recorder, options);
     tracer.add_root("top", &top);
     wave::WaveTap tap(tracer, recorder);

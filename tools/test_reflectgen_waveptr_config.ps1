@@ -108,7 +108,7 @@ $singleRoot = Join-Path $BuildRoot "single\WaveTracer"
 $singleOut = Join-Path $singleRoot "generated_reflect\input_reflect.h"
 $singleConfig = Join-Path $singleRoot "wavetrace_config.json"
 
-Write-Host "[1/8] Missing entries default to true; templates and aliases are discovered"
+Write-Host "[1/11] Missing entries default to true; templates and aliases are discovered"
 $freshLog = Invoke-ReflectGen @(
     $inputHeader, "-o", $singleOut,
     "--header-include", "input.hpp",
@@ -131,7 +131,7 @@ foreach ($member in @("template_ptr", "enabled_ptr", "other_ptr", "direct_ptr", 
     Assert-GeneratedMember $singleText $member $true
 }
 
-Write-Host "[2/8] false is applied during AST collection, while another class remains enabled"
+Write-Host "[2/11] false is applied during AST collection, while another class remains enabled"
 Write-Utf8NoBom $singleConfig (New-CompleteConfigText -TemplatePtr $false -DirectPtr $false)
 $disabledLog = Invoke-ReflectGen @(
     $inputHeader, "-o", $singleOut,
@@ -150,7 +150,7 @@ $entries = Read-ConfigEntries $singleConfig
 $oldEntries = @(Find-Entry $entries "OldClass" "old_ptr")
 Assert-True ($oldEntries.Count -eq 1 -and $oldEntries[0].reflect -eq $false) "stale explicit false entry was not preserved"
 
-Write-Host "[3/8] Batch root-closure mode obeys the same switches"
+Write-Host "[3/11] Batch root-closure mode obeys the same switches"
 $batchInputDir = Join-Path $BuildRoot "batch_input"
 New-Item -ItemType Directory -Force -Path $batchInputDir | Out-Null
 Copy-Item -LiteralPath $inputHeader -Destination (Join-Path $batchInputDir "input.hpp") -Force
@@ -174,7 +174,7 @@ Assert-True (-not $closureText.Contains("reflected_visitor<std::")) "root closur
 Assert-True ($closureText.Contains("ReflectAccess<struct PayloadA>")) "std wrapper traversal did not retain PayloadA"
 Assert-True ($closureText.Contains("ReflectAccess<struct PayloadB>")) "std wrapper traversal did not retain PayloadB"
 
-Write-Host "[4/8] Malformed JSON fails before replacing generated output"
+Write-Host "[4/11] Malformed JSON fails before replacing generated output"
 $beforeHash = (Get-FileHash -LiteralPath $singleOut -Algorithm SHA256).Hash
 Write-Utf8NoBom $singleConfig '{"wave_ptr_members":['
 $malformedLog = Invoke-ReflectGen @(
@@ -186,7 +186,7 @@ $afterHash = (Get-FileHash -LiteralPath $singleOut -Algorithm SHA256).Hash
 Assert-True ($beforeHash -eq $afterHash) "malformed JSON changed an existing generated header"
 Assert-True ($malformedLog.Contains("invalid JSON")) "malformed JSON did not produce a clear diagnostic"
 
-Write-Host "[5/8] Duplicate class/member entries are rejected"
+Write-Host "[5/11] Duplicate class/member entries are rejected"
 $duplicate = @"
 {
   "wave_ptr_members": [
@@ -203,7 +203,7 @@ $duplicateLog = Invoke-ReflectGen @(
 ) 2
 Assert-True ($duplicateLog.Contains("duplicate wave_ptr_members class/member entry")) "duplicate entry was not diagnosed"
 
-Write-Host "[6/8] CMake runner is incremental and reacts to config changes"
+Write-Host "[6/11] CMake runner is incremental and reacts to config changes"
 Write-Utf8NoBom $singleConfig (New-CompleteConfigText -TemplatePtr $false -DirectPtr $false)
 $cmakeOut = (Join-Path $BuildRoot "cmake\WaveTracer\generated_reflect").Replace('\', '/')
 $cmakeLog = "$cmakeOut/reflectgen.log"
@@ -243,7 +243,7 @@ $cmakeClosure = Get-Content -LiteralPath (Join-Path $cmakeOut "root_class_closur
 Assert-GeneratedMember $cmakeClosure "direct_ptr" $true
 Assert-GeneratedMember $cmakeClosure "template_ptr" $false
 
-Write-Host "[7/8] Final deterministic rerun"
+Write-Host "[7/11] Final deterministic rerun"
 $configBefore = Get-Content -LiteralPath $singleConfig -Raw
 $finalLog = Invoke-ReflectGen @(
     $inputHeader, "-o", $singleOut,
@@ -254,7 +254,61 @@ $configAfter = Get-Content -LiteralPath $singleConfig -Raw
 Assert-True ($configBefore -eq $configAfter) "deterministic rerun rewrote config contents"
 Assert-True ($finalLog.Contains("unchanged:")) "deterministic rerun did not report unchanged config"
 
-Write-Host "[8/8] WaveTrace=false skips AST work and emits stable placeholder headers"
+Write-Host "[8/11] A changed read-only config is forcibly replaced and remains read-only"
+Write-Utf8NoBom $singleConfig '{"wave_ptr_members":[]}'
+$configItem = Get-Item -LiteralPath $singleConfig
+$configItem.IsReadOnly = $true
+try {
+    $readOnlyLog = Invoke-ReflectGen @(
+        $inputHeader, "-o", $singleOut,
+        "--header-include", "input.hpp",
+        "--wavetrace-config", $singleConfig,
+        "--main-file-only", "--", "-x", "c++", "-std=c++14"
+    )
+    $readOnlyEntries = Read-ConfigEntries $singleConfig
+    Assert-True ($readOnlyEntries.Count -eq 5) "read-only config was not populated by forced replacement"
+    Assert-True ((Get-Item -LiteralPath $singleConfig).IsReadOnly) "read-only attribute was not restored after replacement"
+    Assert-True ($readOnlyLog.Contains("temporarily cleared protected attributes")) "read-only replacement path was not exercised"
+}
+finally {
+    (Get-Item -LiteralPath $singleConfig).IsReadOnly = $false
+}
+
+Write-Host "[9/11] An exclusively opened config does not fail reflection or corrupt JSON"
+Write-Utf8NoBom $singleConfig '{"wave_ptr_members":[]}'
+$lockedBefore = Get-Content -LiteralPath $singleConfig -Raw
+$lockedStream = [IO.File]::Open($singleConfig, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+try {
+    $lockedLog = Invoke-ReflectGen @(
+        $inputHeader, "-o", $singleOut,
+        "--header-include", "input.hpp",
+        "--wavetrace-config", $singleConfig,
+        "--main-file-only", "--", "-x", "c++", "-std=c++14"
+    )
+}
+finally {
+    $lockedStream.Dispose()
+}
+$lockedAfter = Get-Content -LiteralPath $singleConfig -Raw
+Assert-True ($lockedAfter -eq $lockedBefore) "locked config was partially overwritten or corrupted"
+Assert-True ($lockedLog.Contains("continuing with the discovered table in memory")) "locked config did not report the non-fatal in-memory fallback"
+$lockedGenerated = Get-Content -LiteralPath $singleOut -Raw
+Assert-GeneratedMember $lockedGenerated "direct_ptr" $true
+Assert-GeneratedMember $lockedGenerated "template_ptr" $true
+
+Write-Host "[10/11] The next unlocked run persists the previously discovered table"
+$recoveryLog = Invoke-ReflectGen @(
+    $inputHeader, "-o", $singleOut,
+    "--header-include", "input.hpp",
+    "--wavetrace-config", $singleConfig,
+    "--main-file-only", "--", "-x", "c++", "-std=c++14"
+)
+$recoveredEntries = Read-ConfigEntries $singleConfig
+Assert-True ($recoveredEntries.Count -eq 5) "unlocked recovery run did not persist the discovered table"
+Assert-True ($recoveryLog.Contains("updated:")) "unlocked recovery run did not report a persisted update"
+
+Write-Host "[11/11] WaveTrace=false skips AST work and emits stable placeholder headers"
+$configAfter = Get-Content -LiteralPath $singleConfig -Raw
 $disabledConfigText = $configAfter.Replace('"WaveTrace": true', '"WaveTrace": false')
 Assert-True ($disabledConfigText -ne $configAfter) "serialized config did not contain the WaveTrace switch"
 Write-Utf8NoBom $singleConfig $disabledConfigText

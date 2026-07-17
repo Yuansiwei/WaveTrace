@@ -1,5 +1,5 @@
 param(
-    [string]$ViewerExe = "QtViewer\build\x64\Release\QtViewer.exe",
+    [string]$ViewerExe = "QtViewer\build\x64\Release\WaveViewer.exe",
     [string]$OutputRoot = "build_vs",
     [int]$Width = 1600,
     [int]$Height = 420

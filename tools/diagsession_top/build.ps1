@@ -78,4 +78,17 @@ foreach ($reference in $references) {
     Copy-Item -LiteralPath $reference -Destination $out -Force
 }
 
+$diaNative = Join-Path $vs "DIA SDK\bin\amd64\msdia140.dll"
+if (-not (Test-Path -LiteralPath $diaNative)) {
+    throw "64-bit DIA runtime was not found: $diaNative"
+}
+$diaOutputs = @(
+    (Join-Path $out "native\amd64"),
+    (Join-Path $root "build_vs\diagsession_top\native\amd64")
+)
+foreach ($diaOut in $diaOutputs) {
+    New-Item -ItemType Directory -Force -Path $diaOut | Out-Null
+    Copy-Item -LiteralPath $diaNative -Destination $diaOut -Force
+}
+
 Write-Host "Built: $out\DiagSessionTop.exe"

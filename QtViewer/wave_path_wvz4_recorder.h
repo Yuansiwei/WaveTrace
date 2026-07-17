@@ -177,9 +177,13 @@ public:
         }
         wvz4::Layout layout;
         if (!build_layout(layout, error)) return false;
+        wvz4::WriterOptions writer_options = cfg_.options;
+        // Keep LOD10/100/1000 expressed in business cycles even though the
+        // underlying writer timestamps are scaled clock ticks.
+        writer_options.lod_bucket_cycle_scale = cfg_.clk_period_ticks;
         if (!process_writer_.open(cfg_.file_path,
                                   layout,
-                                  cfg_.options,
+                                  writer_options,
                                   error,
                                   std::string(),
                                   cfg_.writer_process_connect_timeout_ms)) return false;

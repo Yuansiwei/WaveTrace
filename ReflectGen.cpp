@@ -584,6 +584,8 @@ namespace
 
     bool DirectoryExistsForDiagnostics(const std::string& path);
 
+    void PrepareOutputFileForOverwrite(const std::string& path);
+
     void PrintPathFailureContext(const std::string& label, const std::string& path);
 
     void PrintDirectoryCreateFailure(const std::string& label, const std::string& dir);
@@ -800,7 +802,7 @@ namespace
         const std::set<std::string>& preservePaths,
         const std::string& label);
 
-    bool ClearBatchOutputDirectoryBeforeEmit(const std::string& outputDir,
+    bool PrepareBatchOutputDirectoryBeforeEmit(const std::string& outputDir,
         const std::vector<std::string>& roots,
         const Options& opt);
 
@@ -1243,6 +1245,60 @@ namespace
         return os.str();
     }
 
+    std::string MakeWavePtrConfigTemporaryPath(const std::string& path)
+    {
+#ifdef _WIN32
+        static volatile LONG sequence = 0;
+        const unsigned long processId = static_cast<unsigned long>(GetCurrentProcessId());
+        const unsigned long serial = static_cast<unsigned long>(InterlockedIncrement(&sequence));
+#else
+        static unsigned long sequence = 0;
+        const unsigned long processId = static_cast<unsigned long>(getpid());
+        const unsigned long serial = ++sequence;
+#endif
+        std::ostringstream os;
+        os << path << ".tmp." << processId << "." << serial;
+        return os.str();
+    }
+
+    void WarnWavePtrConfigUpdateSkipped(const std::string& path, const std::string& reason)
+    {
+        std::cerr << "[WavePtr config] warning: forced update could not be persisted; "
+            << "keeping the existing JSON and continuing with the discovered table in memory. path="
+            << path << " reason=" << reason << "\n";
+    }
+
+#ifdef _WIN32
+    const DWORD kWavePtrConfigProtectedAttributes =
+        FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+
+    void RestoreWavePtrConfigAttributes(const std::string& path,
+                                        bool existed,
+                                        DWORD originalAttributes)
+    {
+        if (!existed) return;
+        const DWORD current = GetFileAttributesA(path.c_str());
+        if (current == INVALID_FILE_ATTRIBUTES) return;
+        DWORD restored = (current & ~kWavePtrConfigProtectedAttributes) |
+            (originalAttributes & kWavePtrConfigProtectedAttributes);
+        if (restored == 0) restored = FILE_ATTRIBUTE_NORMAL;
+        if (!SetFileAttributesA(path.c_str(), restored))
+        {
+            std::cerr << "[WavePtr config] warning: content was updated but original file attributes "
+                << "could not be restored. path=" << path
+                << " win32_error=" << GetLastError() << "\n";
+        }
+    }
+
+    bool IsTransientWavePtrConfigReplaceError(DWORD error)
+    {
+        return error == ERROR_ACCESS_DENIED ||
+            error == ERROR_SHARING_VIOLATION ||
+            error == ERROR_LOCK_VIOLATION ||
+            error == ERROR_USER_MAPPED_FILE;
+    }
+#endif
+
     bool CommitWavePtrReflectionConfig(const WavePtrReflectionConfig& config)
     {
         const std::string content = SerializeWavePtrReflectionConfig(config);
@@ -1255,31 +1311,144 @@ namespace
         if (!dir.empty() && !MakeDirectoryRecursive(dir))
         {
             PrintDirectoryCreateFailure("[WavePtr config directory]", dir);
-            return false;
+            WarnWavePtrConfigUpdateSkipped(config.path, "parent directory cannot be created or written");
+            return true;
         }
-        const std::string temp = config.path + ".tmp";
+        const std::string temp = MakeWavePtrConfigTemporaryPath(config.path);
         {
             std::ofstream os(temp.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
-            if (!os) { PrintFileOpenFailure("[WavePtr config temp]", temp); return false; }
+            if (!os)
+            {
+                PrintFileOpenFailure("[WavePtr config temp]", temp);
+                WarnWavePtrConfigUpdateSkipped(config.path, "temporary file cannot be created");
+                return true;
+            }
             os.write(content.data(), static_cast<std::streamsize>(content.size()));
             os.flush();
-            if (!os) { std::cerr << "[WavePtr config] failed to write temp file: " << temp << "\n"; return false; }
+            if (!os)
+            {
+                std::cerr << "[WavePtr config] failed to write temp file: " << temp << "\n";
+                os.close();
+                std::remove(temp.c_str());
+                WarnWavePtrConfigUpdateSkipped(config.path, "temporary file write failed");
+                return true;
+            }
         }
 #ifdef _WIN32
-        if (!MoveFileExA(temp.c_str(), config.path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        const DWORD originalAttributes = GetFileAttributesA(config.path.c_str());
+        const bool destinationExisted = originalAttributes != INVALID_FILE_ATTRIBUTES;
+        if (destinationExisted && (originalAttributes & kWavePtrConfigProtectedAttributes) != 0)
         {
-            std::cerr << "[WavePtr config] atomic replace failed: " << config.path
-                << " win32_error=" << GetLastError() << "\n";
-            std::remove(temp.c_str());
-            return false;
+            DWORD writableAttributes = originalAttributes & ~kWavePtrConfigProtectedAttributes;
+            if (writableAttributes == 0) writableAttributes = FILE_ATTRIBUTE_NORMAL;
+            if (SetFileAttributesA(config.path.c_str(), writableAttributes))
+            {
+                std::cout << "[WavePtr config] temporarily cleared protected attributes for forced update: "
+                    << config.path << "\n";
+            }
+            else
+            {
+                std::cerr << "[WavePtr config] warning: failed to clear protected attributes; "
+                    << "continuing with replacement attempts. path=" << config.path
+                    << " win32_error=" << GetLastError() << "\n";
+            }
         }
-#else
-        if (std::rename(temp.c_str(), config.path.c_str()) != 0)
+
+        static const DWORD retryDelayMs[] = { 0, 10, 25, 50, 100, 200, 400 };
+        DWORD replaceError = ERROR_SUCCESS;
+        bool replaced = false;
+        for (std::size_t attempt = 0;
+             attempt < sizeof(retryDelayMs) / sizeof(retryDelayMs[0]);
+             ++attempt)
         {
-            std::cerr << "[WavePtr config] atomic replace failed: " << config.path
-                << " errno=" << errno << "\n";
+            if (retryDelayMs[attempt] != 0) Sleep(retryDelayMs[attempt]);
+            if (MoveFileExA(temp.c_str(), config.path.c_str(),
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            {
+                replaced = true;
+                break;
+            }
+            replaceError = GetLastError();
+            if (!IsTransientWavePtrConfigReplaceError(replaceError)) break;
+        }
+
+        if (!replaced && ReadWholeFileText(config.path) == content)
+        {
+            // Another concurrently running ReflectGen may already have committed
+            // the same table.  Treat that as success and only remove our temp.
             std::remove(temp.c_str());
-            return false;
+            RestoreWavePtrConfigAttributes(config.path, destinationExisted, originalAttributes);
+            std::cout << "[WavePtr config] synchronized by concurrent update: " << config.path << "\n";
+            return true;
+        }
+
+        if (!replaced)
+        {
+            // Some ACLs allow writing the existing file but deny replacing the
+            // directory entry.  CopyFile provides a non-atomic last-resort path.
+            if (CopyFileA(temp.c_str(), config.path.c_str(), FALSE))
+            {
+                replaced = true;
+                std::remove(temp.c_str());
+                std::cout << "[WavePtr config] updated through direct-copy fallback: "
+                    << config.path << "\n";
+            }
+            else
+            {
+                const DWORD copyError = GetLastError();
+                std::remove(temp.c_str());
+                RestoreWavePtrConfigAttributes(config.path, destinationExisted, originalAttributes);
+                std::ostringstream reason;
+                reason << "atomic_replace_win32_error=" << replaceError
+                    << " direct_copy_win32_error=" << copyError;
+                WarnWavePtrConfigUpdateSkipped(config.path, reason.str());
+                return true;
+            }
+        }
+        RestoreWavePtrConfigAttributes(config.path, destinationExisted, originalAttributes);
+#else
+        struct stat originalStat;
+        const bool destinationExisted = stat(config.path.c_str(), &originalStat) == 0;
+        if (destinationExisted && (originalStat.st_mode & S_IWUSR) == 0)
+            (void)chmod(config.path.c_str(), originalStat.st_mode | S_IWUSR);
+
+        int replaceError = 0;
+        bool replaced = false;
+        for (unsigned attempt = 0; attempt != 4; ++attempt)
+        {
+            if (std::rename(temp.c_str(), config.path.c_str()) == 0)
+            {
+                replaced = true;
+                break;
+            }
+            replaceError = errno;
+            if (replaceError != EINTR && replaceError != EBUSY && replaceError != EACCES) break;
+            usleep((attempt + 1) * 25000);
+        }
+        if (!replaced && ReadWholeFileText(config.path) == content)
+        {
+            std::remove(temp.c_str());
+            replaced = true;
+        }
+        if (!replaced)
+        {
+            std::ifstream src(temp.c_str(), std::ios::binary);
+            std::ofstream dst(config.path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+            if (src && dst)
+            {
+                dst << src.rdbuf();
+                dst.flush();
+                replaced = !!dst;
+            }
+        }
+        std::remove(temp.c_str());
+        if (destinationExisted) (void)chmod(config.path.c_str(), originalStat.st_mode);
+        if (!replaced)
+        {
+            std::ostringstream reason;
+            reason << "rename_errno=" << replaceError << " direct_write_failed";
+            WarnWavePtrConfigUpdateSkipped(config.path, reason.str());
+            return true;
         }
 #endif
         std::cout << "[WavePtr config] updated: " << config.path << "\n";
@@ -4812,6 +4981,10 @@ namespace
 
     void PrintPathFailureContext(const std::string& label, const std::string& path)
     {
+        const int savedErrno = errno;
+#ifdef _WIN32
+        const DWORD savedLastError = GetLastError();
+#endif
         std::cerr << label << " path: " << path << "\n";
         std::cerr << label << " cwd: " << CurrentWorkingDirectory() << "\n";
         if (!path.empty())
@@ -4823,7 +4996,26 @@ namespace
             std::cerr << label << " parent exists: " << (DirectoryExistsForDiagnostics(parent) ? "yes" : "NO") << "\n";
             std::cerr << label << " file exists: " << (FileExistsForDiagnostics(abs) ? "yes" : "NO") << "\n";
         }
+        errno = savedErrno;
+#ifdef _WIN32
+        SetLastError(savedLastError);
+#endif
         std::cerr << label << " system error: " << LastSystemErrorForLog() << "\n";
+    }
+
+    void PrepareOutputFileForOverwrite(const std::string& path)
+    {
+#ifdef _WIN32
+        if (path.empty()) return;
+        const DWORD attributes = GetFileAttributesA(path.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES &&
+            (attributes & FILE_ATTRIBUTE_READONLY) != 0)
+        {
+            (void)SetFileAttributesA(path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
+        }
+#else
+        (void)path;
+#endif
     }
 
     void PrintDirectoryCreateFailure(const std::string& label, const std::string& dir)
@@ -6794,7 +6986,7 @@ namespace
 #endif
     }
 
-    bool ClearBatchOutputDirectoryBeforeEmit(const std::string& outputDir,
+    bool PrepareBatchOutputDirectoryBeforeEmit(const std::string& outputDir,
         const std::vector<std::string>& roots,
         const Options& opt)
     {
@@ -6824,12 +7016,17 @@ namespace
             return true;
         }
 
-        std::cout << "[batch output clear] clearing output directory before emission: " << outputDir << "\n";
-        if (!ClearDirectoryContentsRecursive(outputDir, preservePaths, "[batch output clear]"))
-        {
-            std::cerr << "[batch output clear failed] outputDir=" << outputDir << "\n";
-            return false;
-        }
+        // Generated headers and shard sources are all opened with truncation by
+        // the emitters below.  Deleting them first is both unnecessary and
+        // hostile to Windows builds: cl.exe, IntelliSense and editors commonly
+        // open source files with read/write sharing but without FILE_SHARE_DELETE.
+        // In that state DeleteFile fails even though replacing the contents is
+        // legal.  CMake explicitly lists the active shard files, so stale files
+        // from a previous larger shard count are harmless and can remain until
+        // no process holds them.
+        (void)preservePaths;
+        std::cout << "[batch output prepare] reusing output directory; generated files will be overwritten in place: "
+                  << outputDir << "\n";
         return true;
     }
 
@@ -6919,6 +7116,7 @@ namespace
 
     bool EmitGeneratedFile(const std::vector<RecordInfo>& records, const Options& opt, const std::map<std::string, const RecordInfo*>* globalByName = NULL)
     {
+        PrepareOutputFileForOverwrite(opt.outputHeader);
         errno = 0;
         std::ofstream os(opt.outputHeader.c_str(), std::ios::binary);
         if (!os)
@@ -7462,6 +7660,7 @@ namespace
             return false;
         }
 
+        PrepareOutputFileForOverwrite(aggregateHeader);
         errno = 0;
         std::ofstream os(aggregateHeader.c_str(), std::ios::binary);
         if (!os)
@@ -8133,6 +8332,7 @@ namespace
             return false;
         }
 
+        PrepareOutputFileForOverwrite(path);
         errno = 0;
         std::ofstream os(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
         if (!os)
@@ -8166,6 +8366,7 @@ namespace
     bool EmitCompileShardRegistryHeader(const std::string& outputDir, unsigned shardCount)
     {
         const std::string path = JoinPath(outputDir, "root_class_closure_shards_registry.h");
+        PrepareOutputFileForOverwrite(path);
         errno = 0;
         std::ofstream os(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
         if (!os)
@@ -8210,6 +8411,7 @@ namespace
         bool disabled)
     {
         const std::string path = JoinPath(outputDir, CompileShardBaseName(shardIndex) + ".cpp");
+        PrepareOutputFileForOverwrite(path);
         errno = 0;
         std::ofstream os(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
         if (!os)
@@ -8220,6 +8422,7 @@ namespace
         os << "// Generated by ReflectGen. Do not edit.\n";
         if (!disabled)
         {
+            os << "#include \"wave_runtime.h\"\n";
             os << "#include \"" << FileNameOnly(generatedHeader) << "\"\n\n";
         }
         os << "extern \"C\" void wavetrace_register_reflection_shard_" << CompileShardTag(shardIndex) << "()\n";
@@ -8235,6 +8438,8 @@ namespace
     bool EmitDisabledCompileShardFiles(const std::string& outputDir, unsigned shardCount)
     {
         const std::vector<std::string> none;
+        if (!WriteBatchAggregateInputHeader(
+                JoinPath(outputDir, "root_class_closure_root_input.h"), none)) return false;
         for (unsigned i = 0; i < shardCount; ++i)
         {
             const std::string base = CompileShardBaseName(i);
@@ -9704,7 +9909,7 @@ namespace
         }
 
         const std::string outputDir = NormalizePathSlashes(ExpandEnvironmentVariablesInPath(opt.outputHeader));
-        if (!ClearBatchOutputDirectoryBeforeEmit(outputDir, clearSafetyRoots, opt))
+        if (!PrepareBatchOutputDirectoryBeforeEmit(outputDir, clearSafetyRoots, opt))
         {
             return false;
         }
@@ -9813,8 +10018,13 @@ namespace
                 partition = PartitionRootClosureForCompilation(closureRecords, requestedRoots, opt.compileShardCount);
                 rootVisibleRecords.swap(partition.rootRecords);
                 closureInput = JoinPath(outputDir, "root_class_closure_root_input.h");
-                const std::vector<std::string> rootInputs = SelectCompileShardInputHeaders(
-                    rootVisibleRecords, aggregateInputs, aggregateIncludePaths);
+                // Compile every generated TU in the exact umbrella environment that
+                // libclang parsed successfully. Business headers are often not
+                // self-contained and may depend on include order, typedefs or macros
+                // supplied by the root header/PCH. Selecting only the owning source
+                // headers makes otherwise valid projects fail as independent TUs.
+                const std::vector<std::string> rootInputs(
+                    1u, FileNameOnly(tempAggregateInput));
                 if (!WriteBatchAggregateInputHeader(closureInput, rootInputs)) return false;
             }
 
@@ -9845,8 +10055,8 @@ namespace
                     const std::string shardBase = CompileShardBaseName(si);
                     const std::string shardInput = JoinPath(outputDir, shardBase + "_input.h");
                     const std::string shardHeader = JoinPath(outputDir, shardBase + "_reflect_auto.h");
-                    const std::vector<std::string> shardInputs = SelectCompileShardInputHeaders(
-                        partition.shardRecords[si], aggregateInputs, aggregateIncludePaths);
+                    const std::vector<std::string> shardInputs(
+                        1u, FileNameOnly(tempAggregateInput));
                     if (!WriteBatchAggregateInputHeader(shardInput, shardInputs)) return false;
 
                     Options shardOpt = opt;

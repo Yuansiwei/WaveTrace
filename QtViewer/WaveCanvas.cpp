@@ -337,8 +337,8 @@ namespace {
         bool drawRightEdge = true;
     };
 
-    void drawBusFrame(QPainter& p, const BusFrame& busFrame, const QColor& color,
-                      qreal penWidth, const QBrush& brush = Qt::NoBrush) {
+    void drawBusFrame(QPainter& p, const BusFrame& busFrame,
+                      const QBrush& brush = Qt::NoBrush) {
         if (busFrame.rect.isEmpty()) return;
 
         const QRectF frame = busRoundedFrameRect(busFrame.rect);
@@ -346,9 +346,7 @@ namespace {
         const bool drawLeft = busFrame.drawLeftEdge;
         const bool drawRight = busFrame.drawRightEdge;
 
-        p.setPen(waveStrokePen(color, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
         if (drawLeft && drawRight) {
-            p.setBrush(brush);
             p.drawRoundedRect(frame, radius, radius);
             return;
         }
@@ -390,6 +388,7 @@ namespace {
             path.quadTo(left, top, left + radius, top);
         }
         p.drawPath(path);
+        p.setBrush(brush);
     }
 
     void drawBusRoundedFrames(QPainter& p, const QVector<BusFrame>& frames, const QColor& color,
@@ -400,8 +399,10 @@ namespace {
         const QPen oldPen = p.pen();
         const QBrush oldBrush = p.brush();
         p.setRenderHint(QPainter::Antialiasing, true);
+        p.setPen(waveStrokePen(color, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        p.setBrush(brush);
         for (const BusFrame& frame : frames) {
-            drawBusFrame(p, frame, color, penWidth, brush);
+            drawBusFrame(p, frame, brush);
         }
         p.setPen(oldPen);
         p.setBrush(oldBrush);
@@ -417,7 +418,9 @@ namespace {
         const QPen oldPen = p.pen();
         const QBrush oldBrush = p.brush();
         p.setRenderHint(QPainter::Antialiasing, true);
-        drawBusFrame(p, BusFrame{ rect, drawLeftEdge, drawRightEdge }, color, penWidth, brush);
+        p.setPen(waveStrokePen(color, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        p.setBrush(brush);
+        drawBusFrame(p, BusFrame{ rect, drawLeftEdge, drawRightEdge }, brush);
         p.setPen(oldPen);
         p.setBrush(oldBrush);
         p.setRenderHint(QPainter::Antialiasing, oldAntialiasing);
@@ -856,8 +859,9 @@ namespace {
     const WaveLodLevel* chooseLodLevelForViewport(const WaveSignal& sig, qint64 start, qint64 end,
                                                   qint64 spanValue, int plotWidth) {
         const double cyclesPerPixel = double(spanValue) / double(qMax(1, plotWidth));
-        if (cyclesPerPixel < 128.0 || sig.lodLevels.isEmpty()) return nullptr;
+        if (sig.lodLevels.isEmpty()) return nullptr;
         const WaveLodLevel* best = nullptr;
+        const WaveLodLevel* transitionalFallback = nullptr;
 
         const qint64 maxBucketCycles = qMax<qint64>(1, qint64(std::floor(cyclesPerPixel)));
         for (int i = 0; i < sig.lodLevels.size(); ++i) {
@@ -865,9 +869,13 @@ namespace {
             if (level.bucketCycles <= 0 || (level.buckets.isEmpty() && level.samples.isEmpty())) continue;
             if (!lodLevelIntersectsRange(level, start, end)) continue;
             if (level.bucketCycles <= maxBucketCycles) best = &level;
-            else break;
+            else if (!transitionalFallback) transitionalFallback = &level;
         }
-        return best;
+        // While a finer LOD/RAW range is being fetched, keep drawing the
+        // smallest already-loaded coarser level.  Rejecting it outright makes
+        // an otherwise valid waveform disappear for the animation + debounce
+        // + I/O interval at every LOD boundary.
+        return best ? best : transitionalFallback;
     }
 
     int lowerSampleIndexForTime(const QVector<WaveSample>& samples, qint64 t) {
@@ -919,6 +927,11 @@ WaveCanvas::WaveCanvas(QWidget* parent)
         Q_EMIT viewportChanged(m_viewStart, m_viewEnd);
         update();
         });
+    connect(m_viewAnim, &QVariantAnimation::finished, this, [this]() {
+        // Animation frames repaint from the cache. Emit one settled notification
+        // so MainWindow performs at most one range load per zoom gesture.
+        Q_EMIT viewportChanged(m_viewStart, m_viewEnd);
+        });
 }
 
 QSize WaveCanvas::minimumSizeHint() const {
@@ -935,6 +948,10 @@ qint64 WaveCanvas::span() const { return qMax<qint64>(1, m_viewEnd - m_viewStart
 
 qint64 WaveCanvas::fullStartTime() const { return fullStart(); }
 qint64 WaveCanvas::fullEndTime() const { return fullEnd(); }
+
+bool WaveCanvas::viewportAnimationActive() const {
+    return m_viewAnim && m_viewAnim->state() == QAbstractAnimation::Running;
+}
 
 QRect WaveCanvas::overviewRect() const {
     return QRect(m_padX, height() - m_overviewHeight - 8, plotSpanPxForWidth(width(), m_padX), m_overviewHeight);
@@ -972,6 +989,14 @@ void WaveCanvas::setVisibleEntries(const QVector<ActiveSignalRef>& entries) {
     m_selectedEntryIndexes = filtered;
     updateGeometry();
     update();
+}
+
+void WaveCanvas::invalidateSignalSampleCaches(const QVector<int>& signalIndexes) {
+    for (int signalIndex : signalIndexes) {
+        m_lastSampleIndexBySignal.remove(signalIndex);
+        m_strideLevelsBySignal.remove(signalIndex);
+        m_bitParityStrideLevelsBySignal.remove(signalIndex);
+    }
 }
 
 void WaveCanvas::setFirstVisibleEntryIndex(int index) {
@@ -1021,6 +1046,17 @@ void WaveCanvas::setViewportInstant(qint64 start, qint64 end) {
     update();
 }
 
+void WaveCanvas::commitViewportRange(qint64 start, qint64 end) {
+    setViewportInstant(start, end);
+}
+
+void WaveCanvas::clearCursor() {
+    m_cursorTime = -1;
+    m_hoverTime = -1;
+    Q_EMIT cursorMoved(m_cursorTime);
+    update();
+}
+
 void WaveCanvas::animateViewportTo(qint64 start, qint64 end, int durationMs) {
     m_viewAnim->stop();
     m_animFromStart = m_viewStart;
@@ -1031,6 +1067,7 @@ void WaveCanvas::animateViewportTo(qint64 start, qint64 end, int durationMs) {
     m_viewAnim->setStartValue(0.0);
     m_viewAnim->setEndValue(1.0);
     m_viewAnim->start();
+    Q_EMIT viewportTargetRequested(start, end);
 }
 
 void WaveCanvas::resetView() {
@@ -1843,7 +1880,21 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
         const int plotRight = plotRightPixel;
         const int plotWidth = plotSpanPx;
         const bool rawSamplesCoverRow = waveSignalRawSamplesCoverRange(sig, rowViewStart, rowViewEnd);
+        const qint64 maxUsefulLodBucket = qMax<qint64>(
+            1, qint64(std::floor(double(spanValue) / double(qMax(1, plotWidth)))));
+        bool haveResolutionAppropriateLod = false;
+        for (const WaveLodLevel& level : sig.lodLevels) {
+            if (level.bucketCycles <= 0 || level.bucketCycles > maxUsefulLodBucket ||
+                (level.buckets.isEmpty() && level.samples.isEmpty())) continue;
+            if (lodLevelIntersectsRange(level, rowViewStart, rowViewEnd)) {
+                haveResolutionAppropriateLod = true;
+                break;
+            }
+        }
+        const bool rawRequiredForResolution = rawSamplesCoverRow &&
+            !sig.samples.isEmpty() && !haveResolutionAppropriateLod;
         const bool preferRawSamples = viewerDisableLodEnabled() ||
+            rawRequiredForResolution ||
             (rawSamplesCoverRow && !sig.samples.isEmpty() &&
              sig.samples.size() <= qMax(2000, plotWidth * 8));
         if (!preferRawSamples) if (const WaveLodLevel* lodLevel = chooseLodLevelForViewport(sig, rowViewStart, rowViewEnd, spanValue, plotWidth)) {
@@ -2042,7 +2093,14 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                         };
 
                         const int lodVisibleCount = lastExclusive - firstIdx;
-                        const bool lodDenseByPixel = lodVisibleCount > qMax(1, plotWidth);
+                        // At roughly one LOD sample per pixel, outlined bus
+                        // frames degenerate into sparse one-pixel edges. RAW's
+                        // dense renderer fills activity columns, so switching
+                        // at the finest LOD boundary visibly flashes. Enter the
+                        // dense activity renderer before that boundary so both
+                        // representations have the same pixel semantics.
+                        const bool lodDenseByPixel =
+                            lodVisibleCount > qMax(40, plotWidth / 3);
                         if (!lodDenseByPixel) {
                             for (int i = firstIdx; i < lastExclusive; ++i) {
                                 const WaveSample& sample = lodSamples.at(i);
@@ -2826,7 +2884,7 @@ void WaveCanvas::mouseReleaseEvent(QMouseEvent* event) {
             if (ns < fullStart()) ns = fullStart();
             if (ne > fullEnd()) ne = fullEnd();
             if (ne - ns < m_minWindow) ns = qMax(fullStart(), ne - m_minWindow);
-            setViewportInstant(ns, ne);
+            Q_EMIT viewportRangeSelected(ns, ne);
             m_cursorTime = ns + (ne - ns) / 2;
         }
         else {

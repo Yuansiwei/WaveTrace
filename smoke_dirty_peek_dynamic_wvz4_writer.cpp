@@ -1,6 +1,8 @@
 #include "wave_tap.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <set>
 #include <string>
@@ -108,6 +110,7 @@ int main(int argc, char** argv) {
         (argc >= 2 && argv[1] && argv[1][0] != '\0')
             ? argv[1]
             : "build_vs\\dirty_peek_dynamic_wvz4_smoke.wvz4";
+    const int stress_cycles = argc >= 3 ? (std::max)(4, std::atoi(argv[2])) : 4;
 
     DirtyHookTop top;
     top.peek.value.flag = false;
@@ -168,12 +171,25 @@ int main(int argc, char** argv) {
     top.dynamic.write(true, 222u, -22);
     if (!tap.sample_one_cycle()) return fail("cycle3 sample failed: " + tap.last_error());
 
+    for (int cycle = 4; cycle < stress_cycles; ++cycle) {
+        top.peek.write((cycle & 1) != 0,
+                       static_cast<std::uint32_t>(100u + cycle),
+                       -10 - cycle);
+        top.dynamic.write((cycle & 1) == 0,
+                          static_cast<std::uint32_t>(200u + cycle),
+                          -20 - cycle);
+        if (!tap.sample_one_cycle()) {
+            return fail("stress sample failed at cycle " + std::to_string(cycle) +
+                        ": " + tap.last_error());
+        }
+    }
+
     if (!recorder.close(error)) {
         return fail("recorder.close failed: " + error);
     }
 
     std::cout << "dirty_peek_dynamic_wvz4_writer_ok file=" << out_path
               << " tracks=" << recorder.declared_paths.size()
-              << " cycles=4\n";
+              << " cycles=" << stress_cycles << "\n";
     return 0;
 }

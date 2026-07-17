@@ -46,7 +46,7 @@ public:
         // samplesLoaded=false.
         bool loadRawSamples = true;
 
-        // New WVZ4 writer versions finalize files by writing FOOT and patching
+        // WVZ4 v15 writers finalize files by writing FOOT and patching
         // footer_offset in the header. Keep this false in viewer paths so a
         // killed direct writer cannot be mistaken for a complete waveform.
         bool allowUnfinalized = false;
@@ -60,6 +60,25 @@ public:
 
 class WaveParser4Reader {
 public:
+    struct DataBlockDescriptor {
+        enum class Kind {
+            Raw,
+            Lod
+        };
+
+        Kind kind = Kind::Raw;
+        int index = -1;
+        quint64 blockId = 0;
+        qint64 bucketCycles = 1;
+        quint64 signalChunkId = 0;
+        int firstStorageId = 1;
+        int storageCount = 0;
+        qint64 start = 0;
+        qint64 end = 0;
+        quint64 fileBytes = 0;
+        quint64 estimatedDecodedBytes = 0;
+    };
+
     enum class RawBlockCompareResult {
         Equal,
         Different,
@@ -77,16 +96,36 @@ public:
 
     bool open(const QString& filePath, QString& error, bool allowUnfinalized = false);
     const WaveFile& directoryWave() const;
+    WaveFile takeDirectoryWave();
     bool loadSignals(const QVector<int>& signalIds,
                      WaveFile& outWave,
                      QString& error,
                      quint64 maxDecodedSamples = 0,
                      qint64 timeStart = 0,
                      qint64 timeEnd = std::numeric_limits<qint64>::max()) const;
+    bool loadSignalLod(const QVector<int>& signalIds,
+                       WaveFile& outWave,
+                       QString& error,
+                       qint64 timeStart,
+                       qint64 timeEnd,
+                       qint64 targetBucketCycles) const;
+    QVector<DataBlockDescriptor> dataBlocks() const;
+    bool loadDataBlock(const DataBlockDescriptor& block,
+                       WaveFile& outWave,
+                       QString& error,
+                       quint64 maxDecodedSamples = 0) const;
     RawBlockCompareResult compareRawBlocksWith(const WaveParser4Reader& other,
                                                QString& error) const;
 
 private:
+    bool loadSignalLodImpl(const QVector<int>& signalIds,
+                           WaveFile& outWave,
+                           QString& error,
+                           qint64 timeStart,
+                           qint64 timeEnd,
+                           qint64 targetBucketCycles,
+                           bool exactBucketOnly,
+                           int onlyChunkIndex) const;
     struct Impl;
     std::unique_ptr<Impl> d;
 };

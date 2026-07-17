@@ -41,6 +41,8 @@ int main(int argc, char** argv) {
     wave::BuildOptions options;
     options.emit_only_on_change = false;
     options.dump_leaf_distribution_after_topology = false;
+    options.print_cycle_progress = true;
+    options.print_cycle_progress_period = 1;
     wave::Tracer tracer(recorder, options);
     tracer.add_root("top", &top);
     wave::WaveTap tap(tracer, recorder);

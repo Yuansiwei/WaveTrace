@@ -89,6 +89,11 @@ set(_wavetrace_reflect_inputs "${WAVETRACE_REFLECTGEN_EXE}")
 if(DEFINED WAVETRACE_CONFIG_FILE AND EXISTS "${WAVETRACE_CONFIG_FILE}")
     list(APPEND _wavetrace_reflect_inputs "${WAVETRACE_CONFIG_FILE}")
 endif()
+if(DEFINED WAVETRACE_REFLECT_SETTINGS_FILE AND
+        NOT "${WAVETRACE_REFLECT_SETTINGS_FILE}" STREQUAL "" AND
+        EXISTS "${WAVETRACE_REFLECT_SETTINGS_FILE}")
+    list(APPEND _wavetrace_reflect_inputs "${WAVETRACE_REFLECT_SETTINGS_FILE}")
+endif()
 foreach(_wavetrace_reflect_list_file WAVETRACE_REFLECT_TARGET_LIST WAVETRACE_REFLECT_INPUT_LIST)
     if(DEFINED ${_wavetrace_reflect_list_file} AND EXISTS "${${_wavetrace_reflect_list_file}}")
         list(APPEND _wavetrace_reflect_inputs "${${_wavetrace_reflect_list_file}}")
@@ -106,6 +111,35 @@ endforeach()
 set(_wavetrace_reflect_need_run FALSE)
 if(NOT EXISTS "${_wavetrace_reflect_aggregate_output}")
     set(_wavetrace_reflect_need_run TRUE)
+endif()
+
+# A previous unsharded (or differently sharded) generation may leave a fresh
+# aggregate header while the newly declared shard sources do not exist.  Do not
+# let that aggregate-only timestamp suppress regeneration.
+if(DEFINED WAVETRACE_REFLECT_COMPILE_SHARDS AND WAVETRACE_REFLECT_COMPILE_SHARDS GREATER 0)
+    set(_wavetrace_reflect_expected_shard_outputs
+        "${WAVETRACE_REFLECT_OUTPUT_DIR}/root_class_closure_root_input.h"
+        "${WAVETRACE_REFLECT_OUTPUT_DIR}/root_class_closure_shards_registry.h")
+    math(EXPR _wavetrace_reflect_last_shard "${WAVETRACE_REFLECT_COMPILE_SHARDS} - 1")
+    foreach(_wavetrace_reflect_shard_index RANGE 0 ${_wavetrace_reflect_last_shard})
+        if(_wavetrace_reflect_shard_index LESS 10)
+            set(_wavetrace_reflect_shard_tag "0${_wavetrace_reflect_shard_index}")
+        else()
+            set(_wavetrace_reflect_shard_tag "${_wavetrace_reflect_shard_index}")
+        endif()
+        set(_wavetrace_reflect_shard_base
+            "${WAVETRACE_REFLECT_OUTPUT_DIR}/root_class_closure_shard_${_wavetrace_reflect_shard_tag}")
+        list(APPEND _wavetrace_reflect_expected_shard_outputs
+            "${_wavetrace_reflect_shard_base}.cpp"
+            "${_wavetrace_reflect_shard_base}_input.h"
+            "${_wavetrace_reflect_shard_base}_reflect_auto.h")
+    endforeach()
+    foreach(_wavetrace_reflect_expected_output IN LISTS _wavetrace_reflect_expected_shard_outputs)
+        if(NOT EXISTS "${_wavetrace_reflect_expected_output}")
+            set(_wavetrace_reflect_need_run TRUE)
+            break()
+        endif()
+    endforeach()
 endif()
 foreach(_wavetrace_reflect_input IN LISTS _wavetrace_reflect_inputs)
     if(EXISTS "${_wavetrace_reflect_input}" AND "${_wavetrace_reflect_input}" IS_NEWER_THAN "${_wavetrace_reflect_aggregate_output}")

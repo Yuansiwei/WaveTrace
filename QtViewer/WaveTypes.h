@@ -48,7 +48,7 @@ enum class ValueRadix {
 
 struct WaveSample {
     qint64 time = 0;
-    QString value;          // legacy/raw text cache; display logic should prefer rawBits/isZ/isAbsent
+    QString value;          // Optional text cache; display logic should prefer rawBits/isZ/isAbsent.
     quint64 rawBits = 0;
     bool isZ = false;
     bool isAbsent = false;
@@ -90,14 +90,14 @@ struct WaveDiffRegion {
 };
 
 struct WaveSignal {
-    // Stable WVZ3 signal id. For legacy formats this is usually the signalList index.
-    // MainWindow uses this to load samples on demand without assuming signalList index == file id.
+    // Stable WVZ4 v15 signal id. MainWindow uses it for on-demand loading without
+    // assuming signalList index == file id.
     int signalId = -1;
     // Physical WVZ4 storage stream id. Several logical signal ids may share one
     // storage stream through WVZ4 aliases.
     int storageId = -1;
     int bitOffset = 0;
-    // Explicit name for synthetic/legacy signals. Normal WVZ4 file signals
+    // Explicit name for synthetic/non-tree signals. Normal WVZ4 file signals
     // leave this empty and resolve their segment through WaveTreeInfo tokens.
     QString name;
     SignalKind kind = SignalKind::Bit;
@@ -106,7 +106,7 @@ struct WaveSignal {
     ValueRadix currentRadix = ValueRadix::Bin;
     bool supportsZState = false;
     // True means samples already cover the whole file time range for this signal.
-    // Legacy loaders default to true; WVZ3 selective loading sets false for directory-only signal entries.
+    // Directory-only and partial v15 loads leave this false.
     bool samplesLoaded = true;
     QVector<WaveSample> samples;
     // WVZ4 on-demand display path may keep only the current raw viewport plus
@@ -124,29 +124,33 @@ struct WaveSignal {
     // Derived cache for fast navigation. Contains times where samples[i] differs from samples[i-1].
     QVector<qint64> changeTimes;
     bool changeTimesReady = false;
-    // WVZ4 file-level overview data. v7/v8 use bucket summaries; v9 stores a
-    // decimated transition stream in FOOT; v10 stores chunked transition streams in LODZ.
+    // WVZ4 v15 file-level overview data loaded from chunked LODZ streams.
     QVector<WaveLodLevel> lodLevels;
 };
 
 inline bool waveSignalRawSamplesCoverRange(const WaveSignal& sig, qint64 start, qint64 end) {
     if (sig.samplesLoaded) return true;
     if (end <= start) return true;
+    qint64 cursor = start;
     for (const WaveLodValidRange& range : sig.rawLoadedRanges) {
-        if (range.start <= start && range.end >= end) return true;
+        if (range.end <= cursor) continue;
+        if (range.start > cursor) return false;
+        cursor = qMax(cursor, range.end);
+        if (cursor >= end) return true;
     }
     return false;
 }
 
 
 struct WaveTreeNode {
-    int nodeId = -1;
     int parentId = 0;
     int firstChild = 0;
     int nextSibling = 0;
+    int rowInParent = -1;
     int signalIndex = -1;   // -1 means module/container node
     int signalId = -1;
     quint32 nameToken = 0;  // NAME id, or kWaveNameTokenArrayFlag | numeric array index
+    quint8 kind = 0;
     bool valid = false;
 };
 
@@ -158,6 +162,9 @@ struct WaveTreeInfo {
     QVector<WaveTreeNode> nodesById;
     QVector<int> rootNodeIds;
     QVector<int> signalIndexToNodeId;
+    // Directory-only v15 loads build this while decoding SIGD. Values store
+    // signalIndex + 1 so zero remains the missing-id sentinel used by MainWindow.
+    QVector<int> signalIndexBySignalId;
 };
 
 struct WaveMeta {
@@ -273,6 +280,19 @@ inline QString waveFormatDisplayTime(qint64 internalTime) {
     while (frac.endsWith(QLatin1Char('0'))) frac.chop(1);
     const QString wholeText = (internalTime < 0 && whole == 0) ? QStringLiteral("-0") : QString::number(whole);
     return wholeText + QLatin1Char('.') + frac;
+}
+
+// WaveMeta::end is an exclusive internal-tick boundary.  File-range labels
+// describe the actual business-cycle indexes covered by that half-open range,
+// so their right side is the cycle containing end - 1 rather than end itself.
+inline QString waveFormatDisplayCycleRangeEnd(qint64 exclusiveEnd) {
+    if (exclusiveEnd == (std::numeric_limits<qint64>::min)()) {
+        return waveFormatDisplayTime(exclusiveEnd);
+    }
+    const qint64 lastTick = exclusiveEnd - 1;
+    qint64 cycle = lastTick / kWaveViewerDisplayTicksPerCycle;
+    if (lastTick < 0 && lastTick % kWaveViewerDisplayTicksPerCycle != 0) --cycle;
+    return QString::number(cycle);
 }
 
 inline bool waveParseDisplayTime(const QString& text, qint64& internalTime) {
@@ -440,7 +460,7 @@ inline bool waveSamplesEquivalent(const WaveSample& a, const WaveSample& b) {
     if (a.isAbsent != b.isAbsent || a.isZ != b.isZ) return false;
     if (a.rawFieldsReady && b.rawFieldsReady) return a.rawBits == b.rawBits;
 
-    // Do not compare unhydrated legacy/string samples by the default rawBits field.
+    // Do not compare text-only samples by the default rawBits field.
     // Older parsers may compact rows before derived raw fields are rebuilt; treating
     // two unhydrated samples as rawBits==0 would incorrectly drop real transitions.
     if (!a.rawFieldsReady && !b.rawFieldsReady) return a.value == b.value;

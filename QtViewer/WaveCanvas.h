@@ -21,10 +21,13 @@ public:
     int firstVisibleEntryIndex() const { return m_firstVisibleEntryIndex; }
     void setSelectedEntryIndex(int index);
     void setSelectedEntryIndexes(const QSet<int>& indexes);
+    void invalidateSignalSampleCaches(const QVector<int>& signalIndexes);
 
     void resetView();
     void zoomByFactor(double factor);
     void panBy(qint64 deltaTime);
+    void commitViewportRange(qint64 start, qint64 end);
+    void clearCursor();
 
     qint64 cursorTime() const { return m_cursorTime; }
     qint64 hoverTime() const { return m_hoverTime; }
@@ -33,6 +36,7 @@ public:
     qint64 fullStartTime() const;
     qint64 fullEndTime() const;
     bool viewportDragActive() const { return m_dragging || m_overviewDragging; }
+    bool viewportAnimationActive() const;
 
     QString formattedValueAtCursor(const ActiveSignalRef& entry) const;
     bool jumpToNearestChange(int signalIndex, bool forward);
@@ -44,6 +48,10 @@ Q_SIGNALS:
     void cursorMoved(qint64 t);
     void hoverMoved(qint64 t);
     void viewportChanged(qint64 start, qint64 end);
+    // Emitted once with the final animation target so on-demand data can be
+    // decoded while the 130 ms zoom animation is still running.
+    void viewportTargetRequested(qint64 start, qint64 end);
+    void viewportRangeSelected(qint64 start, qint64 end);
     void entryClicked(int index, bool ctrlHeld);
 
 protected:
