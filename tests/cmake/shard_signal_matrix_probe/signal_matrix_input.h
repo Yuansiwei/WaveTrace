@@ -1,6 +1,7 @@
 #pragma once
 
 #include "reflect_macro.h"
+#include "business_complex_types.h"
 
 #include <array>
 #include <cstdint>
@@ -84,6 +85,32 @@ struct ShardBitfieldBundle {
     std::uint32_t ordinary;
 };
 
+class ShardPrivateNestedAnonymousUnion {
+public:
+    static const unsigned kPcWidth = 48;
+    static const unsigned kCallDepthWidth = 16;
+    typedef std::uint64_t RawDType;
+
+    ShardPrivateNestedAnonymousUnion() : raw_(0), is_64bit_(false) {}
+    void initialize(std::uint64_t raw, bool is_64bit) {
+        raw_ = raw;
+        is_64bit_ = is_64bit;
+    }
+
+private:
+    union {
+        struct {
+            std::uint64_t pc_ : kPcWidth;
+            std::uint64_t call_depth_ : kCallDepthWidth;
+        };
+        RawDType raw_;
+    };
+    // Match production placement: the access marker may appear after the
+    // anonymous union and remains valid anywhere in class scope.
+    WAVE_REFLECT_FRIEND;
+    bool is_64bit_;
+};
+
 union ShardVariant {
     std::uint32_t u32_value;
     float f32_value;
@@ -111,23 +138,292 @@ struct ShardStressElement {
     ShardDeepA deep;
 };
 
+class ShardAnnotatedPointerBundle {
+    WAVE_REFLECT_FRIEND
+
+public:
+    void initialize(ShardSmallLeaf* one,
+                    ShardSmallLeaf* array,
+                    std::size_t count,
+                    std::unique_ptr<ShardSmallLeaf> owned,
+                    std::unique_ptr<ShardSmallLeaf[]> owned_array,
+                    std::shared_ptr<ShardSmallLeaf> shared) {
+        raw_one_ = one;
+        raw_array_ = array;
+        count_ = count;
+        owned_ = std::move(owned);
+        owned_array_ = std::move(owned_array);
+        shared_ = std::move(shared);
+    }
+
+private:
+    std::size_t count_ = 0;
+    WAVE_PTR ShardSmallLeaf* raw_one_ = nullptr;
+    WAVE_PTR_ARRAY(count_) ShardSmallLeaf* raw_array_ = nullptr;
+    WAVE_PTR std::unique_ptr<ShardSmallLeaf> owned_;
+    WAVE_PTR_ARRAY(count_) std::unique_ptr<ShardSmallLeaf[]> owned_array_;
+    WAVE_PTR std::shared_ptr<ShardSmallLeaf> shared_;
+};
+
+class ShardAnnotatedWeakOnly {
+    WAVE_REFLECT_FRIEND
+
+public:
+    void set(const std::shared_ptr<ShardSmallLeaf>& value) { weak_target_ = value; }
+    bool expired() const { return weak_target_.expired(); }
+
+private:
+    WAVE_PTR std::weak_ptr<ShardSmallLeaf> weak_target_;
+};
+
+template <typename T>
+class ShardTemplatePointerBox {
+    WAVE_REFLECT_FRIEND
+
+public:
+    void initialize(T* raw,
+                    const std::shared_ptr<T>& shared,
+                    const std::shared_ptr<T>& weak_owner) {
+        raw_ = raw;
+        shared_ = shared;
+        weak_ = weak_owner;
+    }
+
+private:
+    WAVE_PTR T* raw_ = nullptr;
+    WAVE_PTR std::shared_ptr<T> shared_;
+    WAVE_PTR std::weak_ptr<T> weak_;
+};
+
+struct ShardTemplatePointerContainer {
+    ShardTemplatePointerBox<ShardSmallLeaf> nested;
+};
+
+using ShardLeafPointerAlias = ShardSmallLeaf*;
+
+enum class ShardArrayExtent : int {
+    Empty = 0,
+    Pair = 2
+};
+
+class ShardPointerEdgeCases {
+    WAVE_REFLECT_FRIEND
+
+public:
+    void initialize(ShardSmallLeaf* negative,
+                    ShardSmallLeaf* zero,
+                    ShardSmallLeaf* literal_pair,
+                    ShardSmallLeaf* enum_pair,
+                    ShardLeafPointerAlias alias,
+                    const ShardSmallLeaf* const_raw,
+                    const std::shared_ptr<const ShardSmallLeaf>& const_shared,
+                    ShardSmallLeaf* freeze_target) {
+        negative_count_ = -7;
+        zero_count_ = 0;
+        enum_count_ = ShardArrayExtent::Pair;
+        negative_array_ = negative;
+        zero_array_ = zero;
+        literal_pair_ = literal_pair;
+        enum_pair_ = enum_pair;
+        alias_ = alias;
+        const_raw_ = const_raw;
+        const_shared_ = const_shared;
+        freeze_target_ = freeze_target;
+    }
+
+    void set_expiring_weak(const std::shared_ptr<ShardSmallLeaf>& owner) {
+        expired_weak_ = owner;
+    }
+
+    void replace_freeze_target(ShardSmallLeaf* target) {
+        freeze_target_ = target;
+    }
+
+private:
+    int negative_count_ = -1;
+    std::size_t zero_count_ = 0;
+    ShardArrayExtent enum_count_ = ShardArrayExtent::Empty;
+    WAVE_PTR_ARRAY(negative_count_) ShardSmallLeaf* negative_array_ = nullptr;
+    WAVE_PTR_ARRAY(zero_count_) ShardSmallLeaf* zero_array_ = nullptr;
+    WAVE_PTR_ARRAY(2) ShardSmallLeaf* literal_pair_ = nullptr;
+    WAVE_PTR_ARRAY(enum_count_) ShardSmallLeaf* enum_pair_ = nullptr;
+    WAVE_PTR ShardLeafPointerAlias alias_ = nullptr;
+    WAVE_PTR const ShardSmallLeaf* const_raw_ = nullptr;
+    WAVE_PTR std::shared_ptr<const ShardSmallLeaf> const_shared_;
+    WAVE_PTR std::weak_ptr<ShardSmallLeaf> expired_weak_;
+    WAVE_PTR std::unique_ptr<ShardSmallLeaf> empty_unique_;
+    WAVE_PTR std::shared_ptr<ShardSmallLeaf> empty_shared_;
+    WAVE_PTR ShardSmallLeaf* freeze_target_ = nullptr;
+};
+
+struct ShardPointerCycleNode {
+    std::uint32_t value = 0;
+    WAVE_PTR ShardPointerCycleNode* next = nullptr;
+};
+
+// A pointer-only reflected element may have no visible topology when its
+// target is null. Pointer arrays must still inspect later elements instead of
+// treating an empty first/middle element as a reflection failure.
+struct ShardNullablePointerOnly {
+    WAVE_PTR ShardSmallLeaf* leaf = nullptr;
+};
+
+class ShardDynamicWaveTarget
+    : public wave::DynamicTraceTargetFor<ShardDynamicWaveTarget> {
+    WAVE_REFLECT_FRIEND
+
+public:
+    void initialize(std::uint32_t own,
+                    ShardSmallLeaf* leaf,
+                    ShardDynamicWaveTarget* next = nullptr) {
+        own_ = own;
+        leaf_ = leaf;
+        next_ = next;
+    }
+
+    void set_next(ShardDynamicWaveTarget* next) { next_ = next; }
+
+private:
+    std::uint32_t own_ = 0;
+    WAVE_PTR ShardSmallLeaf* leaf_ = nullptr;
+    WAVE_PTR ShardDynamicWaveTarget* next_ = nullptr;
+};
+
+// This concrete runtime type is deliberately reachable only through the
+// DynamicTraceTarget interface.  Root-closure generation must retain and
+// register it even though no field exposes the concrete static type.
+class ShardHiddenDynamicWaveTarget
+    : public wave::DynamicTraceTargetFor<ShardHiddenDynamicWaveTarget> {
+    WAVE_REFLECT_FRIEND
+
+public:
+    void initialize(std::uint32_t value, ShardSmallLeaf* leaf) {
+        value_ = value;
+        leaf_ = leaf;
+    }
+
+private:
+    std::uint32_t value_ = 0;
+    WAVE_PTR ShardSmallLeaf* leaf_ = nullptr;
+};
+
+template <typename PayloadT>
+class ShardTemplateDynamicWaveTarget
+    : public wave::DynamicTraceTargetFor<ShardTemplateDynamicWaveTarget<PayloadT> > {
+    WAVE_REFLECT_FRIEND
+
+public:
+    void initialize(std::uint32_t own, const PayloadT& payload) {
+        own_ = own;
+        payload_ = payload;
+    }
+
+private:
+    std::uint32_t own_ = 0;
+    PayloadT payload_ = {};
+};
+
+// Regression coverage for type spellings that are valid only in their
+// declaration context. The old registration emitter copied PrivatePayload and
+// kElementCount into a namespace-scope function, where neither name is valid.
+template <typename PayloadT, std::size_t ElementCount>
+class ShardScopedTemplateDynamicWaveTarget
+    : public wave::DynamicTraceTargetFor<
+          ShardScopedTemplateDynamicWaveTarget<PayloadT, ElementCount> > {
+    WAVE_REFLECT_FRIEND
+
+public:
+    void initialize(std::uint32_t own, std::uint32_t base) {
+        own_ = own;
+        for (std::size_t i = 0; i < ElementCount; ++i) {
+            payload_[i].value = base + static_cast<std::uint32_t>(i);
+        }
+    }
+
+private:
+    std::uint32_t own_ = 0;
+    std::array<PayloadT, ElementCount> payload_ = {};
+};
+
+class ShardScopedTemplateOwner {
+    WAVE_REFLECT_FRIEND
+
+private:
+    struct PrivatePayload {
+        std::uint32_t value = 0;
+    };
+    static const std::size_t kElementCount = 3u;
+    ShardScopedTemplateDynamicWaveTarget<PrivatePayload, kElementCount> target_;
+
+public:
+    void initialize() { target_.initialize(0xEC10u, 0xEC20u); }
+};
+
+struct ShardAnnotatedWeakArrayRoot {
+    std::size_t count = 0;
+    WAVE_PTR_ARRAY(count) ShardAnnotatedWeakOnly* values = nullptr;
+};
+
+struct ShardPointerSlotContainers {
+    WAVE_PTR ShardSmallLeaf* c_slots[2] = {};
+    WAVE_PTR ShardSmallLeaf* c_matrix[2][2] = {};
+    WAVE_PTR std::array<ShardSmallLeaf*, 2> std_slots = {};
+    WAVE_PTR std::array<std::array<ShardSmallLeaf*, 2>, 2> std_matrix = {};
+    WAVE_PTR wave::array<ShardSmallLeaf*, 2> wave_slots;
+    WAVE_PTR wave::array<wave::array<ShardSmallLeaf*, 2>, 2> wave_matrix;
+    WAVE_PTR std::array<ShardSmallLeaf*, 2> mixed_c_std[2];
+    WAVE_PTR std::array<std::unique_ptr<ShardSmallLeaf>, 2> unique_slots;
+    WAVE_PTR std::array<std::shared_ptr<ShardSmallLeaf>, 2> shared_slots;
+    WAVE_PTR std::array<std::weak_ptr<ShardSmallLeaf>, 2> weak_slots;
+    WAVE_PTR_ARRAY(2) std::array<ShardSmallLeaf*, 2> span_slots = {};
+};
+
 struct ShardSignalMatrixRoot {
     ShardScalarBundle scalars;
     ShardContainerBundle containers;
     ShardDeepC deep;
     ShardDerivedLeaf derived;
     ShardBitfieldBundle bitfields;
+    ShardPrivateNestedAnonymousUnion nested_anonymous_union;
     ShardVariant variant;
-    wave::WavePtr<ShardStressElement*> bulk;
-    wave::WavePtr<ShardSmallLeaf*> alias_a;
-    wave::WavePtr<ShardSmallLeaf*> alias_b;
-    wave::WavePtr<ShardSmallLeaf*> null_pointer;
-    wave::WavePtr<std::unique_ptr<ShardSmallLeaf> > owning_wave_ptr;
-    wave::WavePtr<std::shared_ptr<ShardSmallLeaf> > shared_wave_ptr;
+    std::size_t bulk_count = 0;
+    WAVE_PTR_ARRAY(bulk_count) ShardStressElement* bulk = nullptr;
+    WAVE_PTR ShardSmallLeaf* alias_a = nullptr;
+    WAVE_PTR ShardSmallLeaf* alias_b = nullptr;
+    WAVE_PTR ShardSmallLeaf* null_pointer = nullptr;
+    WAVE_PTR std::unique_ptr<ShardSmallLeaf> owning_wave_ptr;
+    WAVE_PTR std::shared_ptr<ShardSmallLeaf> shared_wave_ptr;
     ShardDirectLeaf* raw_direct;
     std::unique_ptr<ShardDirectLeaf> unique_direct;
     std::shared_ptr<ShardDirectLeaf> shared_direct;
     std::weak_ptr<ShardDirectLeaf> weak_direct;
+    ShardAnnotatedPointerBundle annotated;
+    ShardAnnotatedWeakOnly annotated_weak;
+    ShardAnnotatedWeakArrayRoot annotated_weak_array;
+    ShardTemplatePointerBox<ShardSmallLeaf> template_box;
+    ShardTemplatePointerContainer template_container;
+    std::size_t template_array_count = 0;
+    WAVE_PTR_ARRAY(template_array_count)
+    ShardTemplatePointerBox<ShardSmallLeaf>* template_array = nullptr;
+    ShardPointerEdgeCases pointer_edges;
+    WAVE_PTR ShardPointerCycleNode* cycle_entry = nullptr;
+    std::size_t first_empty_array_count = 0;
+    WAVE_PTR_ARRAY(first_empty_array_count)
+    ShardNullablePointerOnly* first_empty_array = nullptr;
+    std::size_t middle_empty_array_count = 0;
+    WAVE_PTR_ARRAY(middle_empty_array_count)
+    ShardNullablePointerOnly* middle_empty_array = nullptr;
+    ShardDynamicWaveTarget dynamic_inline;
+    WAVE_PTR ShardDynamicWaveTarget* dynamic_ptr = nullptr;
+    std::size_t dynamic_array_count = 0;
+    WAVE_PTR_ARRAY(dynamic_array_count) ShardDynamicWaveTarget* dynamic_array = nullptr;
+    WAVE_PTR wave::DynamicTraceTarget* hidden_dynamic = nullptr;
+    ShardTemplateDynamicWaveTarget<ShardSmallLeaf> template_dynamic_inline;
+    WAVE_PTR ShardTemplateDynamicWaveTarget<ShardSmallLeaf>* template_dynamic_ptr = nullptr;
+    WAVE_PTR wave::DynamicTraceTarget* template_dynamic_erased = nullptr;
+    ShardScopedTemplateOwner scoped_template_dynamic;
+    ShardPointerSlotContainers pointer_slot_containers;
+    business_sim::model::ComplexBusinessRoot business;
 
     // Deliberately unsupported containers must remain absent in every mode.
     std::vector<ShardSmallLeaf> ignored_vector;

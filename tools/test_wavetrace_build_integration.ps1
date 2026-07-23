@@ -59,26 +59,28 @@ Assert-True ((Test-Path $config) -and (Test-Path $aggregate) -and (Test-Path $cl
 Assert-True (-not (Test-Path (Join-Path $buildRoot "WaveTracer"))) "runner created a build-tree WaveTracer output"
 Assert-True ((Get-Content $closure -Raw).Contains('ReflectAccess<struct Root>')) "enabled runner output lacks Root reflection"
 
-Write-Host "[2/5] Unchanged CMake runner invocation is incremental"
+Write-Host "[2/5] Every CMake runner invocation executes ReflectGen"
 $firstStamp = (Get-Item $aggregate).LastWriteTimeUtc
 Start-Sleep -Milliseconds 1200
 & cmake @cmakeArgs | Out-Host
 Assert-True ($LASTEXITCODE -eq 0) "incremental CMake runner failed"
-Assert-True ((Get-Item $aggregate).LastWriteTimeUtc -eq $firstStamp) "unchanged runner rewrote aggregate"
+Assert-True ((Get-Item $aggregate).LastWriteTimeUtc -gt $firstStamp) "unchanged runner did not execute ReflectGen"
 
-Write-Host "[3/5] Config toggle regenerates source placeholder, then settles"
+Write-Host "[3/5] ReflectGen owns the WaveTrace=false decision"
+$enabledStamp = (Get-Item $aggregate).LastWriteTimeUtc
 $json = Get-Content $config -Raw | ConvertFrom-Json
 $json.WaveTrace = $false
 Write-Utf8 $config ($json | ConvertTo-Json -Depth 10)
 Start-Sleep -Milliseconds 1200
 & cmake @cmakeArgs | Out-Host
 Assert-True ($LASTEXITCODE -eq 0) "disabled CMake runner failed"
-Assert-True (-not (Get-Content $closure -Raw).Contains('ReflectAccess<')) "disabled CMake runner left reflection in closure"
+Assert-True (-not (Get-Content $closure -Raw).Contains('ReflectAccess<struct Root>')) "WaveTrace=false did not emit empty reflection"
 $disabledStamp = (Get-Item $aggregate).LastWriteTimeUtc
+Assert-True ($disabledStamp -gt $enabledStamp) "disabled runner did not execute ReflectGen"
 Start-Sleep -Milliseconds 1200
 & cmake @cmakeArgs | Out-Host
 Assert-True ($LASTEXITCODE -eq 0) "settled disabled CMake runner failed"
-Assert-True ((Get-Item $aggregate).LastWriteTimeUtc -eq $disabledStamp) "disabled runner did not settle incrementally"
+Assert-True ((Get-Item $aggregate).LastWriteTimeUtc -gt $disabledStamp) "settled disabled runner did not execute ReflectGen"
 
 Write-Host "[4/5] MSBuild props resolve source paths and C++-safe slashes"
 $propsPath = (Join-Path $repoRoot "props\wavetrace_reflectgen_reference.props").Replace('\','/')

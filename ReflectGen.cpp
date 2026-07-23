@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <streambuf>
@@ -46,6 +47,13 @@
 
 namespace
 {
+    enum class AnnotatedPointerKind
+    {
+        None,
+        Strong,
+        Weak
+    };
+
     struct BaseInfo
     {
         // Actual base specifier spelling as seen by libclang.
@@ -84,6 +92,9 @@ namespace
         int bitWidth = -1;
         long long bitOffset = -1;
         long long unionStorageBytes = -1;
+        AnnotatedPointerKind annotatedPointerKind = AnnotatedPointerKind::None;
+        std::string annotatedPointerCountExpr;
+        bool annotatedPointerStorageArray = false;
     };
 
     struct TemplateParamInfo
@@ -238,7 +249,7 @@ namespace
         // such as "> log.txt 2>&1" when launching from Visual Studio.
         std::string logFile;
 
-        // Unified WaveTrace config plus persistent per-member WavePtr switches.
+        // Unified WaveTrace config plus persistent per-member pointer-target switches.
         // When omitted, the file lives beside generated_reflect as
         // WaveTracer/wavetrace_config.json.
         std::string wavePtrConfigFile;
@@ -304,6 +315,7 @@ namespace
         std::size_t fieldsKept = 0;
         std::size_t fieldsSkippedEmptyName = 0;
         std::size_t fieldsSkippedSystemC = 0;
+        std::vector<std::string> annotatedPointerErrors;
     };
 
     bool gDebugAst = false;
@@ -345,6 +357,11 @@ namespace
         long long unionStorageBytes = -1;
         bool exprIsPointerAlready = false;
         bool asBoolStorage = false;
+        AnnotatedPointerKind annotatedPointerKind = AnnotatedPointerKind::None;
+        std::string annotatedPointerCountExpr;
+        bool annotatedPointerStorageArray = false;
+        std::string annotatedPointerClassName;
+        std::string annotatedPointerMemberName;
         std::string constExpr;
         std::string mutExpr;
     };
@@ -360,6 +377,9 @@ namespace
     std::string ToStdString(CXString s);
 
     std::string EscapeString(const std::string& s);
+
+    std::string BuildAnnotatedPointerCountExpression(const EmittedMember& member,
+                                                     const std::string& objectExpr);
 
     std::string MakeHeaderGuard(const std::string& path);
 
@@ -818,7 +838,10 @@ namespace
 
     std::string MakeReflectAccessAliasName(const RecordInfo& rec);
 
-    bool EmitGeneratedFile(const std::vector<RecordInfo>& records, const Options& opt, const std::map<std::string, const RecordInfo*>* globalByName);
+    bool EmitGeneratedFile(
+        const std::vector<RecordInfo>& records,
+        const Options& opt,
+        const std::map<std::string, const RecordInfo*>* globalByName = NULL);
 
     std::string TopLevelTypeKeyForClosure(const std::string& typeName);
 
@@ -1112,11 +1135,277 @@ namespace
         return NormalizePathSlashes(JoinPath(waveTracerDir, "wavetrace_config.json"));
     }
 
+    bool IsSimpleAnnotatedPointerCountExpression(const std::string& expression)
+    {
+        if (expression.empty()) return false;
+        const unsigned char first = static_cast<unsigned char>(expression[0]);
+        if (std::isdigit(first))
+        {
+            for (std::size_t i = 1; i < expression.size(); ++i)
+            {
+                const unsigned char c = static_cast<unsigned char>(expression[i]);
+                if (!std::isalnum(c) && c != '\'' && c != '_') return false;
+            }
+            return true;
+        }
+        if (!std::isalpha(first) && expression[0] != '_') return false;
+        for (std::size_t i = 1; i < expression.size(); ++i)
+        {
+            const unsigned char c = static_cast<unsigned char>(expression[i]);
+            if (!std::isalnum(c) && expression[i] != '_') return false;
+        }
+        return true;
+    }
+
+    std::string PointerAnnotationFromFieldTokens(CXTranslationUnit tu,
+                                                 CXCursor fieldCursor)
+    {
+        const auto parseTokens = [](const std::string& source) -> std::string {
+            const std::string arrayMacro = "WAVE_PTR_ARRAY";
+            const std::size_t arrayPos = source.find(arrayMacro);
+            if (arrayPos != std::string::npos)
+            {
+                const std::size_t open = source.find('(', arrayPos + arrayMacro.size());
+                const std::size_t close = open == std::string::npos
+                    ? std::string::npos : source.find(')', open + 1u);
+                if (open != std::string::npos && close != std::string::npos)
+                {
+                    std::string count;
+                    for (std::size_t i = open + 1u; i < close; ++i)
+                    {
+                        const unsigned char c = static_cast<unsigned char>(source[i]);
+                        if (!std::isspace(c)) count.push_back(source[i]);
+                    }
+                    return "wavetrace.ptr_array:" + count;
+                }
+            }
+
+            const std::string scalarMacro = "WAVE_PTR";
+            std::size_t pos = source.find(scalarMacro);
+            while (pos != std::string::npos)
+            {
+                const bool leftBoundary = pos == 0u ||
+                    (!std::isalnum(static_cast<unsigned char>(source[pos - 1u])) && source[pos - 1u] != '_');
+                const std::size_t end = pos + scalarMacro.size();
+                const bool rightBoundary = end >= source.size() ||
+                    (!std::isalnum(static_cast<unsigned char>(source[end])) && source[end] != '_');
+                if (leftBoundary && rightBoundary) return "wavetrace.ptr";
+                pos = source.find(scalarMacro, end);
+            }
+            return std::string();
+        };
+
+        std::string result = parseTokens(GetCursorSourceText(tu, fieldCursor));
+        if (!result.empty()) return result;
+
+        CXFile file = NULL;
+        unsigned offset = 0;
+        clang_getExpansionLocation(clang_getCursorLocation(fieldCursor),
+                                   &file, NULL, NULL, &offset);
+        if (file == NULL) return std::string();
+        const std::string path = ToStdString(clang_getFileName(file));
+        const std::string& fileText = GetSourceFileTextCached(path);
+        if (fileText.empty() || offset > fileText.size()) return std::string();
+
+        std::size_t beginOffset = offset;
+        while (beginOffset > 0u)
+        {
+            const char c = fileText[beginOffset - 1u];
+            if (c == ';' || c == '{' || c == '}') break;
+            --beginOffset;
+        }
+        if (beginOffset >= offset) return std::string();
+
+        const std::string rawPrefix = fileText.substr(beginOffset, offset - beginOffset);
+        std::string prefix;
+        enum ScanState { Normal, LineComment, BlockComment, StringLiteral, CharLiteral } state = Normal;
+        for (std::size_t i = 0; i < rawPrefix.size(); ++i)
+        {
+            const char c = rawPrefix[i];
+            const char next = i + 1u < rawPrefix.size() ? rawPrefix[i + 1u] : '\0';
+            if (state == Normal)
+            {
+                if (c == '/' && next == '/') { state = LineComment; ++i; prefix += "  "; continue; }
+                if (c == '/' && next == '*') { state = BlockComment; ++i; prefix += "  "; continue; }
+                if (c == '"') { state = StringLiteral; prefix += ' '; continue; }
+                if (c == '\'') { state = CharLiteral; prefix += ' '; continue; }
+                prefix += c;
+                continue;
+            }
+            if (state == LineComment)
+            {
+                if (c == '\n' || c == '\r') { state = Normal; prefix += c; }
+                else prefix += ' ';
+                continue;
+            }
+            if (state == BlockComment)
+            {
+                if (c == '*' && next == '/') { state = Normal; ++i; prefix += "  "; }
+                else prefix += (c == '\n' || c == '\r') ? c : ' ';
+                continue;
+            }
+            if (c == '\\' && next != '\0') { ++i; prefix += "  "; continue; }
+            if ((state == StringLiteral && c == '"') || (state == CharLiteral && c == '\'')) state = Normal;
+            prefix += ' ';
+        }
+        result = parseTokens(prefix);
+        if (gDebugAst)
+        {
+            std::cerr << "[pointer annotation token fallback] field="
+                      << ToStdString(clang_getCursorSpelling(fieldCursor))
+                      << " direct=[" << ShortenForDebugLog(GetCursorSourceText(tu, fieldCursor), 360u)
+                      << "] prefix=[" << ShortenForDebugLog(prefix, 360u)
+                      << "] annotation=[" << result << "]\n";
+        }
+        return result;
+    }
+
+    std::string FormatAnnotatedPointerDiagnostic(CXCursor cursor,
+                                                 const std::string& message)
+    {
+        CXFile file = NULL;
+        unsigned line = 1u;
+        unsigned column = 1u;
+        clang_getExpansionLocation(
+            clang_getCursorLocation(cursor), &file, &line, &column, NULL);
+        std::string path;
+        if (file != NULL) path = ToStdString(clang_getFileName(file));
+        if (path.empty()) path = "ReflectGen";
+        return NormalizePathSlashes(path) + ":" + std::to_string(line) + ":" +
+            std::to_string(column) + ": error: " + message;
+    }
+
+    void CollectAnnotatedPointerMetadata(CXCursor fieldCursor,
+                                         const RecordInfo& owner,
+                                         FieldInfo& field,
+                                         CollectContext* ctx)
+    {
+        struct Payload
+        {
+            std::vector<std::string> annotations;
+        } payload;
+        clang_visitChildren(
+            fieldCursor,
+            [](CXCursor child, CXCursor, CXClientData clientData) {
+                if (clang_getCursorKind(child) == CXCursor_AnnotateAttr)
+                {
+                    Payload* payload = static_cast<Payload*>(clientData);
+                    payload->annotations.push_back(ToStdString(clang_getCursorSpelling(child)));
+                }
+                return CXChildVisit_Continue;
+            },
+            &payload);
+
+        std::string annotation;
+        for (std::size_t i = 0; i < payload.annotations.size(); ++i)
+        {
+            const std::string& candidate = payload.annotations[i];
+            if (candidate == "wavetrace.ptr" ||
+                candidate.compare(0, 20, "wavetrace.ptr_array:") == 0)
+            {
+                if (!annotation.empty() && annotation != candidate)
+                {
+                    field.annotatedPointerKind = AnnotatedPointerKind::Strong;
+                    field.annotatedPointerCountExpr = "1";
+                    if (ctx) ctx->annotatedPointerErrors.push_back(
+                        FormatAnnotatedPointerDiagnostic(
+                            fieldCursor,
+                            owner.qualifiedName + "::" + field.name +
+                            ": multiple conflicting WaveTrace pointer annotations"));
+                    return;
+                }
+                annotation = candidate;
+            }
+        }
+        if (annotation.empty() && ctx)
+        {
+            // Some libclang versions omit AnnotateAttr children for dependent
+            // template fields such as `WAVE_PTR T*`. The original field tokens
+            // still retain the macro spelling, so use them as a narrow fallback.
+            annotation = PointerAnnotationFromFieldTokens(ctx->tu, fieldCursor);
+        }
+        if (annotation.empty()) return;
+
+        field.annotatedPointerKind = AnnotatedPointerKind::Strong;
+        field.annotatedPointerCountExpr = "1";
+        const bool annotatedArray = annotation.compare(0, 20, "wavetrace.ptr_array:") == 0;
+        if (annotatedArray)
+        {
+            field.annotatedPointerCountExpr = Trim(annotation.substr(20));
+        }
+
+        std::string error;
+        const CXType canonicalType = clang_getCanonicalType(clang_getCursorType(fieldCursor));
+        CXType pointerStorageType = canonicalType;
+        for (;;)
+        {
+            if (pointerStorageType.kind == CXType_ConstantArray ||
+                pointerStorageType.kind == CXType_IncompleteArray ||
+                pointerStorageType.kind == CXType_VariableArray ||
+                pointerStorageType.kind == CXType_DependentSizedArray)
+            {
+                field.annotatedPointerStorageArray = true;
+                pointerStorageType = clang_getCanonicalType(
+                    clang_getArrayElementType(pointerStorageType));
+                continue;
+            }
+            const std::string containerTypeName =
+                ToStdString(clang_getTypeSpelling(pointerStorageType));
+            const std::string containerKey = TopLevelTypeKeyForClosure(containerTypeName);
+            if (containerKey == "std::array" || containerKey == "wave::array")
+            {
+                const CXType elementType =
+                    clang_Type_getTemplateArgumentAsType(pointerStorageType, 0u);
+                if (elementType.kind != CXType_Invalid)
+                {
+                    field.annotatedPointerStorageArray = true;
+                    pointerStorageType = clang_getCanonicalType(elementType);
+                    continue;
+                }
+            }
+            break;
+        }
+        const std::string pointerStorageTypeName =
+            ToStdString(clang_getTypeSpelling(pointerStorageType));
+        const std::string topKey = TopLevelTypeKeyForClosure(
+            !pointerStorageTypeName.empty() ? pointerStorageTypeName :
+            (!field.canonicalTypeName.empty() ? field.canonicalTypeName : field.typeName));
+        const bool rawPointer = pointerStorageType.kind == CXType_Pointer;
+        const bool uniquePointer = topKey == "std::unique_ptr";
+        const bool sharedPointer = topKey == "std::shared_ptr";
+        const bool weakPointer = topKey == "std::weak_ptr";
+        if (weakPointer) field.annotatedPointerKind = AnnotatedPointerKind::Weak;
+
+        if (field.isBitField || field.isUnionField)
+        {
+            error = "annotations are not supported on bit-field/union storage";
+        }
+        else if (!rawPointer && !uniquePointer && !sharedPointer && !weakPointer)
+        {
+            error = "WAVE_PTR/WAVE_PTR_ARRAY requires T*, std::unique_ptr, std::shared_ptr, or std::weak_ptr";
+        }
+        else if (weakPointer && annotatedArray)
+        {
+            error = "WAVE_PTR_ARRAY does not support std::weak_ptr; use WAVE_PTR";
+        }
+        else if (!IsSimpleAnnotatedPointerCountExpression(field.annotatedPointerCountExpr))
+        {
+            error = "WAVE_PTR_ARRAY length must be an integer literal or member identifier";
+        }
+
+        if (!error.empty() && ctx)
+        {
+            ctx->annotatedPointerErrors.push_back(
+                FormatAnnotatedPointerDiagnostic(
+                    fieldCursor,
+                    owner.qualifiedName + "::" + field.name + ": " + error +
+                    " (type='" + field.typeName + "')"));
+        }
+    }
+
     bool IsDirectWavePtrField(const FieldInfo& field)
     {
-        if (TopLevelTypeKeyForClosure(field.typeName) == "wave::WavePtr") return true;
-        return !field.canonicalTypeName.empty() &&
-            TopLevelTypeKeyForClosure(field.canonicalTypeName) == "wave::WavePtr";
+        return field.annotatedPointerKind != AnnotatedPointerKind::None;
     }
 
     WavePtrMemberKey MakeWavePtrMemberKey(const RecordInfo& rec, const FieldInfo& field)
@@ -1138,14 +1427,14 @@ namespace
             const std::string text = ReadWholeFileText(config.path);
             if (text.empty())
             {
-                std::cerr << "[WavePtr config] existing JSON is empty or unreadable: " << config.path << "\n";
+                std::cerr << "[pointer config] existing JSON is empty or unreadable: " << config.path << "\n";
                 return false;
             }
             std::string error;
             WavePtrJsonReader reader(text);
             if (!reader.parse(config, error))
             {
-                std::cerr << "[WavePtr config] invalid JSON: " << config.path << ": " << error << "\n";
+                std::cerr << "[pointer config] invalid JSON: " << config.path << ": " << error << "\n";
                 return false;
             }
             // Keep switches for fields outside this invocation's target set. A
@@ -1201,18 +1490,15 @@ namespace
         const std::map<WavePtrMemberKey, bool>::const_iterator old = config.loaded.find(key);
         if (old != config.loaded.end()) reflect = old->second;
         config.current[key] = reflect;
-        if (!reflect)
-        {
-            ++config.disabledInstances;
-            std::cout << "[WavePtr config] skipped during AST collection class=" << key.className
-                << " member=" << key.memberName << "\n";
-        }
-        return reflect;
+        if (!reflect) ++config.disabledInstances;
+        // `reflect` is a runtime topology switch. Always retain the member in
+        // generated code so editing JSON never requires regeneration/recompile.
+        return true;
     }
 
     void PrintWavePtrReflectionConfigSummary(const WavePtrReflectionConfig& config)
     {
-        std::cout << "[WavePtr config] path=" << config.path
+        std::cout << "[pointer config] path=" << config.path
             << " discovered_instances=" << config.discoveredInstances
             << " table_entries=" << config.current.size()
             << " disabled_instances=" << config.disabledInstances << "\n";
@@ -1263,7 +1549,7 @@ namespace
 
     void WarnWavePtrConfigUpdateSkipped(const std::string& path, const std::string& reason)
     {
-        std::cerr << "[WavePtr config] warning: forced update could not be persisted; "
+        std::cerr << "[pointer config] warning: forced update could not be persisted; "
             << "keeping the existing JSON and continuing with the discovered table in memory. path="
             << path << " reason=" << reason << "\n";
     }
@@ -1284,7 +1570,7 @@ namespace
         if (restored == 0) restored = FILE_ATTRIBUTE_NORMAL;
         if (!SetFileAttributesA(path.c_str(), restored))
         {
-            std::cerr << "[WavePtr config] warning: content was updated but original file attributes "
+            std::cerr << "[pointer config] warning: content was updated but original file attributes "
                 << "could not be restored. path=" << path
                 << " win32_error=" << GetLastError() << "\n";
         }
@@ -1304,13 +1590,13 @@ namespace
         const std::string content = SerializeWavePtrReflectionConfig(config);
         if (IsExistingRegularFile(config.path) && ReadWholeFileText(config.path) == content)
         {
-            std::cout << "[WavePtr config] unchanged: " << config.path << "\n";
+            std::cout << "[pointer config] unchanged: " << config.path << "\n";
             return true;
         }
         const std::string dir = DirectoryName(config.path);
         if (!dir.empty() && !MakeDirectoryRecursive(dir))
         {
-            PrintDirectoryCreateFailure("[WavePtr config directory]", dir);
+            PrintDirectoryCreateFailure("[pointer config directory]", dir);
             WarnWavePtrConfigUpdateSkipped(config.path, "parent directory cannot be created or written");
             return true;
         }
@@ -1319,7 +1605,7 @@ namespace
             std::ofstream os(temp.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
             if (!os)
             {
-                PrintFileOpenFailure("[WavePtr config temp]", temp);
+                PrintFileOpenFailure("[pointer config temp]", temp);
                 WarnWavePtrConfigUpdateSkipped(config.path, "temporary file cannot be created");
                 return true;
             }
@@ -1327,7 +1613,7 @@ namespace
             os.flush();
             if (!os)
             {
-                std::cerr << "[WavePtr config] failed to write temp file: " << temp << "\n";
+                std::cerr << "[pointer config] failed to write temp file: " << temp << "\n";
                 os.close();
                 std::remove(temp.c_str());
                 WarnWavePtrConfigUpdateSkipped(config.path, "temporary file write failed");
@@ -1343,12 +1629,12 @@ namespace
             if (writableAttributes == 0) writableAttributes = FILE_ATTRIBUTE_NORMAL;
             if (SetFileAttributesA(config.path.c_str(), writableAttributes))
             {
-                std::cout << "[WavePtr config] temporarily cleared protected attributes for forced update: "
+                std::cout << "[pointer config] temporarily cleared protected attributes for forced update: "
                     << config.path << "\n";
             }
             else
             {
-                std::cerr << "[WavePtr config] warning: failed to clear protected attributes; "
+                std::cerr << "[pointer config] warning: failed to clear protected attributes; "
                     << "continuing with replacement attempts. path=" << config.path
                     << " win32_error=" << GetLastError() << "\n";
             }
@@ -1378,7 +1664,7 @@ namespace
             // the same table.  Treat that as success and only remove our temp.
             std::remove(temp.c_str());
             RestoreWavePtrConfigAttributes(config.path, destinationExisted, originalAttributes);
-            std::cout << "[WavePtr config] synchronized by concurrent update: " << config.path << "\n";
+            std::cout << "[pointer config] synchronized by concurrent update: " << config.path << "\n";
             return true;
         }
 
@@ -1390,7 +1676,7 @@ namespace
             {
                 replaced = true;
                 std::remove(temp.c_str());
-                std::cout << "[WavePtr config] updated through direct-copy fallback: "
+                std::cout << "[pointer config] updated through direct-copy fallback: "
                     << config.path << "\n";
             }
             else
@@ -1451,7 +1737,7 @@ namespace
             return true;
         }
 #endif
-        std::cout << "[WavePtr config] updated: " << config.path << "\n";
+        std::cout << "[pointer config] updated: " << config.path << "\n";
         return true;
     }
 
@@ -1462,7 +1748,13 @@ namespace
         std::size_t& recordCount);
 
     bool EmitAggregateHeader(const std::string& aggregateHeader,
-        const std::vector<std::string>& generatedHeaders);
+        const std::vector<std::string>& generatedHeaders,
+        bool includeWaveRuntime);
+
+    bool EmitEmptyGeneratedHeader(const std::string& path);
+
+    bool EmitDisabledReflectionHeaders(const Options& opt,
+        const WavePtrReflectionConfig& config);
 
     std::map<std::string, const RecordInfo*> BuildRecordLookupMap(const std::vector<RecordInfo>& records);
 
@@ -1506,6 +1798,7 @@ namespace
         bool disabled);
 
     bool EmitDisabledCompileShardFiles(const std::string& outputDir, unsigned shardCount);
+
 
     bool CollectRecordsFromTranslationUnit(const Options& opt,
         CXTranslationUnit tu,
@@ -3514,6 +3807,16 @@ namespace
         }
     }
 
+    bool AnnotatedPointerMetadataIsValid(const CollectContext& ctx)
+    {
+        if (ctx.annotatedPointerErrors.empty()) return true;
+        for (std::size_t i = 0; i < ctx.annotatedPointerErrors.size(); ++i)
+        {
+            std::cerr << ctx.annotatedPointerErrors[i] << "\n";
+        }
+        return false;
+    }
+
     bool IsUnderNamespaceNamed(CXCursor cursor, const std::string& namespaceName)
     {
         for (CXCursor cur = clang_getCursorSemanticParent(cursor); !clang_Cursor_isNull(cur); cur = clang_getCursorSemanticParent(cur))
@@ -3732,7 +4035,33 @@ namespace
                 RecordInfo* out = payload->out;
                 CollectContext* ctx = payload->ctx;
                 const CXCursorKind kind = clang_getCursorKind(child);
-                if (kind != CXCursor_FieldDecl) return CXChildVisit_Continue;
+                if (kind != CXCursor_FieldDecl)
+                {
+                    // Microsoft-style anonymous structs inside an anonymous union
+                    // inject their fields into the containing class:
+                    //
+                    //   union { struct { unsigned lo : 4; unsigned hi : 4; }; U8 raw; };
+                    //
+                    // libclang exposes lo/hi below the StructDecl rather than as
+                    // direct UnionDecl children. Recurse only through anonymous
+                    // record declarations that do not have a named holder; a
+                    // declaration such as `struct { int x; } named;` must remain a
+                    // single named union alternative instead of being flattened.
+                    if (kind == CXCursor_StructDecl || kind == CXCursor_UnionDecl)
+                    {
+                        const std::string recordName = ToStdString(clang_getCursorSpelling(child));
+                        if (recordName.empty() || LooksLikeLibclangAnonymousName(recordName))
+                        {
+                            CXCursor parent = clang_getCursorLexicalParent(child);
+                            if (clang_Cursor_isNull(parent)) parent = clang_getCursorSemanticParent(child);
+                            const std::string holder = clang_Cursor_isNull(parent)
+                                ? std::string()
+                                : FindNamedFieldForAnonymousUnion(parent, child);
+                            if (holder.empty()) return CXChildVisit_Recurse;
+                        }
+                    }
+                    return CXChildVisit_Continue;
+                }
 
                 FieldInfo f;
                 const std::string rawFieldName = ToStdString(clang_getCursorSpelling(child));
@@ -3785,6 +4114,7 @@ namespace
                     f.bitWidth = clang_getFieldDeclBitWidth(child);
                     f.bitOffset = clang_Cursor_getOffsetOfField(child);
                 }
+                CollectAnnotatedPointerMetadata(child, *out, f, ctx);
                 if (!ShouldCollectReflectedField(*out, f, ctx))
                 {
                     if (payload->foundBody) *payload->foundBody = true;
@@ -3947,6 +4277,7 @@ namespace
                         f.bitWidth = clang_getFieldDeclBitWidth(child);
                         f.bitOffset = clang_Cursor_getOffsetOfField(child);
                     }
+                    CollectAnnotatedPointerMetadata(child, *out, f, ctx);
                     if (!ShouldCollectReflectedField(*out, f, ctx))
                     {
                         return CXChildVisit_Continue;
@@ -4264,6 +4595,7 @@ namespace
                             f.bitWidth = clang_getFieldDeclBitWidth(child);
                             f.bitOffset = clang_Cursor_getOffsetOfField(child);
                         }
+                        CollectAnnotatedPointerMetadata(child, *out, f, payload->ctx);
                         if (!ShouldCollectReflectedField(*out, f, payload->ctx))
                         {
                             *foundBody = true;
@@ -5412,6 +5744,15 @@ namespace
             m.unionStorageBytes = f.unionStorageBytes;
             m.exprIsPointerAlready = false;
             m.asBoolStorage = !f.isBitField && IsBoolStorageTypedefSpelling(opt, f.typeName);
+            m.annotatedPointerKind = f.annotatedPointerKind;
+            m.annotatedPointerCountExpr = f.annotatedPointerCountExpr;
+            m.annotatedPointerStorageArray = f.annotatedPointerStorageArray;
+            if (f.annotatedPointerKind != AnnotatedPointerKind::None)
+            {
+                const WavePtrMemberKey key = MakeWavePtrMemberKey(rec, f);
+                m.annotatedPointerClassName = key.className;
+                m.annotatedPointerMemberName = key.memberName;
+            }
             const std::string accessPath = f.accessPath.empty() ? f.name : f.accessPath;
             m.constExpr = constObjExpr + "->" + accessPath;
             m.mutExpr = mutObjExpr + "->" + accessPath;
@@ -5531,6 +5872,24 @@ namespace
     std::string BuildReflectedType(const RecordInfo& rec)
     {
         return BuildElaboratedReflectedTypeNameGlobal(rec);
+    }
+
+    bool IsDynamicTraceTargetMarkerType(const std::string& typeName)
+    {
+        const std::string key = TopLevelTypeKeyForClosure(typeName);
+        const char* markers[] = { "DynamicTraceTargetFor", "DynamicTraceTarget" };
+        for (std::size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i)
+        {
+            const std::string marker(markers[i]);
+            if (key == marker) return true;
+            if (key.size() > marker.size() + 1u &&
+                key.compare(key.size() - marker.size(), marker.size(), marker) == 0 &&
+                key[key.size() - marker.size() - 1u] == ':')
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     std::string StripExtension(const std::string& path)
@@ -5682,10 +6041,15 @@ namespace
         if (file == "reflect_force_access.h" || file == "reflect_force_access.hpp") return true;
         if (file == "reflect_force_new_hook.h" || file == "reflect_force_new_hook.hpp") return true;
         if (file == "wave_runtime.h" || file == "wave_runtime.hpp") return true;
+        if (file == "wave_tap.h" || file == "wave_tap.hpp") return true;
+        if (file == "wavetrace_config.h" || file == "wavetrace_config.hpp") return true;
         if (file == "wave_path_wvz3_recorder.h" || file == "wave_path_wvz3_recorder.hpp") return true;
+        if (file == "wave_path_wvz4_recorder.h" || file == "wave_path_wvz4_recorder.hpp") return true;
         if (file == "wvz3_writer_typed.h" || file == "wvz3_writer_typed.hpp") return true;
         if (file == "wvz3_writer.h" || file == "wvz3_writer.hpp") return true;
         if (file == "wvz3_reader.h" || file == "wvz3_reader.hpp") return true;
+        if (file == "wvz4_writer_typed.h" || file == "wvz4_writer_typed.hpp") return true;
+        if (file == "wvz4_lod_residual_experiment.h" || file == "wvz4_lod_residual_experiment.hpp") return true;
 
         return false;
     }
@@ -7114,7 +7478,10 @@ namespace
         return "__reflect_nested_" + SanitizeIdentifier(name);
     }
 
-    bool EmitGeneratedFile(const std::vector<RecordInfo>& records, const Options& opt, const std::map<std::string, const RecordInfo*>* globalByName = NULL)
+    bool EmitGeneratedFile(
+        const std::vector<RecordInfo>& records,
+        const Options& opt,
+        const std::map<std::string, const RecordInfo*>* globalByName)
     {
         PrepareOutputFileForOverwrite(opt.outputHeader);
         errno = 0;
@@ -7216,6 +7583,9 @@ namespace
             os << "{\n";
             os << "    typedef " << recType << " Self;\n";
             os << "    static ::reflect::TopologyTypeEstimate topology_type_estimate() noexcept;\n";
+            os << "#ifdef WAVE_RUNTIME_AVAILABLE\n";
+            os << "    static void register_dynamic_member_types();\n";
+            os << "#endif\n";
             os << "    static const void* generated_class_id() noexcept { return ::reflect::type_tag_of<Self>(); }\n";
             os << "    static const char* const* generated_member_names() noexcept\n";
             os << "    {\n";
@@ -7283,7 +7653,23 @@ namespace
                 }
                 else
                 {
-                    if (m.asBoolStorage)
+                    if (m.annotatedPointerKind == AnnotatedPointerKind::Weak && m.annotatedPointerStorageArray)
+                    {
+                        os << "        ::wave::detail::invoke_annotated_weak_ptr_storage_array_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.constExpr << ", ::wave::detail::AnnotatedPointerMemberKey(\"" << EscapeString(m.annotatedPointerClassName) << "\", \"" << EscapeString(m.annotatedPointerMemberName) << "\"), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                    }
+                    else if (m.annotatedPointerKind == AnnotatedPointerKind::Weak)
+                    {
+                        os << "        ::wave::detail::invoke_annotated_weak_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.constExpr << ", ::wave::detail::AnnotatedPointerMemberKey(\"" << EscapeString(m.annotatedPointerClassName) << "\", \"" << EscapeString(m.annotatedPointerMemberName) << "\"), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                    }
+                    else if (m.annotatedPointerKind == AnnotatedPointerKind::Strong && m.annotatedPointerStorageArray)
+                    {
+                        os << "        ::wave::detail::invoke_annotated_ptr_storage_array_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.constExpr << ", " << BuildAnnotatedPointerCountExpression(m, "obj") << ", ::wave::detail::AnnotatedPointerMemberKey(\"" << EscapeString(m.annotatedPointerClassName) << "\", \"" << EscapeString(m.annotatedPointerMemberName) << "\"), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                    }
+                    else if (m.annotatedPointerKind == AnnotatedPointerKind::Strong)
+                    {
+                        os << "        ::wave::detail::invoke_annotated_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.constExpr << ", " << BuildAnnotatedPointerCountExpression(m, "obj") << ", ::wave::detail::AnnotatedPointerMemberKey(\"" << EscapeString(m.annotatedPointerClassName) << "\", \"" << EscapeString(m.annotatedPointerMemberName) << "\"), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                    }
+                    else if (m.asBoolStorage)
                     {
                         os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", ::wave::as_bool_storage_ptr(std::addressof(" << m.constExpr << ")), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
@@ -7333,7 +7719,23 @@ namespace
                 }
                 else
                 {
-                    if (m.asBoolStorage)
+                    if (m.annotatedPointerKind == AnnotatedPointerKind::Weak && m.annotatedPointerStorageArray)
+                    {
+                        os << "        ::wave::detail::invoke_annotated_weak_ptr_storage_array_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.mutExpr << ", ::wave::detail::AnnotatedPointerMemberKey(\"" << EscapeString(m.annotatedPointerClassName) << "\", \"" << EscapeString(m.annotatedPointerMemberName) << "\"), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                    }
+                    else if (m.annotatedPointerKind == AnnotatedPointerKind::Weak)
+                    {
+                        os << "        ::wave::detail::invoke_annotated_weak_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.mutExpr << ", ::wave::detail::AnnotatedPointerMemberKey(\"" << EscapeString(m.annotatedPointerClassName) << "\", \"" << EscapeString(m.annotatedPointerMemberName) << "\"), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                    }
+                    else if (m.annotatedPointerKind == AnnotatedPointerKind::Strong && m.annotatedPointerStorageArray)
+                    {
+                        os << "        ::wave::detail::invoke_annotated_ptr_storage_array_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.mutExpr << ", " << BuildAnnotatedPointerCountExpression(m, "obj") << ", ::wave::detail::AnnotatedPointerMemberKey(\"" << EscapeString(m.annotatedPointerClassName) << "\", \"" << EscapeString(m.annotatedPointerMemberName) << "\"), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                    }
+                    else if (m.annotatedPointerKind == AnnotatedPointerKind::Strong)
+                    {
+                        os << "        ::wave::detail::invoke_annotated_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.mutExpr << ", " << BuildAnnotatedPointerCountExpression(m, "obj") << ", ::wave::detail::AnnotatedPointerMemberKey(\"" << EscapeString(m.annotatedPointerClassName) << "\", \"" << EscapeString(m.annotatedPointerMemberName) << "\"), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                    }
+                    else if (m.asBoolStorage)
                     {
                         os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", ::wave::as_bool_storage_ptr(std::addressof(" << m.mutExpr << ")), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
@@ -7380,6 +7782,12 @@ namespace
             const std::string recType = emittedTypeByQName[rec.qualifiedName];
             os << BuildClassSpecializationPrefix(rec);
             os << "struct is_reflected<" << recType << "> : std::true_type {};\n\n";
+            if (rec.templateKind == RecordTemplateKind::Primary)
+            {
+                os << BuildClassSpecializationPrefix(rec);
+                os << "struct is_compile_shard_visible_reflected<" << recType
+                   << "> : std::true_type {};\n\n";
+            }
         }
 
         for (std::size_t oi = 0; oi < emitOrder.size(); ++oi)
@@ -7422,6 +7830,9 @@ namespace
             os << "};\n\n";
         }
 
+        os << "#ifdef WAVE_RUNTIME_AVAILABLE\n";
+        os << "struct DynamicRegistrationPolicy_" << GetOutputStem(opt) << " {};\n";
+        os << "#endif\n\n";
         os << "} // namespace reflect\n\n";
         os << "namespace wave {\n\n";
         for (std::size_t oi = 0; oi < emitOrder.size(); ++oi)
@@ -7479,14 +7890,89 @@ namespace
                         }
                         os << "    typedef typename std::remove_cv<typename std::remove_reference<"
                            << typeExpr << ">::type>::type EstimateField" << mi << ";\n";
-                        os << "    estimate = ::reflect::detail::combine_topology_estimates(estimate, "
-                           << "::reflect::topology_type_estimate<EstimateField" << mi << ">::get());\n";
+                        if (member.annotatedPointerKind != AnnotatedPointerKind::None)
+                        {
+                            const char* traitsName = member.annotatedPointerStorageArray
+                                ? (member.annotatedPointerKind == AnnotatedPointerKind::Weak
+                                    ? "annotated_weak_pointer_storage_array_traits"
+                                    : "annotated_pointer_storage_array_traits")
+                                : (member.annotatedPointerKind == AnnotatedPointerKind::Weak
+                                    ? "annotated_weak_pointer_storage_traits"
+                                    : "annotated_pointer_storage_traits");
+                            os << "    typedef typename ::wave::detail::" << traitsName
+                               << "<EstimateField" << mi << ">::element_type EstimatePointee" << mi << ";\n";
+                            os << "    const ::reflect::TopologyTypeEstimate estimate_pointee" << mi
+                               << " = ::reflect::topology_type_estimate<typename std::remove_cv<EstimatePointee" << mi << ">::type>::get();\n";
+                            if (member.annotatedPointerStorageArray)
+                            {
+                                os << "    const std::size_t estimate_pointer_slots" << mi
+                                   << " = ::wave::detail::" << traitsName
+                                   << "<EstimateField" << mi << ">::slot_count;\n";
+                            }
+                            os << "    estimate = ::reflect::detail::combine_topology_estimates(estimate, "
+                               << "::reflect::TopologyTypeEstimate(";
+                            if (member.annotatedPointerStorageArray)
+                            {
+                                os << "::reflect::detail::saturating_leaf_multiply(estimate_pointer_slots" << mi
+                                   << ", estimate_pointee" << mi << ".estimated_leaves)";
+                            }
+                            else
+                            {
+                                os << "estimate_pointee" << mi << ".estimated_leaves";
+                            }
+                            os << ", false, true));\n";
+                        }
+                        else
+                        {
+                            os << "    estimate = ::reflect::detail::combine_topology_estimates(estimate, "
+                               << "::reflect::topology_type_estimate<EstimateField" << mi << ">::get());\n";
+                        }
                     }
                 }
                 os << "    return estimate;\n";
             }
             os << "}\n\n";
         }
+
+        os << "#ifdef WAVE_RUNTIME_AVAILABLE\n";
+        for (std::size_t oi = 0; oi < emitOrder.size(); ++oi)
+        {
+            const RecordInfo& rec = *emitOrder[oi];
+            const std::string recType = emittedTypeByQName[rec.qualifiedName];
+            const std::vector<EmittedMember> members = BuildFlattenedMembers(opt, rec, byName);
+            bool isTypedPeekSource = false;
+            for (std::size_t bi = 0; bi < rec.bases.size(); ++bi)
+            {
+                const BaseInfo& base = rec.bases[bi];
+                const std::string baseText = base.typeName + " " +
+                    base.canonicalTypeName + " " + base.qualifiedTypeName;
+                if (baseText.find("PeekTraceSourceFor") != std::string::npos)
+                {
+                    isTypedPeekSource = true;
+                    break;
+                }
+            }
+            if (rec.templateKind == RecordTemplateKind::Primary) os << BuildTemplatePrefix(rec);
+            os << "inline void ReflectAccess<" << recType << ">::register_dynamic_member_types()\n";
+            os << "{\n";
+            os << "    Self* obj = NULL;\n";
+            os << "    (void)obj;\n";
+            if (isTypedPeekSource)
+            {
+                os << "    ::wave::detail::register_peek_value_type<typename Self::wave_trace_peek_value_type, "
+                   << "::reflect::DynamicRegistrationPolicy_" << GetOutputStem(opt) << ">();\n";
+            }
+            for (std::size_t mi = 0; mi < members.size(); ++mi)
+            {
+                if (members[mi].isBitField) continue;
+                os << "    typedef typename std::remove_cv<typename std::remove_reference<decltype("
+                   << members[mi].mutExpr << ")>::type>::type DynamicMember" << mi << ";\n";
+                os << "    ::wave::detail::register_dynamic_types_in<DynamicMember" << mi
+                   << ", ::reflect::DynamicRegistrationPolicy_" << GetOutputStem(opt) << ">();\n";
+            }
+            os << "}\n\n";
+        }
+        os << "#endif\n\n";
         os << "} // namespace wave\n\n";
         os << "namespace reflect {\n\n";
 
@@ -7498,8 +7984,10 @@ namespace
             const RecordInfo& rec = *emitOrder[oi];
             if (rec.templateKind == RecordTemplateKind::Primary) continue;
             const std::string recType = emittedTypeByQName[rec.qualifiedName];
-            os << "    static wave::DynamicTypeRegistration<" << recType << "> reg_" << oi << ";\n";
-            os << "    (void)reg_" << oi << ";\n";
+            os << "    ::wave::detail::register_dynamic_types_in<" << recType
+               << ", ::reflect::DynamicRegistrationPolicy_" << GetOutputStem(opt) << ">();\n";
+            os << "    ::wave::ReflectAccess<" << recType
+               << ">::register_dynamic_member_types();\n";
         }
         os << "}\n\n";
         os << "inline void " << BuildConvenienceRegistrationFunctionName(opt) << "()\n";
@@ -7609,6 +8097,12 @@ namespace
         const CXCursor root = clang_getTranslationUnitCursor(tu);
         clang_visitChildren(root, AstVisitor, &ctx);
         PrintRecordCollectionSummary(opt, ctx);
+        if (!AnnotatedPointerMetadataIsValid(ctx))
+        {
+            clang_disposeTranslationUnit(tu);
+            clang_disposeIndex(index);
+            return false;
+        }
 
         const std::string outDir = DirectoryName(opt.outputHeader);
         if (!outDir.empty() && !MakeDirectoryRecursive(outDir))
@@ -7651,7 +8145,8 @@ namespace
     }
 
     bool EmitAggregateHeader(const std::string& aggregateHeader,
-        const std::vector<std::string>& generatedHeaders)
+        const std::vector<std::string>& generatedHeaders,
+        bool includeWaveRuntime)
     {
         const std::string outDir = DirectoryName(aggregateHeader);
         if (!outDir.empty() && !MakeDirectoryRecursive(outDir))
@@ -7681,7 +8176,10 @@ namespace
         os << "#ifdef make_unique\n";
         os << "#undef make_unique\n";
         os << "#endif\n\n";
-        os << "#include \"wave_runtime.h\"\n\n";
+        if (includeWaveRuntime)
+        {
+            os << "#include \"wave_runtime.h\"\n\n";
+        }
 
         for (std::size_t i = 0; i < generatedHeaders.size(); ++i)
         {
@@ -7692,15 +8190,36 @@ namespace
         return FlushAndCheckFile(os, aggregateHeader, "[aggregate header write error]");
     }
 
+    bool EmitEmptyGeneratedHeader(const std::string& path)
+    {
+        const std::string outDir = DirectoryName(path);
+        if (!outDir.empty() && !MakeDirectoryRecursive(outDir))
+        {
+            PrintDirectoryCreateFailure("[empty generated header]", outDir);
+            return false;
+        }
+
+        PrepareOutputFileForOverwrite(path);
+        errno = 0;
+        std::ofstream os(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!os)
+        {
+            PrintFileOpenFailure("[empty generated header open error]", path);
+            return false;
+        }
+        os << "#pragma once\n";
+        os << "// WaveTrace=false: reflection intentionally omitted.\n";
+        return FlushAndCheckFile(os, path, "[empty generated header write error]");
+    }
+
     bool EmitDisabledReflectionHeaders(const Options& opt,
         const WavePtrReflectionConfig& config)
     {
         if (!opt.batchMode)
         {
-            const std::vector<std::string> none;
-            if (!EmitAggregateHeader(NormalizePathSlashes(opt.outputHeader), none)) return false;
+            if (!EmitEmptyGeneratedHeader(NormalizePathSlashes(opt.outputHeader))) return false;
             if (!CommitWavePtrReflectionConfig(config)) return false;
-            std::cout << "[WaveTrace config] WaveTrace=false; emitted placeholder header: "
+            std::cout << "[WaveTrace config] WaveTrace=false; emitted empty reflection header: "
                       << opt.outputHeader << "\n";
             return true;
         }
@@ -7720,19 +8239,21 @@ namespace
         if (!IsAbsolutePath(aggregateHeader)) aggregateHeader = JoinPath(outputDir, aggregateHeader);
         aggregateHeader = NormalizePathSlashes(CollapseDotDotPath(aggregateHeader));
 
-        const std::vector<std::string> none;
-        if (!EmitAggregateHeader(closureHeader, none)) return false;
+        if (!EmitEmptyGeneratedHeader(closureHeader)) return false;
         std::vector<std::string> generatedPlaceholders(1, closureHeader);
         if (opt.compileShardCount != 0)
         {
             if (!EmitDisabledCompileShardFiles(outputDir, opt.compileShardCount)) return false;
             generatedPlaceholders.push_back(JoinPath(outputDir, "root_class_closure_shards_registry.h"));
         }
-        if (!EmitAggregateHeader(aggregateHeader, generatedPlaceholders)) return false;
+        // Keep the aggregate include contract and wave runtime API intact.  Only
+        // reflection bodies are empty, so business code that includes the usual
+        // project header continues to compile unchanged.
+        if (!EmitAggregateHeader(aggregateHeader, generatedPlaceholders, false)) return false;
         if (!CommitWavePtrReflectionConfig(config)) return false;
 
         std::cout << "[WaveTrace config] WaveTrace=false; skipped libclang/AST reflection\n";
-        std::cout << "[WaveTrace config] placeholder aggregate: " << aggregateHeader << "\n";
+        std::cout << "[WaveTrace config] empty reflection aggregate: " << aggregateHeader << "\n";
         return true;
     }
 
@@ -7788,7 +8309,7 @@ namespace
         // a business payload type that must remain reachable in root-class
         // closure mode.  Do not emit the wrapper itself; recurse into template
         // arguments instead.
-        return key == "wave::WavePtr" || key == "wave::array";
+        return key == "wave::array";
     }
 
     std::string StripTypeForClosure(std::string s)
@@ -8026,6 +8547,80 @@ namespace
             select_record(rec, std::string("root requested=") + rootNames[i]);
         }
 
+        // Runtime-typed targets are intentionally allowed to hide their concrete
+        // type behind an interface pointer.  Such a concrete type is not reachable
+        // by following the root's static field types, but wave_runtime still needs
+        // its generated DynamicTypeRegistration entry.  Treat every business
+        // implementation of the runtime-typed marker interfaces as an implicit
+        // root, then let the normal closure walk retain its member dependencies.
+        // This is especially important in compile-shard mode because business TUs
+        // deliberately do not instantiate a weaker local registration.
+        auto is_runtime_typed_marker_text = [](const std::string& text) -> bool
+        {
+            const std::string key = CanonicalRecordLookupKey(text);
+            const auto is_name = [&](const char* marker) -> bool
+            {
+                const std::string name(marker);
+                if (key == name) return true;
+                return key.size() > name.size() + 1u &&
+                    key.compare(key.size() - name.size(), name.size(), name) == 0 &&
+                    key[key.size() - name.size() - 1u] == ':';
+            };
+            return is_name("DynamicTraceTargetFor") ||
+                   is_name("PeekTraceSourceFor") ||
+                   is_name("DynamicTraceTarget") ||
+                   is_name("PeekTraceSource");
+        };
+
+        std::map<const RecordInfo*, int> runtimeTypedMemo;
+        std::function<bool(const RecordInfo*)> is_runtime_typed_record;
+        is_runtime_typed_record = [&](const RecordInfo* rec) -> bool
+        {
+            if (!rec) return false;
+            std::map<const RecordInfo*, int>::const_iterator memo = runtimeTypedMemo.find(rec);
+            if (memo != runtimeTypedMemo.end())
+            {
+                // A visiting node is an inheritance cycle for our purposes; it
+                // cannot establish the marker on its own.
+                return memo->second == 2;
+            }
+            runtimeTypedMemo[rec] = 1;
+            for (std::size_t bi = 0; bi < rec->bases.size(); ++bi)
+            {
+                const BaseInfo& base = rec->bases[bi];
+                const std::string baseText = base.typeName + " " +
+                    base.canonicalTypeName + " " + base.qualifiedTypeName;
+                if (is_runtime_typed_marker_text(baseText))
+                {
+                    runtimeTypedMemo[rec] = 2;
+                    return true;
+                }
+
+                std::vector<std::string> candidates;
+                AddClosureTypeCandidatesFromBase(base, candidates);
+                for (std::size_t ci = 0; ci < candidates.size(); ++ci)
+                {
+                    if (is_runtime_typed_record(FindRecord(byName, candidates[ci])))
+                    {
+                        runtimeTypedMemo[rec] = 2;
+                        return true;
+                    }
+                }
+            }
+            runtimeTypedMemo[rec] = 3;
+            return false;
+        };
+
+        std::size_t runtimeTypedRoots = 0;
+        for (std::size_t i = 0; i < allRecords.size(); ++i)
+        {
+            if (is_runtime_typed_record(&allRecords[i]) &&
+                select_record(&allRecords[i], "runtime-typed target implementation"))
+            {
+                ++runtimeTypedRoots;
+            }
+        }
+
         std::size_t closureEdges = 0;
         std::size_t closureMatchedEdges = 0;
         std::size_t closureUnmatchedEdges = 0;
@@ -8184,6 +8779,7 @@ namespace
             if (selected.find(i) != selected.end()) out.push_back(allRecords[i]);
         }
         std::cout << "[root closure] requested_roots=" << rootNames.size()
+            << " runtime_typed_roots=" << runtimeTypedRoots
             << " missing_roots=" << missingRoots
             << " all_records=" << allRecords.size()
             << " selected_records=" << out.size()
@@ -8192,6 +8788,15 @@ namespace
             << " unmatched_edges=" << closureUnmatchedEdges
             << " skipped_edges=" << closureSkippedEdges << "\n";
         return out;
+    }
+
+    std::string BuildAnnotatedPointerCountExpression(const EmittedMember& member,
+                                                      const std::string& objectExpr)
+    {
+        const std::string count = Trim(member.annotatedPointerCountExpr);
+        if (count.empty()) return "0u";
+        if (std::isdigit(static_cast<unsigned char>(count[0]))) return count;
+        return objectExpr + "->" + count;
     }
 
     struct CompileShardPartition
@@ -8266,11 +8871,38 @@ namespace
         std::vector<Group> groups;
         for (std::map<std::string, Group>::const_iterator it = groupsByOwner.begin(); it != groupsByOwner.end(); ++it)
         {
-            if (rootGroups.find(it->first) != rootGroups.end())
+            bool isTemplateSupportGroup = false;
+            for (std::size_t ri = 0; ri < it->second.records.size(); ++ri)
+            {
+                if (it->second.records[ri].templateKind == RecordTemplateKind::Primary)
+                {
+                    isTemplateSupportGroup = true;
+                    break;
+                }
+            }
+
+            // A primary-template reflection specialization cannot be hidden in
+            // one compiled shard and recovered through the concrete-type dynamic
+            // registry: its concrete instantiations are formed in whichever TU
+            // owns a field of that template type.  Keep the (normally tiny)
+            // template owner group visible to the root TU and every shard.  This
+            // prevents a parent in any shard from silently treating a reflected
+            // Template<T> field as unsupported. Non-template records remain
+            // partitioned exactly once, which is where nearly all generated code
+            // and compile cost lives.
+            if (rootGroups.find(it->first) != rootGroups.end() || isTemplateSupportGroup)
             {
                 result.rootRecords.insert(result.rootRecords.end(), it->second.records.begin(), it->second.records.end());
             }
-            else
+            if (isTemplateSupportGroup)
+            {
+                for (unsigned si = 0; si < shardCount; ++si)
+                {
+                    result.shardRecords[si].insert(result.shardRecords[si].end(),
+                        it->second.records.begin(), it->second.records.end());
+                }
+            }
+            else if (rootGroups.find(it->first) == rootGroups.end())
             {
                 groups.push_back(it->second);
             }
@@ -8422,14 +9054,18 @@ namespace
         os << "// Generated by ReflectGen. Do not edit.\n";
         if (!disabled)
         {
+            os << "#if defined(gcdMODELING_MODE) && (gcdMODELING_MODE == 2)\n";
             os << "#include \"wave_runtime.h\"\n";
-            os << "#include \"" << FileNameOnly(generatedHeader) << "\"\n\n";
+            os << "#include \"" << FileNameOnly(generatedHeader) << "\"\n";
+            os << "#endif\n\n";
         }
         os << "extern \"C\" void wavetrace_register_reflection_shard_" << CompileShardTag(shardIndex) << "()\n";
         os << "{\n";
         if (!disabled)
         {
+            os << "#if defined(gcdMODELING_MODE) && (gcdMODELING_MODE == 2)\n";
             os << "    ::reflect::" << registrationFunction << "();\n";
+            os << "#endif\n";
         }
         os << "}\n";
         return FlushAndCheckFile(os, path, "[compile shard source write error]");
@@ -8446,8 +9082,9 @@ namespace
             const std::string inputHeader = JoinPath(outputDir, base + "_input.h");
             const std::string generatedHeader = JoinPath(outputDir, base + "_reflect_auto.h");
             if (!WriteBatchAggregateInputHeader(inputHeader, none)) return false;
-            if (!EmitAggregateHeader(generatedHeader, none)) return false;
-            if (!EmitCompileShardTranslationUnit(outputDir, i, generatedHeader, std::string(), true)) return false;
+            if (!EmitEmptyGeneratedHeader(generatedHeader)) return false;
+            if (!EmitCompileShardTranslationUnit(
+                    outputDir, i, generatedHeader, std::string(), true)) return false;
         }
         return EmitCompileShardRegistryHeader(outputDir, shardCount);
     }
@@ -8469,6 +9106,7 @@ namespace
         const CXCursor root = clang_getTranslationUnitCursor(tu);
         clang_visitChildren(root, AstVisitor, &ctx);
         PrintRecordCollectionSummary(opt, ctx);
+        if (!AnnotatedPointerMetadataIsValid(ctx)) return false;
         records.swap(ctx.records);
         return true;
     }
@@ -10008,7 +10646,6 @@ namespace
         {
             const std::vector<RecordInfo> closureRecords = ComputeRootClassClosureRecords(allRecords, requestedRoots);
             const std::map<std::string, const RecordInfo*> globalByName = BuildRecordLookupMap(allRecords);
-
             std::string closureHeader = JoinPath(outputDir, "root_class_closure_reflect_auto.h");
             std::string closureInput = tempAggregateInput;
             std::vector<RecordInfo> rootVisibleRecords = closureRecords;
@@ -10041,7 +10678,10 @@ namespace
                 return false;
             }
 
-            if (!EmitGeneratedFile(rootVisibleRecords, fileOpt, &globalByName))
+            if (!EmitGeneratedFile(
+                    rootVisibleRecords,
+                    fileOpt,
+                    &globalByName))
             {
                 return false;
             }
@@ -10064,7 +10704,10 @@ namespace
                     shardOpt.inputHeader = shardInput;
                     shardOpt.outputHeader = shardHeader;
                     shardOpt.headerInclude = MakeGeneratedHeaderIncludeText(shardHeader, shardInput);
-                    if (!EmitGeneratedFile(partition.shardRecords[si], shardOpt, &globalByName)) return false;
+                    if (!EmitGeneratedFile(
+                            partition.shardRecords[si],
+                            shardOpt,
+                            &globalByName)) return false;
                     if (!EmitCompileShardTranslationUnit(outputDir,
                         si,
                         shardHeader,
@@ -10084,7 +10727,7 @@ namespace
             }
             std::string aggregate = ExpandEnvironmentVariablesInPath(opt.aggregateHeader);
             if (!IsAbsolutePath(aggregate)) aggregate = JoinPath(outputDir, aggregate);
-            if (!EmitAggregateHeader(aggregate, generatedClosure))
+            if (!EmitAggregateHeader(aggregate, generatedClosure, true))
             {
                 std::cerr << "Failed to generate aggregate header: " << aggregate << "\n";
                 return false;
@@ -10157,7 +10800,7 @@ namespace
 
         std::string aggregate = ExpandEnvironmentVariablesInPath(opt.aggregateHeader);
         if (!IsAbsolutePath(aggregate)) aggregate = JoinPath(outputDir, aggregate);
-        if (!EmitAggregateHeader(aggregate, generated))
+        if (!EmitAggregateHeader(aggregate, generated, true))
         {
             std::cerr << "Failed to generate aggregate header: " << aggregate << "\n";
             return false;

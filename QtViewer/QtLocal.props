@@ -48,6 +48,9 @@
     <QtWidgetsLib Condition="'$(QtWidgetsLib)'=='' and '$(Configuration)'=='Debug' and Exists('$(QtLocalLib)Qt5Widgetsd.lib')">Qt5Widgetsd.lib</QtWidgetsLib>
     <QtWidgetsLib Condition="'$(QtWidgetsLib)'==''">Qt5Widgets.lib</QtWidgetsLib>
 
+    <QtNetworkLib Condition="'$(QtNetworkLib)'=='' and '$(Configuration)'=='Debug' and Exists('$(QtLocalLib)Qt5Networkd.lib')">Qt5Networkd.lib</QtNetworkLib>
+    <QtNetworkLib Condition="'$(QtNetworkLib)'==''">Qt5Network.lib</QtNetworkLib>
+
     <QtEntryPointLib Condition="'$(QtEntryPointLib)'=='' and '$(Configuration)'=='Debug' and Exists('$(QtLocalLib)qtmaind.lib')">qtmaind.lib</QtEntryPointLib>
     <QtEntryPointLib Condition="'$(QtEntryPointLib)'==''">qtmain.lib</QtEntryPointLib>
 
@@ -60,19 +63,22 @@
     <QtWidgetsDll Condition="'$(QtWidgetsDll)'=='' and '$(Configuration)'=='Debug' and Exists('$(QtLocalBin)Qt5Widgetsd.dll')">Qt5Widgetsd.dll</QtWidgetsDll>
     <QtWidgetsDll Condition="'$(QtWidgetsDll)'==''">Qt5Widgets.dll</QtWidgetsDll>
 
+    <QtNetworkDll Condition="'$(QtNetworkDll)'=='' and '$(Configuration)'=='Debug' and Exists('$(QtLocalBin)Qt5Networkd.dll')">Qt5Networkd.dll</QtNetworkDll>
+    <QtNetworkDll Condition="'$(QtNetworkDll)'==''">Qt5Network.dll</QtNetworkDll>
+
     <QtWindowsPlatformDll Condition="'$(QtWindowsPlatformDll)'=='' and '$(Configuration)'=='Debug' and Exists('$(QtLocalPlugins)platforms\qwindowsd.dll')">qwindowsd.dll</QtWindowsPlatformDll>
     <QtWindowsPlatformDll Condition="'$(QtWindowsPlatformDll)'==''">qwindows.dll</QtWindowsPlatformDll>
   </PropertyGroup>
 
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(QtLocalInclude);$(QtLocalInclude)QtCore;$(QtLocalInclude)QtGui;$(QtLocalInclude)QtWidgets;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>QT_WIDGETS_LIB;QT_GUI_LIB;QT_CORE_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(QtLocalInclude);$(QtLocalInclude)QtCore;$(QtLocalInclude)QtGui;$(QtLocalInclude)QtWidgets;$(QtLocalInclude)QtNetwork;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>QT_WIDGETS_LIB;QT_GUI_LIB;QT_NETWORK_LIB;QT_CORE_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
 
     <Link>
       <AdditionalLibraryDirectories>$(QtLocalLib);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>$(QtWidgetsLib);$(QtGuiLib);$(QtCoreLib);%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(QtWidgetsLib);$(QtGuiLib);$(QtNetworkLib);$(QtCoreLib);%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 

@@ -55,10 +55,10 @@ the build tree:
 <original-WaveTracer-dir>\wavetrace_config.json
 ```
 
-`WaveTrace=false` is read before libclang/AST collection. ReflectGen then skips
-reflection and emits small `project_reflect_auto.h` and
-`root_class_closure_reflect_auto.h` placeholders so existing includes continue
-to compile. `WaveTraceFileName` controls the WVZ4 output. `WaveTraceStart` and
+Changing `WaveTrace` to `true` requires rebuilding `cmodel`, so ReflectGen can
+generate and compile the full reflection code. Changing `WaveTrace` to `false`
+only requires restarting the business process; no rebuild is needed.
+`WaveTraceFileName` controls the WVZ4 output. `WaveTraceStart` and
 `WaveTraceEnd` are inclusive business-cycle bounds; an empty start means zero
 and an empty end means no configured limit. The generated file and Viewer use
 the configured absolute start and the actual recorded end.
@@ -67,14 +67,19 @@ The same JSON also replaces the former WaveTrace runtime environment variables:
 `WaveTraceLevel`, `WaveTraceDirtyArrayStats`, `WaveTraceDirtyArrayMarks`, and
 `WaveTraceMemoryUsage`.
 
-### Per-member `WavePtr` reflection switches
+### Per-member pointer-target reflection switches
 
-Each entry is keyed by the declaring class and member name. A `wave::WavePtr`
-member is excluded only when its matching entry has `"reflect": false`.
-Missing entries and entries set to `true` are reflected. ReflectGen discovers
-fields while collecting the AST, preserves existing `false` values, adds new
-members as `true`, and atomically updates the JSON after successful generation.
-It does not generate and then prune disabled fields.
+Each entry is keyed by the declaring class and member name. Members marked with
+`WAVE_PTR` or `WAVE_PTR_ARRAY(count_member)` are skipped during the first runtime
+topology expansion only when the matching entry has `"reflect": false`.
+Changing an existing entry requires only restarting the program, not rebuilding.
+`WAVE_PTR` accepts raw pointers, `unique_ptr`,
+`shared_ptr`, and `weak_ptr`; weak pointers are detected from their C++ type.
+Missing entries and entries set to `true` are reflected.
+ReflectGen discovers fields while collecting the AST, preserves existing
+`false` values, adds new members as `true`, and atomically updates the JSON
+after successful generation. It always generates the member visitor so the
+runtime switch remains reversible without recompilation.
 
 Class-template instances share one entry. For example, `Box<int>::ptr` and
 `Box<float>::ptr` are both controlled by `Box::ptr`.

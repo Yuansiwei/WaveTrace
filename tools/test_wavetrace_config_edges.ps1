@@ -57,17 +57,17 @@ Write-Host "[4/7] Unicode escape is valid JSON"
 $unicodeFileNeedle = 'file=' + [char]0x6ce2 + [char]0x5f62 + '.wvz4'
 Invoke-Probe '{"WaveTraceFileName":"\u6ce2\u5f62.wvz4"}' 0 @($unicodeFileNeedle)
 
-Write-Host "[5/7] WaveTrace=false placeholder headers compile"
+Write-Host "[5/7] WaveTrace=false emits compile-safe empty reflection headers"
 $reflectConfig = Join-Path $buildRoot "wavetrace_config.json"
 Write-Utf8 $reflectConfig '{"WaveTrace":false,"WaveTraceFileName":"off.wvz4","WaveTraceStart":"","WaveTraceEnd":"","wave_ptr_members":[]}'
 & $reflectGen --reflect-root-class Root --batch-dir (Split-Path -Parent $fixture) --no-recursive --wavetrace-config $reflectConfig -o $generated --aggregate-header project_reflect_auto.h -- -x c++ -std=c++14 | Out-Host
 Assert-True ($LASTEXITCODE -eq 0) "disabled ReflectGen invocation failed"
 & $msbuild (Join-Path $repoRoot "smoke_wavetrace_placeholder_include.vcxproj") /t:Rebuild /m /p:Configuration=Release /p:Platform=x64 /nologo /verbosity:minimal | Out-Host
-Assert-True ($LASTEXITCODE -eq 0) "placeholder aggregate failed to compile"
+Assert-True ($LASTEXITCODE -eq 0) "runtime-disabled aggregate failed to compile"
 
-Write-Host "[6/7] false -> true -> false removes stale aggregate reflection"
+Write-Host "[6/7] Direct ReflectGen false -> true -> false switches reflection content"
 $falseClosure = Get-Content (Join-Path $generated "root_class_closure_reflect_auto.h") -Raw
-Assert-True (-not $falseClosure.Contains('ReflectAccess<')) "disabled closure contains reflection"
+Assert-True (-not $falseClosure.Contains('ReflectAccess<struct Root>')) "runtime-disabled closure retained reflection"
 Write-Utf8 $reflectConfig '{"WaveTrace":true,"WaveTraceFileName":"on.wvz4","WaveTraceStart":"","WaveTraceEnd":"","wave_ptr_members":[]}'
 & $reflectGen --reflect-root-class Root --batch-dir (Split-Path -Parent $fixture) --no-recursive --wavetrace-config $reflectConfig -o $generated --aggregate-header project_reflect_auto.h -- -x c++ -std=c++14 | Out-Host
 Assert-True ($LASTEXITCODE -eq 0) "enabled ReflectGen invocation failed"
@@ -79,10 +79,11 @@ Write-Utf8 $reflectConfig ($configObject | ConvertTo-Json -Depth 10)
 & $reflectGen --reflect-root-class Root --batch-dir (Split-Path -Parent $fixture) --no-recursive --wavetrace-config $reflectConfig -o $generated --aggregate-header project_reflect_auto.h -- -x c++ -std=c++14 | Out-Host
 Assert-True ($LASTEXITCODE -eq 0) "second disabled ReflectGen invocation failed"
 $falseAgain = Get-Content (Join-Path $generated "root_class_closure_reflect_auto.h") -Raw
-Assert-True (-not $falseAgain.Contains('ReflectAccess<')) "false-after-true left stale aggregate reflection"
+Assert-True (-not $falseAgain.Contains('ReflectAccess<struct Root>')) "false-after-true retained reflection"
+Assert-True ($falseAgain.Contains('reflection intentionally omitted')) "false-after-true did not emit the empty placeholder"
 
-Write-Host "[7/7] WavePtr table survives disabled fast path"
+Write-Host "[7/7] Pointer-target table survives runtime-disabled generation"
 $finalConfig = Get-Content $reflectConfig -Raw | ConvertFrom-Json
-Assert-True (@($finalConfig.wave_ptr_members).Count -gt 0) "disabled pass discarded discovered WavePtr entries"
+Assert-True (@($finalConfig.wave_ptr_members).Count -gt 0) "disabled pass discarded discovered pointer entries"
 
 Write-Host "PASS: WaveTrace config edge cases passed"

@@ -1,5 +1,531 @@
 #pragma once
 
+#ifndef WAVETRACE_REFLECT_MACRO_H_INCLUDED_
+#define WAVETRACE_REFLECT_MACRO_H_INCLUDED_
+
+// Wave tracing is currently a Windows-only runtime.  Every non-Windows build
+// therefore selects the zero-standard-header API surface directly from the
+// platform, without relying on target-specific CMake definitions.  The
+// traditional include guard is intentional in addition to #pragma once: the
+// package may still be reached through different physical/canonical paths.
+#if !defined(_WIN32)
+
+// Linux API-only compatibility surface. This header deliberately includes no
+// C or C++ library headers, so placing it in a GCC/distcc PCH cannot preload
+// libstdc++ declarations. It preserves business-code syntax and ordinary
+// simulation behavior, but performs no waveform bookkeeping.
+
+namespace reflect {
+template <typename T>
+inline const void* type_tag_of() noexcept {
+    static const char tag = 0;
+    return &tag;
+}
+} // namespace reflect
+
+namespace wave {
+
+typedef __SIZE_TYPE__ size_type;
+typedef __PTRDIFF_TYPE__ difference_type;
+typedef __UINT32_TYPE__ uint32_type;
+typedef __UINT64_TYPE__ NodeId;
+
+namespace compat_detail {
+
+template <bool Enabled, typename T = void>
+struct enable_if {};
+
+template <typename T>
+struct enable_if<true, T> { typedef T type; };
+
+template <typename T>
+struct is_lvalue_reference { static constexpr bool value = false; };
+
+template <typename T>
+struct is_lvalue_reference<T&> { static constexpr bool value = true; };
+
+template <typename T>
+struct remove_reference { typedef T type; };
+
+template <typename T>
+struct remove_reference<T&> { typedef T type; };
+
+template <typename T>
+struct remove_reference<T&&> { typedef T type; };
+
+template <typename T>
+inline typename remove_reference<T>::type&& move(T&& value) noexcept {
+    return static_cast<typename remove_reference<T>::type&&>(value);
+}
+
+template <typename PointerT, typename ReferenceT, typename DifferenceT>
+class reverse_iterator {
+public:
+    typedef PointerT pointer;
+    typedef ReferenceT reference;
+    typedef DifferenceT difference_type;
+
+    reverse_iterator() noexcept : current_() {}
+    explicit reverse_iterator(pointer current) noexcept : current_(current) {}
+
+    template <typename OtherPointer, typename OtherReference>
+    reverse_iterator(const reverse_iterator<OtherPointer, OtherReference, DifferenceT>& other) noexcept
+        : current_(other.base()) {}
+
+    pointer base() const noexcept { return current_; }
+    reference operator*() const noexcept { pointer previous = current_; return *--previous; }
+    pointer operator->() const noexcept { pointer previous = current_; return --previous; }
+    reference operator[](difference_type offset) const noexcept { return *(*this + offset); }
+
+    reverse_iterator& operator++() noexcept { --current_; return *this; }
+    reverse_iterator operator++(int) noexcept { reverse_iterator old(*this); --current_; return old; }
+    reverse_iterator& operator--() noexcept { ++current_; return *this; }
+    reverse_iterator operator--(int) noexcept { reverse_iterator old(*this); ++current_; return old; }
+    reverse_iterator& operator+=(difference_type offset) noexcept { current_ -= offset; return *this; }
+    reverse_iterator& operator-=(difference_type offset) noexcept { current_ += offset; return *this; }
+
+    reverse_iterator operator+(difference_type offset) const noexcept {
+        reverse_iterator result(*this); result += offset; return result;
+    }
+    reverse_iterator operator-(difference_type offset) const noexcept {
+        reverse_iterator result(*this); result -= offset; return result;
+    }
+
+private:
+    pointer current_;
+};
+
+template <typename LP, typename LR, typename RP, typename RR, typename D>
+inline bool operator==(const reverse_iterator<LP, LR, D>& lhs,
+                       const reverse_iterator<RP, RR, D>& rhs) noexcept {
+    return lhs.base() == rhs.base();
+}
+
+template <typename LP, typename LR, typename RP, typename RR, typename D>
+inline bool operator!=(const reverse_iterator<LP, LR, D>& lhs,
+                       const reverse_iterator<RP, RR, D>& rhs) noexcept {
+    return !(lhs == rhs);
+}
+
+template <typename LP, typename LR, typename RP, typename RR, typename D>
+inline bool operator<(const reverse_iterator<LP, LR, D>& lhs,
+                      const reverse_iterator<RP, RR, D>& rhs) noexcept {
+    return rhs.base() < lhs.base();
+}
+
+template <typename LP, typename LR, typename RP, typename RR, typename D>
+inline bool operator>(const reverse_iterator<LP, LR, D>& lhs,
+                      const reverse_iterator<RP, RR, D>& rhs) noexcept {
+    return rhs < lhs;
+}
+
+template <typename LP, typename LR, typename RP, typename RR, typename D>
+inline bool operator<=(const reverse_iterator<LP, LR, D>& lhs,
+                       const reverse_iterator<RP, RR, D>& rhs) noexcept {
+    return !(rhs < lhs);
+}
+
+template <typename LP, typename LR, typename RP, typename RR, typename D>
+inline bool operator>=(const reverse_iterator<LP, LR, D>& lhs,
+                       const reverse_iterator<RP, RR, D>& rhs) noexcept {
+    return !(lhs < rhs);
+}
+
+template <typename LP, typename LR, typename RP, typename RR, typename D>
+inline D operator-(const reverse_iterator<LP, LR, D>& lhs,
+                   const reverse_iterator<RP, RR, D>& rhs) noexcept {
+    return rhs.base() - lhs.base();
+}
+
+template <typename P, typename R, typename D>
+inline reverse_iterator<P, R, D> operator+(D offset,
+                                           const reverse_iterator<P, R, D>& value) noexcept {
+    return value + offset;
+}
+
+} // namespace compat_detail
+
+// API-only placeholders. Full builds use the concrete Tracer/std::string
+// callbacks from reflect_macro.h; Linux compatibility builds never invoke an
+// expander, but keeping these public names and virtual methods lets business
+// interfaces compile unchanged without pulling a standard header into PCH.
+typedef void (*DynamicExpandFn)();
+typedef void (*DynamicExpandArrayFn)();
+
+template <typename T> struct ReflectAccess;
+struct ReflectFriendMarker {};
+
+template <typename T>
+struct GeneratedMemberNameTable {
+    static constexpr bool generated = false;
+    static const void* class_id() noexcept { return nullptr; }
+    static const char* const* names() noexcept { return nullptr; }
+    static size_type count() noexcept { return 0; }
+};
+
+struct WaveDirtyHook {
+    typedef void (*MarkFn)(void*, uint32_type);
+
+    void* tracer;
+    uint32_type group_id;
+    MarkFn mark_fn;
+
+    WaveDirtyHook() noexcept : tracer(nullptr), group_id(~uint32_type(0)), mark_fn(nullptr) {}
+    WaveDirtyHook(const WaveDirtyHook&) noexcept : tracer(nullptr), group_id(~uint32_type(0)), mark_fn(nullptr) {}
+    WaveDirtyHook(WaveDirtyHook&&) noexcept : tracer(nullptr), group_id(~uint32_type(0)), mark_fn(nullptr) {}
+
+    WaveDirtyHook& operator=(const WaveDirtyHook&) noexcept { clear(); return *this; }
+    WaveDirtyHook& operator=(WaveDirtyHook&&) noexcept { clear(); return *this; }
+
+    void clear() noexcept {
+        tracer = nullptr;
+        group_id = ~uint32_type(0);
+        mark_fn = nullptr;
+    }
+
+    void bind(void* owner, uint32_type id, MarkFn fn) noexcept {
+        tracer = owner;
+        group_id = id;
+        mark_fn = fn;
+    }
+
+    void mark_dirty() const noexcept {
+        // Preserve harmless user-supplied hook behavior while WaveTrace itself
+        // remains absent in Linux API-only builds.
+        if (tracer && mark_fn && group_id != ~uint32_type(0)) mark_fn(tracer, group_id);
+    }
+};
+
+struct DirectReflectPointerTarget {};
+
+struct DynamicTraceTarget {
+    virtual ~DynamicTraceTarget() {}
+    virtual const void* wave_trace_target_ptr() const = 0;
+    virtual const void* wave_trace_target_type_tag() const = 0;
+    virtual uint32_type wave_trace_target_byte_width() const { return 0; }
+    virtual WaveDirtyHook* wave_trace_dirty_hook() const { return nullptr; }
+    virtual DynamicExpandFn wave_trace_dynamic_expander() const { return nullptr; }
+};
+
+template <typename T>
+struct DynamicTraceTargetFor : DynamicTraceTarget {
+protected:
+    mutable WaveDirtyHook dynamic_trace_dirty_hook_;
+public:
+    const void* wave_trace_target_ptr() const override { return static_cast<const T*>(this); }
+    const void* wave_trace_target_type_tag() const override { return reflect::type_tag_of<T>(); }
+    uint32_type wave_trace_target_byte_width() const override { return static_cast<uint32_type>(sizeof(T)); }
+    WaveDirtyHook* wave_trace_dirty_hook() const override { return wave_dirty_hook(); }
+    WaveDirtyHook* wave_dirty_hook() const { return &dynamic_trace_dirty_hook_; }
+};
+
+struct PeekTraceSource {
+    virtual ~PeekTraceSource() {}
+    virtual const void* wave_trace_peek_ptr() const = 0;
+    virtual const void* wave_trace_peek_type_tag() const = 0;
+    virtual uint32_type wave_trace_peek_byte_width() const { return 0; }
+    virtual WaveDirtyHook* wave_trace_peek_dirty_hook() const { return nullptr; }
+    virtual DynamicExpandFn wave_trace_peek_dynamic_expander() const { return nullptr; }
+};
+
+template <typename DerivedT, typename ValueT>
+struct PeekTraceSourceFor : PeekTraceSource {
+    typedef ValueT wave_trace_peek_value_type;
+protected:
+    mutable WaveDirtyHook peek_trace_dirty_hook_;
+public:
+    const void* wave_trace_peek_ptr() const override {
+        DerivedT* self = const_cast<DerivedT*>(static_cast<const DerivedT*>(this));
+        return static_cast<const void*>(self->peek());
+    }
+    const void* wave_trace_peek_type_tag() const override { return reflect::type_tag_of<ValueT>(); }
+    uint32_type wave_trace_peek_byte_width() const override { return static_cast<uint32_type>(sizeof(ValueT)); }
+    DynamicExpandFn wave_trace_peek_dynamic_expander() const override { return nullptr; }
+    WaveDirtyHook* wave_trace_peek_dirty_hook() const override { return wave_dirty_hook(); }
+    WaveDirtyHook* wave_dirty_hook() const { return &peek_trace_dirty_hook_; }
+};
+
+template <typename T>
+struct BoolStoragePtr { const T* ptr; };
+
+template <typename T>
+inline BoolStoragePtr<T> as_bool_storage_ptr(const T* ptr) noexcept {
+    BoolStoragePtr<T> result = { ptr };
+    return result;
+}
+
+template <typename T>
+class WaveValue {
+public:
+    typedef T value_type;
+
+    WaveValue() noexcept : value_() {}
+    WaveValue(const T& value) noexcept : value_(value) {}
+    WaveValue(const WaveValue&) noexcept = default;
+    WaveValue& operator=(const WaveValue&) noexcept = default;
+    WaveValue& operator=(const T& value) noexcept { value_ = value; return *this; }
+    operator T() const noexcept { return value_; }
+    const T& read() const noexcept { return value_; }
+    T& raw_unsafe_for_initialization_only() noexcept { return value_; }
+    WaveValue& operator+=(const T& value) noexcept { value_ = static_cast<T>(value_ + value); return *this; }
+    WaveValue& operator-=(const T& value) noexcept { value_ = static_cast<T>(value_ - value); return *this; }
+    WaveValue& operator*=(const T& value) noexcept { value_ = static_cast<T>(value_ * value); return *this; }
+    WaveValue& operator/=(const T& value) noexcept { value_ = static_cast<T>(value_ / value); return *this; }
+    WaveValue& operator%=(const T& value) noexcept { value_ = static_cast<T>(value_ % value); return *this; }
+    WaveValue& operator&=(const T& value) noexcept { value_ = static_cast<T>(value_ & value); return *this; }
+    WaveValue& operator|=(const T& value) noexcept { value_ = static_cast<T>(value_ | value); return *this; }
+    WaveValue& operator^=(const T& value) noexcept { value_ = static_cast<T>(value_ ^ value); return *this; }
+    WaveValue& operator<<=(int bits) noexcept { value_ = static_cast<T>(value_ << bits); return *this; }
+    WaveValue& operator>>=(int bits) noexcept { value_ = static_cast<T>(value_ >> bits); return *this; }
+    WaveValue& operator++() noexcept { value_ = static_cast<T>(value_ + T(1)); return *this; }
+    T operator++(int) noexcept { T old = value_; ++(*this); return old; }
+    WaveValue& operator--() noexcept { value_ = static_cast<T>(value_ - T(1)); return *this; }
+    T operator--(int) noexcept { T old = value_; --(*this); return old; }
+private:
+    T value_;
+};
+
+template <typename T> struct wave_value_underlying { typedef T type; };
+template <typename T> struct wave_value_underlying<WaveValue<T> > { typedef T type; };
+
+typedef WaveValue<bool> WaveBool;
+typedef WaveValue<char> WaveChar;
+typedef WaveValue<__INT8_TYPE__> WaveI8;
+typedef WaveValue<__UINT8_TYPE__> WaveU8;
+typedef WaveValue<__INT16_TYPE__> WaveI16;
+typedef WaveValue<__UINT16_TYPE__> WaveU16;
+typedef WaveValue<__INT32_TYPE__> WaveI32;
+typedef WaveValue<__UINT32_TYPE__> WaveU32;
+typedef WaveValue<__INT64_TYPE__> WaveI64;
+typedef WaveValue<__UINT64_TYPE__> WaveU64;
+typedef WaveValue<float> WaveFloat;
+typedef WaveValue<double> WaveDouble;
+
+template <typename T, size_type N>
+struct array {
+    typedef T value_type;
+    typedef wave::size_type size_type;
+    typedef wave::difference_type difference_type;
+    typedef T& reference;
+    typedef const T& const_reference;
+    typedef T* pointer;
+    typedef const T* const_pointer;
+    typedef T* iterator;
+    typedef const T* const_iterator;
+    typedef compat_detail::reverse_iterator<iterator, reference, difference_type> reverse_iterator;
+    typedef compat_detail::reverse_iterator<const_iterator, const_reference, difference_type> const_reverse_iterator;
+
+    // The one-slot N==0 representation is only a compile-compatibility corner
+    // case; ordinary N>0 arrays retain T[N] layout and alignment.
+    T storage_[N == 0 ? 1 : N];
+
+    array() = default;
+
+    array(const T (&values)[N == 0 ? 1 : N]) {
+        for (size_type i = 0; i < N; ++i) storage_[i] = values[i];
+    }
+
+    // Keep the API-only Linux surface source-compatible with the full
+    // wave::array without including <array> (or any other standard header) in
+    // the GCC/distcc PCH.  In particular, business code commonly passes a
+    // std::array<T,N> to an interface taking const wave::array<T,N>&.  The
+    // dependent operator[] expression makes this constructor participate only
+    // for fixed/indexable array-like objects; std::array does not need to be
+    // declared here and is complete by the time the conversion is instantiated.
+    template <typename ArrayLike,
+              typename ElementReference = decltype(
+                  (*static_cast<const ArrayLike*>(nullptr))[size_type(0)])>
+    array(const ArrayLike& other) {
+        assign_from_array_like_(other);
+    }
+
+    template <typename ArrayLike,
+              typename compat_detail::enable_if<
+                  !compat_detail::is_lvalue_reference<ArrayLike>::value,
+                  int>::type = 0,
+              typename ElementReference = decltype(
+                  (*static_cast<ArrayLike*>(nullptr))[size_type(0)])>
+    array(ArrayLike&& other) {
+        move_from_array_like_(other);
+    }
+
+    template <typename ArrayLike>
+    auto operator=(const ArrayLike& other)
+        -> decltype(other[size_type(0)], *this) {
+        assign_from_array_like_(other);
+        return *this;
+    }
+
+
+    template <typename ArrayLike,
+              typename compat_detail::enable_if<
+                  !compat_detail::is_lvalue_reference<ArrayLike>::value,
+                  int>::type = 0>
+    auto operator=(ArrayLike&& other)
+        -> decltype(other[size_type(0)], *this) {
+        move_from_array_like_(other);
+        return *this;
+    }
+
+    T& operator[](size_type index) noexcept { return storage_[index]; }
+    const T& operator[](size_type index) const noexcept { return storage_[index]; }
+    T& at(size_type index) noexcept { return storage_[index]; }
+    const T& at(size_type index) const noexcept { return storage_[index]; }
+    T& front() noexcept { return storage_[0]; }
+    const T& front() const noexcept { return storage_[0]; }
+    T& back() noexcept { return storage_[N - 1]; }
+    const T& back() const noexcept { return storage_[N - 1]; }
+    const T& read(size_type index) const noexcept { return storage_[index]; }
+    const array& read() const noexcept { return *this; }
+    constexpr size_type size() const noexcept { return N; }
+    constexpr size_type max_size() const noexcept { return N; }
+    constexpr bool empty() const noexcept { return N == 0; }
+    T* data() noexcept { return storage_; }
+    const T* data() const noexcept { return storage_; }
+    iterator begin() noexcept { return storage_; }
+    const_iterator begin() const noexcept { return storage_; }
+    const_iterator cbegin() const noexcept { return storage_; }
+    iterator end() noexcept { return storage_ + N; }
+    const_iterator end() const noexcept { return storage_ + N; }
+    const_iterator cend() const noexcept { return storage_ + N; }
+    reverse_iterator rbegin() noexcept { return reverse_iterator(end()); }
+    const_reverse_iterator rbegin() const noexcept { return const_reverse_iterator(end()); }
+    const_reverse_iterator crbegin() const noexcept { return const_reverse_iterator(cend()); }
+    reverse_iterator rend() noexcept { return reverse_iterator(begin()); }
+    const_reverse_iterator rend() const noexcept { return const_reverse_iterator(begin()); }
+    const_reverse_iterator crend() const noexcept { return const_reverse_iterator(cbegin()); }
+    void fill(const T& value) { for (size_type i = 0; i < N; ++i) storage_[i] = value; }
+    void swap(array& other) noexcept {
+        for (size_type i = 0; i < N; ++i) {
+            T temporary = static_cast<T&&>(storage_[i]);
+            storage_[i] = static_cast<T&&>(other.storage_[i]);
+            other.storage_[i] = static_cast<T&&>(temporary);
+        }
+    }
+    array* operator&() noexcept { return this; }
+    const array* operator&() const noexcept { return this; }
+
+    // The full implementation exposes its underlying std::array by const
+    // reference.  The header-only Linux surface cannot name std::array without
+    // importing a standard header into the PCH, so provide a checked value
+    // conversion to any matching fixed/indexable target instead.  This keeps
+    // calls taking const std::array<T,N>& source-compatible and avoids aliasing
+    // one unrelated class layout as another.
+    template <typename ArrayLike,
+              typename ElementReference = decltype(
+                  (*static_cast<ArrayLike*>(nullptr))[size_type(0)])>
+    operator ArrayLike() const {
+        ArrayLike result = {};
+        copy_to_array_like_(result);
+        return result;
+    }
+
+    operator T*() = delete;
+    operator const T*() const = delete;
+
+private:
+    template <typename ArrayLike>
+    void assign_from_array_like_(const ArrayLike& other) {
+        // Reject dynamic containers and mismatched fixed arrays at compile
+        // time.  This keeps the header independent of <type_traits>/<array>
+        // without turning the convenience conversion into an unchecked read.
+        static_assert(N == 0 || sizeof(ArrayLike) == sizeof(storage_),
+                      "wave::array conversion requires matching fixed storage");
+        static_assert(N == 0 || sizeof(other[size_type(0)]) == sizeof(T),
+                      "wave::array conversion requires matching element width");
+        for (size_type i = 0; i < N; ++i) storage_[i] = other[i];
+    }
+
+
+    template <typename ArrayLike>
+    void move_from_array_like_(ArrayLike& other) {
+        static_assert(N == 0 || sizeof(ArrayLike) == sizeof(storage_),
+                      "wave::array move conversion requires matching fixed storage");
+        static_assert(N == 0 || sizeof(other[size_type(0)]) == sizeof(T),
+                      "wave::array move conversion requires matching element width");
+        for (size_type i = 0; i < N; ++i) {
+            storage_[i] = compat_detail::move(other[i]);
+        }
+    }
+
+    template <typename ArrayLike>
+    void copy_to_array_like_(ArrayLike& other) const {
+        static_assert(N == 0 || sizeof(ArrayLike) == sizeof(storage_),
+                      "wave::array target conversion requires matching fixed storage");
+        static_assert(N == 0 || sizeof(other[size_type(0)]) == sizeof(T),
+                      "wave::array target conversion requires matching element width");
+        for (size_type i = 0; i < N; ++i) other[i] = storage_[i];
+    }
+};
+
+template <typename T, size_type N>
+inline bool operator==(const array<T, N>& lhs, const array<T, N>& rhs) {
+    for (size_type i = 0; i < N; ++i) if (!(lhs[i] == rhs[i])) return false;
+    return true;
+}
+template <typename T, size_type N>
+inline bool operator!=(const array<T, N>& lhs, const array<T, N>& rhs) { return !(lhs == rhs); }
+
+template <typename T, size_type N>
+inline bool operator<(const array<T, N>& lhs, const array<T, N>& rhs) {
+    for (size_type i = 0; i < N; ++i) {
+        if (lhs[i] < rhs[i]) return true;
+        if (rhs[i] < lhs[i]) return false;
+    }
+    return false;
+}
+
+template <typename T, size_type N>
+inline bool operator>(const array<T, N>& lhs, const array<T, N>& rhs) { return rhs < lhs; }
+
+template <typename T, size_type N>
+inline bool operator<=(const array<T, N>& lhs, const array<T, N>& rhs) { return !(rhs < lhs); }
+
+template <typename T, size_type N>
+inline bool operator>=(const array<T, N>& lhs, const array<T, N>& rhs) { return !(lhs < rhs); }
+
+template <typename T, size_type N>
+inline void swap(array<T, N>& lhs, array<T, N>& rhs) noexcept { lhs.swap(rhs); }
+
+template <size_type I, typename T, size_type N>
+inline T& get(array<T, N>& value) noexcept { static_assert(I < N, "wave::array index out of range"); return value[I]; }
+template <size_type I, typename T, size_type N>
+inline const T& get(const array<T, N>& value) noexcept { static_assert(I < N, "wave::array index out of range"); return value[I]; }
+
+template <size_type I, typename T, size_type N>
+inline T&& get(array<T, N>&& value) noexcept {
+    static_assert(I < N, "wave::array index out of range");
+    return compat_detail::move(value[I]);
+}
+
+template <size_type I, typename T, size_type N>
+inline const T&& get(const array<T, N>&& value) noexcept {
+    static_assert(I < N, "wave::array index out of range");
+    return compat_detail::move(value[I]);
+}
+
+template <typename T> struct wave_array_traits;
+
+template <typename T, size_type N>
+struct wave_array_traits<array<T, N> > {
+    typedef T element_type;
+    static const size_type size = N;
+};
+
+} // namespace wave
+
+#ifndef WAVE_REFLECT_FRIEND
+#define WAVE_REFLECT_FRIEND
+#endif
+#ifndef WAVE_PTR
+#define WAVE_PTR
+#endif
+#ifndef WAVE_PTR_ARRAY
+#define WAVE_PTR_ARRAY(count)
+#endif
+
+#else
+
 // Lightweight public surface for business model headers.
 // Include this header instead of wave_runtime.h when a business type only needs
 // reflection opt-in macros, WaveValue<T>, wave::array<T,N>, or WaveDirtyHook.
@@ -60,6 +586,7 @@ inline const void* type_tag_of() {
 namespace wave {
 
 class Tracer;
+template <typename T, std::size_t N> class array;
 typedef std::uint64_t NodeId;
 typedef NodeId (*DynamicExpandFn)(Tracer&, const std::string&, NodeId, const void*);
 typedef bool (*DynamicExpandArrayFn)(Tracer&, NodeId, const void*, std::size_t);
@@ -255,6 +782,37 @@ struct GeneratedMemberId {
     const void* class_id;
     std::uint32_t member_id;
 };
+
+// Runtime identity for a WAVE_PTR/WAVE_PTR_ARRAY member. Unlike
+// GeneratedMemberId this key is also forwarded through fixed pointer-slot
+// arrays, where every indexed child must share the owning member's JSON switch.
+struct AnnotatedPointerMemberKey {
+    AnnotatedPointerMemberKey() : class_name(NULL), member_name(NULL) {}
+    AnnotatedPointerMemberKey(const char* class_name_in, const char* member_name_in)
+        : class_name(class_name_in), member_name(member_name_in) {}
+    bool valid() const noexcept {
+        return class_name != NULL && class_name[0] != '\0' &&
+               member_name != NULL && member_name[0] != '\0';
+    }
+    const char* class_name;
+    const char* member_name;
+};
+
+inline AnnotatedPointerMemberKey annotated_pointer_member_key_or_invalid() {
+    return AnnotatedPointerMemberKey();
+}
+
+template <typename... Rest>
+inline AnnotatedPointerMemberKey annotated_pointer_member_key_or_invalid(
+    AnnotatedPointerMemberKey key, Rest&&...) {
+    return key;
+}
+
+template <typename First, typename... Rest>
+inline AnnotatedPointerMemberKey annotated_pointer_member_key_or_invalid(
+    First&&, Rest&&... rest) {
+    return annotated_pointer_member_key_or_invalid(std::forward<Rest>(rest)...);
+}
 
 struct UnionFieldBase {
     UnionFieldBase() : ptr(nullptr) {}
@@ -536,52 +1094,6 @@ struct is_wave_value : std::false_type {};
 
 template <typename T> struct is_wave_array : std::false_type {};
 
-template <typename PtrT> struct is_wave_ptr_storage : std::false_type {};
-
-template <typename PtrT> struct wave_ptr_storage_traits {
-    typedef void element_type;
-};
-
-template <typename T>
-struct is_wave_ptr_storage<T*> : std::integral_constant<bool,
-    !std::is_void<typename std::remove_cv<T>::type>::value &&
-    !std::is_array<typename std::remove_cv<T>::type>::value
-> {};
-
-template <typename T>
-struct wave_ptr_storage_traits<T*> {
-    typedef T element_type;
-    static element_type* get(T* p) noexcept { return p; }
-    static void reset(T*& p) noexcept { p = NULL; }
-    static void reset(T*& p, element_type* value) noexcept { p = value; }
-};
-
-template <typename T, typename D>
-struct is_wave_ptr_storage<std::unique_ptr<T, D> > : std::integral_constant<bool,
-    !std::is_void<typename std::remove_cv<T>::type>::value &&
-    !std::is_array<T>::value
-> {};
-
-template <typename T, typename D>
-struct wave_ptr_storage_traits<std::unique_ptr<T, D> > {
-    typedef T element_type;
-    static element_type* get(const std::unique_ptr<T, D>& p) noexcept { return p.get(); }
-    static void reset(std::unique_ptr<T, D>& p) noexcept { p.reset(); }
-};
-
-template <typename T>
-struct is_wave_ptr_storage<std::shared_ptr<T> > : std::integral_constant<bool,
-    !std::is_void<typename std::remove_cv<T>::type>::value &&
-    !std::is_array<T>::value
-> {};
-
-template <typename T>
-struct wave_ptr_storage_traits<std::shared_ptr<T> > {
-    typedef T element_type;
-    static element_type* get(const std::shared_ptr<T>& p) noexcept { return p.get(); }
-    static void reset(std::shared_ptr<T>& p) noexcept { p.reset(); }
-};
-
 template <typename T> struct is_wave_ptr : std::false_type {};
 
 } // namespace detail
@@ -785,142 +1297,419 @@ WAVE_DEFINE_WAVEVALUE_ALIAS(WaveDouble, double);
 static_assert(sizeof(WaveValue<std::uint32_t>) == sizeof(std::uint32_t), "WaveValue size mismatch");
 static_assert(alignof(WaveValue<std::uint32_t>) == alignof(std::uint32_t), "WaveValue align mismatch");
 
-// WavePtr<PtrT> is a pointer-like wrapper whose tracing semantic is:
-// expand the object(s) currently referenced by the wrapped pointer.  By default
-// it expands a single object; business code may call declareSize(n) before
-// tracing topology is prepared to expand ptr[0]..ptr[n-1].
-//
-// Supported PtrT forms:
-//   T*
-//   std::unique_ptr<T, D>
-//   std::shared_ptr<T>
-//
-// The pointee T does not need to inherit DirectReflectPointerTarget.  The
-// wrapper itself is the explicit opt-in marker.  Topology is still stable:
-// changing the pointer or declared size after topology preparation does not
-// rebuild the tree.
-template <typename PtrT>
-class WavePtr {
-    static_assert(detail::is_wave_ptr_storage<PtrT>::value,
-                  "wave::WavePtr<PtrT> requires PtrT to be T*, std::unique_ptr<T, D>, or std::shared_ptr<T> for a non-array object type");
-
-public:
-    typedef PtrT pointer_type;
-    typedef typename detail::wave_ptr_storage_traits<PtrT>::element_type element_type;
-
-    WavePtr() noexcept : ptr_(), declared_size_(1) {}
-    WavePtr(std::nullptr_t) noexcept : ptr_(), declared_size_(1) {}
-    WavePtr(const WavePtr& other) = default;
-    WavePtr& operator=(const WavePtr& other) = default;
-    WavePtr(WavePtr&& other) noexcept : ptr_(std::move(other.ptr_)), declared_size_(other.declared_size_) {}
-    WavePtr& operator=(WavePtr&& other) noexcept {
-        ptr_ = std::move(other.ptr_);
-        declared_size_ = other.declared_size_;
-        return *this;
-    }
-
-    template <typename U = PtrT, typename std::enable_if<std::is_pointer<U>::value, int>::type = 0>
-    WavePtr(element_type* ptr) noexcept : ptr_(ptr), declared_size_(1) {}
-
-    template <typename U = PtrT, typename std::enable_if<std::is_pointer<U>::value, int>::type = 0>
-    WavePtr& operator=(element_type* ptr) noexcept {
-        detail::wave_ptr_storage_traits<PtrT>::reset(ptr_, ptr);
-        return *this;
-    }
-
-    template <typename U = PtrT, typename std::enable_if<
-        !std::is_pointer<PtrT>::value &&
-        !std::is_pointer<U>::value &&
-        std::is_constructible<PtrT, const U&>::value, int>::type = 0>
-    WavePtr(const U& ptr) : ptr_(ptr), declared_size_(1) {}
-
-    template <typename U = PtrT, typename std::enable_if<
-        !std::is_pointer<PtrT>::value &&
-        !std::is_pointer<U>::value &&
-        std::is_assignable<PtrT&, const U&>::value, int>::type = 0>
-    WavePtr& operator=(const U& ptr) {
-        ptr_ = ptr;
-        return *this;
-    }
-
-    template <typename U = PtrT, typename std::enable_if<
-        !std::is_pointer<U>::value &&
-        std::is_constructible<PtrT, PtrT&&>::value, int>::type = 0>
-    WavePtr(PtrT&& ptr) noexcept : ptr_(std::move(ptr)), declared_size_(1) {}
-
-    template <typename U = PtrT, typename std::enable_if<
-        !std::is_pointer<U>::value &&
-        std::is_assignable<PtrT&, PtrT&&>::value, int>::type = 0>
-    WavePtr& operator=(PtrT&& ptr) noexcept {
-        ptr_ = std::move(ptr);
-        return *this;
-    }
-
-    WavePtr& operator=(std::nullptr_t) noexcept {
-        detail::wave_ptr_storage_traits<PtrT>::reset(ptr_);
-        return *this;
-    }
-
-    element_type* get() const noexcept {
-        return detail::wave_ptr_storage_traits<PtrT>::get(ptr_);
-    }
-
-    element_type& operator*() const noexcept { return *get(); }
-    element_type* operator->() const noexcept { return get(); }
-    element_type& operator[](std::size_t index) const noexcept { return get()[index]; }
-    operator element_type*() const noexcept { return get(); }
-
-    template <typename U = PtrT, typename std::enable_if<!std::is_pointer<U>::value, int>::type = 0>
-    operator U&() noexcept { return ptr_; }
-
-    template <typename U = PtrT, typename std::enable_if<!std::is_pointer<U>::value, int>::type = 0>
-    operator const U&() const noexcept { return ptr_; }
-
-    template <typename U = PtrT, typename std::enable_if<!std::is_pointer<U>::value, int>::type = 0>
-    operator U&&() && noexcept { return std::move(ptr_); }
-
-    explicit operator bool() const noexcept { return get() != NULL; }
-
-    WavePtr& declareSize(std::size_t count) noexcept {
-        declared_size_ = count;
-        return *this;
-    }
-
-    std::size_t declared_size() const noexcept { return declared_size_; }
-    std::size_t declaredSize() const noexcept { return declared_size_; }
-
-    void reset() noexcept {
-        detail::wave_ptr_storage_traits<PtrT>::reset(ptr_);
-    }
-
-    PtrT& storage() noexcept { return ptr_; }
-    const PtrT& storage() const noexcept { return ptr_; }
-
-    PtrT& raw_storage_unsafe_for_initialization_only() noexcept { return ptr_; }
-    const PtrT& raw_storage_unsafe_for_initialization_only() const noexcept { return ptr_; }
-
-private:
-    PtrT ptr_;
-    std::size_t declared_size_;
-};
-
-template <typename PtrT>
-struct detail::is_wave_ptr<WavePtr<PtrT> > : std::true_type {};
-
 template <typename WavePtrT>
 struct wave_ptr_traits;
 
-template <typename PtrT>
-struct wave_ptr_traits<WavePtr<PtrT> > {
-    typedef PtrT pointer_type;
-    typedef typename detail::wave_ptr_storage_traits<PtrT>::element_type element_type;
-    static std::size_t declared_size(const WavePtr<PtrT>& ptr) noexcept { return ptr.declared_size(); }
+namespace detail {
+
+// Generated reflection uses these short-lived views to opt an ordinary raw or
+// smart pointer into the pointer-target topology path. They never become
+// business-object members, so WAVE_PTR annotations do not change object layout.
+template <typename T>
+class AnnotatedWavePtrView {
+public:
+    typedef T element_type;
+
+    AnnotatedWavePtrView(T* ptr, std::size_t count) noexcept
+        : ptr_(ptr), count_(count) {}
+
+    T* get() const noexcept { return ptr_; }
+    std::size_t declared_size() const noexcept { return count_; }
+
+private:
+    T* ptr_;
+    std::size_t count_;
 };
 
-template <typename PtrT>
-WavePtr<typename std::decay<PtrT>::type> make_wave_ptr(PtrT&& ptr) {
-    return WavePtr<typename std::decay<PtrT>::type>(std::forward<PtrT>(ptr));
+template <typename T>
+class AnnotatedWeakPtrView {
+public:
+    typedef T element_type;
+
+    AnnotatedWeakPtrView(std::shared_ptr<T> locked, std::size_t count) noexcept
+        : locked_(std::move(locked)), count_(count) {}
+
+    T* get() const noexcept { return locked_.get(); }
+    std::size_t declared_size() const noexcept { return count_; }
+    std::shared_ptr<const void> keepalive() const noexcept {
+        return std::shared_ptr<const void>(locked_);
+    }
+
+private:
+    std::shared_ptr<T> locked_;
+    std::size_t count_;
+};
+
+template <typename T>
+struct is_wave_ptr<AnnotatedWavePtrView<T> > : std::true_type {};
+
+template <typename T>
+struct is_wave_ptr<AnnotatedWeakPtrView<T> > : std::true_type {};
+
+template <typename StorageT>
+struct annotated_pointer_storage_traits;
+
+template <typename T>
+struct annotated_pointer_storage_traits<T*> {
+    typedef T element_type;
+    static T* get(T* ptr) noexcept { return ptr; }
+};
+
+template <typename T, typename Deleter>
+struct annotated_pointer_storage_traits<std::unique_ptr<T, Deleter> > {
+    typedef typename std::unique_ptr<T, Deleter>::element_type element_type;
+    static element_type* get(const std::unique_ptr<T, Deleter>& ptr) noexcept {
+        return ptr.get();
+    }
+};
+
+template <typename T>
+struct annotated_pointer_storage_traits<std::shared_ptr<T> > {
+    typedef typename std::shared_ptr<T>::element_type element_type;
+    static element_type* get(const std::shared_ptr<T>& ptr) noexcept { return ptr.get(); }
+};
+
+template <typename T>
+struct annotated_weak_pointer_storage_traits;
+
+template <typename T>
+struct annotated_weak_pointer_storage_traits<std::weak_ptr<T> > {
+    typedef T element_type;
+    static std::shared_ptr<T> lock(const std::weak_ptr<T>& ptr) noexcept {
+        return ptr.lock();
+    }
+};
+
+template <typename StorageT>
+struct annotated_pointer_storage_array_traits {
+    typedef typename annotated_pointer_storage_traits<StorageT>::element_type element_type;
+    static constexpr std::size_t slot_count = 1u;
+};
+
+template <typename StorageT, std::size_t N>
+struct annotated_pointer_storage_array_traits<StorageT[N]> {
+    typedef typename annotated_pointer_storage_array_traits<StorageT>::element_type element_type;
+    static constexpr std::size_t slot_count =
+        N * annotated_pointer_storage_array_traits<StorageT>::slot_count;
+};
+
+template <typename StorageT, std::size_t N>
+struct annotated_pointer_storage_array_traits<std::array<StorageT, N> > {
+    typedef typename annotated_pointer_storage_array_traits<StorageT>::element_type element_type;
+    static constexpr std::size_t slot_count =
+        N * annotated_pointer_storage_array_traits<StorageT>::slot_count;
+};
+
+template <typename StorageT, std::size_t N>
+struct annotated_pointer_storage_array_traits< ::wave::array<StorageT, N> > {
+    typedef typename annotated_pointer_storage_array_traits<StorageT>::element_type element_type;
+    static constexpr std::size_t slot_count =
+        N * annotated_pointer_storage_array_traits<StorageT>::slot_count;
+};
+
+template <typename StorageT>
+struct annotated_weak_pointer_storage_array_traits {
+    typedef typename annotated_weak_pointer_storage_traits<StorageT>::element_type element_type;
+    static constexpr std::size_t slot_count = 1u;
+};
+
+template <typename StorageT, std::size_t N>
+struct annotated_weak_pointer_storage_array_traits<StorageT[N]> {
+    typedef typename annotated_weak_pointer_storage_array_traits<StorageT>::element_type element_type;
+    static constexpr std::size_t slot_count =
+        N * annotated_weak_pointer_storage_array_traits<StorageT>::slot_count;
+};
+
+template <typename StorageT, std::size_t N>
+struct annotated_weak_pointer_storage_array_traits<std::array<StorageT, N> > {
+    typedef typename annotated_weak_pointer_storage_array_traits<StorageT>::element_type element_type;
+    static constexpr std::size_t slot_count =
+        N * annotated_weak_pointer_storage_array_traits<StorageT>::slot_count;
+};
+
+template <typename StorageT, std::size_t N>
+struct annotated_weak_pointer_storage_array_traits< ::wave::array<StorageT, N> > {
+    typedef typename annotated_weak_pointer_storage_array_traits<StorageT>::element_type element_type;
+    static constexpr std::size_t slot_count =
+        N * annotated_weak_pointer_storage_array_traits<StorageT>::slot_count;
+};
+
+template <typename StorageT>
+struct is_annotated_pointer_storage_array : std::false_type {};
+
+template <typename StorageT, std::size_t N>
+struct is_annotated_pointer_storage_array<StorageT[N]> : std::true_type {};
+
+template <typename StorageT, std::size_t N>
+struct is_annotated_pointer_storage_array<std::array<StorageT, N> > : std::true_type {};
+
+template <typename StorageT, std::size_t N>
+struct is_annotated_pointer_storage_array< ::wave::array<StorageT, N> > : std::true_type {};
+
+template <typename CountT>
+std::size_t normalize_annotated_pointer_count_impl(CountT count, std::true_type) noexcept {
+    return count < 0 ? 0u : static_cast<std::size_t>(count);
 }
+
+template <typename CountT>
+std::size_t normalize_annotated_pointer_count_impl(CountT count, std::false_type) noexcept {
+    return static_cast<std::size_t>(count);
+}
+
+template <typename CountT>
+std::size_t normalize_annotated_pointer_count_clean(CountT count, std::false_type) noexcept {
+    return normalize_annotated_pointer_count_impl(
+        count,
+        std::integral_constant<bool, std::is_signed<CountT>::value>());
+}
+
+template <typename CountT>
+std::size_t normalize_annotated_pointer_count_clean(CountT count, std::true_type) noexcept {
+    typedef typename std::underlying_type<CountT>::type Underlying;
+    return normalize_annotated_pointer_count_impl(
+        static_cast<Underlying>(count),
+        std::integral_constant<bool, std::is_signed<Underlying>::value>());
+}
+
+template <typename CountT>
+std::size_t normalize_annotated_pointer_count(CountT count) noexcept {
+    typedef typename std::remove_cv<typename std::remove_reference<CountT>::type>::type CleanCount;
+    static_assert(std::is_integral<CleanCount>::value || std::is_enum<CleanCount>::value,
+                  "WAVE_PTR_ARRAY length must be an integral or enum value");
+    return normalize_annotated_pointer_count_clean(
+        static_cast<CleanCount>(count),
+        std::integral_constant<bool, std::is_enum<CleanCount>::value>());
+}
+
+template <typename Visitor, typename StorageT, typename CountT, typename... Meta>
+void invoke_annotated_ptr_visitor(Visitor&& visitor,
+                                  const char* name,
+                                  const StorageT& storage,
+                                  CountT count,
+                                  Meta&&... meta) {
+    typedef typename std::remove_cv<typename std::remove_reference<StorageT>::type>::type CleanStorage;
+    typedef annotated_pointer_storage_traits<CleanStorage> StorageTraits;
+    typedef typename StorageTraits::element_type Element;
+    AnnotatedWavePtrView<Element> view(
+        StorageTraits::get(storage),
+        normalize_annotated_pointer_count(count));
+    invoke_ptr_visitor(std::forward<Visitor>(visitor),
+                       name,
+                       std::addressof(view),
+                       std::forward<Meta>(meta)...);
+}
+
+template <typename Visitor, typename StorageT, typename... Meta>
+void invoke_annotated_weak_ptr_visitor(Visitor&& visitor,
+                                       const char* name,
+                                       const StorageT& storage,
+                                       Meta&&... meta) {
+    typedef typename std::remove_cv<typename std::remove_reference<StorageT>::type>::type CleanStorage;
+    typedef annotated_weak_pointer_storage_traits<CleanStorage> StorageTraits;
+    typedef typename StorageTraits::element_type Element;
+    AnnotatedWeakPtrView<Element> view(StorageTraits::lock(storage), 1u);
+    invoke_ptr_visitor(std::forward<Visitor>(visitor),
+                       name,
+                       std::addressof(view),
+                       std::forward<Meta>(meta)...);
+}
+
+inline std::string annotated_pointer_storage_array_child_name(const std::string& base,
+                                                              std::size_t index) {
+    return base + "[" + std::to_string(index) + "]";
+}
+
+template <typename StorageT>
+struct AnnotatedPointerStorageArrayVisitor {
+    template <typename Visitor, typename CountT>
+    static void visit(Visitor& visitor,
+                      const std::string& name,
+                      const StorageT& storage,
+                      CountT count,
+                      AnnotatedPointerMemberKey member_key) {
+        // Do not forward GeneratedMemberId here: it names the array field, not
+        // an individual pointer slot. The indexed name is consumed immediately
+        // by Tracer and remains unambiguous for nested C arrays.
+        invoke_annotated_ptr_visitor(visitor, name.c_str(), storage, count, member_key);
+    }
+};
+
+template <typename StorageT, std::size_t N>
+struct AnnotatedPointerStorageArrayVisitor<StorageT[N]> {
+    template <typename Visitor, typename CountT>
+    static void visit(Visitor& visitor,
+                      const std::string& name,
+                      const StorageT (&storage)[N],
+                      CountT count,
+                      AnnotatedPointerMemberKey member_key) {
+        for (std::size_t i = 0; i < N; ++i) {
+            AnnotatedPointerStorageArrayVisitor<StorageT>::visit(
+                visitor,
+                annotated_pointer_storage_array_child_name(name, i),
+                storage[i],
+                count,
+                member_key);
+        }
+    }
+};
+
+template <typename StorageT, std::size_t N>
+struct AnnotatedPointerStorageArrayVisitor<std::array<StorageT, N> > {
+    template <typename Visitor, typename CountT>
+    static void visit(Visitor& visitor,
+                      const std::string& name,
+                      const std::array<StorageT, N>& storage,
+                      CountT count,
+                      AnnotatedPointerMemberKey member_key) {
+        for (std::size_t i = 0; i < N; ++i) {
+            AnnotatedPointerStorageArrayVisitor<StorageT>::visit(
+                visitor,
+                annotated_pointer_storage_array_child_name(name, i),
+                storage[i],
+                count,
+                member_key);
+        }
+    }
+};
+
+template <typename StorageT, std::size_t N>
+struct AnnotatedPointerStorageArrayVisitor< ::wave::array<StorageT, N> > {
+    template <typename Visitor, typename CountT>
+    static void visit(Visitor& visitor,
+                      const std::string& name,
+                      const ::wave::array<StorageT, N>& storage,
+                      CountT count,
+                      AnnotatedPointerMemberKey member_key) {
+        for (std::size_t i = 0; i < N; ++i) {
+            AnnotatedPointerStorageArrayVisitor<StorageT>::visit(
+                visitor,
+                annotated_pointer_storage_array_child_name(name, i),
+                storage[i],
+                count,
+                member_key);
+        }
+    }
+};
+
+template <typename StorageT>
+struct AnnotatedWeakPointerStorageArrayVisitor {
+    template <typename Visitor>
+    static void visit(Visitor& visitor,
+                      const std::string& name,
+                      const StorageT& storage,
+                      AnnotatedPointerMemberKey member_key) {
+        invoke_annotated_weak_ptr_visitor(visitor, name.c_str(), storage, member_key);
+    }
+};
+
+template <typename StorageT, std::size_t N>
+struct AnnotatedWeakPointerStorageArrayVisitor<StorageT[N]> {
+    template <typename Visitor>
+    static void visit(Visitor& visitor,
+                      const std::string& name,
+                      const StorageT (&storage)[N],
+                      AnnotatedPointerMemberKey member_key) {
+        for (std::size_t i = 0; i < N; ++i) {
+            AnnotatedWeakPointerStorageArrayVisitor<StorageT>::visit(
+                visitor,
+                annotated_pointer_storage_array_child_name(name, i),
+                storage[i],
+                member_key);
+        }
+    }
+};
+
+template <typename StorageT, std::size_t N>
+struct AnnotatedWeakPointerStorageArrayVisitor<std::array<StorageT, N> > {
+    template <typename Visitor>
+    static void visit(Visitor& visitor,
+                      const std::string& name,
+                      const std::array<StorageT, N>& storage,
+                      AnnotatedPointerMemberKey member_key) {
+        for (std::size_t i = 0; i < N; ++i) {
+            AnnotatedWeakPointerStorageArrayVisitor<StorageT>::visit(
+                visitor,
+                annotated_pointer_storage_array_child_name(name, i),
+                storage[i],
+                member_key);
+        }
+    }
+};
+
+template <typename StorageT, std::size_t N>
+struct AnnotatedWeakPointerStorageArrayVisitor< ::wave::array<StorageT, N> > {
+    template <typename Visitor>
+    static void visit(Visitor& visitor,
+                      const std::string& name,
+                      const ::wave::array<StorageT, N>& storage,
+                      AnnotatedPointerMemberKey member_key) {
+        for (std::size_t i = 0; i < N; ++i) {
+            AnnotatedWeakPointerStorageArrayVisitor<StorageT>::visit(
+                visitor,
+                annotated_pointer_storage_array_child_name(name, i),
+                storage[i],
+                member_key);
+        }
+    }
+};
+
+template <typename Visitor, typename StorageT, typename CountT, typename... Meta>
+void invoke_annotated_ptr_storage_array_visitor(Visitor&& visitor,
+                                                const char* name,
+                                                const StorageT& storage,
+                                                CountT count,
+                                                Meta&&... meta) {
+    typedef typename std::remove_cv<typename std::remove_reference<StorageT>::type>::type CleanStorage;
+    static_assert(is_annotated_pointer_storage_array<CleanStorage>::value,
+                  "annotated pointer storage array helper requires a supported fixed array");
+    AnnotatedPointerStorageArrayVisitor<CleanStorage>::visit(
+        visitor,
+        std::string(name ? name : ""),
+        storage,
+        count,
+        annotated_pointer_member_key_or_invalid(std::forward<Meta>(meta)...));
+}
+
+template <typename Visitor, typename StorageT, typename... Meta>
+void invoke_annotated_weak_ptr_storage_array_visitor(Visitor&& visitor,
+                                                     const char* name,
+                                                     const StorageT& storage,
+                                                     Meta&&... meta) {
+    typedef typename std::remove_cv<typename std::remove_reference<StorageT>::type>::type CleanStorage;
+    static_assert(is_annotated_pointer_storage_array<CleanStorage>::value,
+                  "annotated weak pointer storage array helper requires a supported fixed array");
+    AnnotatedWeakPointerStorageArrayVisitor<CleanStorage>::visit(
+        visitor,
+        std::string(name ? name : ""),
+        storage,
+        annotated_pointer_member_key_or_invalid(std::forward<Meta>(meta)...));
+}
+
+} // namespace detail
+
+template <typename T>
+struct wave_ptr_traits<detail::AnnotatedWavePtrView<T> > {
+    typedef T* pointer_type;
+    typedef T element_type;
+    static std::size_t declared_size(const detail::AnnotatedWavePtrView<T>& ptr) noexcept {
+        return ptr.declared_size();
+    }
+    static std::shared_ptr<const void> keepalive(const detail::AnnotatedWavePtrView<T>&) noexcept {
+        return std::shared_ptr<const void>();
+    }
+};
+
+template <typename T>
+struct wave_ptr_traits<detail::AnnotatedWeakPtrView<T> > {
+    typedef std::weak_ptr<T> pointer_type;
+    typedef T element_type;
+    static std::size_t declared_size(const detail::AnnotatedWeakPtrView<T>& ptr) noexcept {
+        return ptr.declared_size();
+    }
+    static std::shared_ptr<const void> keepalive(const detail::AnnotatedWeakPtrView<T>& ptr) noexcept {
+        return ptr.keepalive();
+    }
+};
 
 template <typename T, std::size_t N> class array;
 
@@ -1185,6 +1974,22 @@ struct tuple_element<I, ::wave::array<T, N> > {
     using wave_reflect_friend_marker_do_not_use = ::wave::ReflectFriendMarker;
 #endif
 
+// Keyword-like pointer annotations.  Clang retains the payload for ReflectGen;
+// MSVC/GCC see an ordinary pointer/smart-pointer declaration with no ABI change.
+#if defined(__clang__)
+#define WAVE_DETAIL_POINTER_ANNOTATE_(payload) __attribute__((annotate(payload)))
+#else
+#define WAVE_DETAIL_POINTER_ANNOTATE_(payload)
+#endif
+
+#ifndef WAVE_PTR
+#define WAVE_PTR WAVE_DETAIL_POINTER_ANNOTATE_("wavetrace.ptr")
+#endif
+
+#ifndef WAVE_PTR_ARRAY
+#define WAVE_PTR_ARRAY(count) WAVE_DETAIL_POINTER_ANNOTATE_("wavetrace.ptr_array:" #count)
+#endif
+
 #if defined(REFLECT_MACRO_RESTORE_MAX_MACRO_)
 #pragma pop_macro("max")
 #undef REFLECT_MACRO_RESTORE_MAX_MACRO_
@@ -1193,3 +1998,7 @@ struct tuple_element<I, ::wave::array<T, N> > {
 #pragma pop_macro("min")
 #undef REFLECT_MACRO_RESTORE_MIN_MACRO_
 #endif
+
+#endif // !_WIN32
+
+#endif // WAVETRACE_REFLECT_MACRO_H_INCLUDED_

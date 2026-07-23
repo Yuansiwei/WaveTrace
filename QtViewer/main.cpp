@@ -15,6 +15,7 @@
 #include <QGuiApplication>
 #include <QIcon>
 #include <QImage>
+#include <QKeyEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPen>
@@ -25,6 +26,8 @@
 #include <QTextStream>
 #include <QThread>
 #include <QTimer>
+#include <QTreeView>
+#include <QTreeWidget>
 #include <QtGlobal>
 
 #include <memory>
@@ -417,7 +420,13 @@ static int runDumpSignalHead(const QStringList& args) {
             << " width=" << sig.width
             << " samplesLoaded=" << (sig.samplesLoaded ? 1 : 0)
             << " samples=" << sig.samples.size()
-            << " lodLevels=" << sig.lodLevels.size() << "\n";
+            << " lodLevels=" << sig.lodLevels.size()
+            << " proceduralClock=" << (sig.proceduralClock ? 1 : 0);
+        if (sig.proceduralClock) {
+            out << " clockInitial=" << (sig.clockInitialValue ? 1 : 0)
+                << " clockTogglePeriod=" << sig.clockTogglePeriodTicks;
+        }
+        out << "\n";
         for (int s = 0; s < sig.samples.size() && s < headCount; ++s) {
             const WaveSample& sample = sig.samples.at(s);
             out << "  sample[" << s << "] t=" << sample.time
@@ -485,7 +494,8 @@ static int runRenderBenchmark(QApplication& app, const QStringList& args) {
     QVector<ActiveSignalRef> entries;
     for (int i = 0; i < wave.signalList.size() && entries.size() < requestedSignals; ++i) {
         const WaveSignal& sig = wave.signalList.at(i);
-        if (sig.samples.isEmpty() && sig.lodLevels.isEmpty()) continue;
+        if (!sig.proceduralClock &&
+            sig.samples.isEmpty() && sig.lodLevels.isEmpty()) continue;
         ActiveSignalRef ref;
         ref.signalIndex = i;
         ref.format = sig.defaultRadix;
@@ -544,6 +554,78 @@ static int runRenderBenchmark(QApplication& app, const QStringList& args) {
     return 0;
 }
 
+static int runProceduralClockRenderRegression(QApplication& app) {
+    WaveFile wave;
+    wave.meta.start = 0;
+    wave.meta.end = 10'000'010;
+
+    WaveSignal clock;
+    clock.signalId = 1;
+    clock.storageId = 1;
+    clock.name = QStringLiteral("clk_over_two_million_edges");
+    clock.kind = SignalKind::Bit;
+    clock.width = 1;
+    clock.defaultRadix = ValueRadix::Bin;
+    clock.currentRadix = ValueRadix::Bin;
+    clock.samplesLoaded = true;
+    clock.proceduralClock = true;
+    clock.clockInitialValue = false;
+    clock.clockTogglePeriodTicks = 5;
+    wave.signalList.push_back(clock);
+
+    const WaveSignal& signal = wave.signalList.constFirst();
+    const qint64 millionthEdge =
+        qint64(signal.clockTogglePeriodTicks * 1'000'001ull);
+    if (waveProceduralClockTransitionAtOrAfter(signal, millionthEdge) !=
+            millionthEdge ||
+        waveProceduralClockPreviousTransition(signal, millionthEdge + 1) !=
+            millionthEdge ||
+        waveProceduralClockValueAtTime(signal, millionthEdge - 1) ==
+            waveProceduralClockValueAtTime(signal, millionthEdge)) {
+        QTextStream(stderr) << "error: procedural clock formula failed after one million edges\n";
+        return 5;
+    }
+
+    ActiveSignalRef ref;
+    ref.signalIndex = 0;
+    ref.format = ValueRadix::Bin;
+    QVector<ActiveSignalRef> entries;
+    entries.push_back(ref);
+
+    WaveCanvas canvas;
+    canvas.resize(1600, 240);
+    canvas.setWave(&wave);
+    canvas.setVisibleEntries(entries);
+    canvas.setVisibleEntryWindow(0, 1);
+    canvas.show();
+    processEventsFor(app, 20);
+
+    QPixmap pixmap(canvas.size());
+    pixmap.fill(Qt::transparent);
+    QElapsedTimer timer;
+    timer.start();
+    for (int i = 0; i < 5; ++i) {
+        pixmap.fill(Qt::transparent);
+        canvas.render(&pixmap);
+    }
+    const qint64 renderMs = timer.elapsed();
+
+    if (!wave.signalList.constFirst().samples.isEmpty() ||
+        !wave.signalList.constFirst().lodLevels.isEmpty()) {
+        QTextStream(stderr) << "error: procedural clock rendering materialized samples\n";
+        return 6;
+    }
+
+    QTextStream out(stdout);
+    out << "procedural_clock_render_ok"
+        << " transitions=" << (wave.meta.end / qint64(signal.clockTogglePeriodTicks))
+        << " samples=" << wave.signalList.constFirst().samples.size()
+        << " lod_levels=" << wave.signalList.constFirst().lodLevels.size()
+        << " renders=5"
+        << " elapsed_ms=" << renderMs << "\n";
+    return 0;
+}
+
 static bool lodCompareActivePixel(const QColor& c) {
     return c.green() >= 90 && c.green() >= c.red() + 24 && c.green() >= c.blue() + 24;
 }
@@ -574,6 +656,222 @@ static QImage renderCanvasImage(WaveCanvas& canvas) {
     pixmap.fill(Qt::transparent);
     canvas.render(&pixmap);
     return pixmap.toImage().convertToFormat(QImage::Format_ARGB32);
+}
+
+static int runBitStateRenderRegression(QApplication& app, const QStringList& args) {
+    auto makeSample = [](qint64 time, quint64 value) {
+        WaveSample sample;
+        sample.time = time;
+        sample.rawBits = value;
+        sample.rawFieldsReady = true;
+        return sample;
+    };
+    auto makeWave = [&](bool lodOnly) {
+        WaveFile wave;
+        wave.meta.start = 0;
+        wave.meta.end = 100000;
+        WaveSignal signal;
+        signal.name = QStringLiteral("initial_zero_then_one");
+        signal.kind = SignalKind::Bit;
+        signal.width = 1;
+        signal.defaultRadix = ValueRadix::Bin;
+        signal.currentRadix = ValueRadix::Bin;
+        signal.samplesLoaded = !lodOnly;
+        if (lodOnly) {
+            WaveLodLevel level;
+            level.bucketCycles = 1000;
+            level.samples.push_back(makeSample(0, 0));
+            level.samples.push_back(makeSample(1000, 1));
+            level.validRanges.push_back(WaveLodValidRange{ 0, wave.meta.end });
+            level.loadedRanges.push_back(WaveLodValidRange{ 0, wave.meta.end });
+            signal.lodLevels.push_back(std::move(level));
+        } else {
+            signal.samples.push_back(makeSample(0, 0));
+            signal.samples.push_back(makeSample(1000, 1));
+        }
+        wave.signalList.push_back(std::move(signal));
+        return wave;
+    };
+
+    WaveFile rawWave = makeWave(false);
+    WaveFile lodWave = makeWave(true);
+    WaveFile fragmentedLodWave;
+    fragmentedLodWave.meta.start = 0;
+    fragmentedLodWave.meta.end = 200000;
+    WaveSignal fragmentedSignal;
+    fragmentedSignal.name = QStringLiteral("two_high_pulses_fragmented_legacy_valid_ranges");
+    fragmentedSignal.kind = SignalKind::Bit;
+    fragmentedSignal.width = 1;
+    fragmentedSignal.defaultRadix = ValueRadix::Bin;
+    fragmentedSignal.currentRadix = ValueRadix::Bin;
+    fragmentedSignal.samplesLoaded = false;
+    WaveLodLevel fragmentedLevel;
+    fragmentedLevel.bucketCycles = 1000;
+    fragmentedLevel.samples.push_back(makeSample(30000, 1));
+    fragmentedLevel.samples.push_back(makeSample(50000, 0));
+    fragmentedLevel.samples.push_back(makeSample(90000, 1));
+    fragmentedLevel.samples.push_back(makeSample(110000, 0));
+    fragmentedLevel.validRanges.push_back(WaveLodValidRange{ 30000, 91000 });
+    fragmentedLevel.validRanges.push_back(WaveLodValidRange{ 110000, fragmentedLodWave.meta.end });
+    fragmentedLevel.loadedRanges.push_back(WaveLodValidRange{ 0, fragmentedLodWave.meta.end });
+    fragmentedSignal.lodLevels.push_back(std::move(fragmentedLevel));
+    fragmentedLodWave.signalList.push_back(std::move(fragmentedSignal));
+    WaveFile equalFinalLodWave;
+    equalFinalLodWave.meta.start = 0;
+    equalFinalLodWave.meta.end = 100000;
+    WaveSignal equalFinalSignal;
+    equalFinalSignal.name = QStringLiteral("equal_final_value_but_active_lod_windows");
+    equalFinalSignal.kind = SignalKind::Bit;
+    equalFinalSignal.width = 1;
+    equalFinalSignal.defaultRadix = ValueRadix::Bin;
+    equalFinalSignal.currentRadix = ValueRadix::Bin;
+    equalFinalSignal.samplesLoaded = false;
+    WaveLodLevel equalFinalLevel;
+    equalFinalLevel.bucketCycles = 10000;
+    // Each record is the last transition in an active LOD window.  Equal
+    // final values must still produce one visible activity edge per record.
+    equalFinalLevel.samples.push_back(makeSample(10000, 1));
+    equalFinalLevel.samples.push_back(makeSample(20000, 1));
+    equalFinalLevel.samples.push_back(makeSample(30000, 1));
+    equalFinalLevel.loadedRanges.push_back(WaveLodValidRange{ 0, equalFinalLodWave.meta.end });
+    equalFinalSignal.lodLevels.push_back(std::move(equalFinalLevel));
+    equalFinalLodWave.signalList.push_back(std::move(equalFinalSignal));
+    WaveFile rawDenseWave;
+    rawDenseWave.meta.start = 0;
+    rawDenseWave.meta.end = 100000;
+    WaveSignal rawDenseSignal;
+    rawDenseSignal.name = QStringLiteral("dense_initial_zero_then_one");
+    rawDenseSignal.kind = SignalKind::Bit;
+    rawDenseSignal.width = 1;
+    rawDenseSignal.defaultRadix = ValueRadix::Bin;
+    rawDenseSignal.currentRadix = ValueRadix::Bin;
+    rawDenseSignal.samplesLoaded = true;
+    rawDenseSignal.samples.reserve(10001);
+    for (qint64 time = 0; time < 10000; ++time) {
+        rawDenseSignal.samples.push_back(makeSample(time, static_cast<quint64>(time & 1)));
+    }
+    rawDenseSignal.samples.push_back(makeSample(10000, 1));
+    rawDenseWave.signalList.push_back(std::move(rawDenseSignal));
+    ActiveSignalRef entry;
+    entry.signalIndex = 0;
+    entry.format = ValueRadix::Bin;
+    const QVector<ActiveSignalRef> entries{ entry };
+
+    WaveCanvas rawCanvas;
+    WaveCanvas lodCanvas;
+    WaveCanvas fragmentedLodCanvas;
+    WaveCanvas equalFinalLodCanvas;
+    WaveCanvas rawDenseCanvas;
+    rawCanvas.resize(1000, 150);
+    lodCanvas.resize(1000, 150);
+    fragmentedLodCanvas.resize(1000, 150);
+    equalFinalLodCanvas.resize(1000, 150);
+    rawDenseCanvas.resize(1000, 150);
+    rawCanvas.setWave(&rawWave);
+    lodCanvas.setWave(&lodWave);
+    fragmentedLodCanvas.setWave(&fragmentedLodWave);
+    equalFinalLodCanvas.setWave(&equalFinalLodWave);
+    rawDenseCanvas.setWave(&rawDenseWave);
+    rawCanvas.setVisibleEntries(entries);
+    lodCanvas.setVisibleEntries(entries);
+    fragmentedLodCanvas.setVisibleEntries(entries);
+    equalFinalLodCanvas.setVisibleEntries(entries);
+    rawDenseCanvas.setVisibleEntries(entries);
+    rawCanvas.setVisibleEntryWindow(0, 1);
+    lodCanvas.setVisibleEntryWindow(0, 1);
+    fragmentedLodCanvas.setVisibleEntryWindow(0, 1);
+    equalFinalLodCanvas.setVisibleEntryWindow(0, 1);
+    rawDenseCanvas.setVisibleEntryWindow(0, 1);
+    rawCanvas.show();
+    lodCanvas.show();
+    fragmentedLodCanvas.show();
+    equalFinalLodCanvas.show();
+    rawDenseCanvas.show();
+    processEventsFor(app, 80);
+
+    const QImage raw = renderCanvasImage(rawCanvas);
+    const QImage lod = renderCanvasImage(lodCanvas);
+    const QImage fragmentedLod = renderCanvasImage(fragmentedLodCanvas);
+    const QImage equalFinalLod = renderCanvasImage(equalFinalLodCanvas);
+    const QImage rawDense = renderCanvasImage(rawDenseCanvas);
+    if (args.size() >= 3) {
+        QDir out(args.at(2));
+        if (!out.exists() && !QDir().mkpath(out.path())) return 3;
+        raw.save(out.filePath(QStringLiteral("bit_raw.png")));
+        lod.save(out.filePath(QStringLiteral("bit_lod.png")));
+        fragmentedLod.save(out.filePath(QStringLiteral("bit_lod_fragmented_valid.png")));
+        equalFinalLod.save(out.filePath(QStringLiteral("bit_lod_equal_final_activity.png")));
+        rawDense.save(out.filePath(QStringLiteral("bit_raw_dense.png")));
+    }
+
+    auto isGreen = [](QRgb pixel) {
+        const QColor color(pixel);
+        return color.green() >= 90 && color.green() >= color.red() + 24 &&
+            color.green() >= color.blue() + 24;
+    };
+    const int yHigh = 43;
+    const int yLow = 71;
+    int initialLow = 0;
+    int steadyHigh = 0;
+    int steadyLow = 0;
+    int steadyInterior = 0;
+    int denseSteadyHigh = 0;
+    int denseSteadyLow = 0;
+    int denseSteadyInterior = 0;
+    int fragmentedSecondPulseHigh = 0;
+    int fragmentedSecondPulseLow = 0;
+    int fragmentedSecondPulseInterior = 0;
+    int equalFinalActivityInterior = 0;
+    for (int x = 11; x <= 17; ++x) {
+        if (isGreen(lod.pixel(x, yLow))) ++initialLow;
+    }
+    for (int x = 40; x < lod.width() - 11; ++x) {
+        if (isGreen(lod.pixel(x, yHigh))) ++steadyHigh;
+        if (isGreen(lod.pixel(x, yLow))) ++steadyLow;
+        for (int y = yHigh + 3; y <= yLow - 3; ++y) {
+            if (isGreen(lod.pixel(x, y))) ++steadyInterior;
+        }
+    }
+    for (int x = 160; x < rawDense.width() - 11; ++x) {
+        if (isGreen(rawDense.pixel(x, yHigh))) ++denseSteadyHigh;
+        if (isGreen(rawDense.pixel(x, yLow))) ++denseSteadyLow;
+        for (int y = yHigh + 3; y <= yLow - 3; ++y) {
+            if (isGreen(rawDense.pixel(x, y))) ++denseSteadyInterior;
+        }
+    }
+    for (int x = 465; x <= 535; ++x) {
+        if (isGreen(fragmentedLod.pixel(x, yHigh))) ++fragmentedSecondPulseHigh;
+        if (isGreen(fragmentedLod.pixel(x, yLow))) ++fragmentedSecondPulseLow;
+        for (int y = yHigh + 3; y <= yLow - 3; ++y) {
+            if (isGreen(fragmentedLod.pixel(x, y))) ++fragmentedSecondPulseInterior;
+        }
+    }
+    for (int x = 10; x < equalFinalLod.width() - 10; ++x) {
+        for (int y = yHigh + 3; y <= yLow - 3; ++y) {
+            if (isGreen(equalFinalLod.pixel(x, y))) ++equalFinalActivityInterior;
+        }
+    }
+
+    QTextStream out(stdout);
+    out << "initial_low_green_pixels," << initialLow << "\n";
+    out << "steady_high_green_pixels," << steadyHigh << "\n";
+    out << "steady_low_green_pixels," << steadyLow << "\n";
+    out << "steady_interior_green_pixels," << steadyInterior << "\n";
+    out << "dense_steady_high_green_pixels," << denseSteadyHigh << "\n";
+    out << "dense_steady_low_green_pixels," << denseSteadyLow << "\n";
+    out << "dense_steady_interior_green_pixels," << denseSteadyInterior << "\n";
+    out << "fragmented_second_pulse_high_green_pixels," << fragmentedSecondPulseHigh << "\n";
+    out << "fragmented_second_pulse_low_green_pixels," << fragmentedSecondPulseLow << "\n";
+    out << "fragmented_second_pulse_interior_green_pixels," << fragmentedSecondPulseInterior << "\n";
+    out << "equal_final_activity_interior_green_pixels," << equalFinalActivityInterior << "\n";
+    const bool ok = initialLow >= 4 && steadyHigh >= 900 &&
+        steadyLow == 0 && steadyInterior == 0 && denseSteadyHigh >= 800 &&
+        denseSteadyLow == 0 && denseSteadyInterior == 0 &&
+        fragmentedSecondPulseHigh >= 60 && fragmentedSecondPulseLow == 0 &&
+        fragmentedSecondPulseInterior == 0 && equalFinalActivityInterior >= 55;
+    out << "result," << (ok ? "pass" : "fail") << "\n";
+    out.flush();
+    return ok ? 0 : 6;
 }
 
 static LodVisualCompareMetrics compareRenderedImages(const QImage& raw,
@@ -702,7 +1000,8 @@ static int runLodVisualCompare(QApplication& app, const QStringList& args) {
     QVector<ActiveSignalRef> entries;
     for (int i = 0; i < loaded.signalList.size() && entries.size() < requestedSignals; ++i) {
         const WaveSignal& sig = loaded.signalList.at(i);
-        if (sig.samples.isEmpty() && sig.lodLevels.isEmpty()) continue;
+        if (!sig.proceduralClock &&
+            sig.samples.isEmpty() && sig.lodLevels.isEmpty()) continue;
         ActiveSignalRef ref;
         ref.signalIndex = i;
         ref.format = sig.defaultRadix;
@@ -876,13 +1175,15 @@ static int runLodVisualCompareFiles(QApplication& app, const QStringList& args) 
     QStringList matchedNames;
     for (int rawIndex = 0; rawIndex < rawWave.signalList.size() && rawEntries.size() < requestedSignals; ++rawIndex) {
         const WaveSignal& rawSig = rawWave.signalList.at(rawIndex);
-        if (rawSig.samples.isEmpty() && rawSig.lodLevels.isEmpty()) continue;
+        if (!rawSig.proceduralClock &&
+            rawSig.samples.isEmpty() && rawSig.lodLevels.isEmpty()) continue;
 
         const QString rawName = benchmarkSignalName(rawWave, rawIndex);
         int lodIndex = -1;
         for (int i = 0; i < lodWave.signalList.size(); ++i) {
             const WaveSignal& candidate = lodWave.signalList.at(i);
-            if (candidate.samples.isEmpty() && candidate.lodLevels.isEmpty()) continue;
+            if (!candidate.proceduralClock &&
+                candidate.samples.isEmpty() && candidate.lodLevels.isEmpty()) continue;
             if (benchmarkSignalName(lodWave, i) == rawName) {
                 lodIndex = i;
                 break;
@@ -1025,6 +1326,7 @@ static int runZoomCaptureSequence(QApplication& app, const QStringList& args) {
     const QString wavePath = args.at(2);
     const QString outDirPath = args.at(3);
     const int steps = (args.size() >= 5) ? qMax(0, args.at(4).toInt()) : 12;
+    const int firstSignal = (args.size() >= 6) ? qMax(0, args.at(5).toInt()) : 0;
 
     QDir outDir(outDirPath);
     if (!outDir.exists() && !QDir().mkpath(outDirPath)) {
@@ -1033,7 +1335,7 @@ static int runZoomCaptureSequence(QApplication& app, const QStringList& args) {
 
     WaveFile wave;
     QString error;
-    if (!loadWaveForCaptureTool(wavePath, wave, error, 6, 20ull * 1000ull * 1000ull)) {
+    if (!loadWaveForCaptureTool(wavePath, wave, error, firstSignal + 6, 20ull * 1000ull * 1000ull)) {
         QFile errorFile(outDir.filePath(QStringLiteral("zoom_sequence_error.txt")));
         if (errorFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
             QTextStream stream(&errorFile);
@@ -1043,9 +1345,10 @@ static int runZoomCaptureSequence(QApplication& app, const QStringList& args) {
     }
 
     QVector<ActiveSignalRef> entries;
-    for (int i = 0; i < wave.signalList.size() && entries.size() < 6; ++i) {
+    for (int i = firstSignal; i < wave.signalList.size() && entries.size() < 6; ++i) {
         const WaveSignal& sig = wave.signalList.at(i);
-        if (sig.samples.isEmpty() && sig.lodLevels.isEmpty()) continue;
+        if (!sig.proceduralClock &&
+            sig.samples.isEmpty() && sig.lodLevels.isEmpty()) continue;
         ActiveSignalRef ref;
         ref.signalIndex = i;
         ref.format = sig.defaultRadix;
@@ -1390,6 +1693,162 @@ static int runGlobalReturnBenchmark(QApplication& app, const QStringList& args) 
             firstCommittedPixels > 0 && firstCommittedPixels == settledPixels && coverageOk) ? 0 : 6;
 }
 
+static int runAddSignalsBenchmark(QApplication& app, const QStringList& args) {
+    if (args.size() < 3) return 2;
+    const int activeSignals = args.size() >= 4 ? qBound(1, args.at(3).toInt(), 65536) : 256;
+    const int readyTimeoutMs = args.size() >= 5 ? qBound(100, args.at(4).toInt(), 60000) : 15000;
+
+    MainWindow window;
+    window.resize(1600, 800);
+    window.show();
+    if (!window.openWaveFilePath(args.at(2), false)) return 3;
+    processEventsFor(app, 250);
+
+    QElapsedTimer timer;
+    timer.start();
+    window.activateFirstSignalsForBenchmark(activeSignals);
+    const qint64 synchronousMs = timer.elapsed();
+
+    bool ready = false;
+    int covered = 0;
+    int total = 0;
+    while (timer.elapsed() < readyTimeoutMs) {
+        processEventsFor(app, 5);
+        if (window.benchmarkActiveViewportCoverage(&covered, &total)) {
+            ready = true;
+            break;
+        }
+    }
+    const qint64 readyMs = timer.elapsed();
+    QTextStream out(stdout);
+    out << "add_signals,requested," << activeSignals
+        << ",active," << total
+        << ",sync_ms," << synchronousMs
+        << ",ready_ms," << readyMs
+        << ",covered," << covered
+        << ",ready," << (ready ? 1 : 0) << '\n';
+    out.flush();
+    return ready ? 0 : 6;
+}
+
+static int runActiveShortcutBenchmark(QApplication& app, const QStringList& args) {
+    if (args.size() < 3) return 2;
+    const int activeSignals =
+        args.size() >= 4 ? qBound(1, args.at(3).toInt(), 65536) : 16384;
+
+    MainWindow window;
+    window.resize(1600, 800);
+    window.show();
+    if (!window.openWaveFilePath(args.at(2), false)) return 3;
+    processEventsFor(app, 100);
+    window.activateFirstSignalsForBenchmark(activeSignals);
+    processEventsFor(app, 50);
+
+    QTreeWidget* activeList =
+        window.findChild<QTreeWidget*>(QStringLiteral("activeSignalList"));
+    if (!activeList) return 4;
+    activeList->setFocus();
+
+    QElapsedTimer timer;
+    timer.start();
+    QKeyEvent selectAllEvent(
+        QEvent::KeyPress, Qt::Key_A, Qt::ControlModifier);
+    QApplication::sendEvent(activeList, &selectAllEvent);
+    const qint64 selectAllMs = timer.restart();
+
+    QKeyEvent copyEvent(
+        QEvent::KeyPress, Qt::Key_C, Qt::ControlModifier);
+    QApplication::sendEvent(activeList, &copyEvent);
+    const qint64 copyMs = timer.restart();
+
+    const int selectedCount = activeList->selectionModel()
+        ? activeList->selectionModel()->selectedRows(0).size()
+        : 0;
+    QKeyEvent deleteEvent(
+        QEvent::KeyPress, Qt::Key_Delete, Qt::NoModifier);
+    QApplication::sendEvent(activeList, &deleteEvent);
+    const qint64 deleteMs = timer.elapsed();
+    const int remaining = activeList->topLevelItemCount();
+
+    QTextStream out(stdout);
+    out << "active_shortcuts,active," << activeSignals
+        << ",selected," << selectedCount
+        << ",select_all_ms," << selectAllMs
+        << ",copy_ms," << copyMs
+        << ",delete_ms," << deleteMs
+        << ",remaining," << remaining << '\n';
+    out.flush();
+    return selectedCount == activeSignals && remaining == 0 ? 0 : 6;
+}
+
+static int runTreeEventJumpBenchmark(QApplication& app, const QStringList& args) {
+    if (args.size() < 3) return 2;
+    const bool firstEvent = args.size() < 4 ||
+        args.at(3).compare(QStringLiteral("last"), Qt::CaseInsensitive) != 0;
+    const bool legacy = args.size() >= 5 &&
+        args.at(4).compare(QStringLiteral("legacy"), Qt::CaseInsensitive) == 0;
+    if (legacy) qputenv("WV_VIEWER_LEGACY_TREE_EVENT_JUMP", QByteArray("1"));
+    else qunsetenv("WV_VIEWER_LEGACY_TREE_EVENT_JUMP");
+
+    MainWindow window;
+    window.resize(1600, 800);
+    window.show();
+    if (!window.openWaveFilePath(args.at(2), false)) return 3;
+    processEventsFor(app, 100);
+
+    QTreeView* tree =
+        window.findChild<QTreeView*>(QStringLiteral("signalTree"));
+    WaveCanvas* canvas = window.findChild<WaveCanvas*>();
+    if (!tree || !tree->model() || !tree->selectionModel() || !canvas) return 4;
+    const QModelIndex root = tree->model()->index(0, 0);
+    if (!root.isValid()) return 5;
+    tree->selectionModel()->select(
+        root, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+    tree->setCurrentIndex(root);
+
+    QElapsedTimer timer;
+    timer.start();
+    window.jumpSelectedTreeSignalToViewportEventForBenchmark(firstEvent);
+    const qint64 elapsedMs = timer.elapsed();
+
+    QTextStream out(stdout);
+    out << "tree_event_jump,direction," << (firstEvent ? "first" : "last")
+        << ",mode," << (legacy ? "legacy" : "optimized")
+        << ",elapsed_ms," << elapsedMs
+        << ",cursor," << canvas->cursorTime() << '\n';
+    out.flush();
+    return canvas->cursorTime() >= 0 ? 0 : 6;
+}
+
+static int runValueFindUiBenchmark(QApplication& app, const QStringList& args) {
+    if (args.size() < 4) return 2;
+    const int activeSignals =
+        args.size() >= 5 ? qMax(1, args.at(4).toInt()) : 64;
+
+    MainWindow window;
+    window.resize(1600, 800);
+    window.show();
+    if (!window.openWaveFilePath(args.at(2), false)) return 3;
+    processEventsFor(app, 100);
+
+    int hitCount = 0;
+    quint64 checksum = 0;
+    qint64 elapsedMs = 0;
+    if (!window.runValueFindForBenchmark(args.at(3), activeSignals,
+                                         &hitCount, &checksum, &elapsedMs)) {
+        return 4;
+    }
+
+    QTextStream out(stdout);
+    out << "value_find_ui,active," << activeSignals
+        << ",target," << args.at(3)
+        << ",elapsed_ms," << elapsedMs
+        << ",hits," << hitCount
+        << ",checksum," << QString::number(checksum, 16) << '\n';
+    out.flush();
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
     QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
@@ -1419,12 +1878,36 @@ int main(int argc, char *argv[]) {
         return runGlobalReturnBenchmark(a, args);
     }
 
+    if (args.size() >= 2 && args.at(1) == QStringLiteral("--add-signals-benchmark")) {
+        return runAddSignalsBenchmark(a, args);
+    }
+    if (args.size() >= 2 && args.at(1) == QStringLiteral("--active-shortcut-benchmark")) {
+        return runActiveShortcutBenchmark(a, args);
+    }
+    if (args.size() >= 2 && args.at(1) == QStringLiteral("--tree-event-jump-benchmark")) {
+        return runTreeEventJumpBenchmark(a, args);
+    }
+    if (args.size() >= 2 && args.at(1) == QStringLiteral("--value-find-ui-benchmark")) {
+        return runValueFindUiBenchmark(a, args);
+    }
+
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--value-find-benchmark")) {
         return runValueFindBenchmark(args);
     }
 
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--render-benchmark")) {
         return runRenderBenchmark(a, args);
+    }
+
+    if (args.size() >= 2 &&
+        args.at(1) == QStringLiteral("--procedural-clock-render-regression")) {
+        qputenv("WV_VIEWER_STRICT_RENDER_CHECKS", QByteArray("1"));
+        return runProceduralClockRenderRegression(a);
+    }
+
+    if (args.size() >= 2 && args.at(1) == QStringLiteral("--bit-state-render-regression")) {
+        qputenv("WV_VIEWER_STRICT_RENDER_CHECKS", QByteArray("1"));
+        return runBitStateRenderRegression(a, args);
     }
 
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--lod-visual-compare")) {

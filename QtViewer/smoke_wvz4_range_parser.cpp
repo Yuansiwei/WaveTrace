@@ -43,12 +43,54 @@ int main(int argc, char** argv) {
     qint64 firstSample = (std::numeric_limits<qint64>::max)();
     qint64 lastSample = (std::numeric_limits<qint64>::min)();
     qint64 lastNonClockSample = (std::numeric_limits<qint64>::min)();
+    int proceduralClockCount = 0;
     for (int signalIndex = 0; signalIndex < wave.signalList.size(); ++signalIndex) {
         const WaveSignal& signal = wave.signalList.at(signalIndex);
+        if (signal.proceduralClock) {
+            ++proceduralClockCount;
+            if (signal.clockTogglePeriodTicks == 0 ||
+                !signal.samples.isEmpty() ||
+                !signal.lodLevels.isEmpty()) {
+                std::cerr << "procedural clock materialized samples or has invalid metadata\n";
+                return 8;
+            }
+
+            // Exercise the formula beyond the deleted one-million-transition
+            // expansion cap. This must remain constant-memory.
+            const quint64 probeMultiple = 1000001ull;
+            const quint64 maxTime = quint64((std::numeric_limits<qint64>::max)());
+            if (signal.clockTogglePeriodTicks <= (maxTime - 1u) / probeMultiple) {
+                const qint64 probe =
+                    qint64(signal.clockTogglePeriodTicks * probeMultiple);
+                if (waveProceduralClockTransitionAtOrAfter(signal, probe) != probe ||
+                    waveProceduralClockPreviousTransition(signal, probe + 1) != probe ||
+                    waveProceduralClockValueAtTime(signal, probe) ==
+                        waveProceduralClockValueAtTime(signal, probe - 1)) {
+                    std::cerr << "procedural clock million-transition formula mismatch\n";
+                    return 9;
+                }
+            }
+
+            qint64 finalTransition = -1;
+            if (wave.meta.end < (std::numeric_limits<qint64>::max)()) {
+                finalTransition =
+                    waveProceduralClockPreviousTransition(signal, wave.meta.end + 1);
+            } else {
+                finalTransition =
+                    waveProceduralClockTransitionAtOrAfter(signal, wave.meta.end);
+                if (finalTransition != wave.meta.end) {
+                    finalTransition =
+                        waveProceduralClockPreviousTransition(signal, wave.meta.end);
+                }
+            }
+            if (finalTransition >= wave.meta.start && finalTransition <= wave.meta.end) {
+                lastSample = qMax(lastSample, finalTransition);
+            }
+        }
         for (const WaveSample& sample : signal.samples) {
             firstSample = qMin(firstSample, sample.time);
             lastSample = qMax(lastSample, sample.time);
-            if (waveSignalSegmentName(wave, signalIndex) != QStringLiteral("clk")) {
+            if (!signal.proceduralClock) {
                 lastNonClockSample = qMax(lastNonClockSample, sample.time);
             }
         }
@@ -68,10 +110,59 @@ int main(int argc, char** argv) {
         return 7;
     }
 
+    WaveParser4Reader reader;
+    QString readerError;
+    if (!reader.open(QString::fromLocal8Bit(argv[1]), readerError)) {
+        std::cerr << "directory reader open failed: "
+                  << readerError.toLocal8Bit().constData() << "\n";
+        return 10;
+    }
+    QVector<int> clockIds;
+    for (const WaveSignal& signal : reader.directoryWave().signalList) {
+        if (signal.proceduralClock) clockIds.push_back(signal.signalId);
+    }
+    if (clockIds.size() != proceduralClockCount) {
+        std::cerr << "directory reader procedural clock count mismatch\n";
+        return 11;
+    }
+    if (!clockIds.isEmpty()) {
+        WaveFile rawClockWave;
+        if (!reader.loadSignals(clockIds, rawClockWave, readerError, 1,
+                                wave.meta.start, wave.meta.end) ||
+            rawClockWave.signalList.size() != clockIds.size()) {
+            std::cerr << "directory reader clock raw load failed: "
+                      << readerError.toLocal8Bit().constData() << "\n";
+            return 12;
+        }
+        WaveFile lodClockWave;
+        if (!reader.loadSignalLod(clockIds, lodClockWave, readerError,
+                                  wave.meta.start, wave.meta.end, 100) ||
+            lodClockWave.signalList.size() != clockIds.size()) {
+            std::cerr << "directory reader clock LOD load failed: "
+                      << readerError.toLocal8Bit().constData() << "\n";
+            return 13;
+        }
+        for (const WaveSignal& signal : rawClockWave.signalList) {
+            if (!signal.proceduralClock || !signal.samples.isEmpty() ||
+                !signal.lodLevels.isEmpty()) {
+                std::cerr << "directory reader raw clock was materialized\n";
+                return 14;
+            }
+        }
+        for (const WaveSignal& signal : lodClockWave.signalList) {
+            if (!signal.proceduralClock || !signal.samples.isEmpty() ||
+                !signal.lodLevels.isEmpty()) {
+                std::cerr << "directory reader LOD clock was materialized\n";
+                return 15;
+            }
+        }
+    }
+
     std::cout << "wavetrace_range_ok start=" << wave.meta.start
               << " end=" << wave.meta.end
               << " first_sample=" << firstSample
               << " last_sample=" << lastSample
-              << " last_non_clock=" << lastNonClockSample << "\n";
+              << " last_non_clock=" << lastNonClockSample
+              << " procedural_clocks=" << proceduralClockCount << "\n";
     return 0;
 }

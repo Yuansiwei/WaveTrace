@@ -114,16 +114,23 @@ struct CreditPerfSampler : sc_core::sc_module {
             tracer->attach_current_thread_for_dirty_peek();
         }
         for (std::uint64_t i = 0; i < cycles_to_sample; ++i) {
-            wait(clk.posedge_event());
-            wait(sc_core::SC_ZERO_TIME);
             if (perf && perf->enabled) {
+                wait(clk.posedge_event());
+                wait(sc_core::SC_ZERO_TIME);
                 if (!sample_one_cycle_profiled(i)) {
                     sc_core::sc_stop();
                     return;
                 }
             } else {
-                if (!tap || !tap->sample_one_cycle()) {
+                wait(clk.negedge_event());
+                wait(sc_core::SC_ZERO_TIME);
+                if (!tap || !tap->last_error().empty()) {
                     if (error) *error = tap ? tap->last_error() : "missing WaveTap";
+                    sc_core::sc_stop();
+                    return;
+                }
+                if (tap->next_cycle() != static_cast<wave::Cycle>(i + 2u)) {
+                    if (error) *error = "WaveTap automatic sample count mismatch";
                     sc_core::sc_stop();
                     return;
                 }
@@ -247,7 +254,10 @@ int sc_main(int argc, char* argv[]) {
     wave::Tracer tracer(recorder, opt);
     tracer.add_root("dut", &dut);
 
-    wave::WaveTap tap(tracer, recorder);
+    std::unique_ptr<wave::WaveTap> tap;
+    if (!profile_breakdown) {
+        tap.reset(new wave::WaveTap("wave_tap", tracer, recorder, clk));
+    }
     if (profile_breakdown) {
         const auto t0 = std::chrono::steady_clock::now();
         tracer.prepare_topology(0);
@@ -260,7 +270,7 @@ int sc_main(int argc, char* argv[]) {
     }
 
     CreditPerfSampler sampler("credit_perf_sampler",
-                              profile_breakdown ? NULL : &tap,
+                              tap.get(),
                               profile_breakdown ? &tracer : NULL,
                               profile_breakdown ? &recorder : NULL,
                               cycles,

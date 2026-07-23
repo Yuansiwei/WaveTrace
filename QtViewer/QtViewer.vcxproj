@@ -53,8 +53,8 @@
     <IntDir>$(ProjectDir)build\obj\$(Platform)\$(Configuration)\</IntDir>
     <TargetName>WaveViewer</TargetName>
     <QtGeneratedDir>$(IntDir)qt\</QtGeneratedDir>
-    <QtMocDefines>-DWIN32 -D_WIN64 -D_WINDOWS -DUNICODE -D_UNICODE -DQT_WIDGETS_LIB -DQT_GUI_LIB -DQT_CORE_LIB</QtMocDefines>
-    <QtMocIncludes>-I&quot;$(MSBuildProjectDirectory)&quot; -I&quot;$(QtGeneratedDir)&quot; -I&quot;$(QtLocalInclude)&quot; -I&quot;$(QtLocalInclude)QtCore&quot; -I&quot;$(QtLocalInclude)QtGui&quot; -I&quot;$(QtLocalInclude)QtWidgets&quot;</QtMocIncludes>
+    <QtMocDefines>-DWIN32 -D_WIN64 -D_WINDOWS -DUNICODE -D_UNICODE -DQT_WIDGETS_LIB -DQT_GUI_LIB -DQT_NETWORK_LIB -DQT_CORE_LIB</QtMocDefines>
+    <QtMocIncludes>-I&quot;$(MSBuildProjectDirectory)&quot; -I&quot;$(QtGeneratedDir)&quot; -I&quot;$(QtLocalInclude)&quot; -I&quot;$(QtLocalInclude)QtCore&quot; -I&quot;$(QtLocalInclude)QtGui&quot; -I&quot;$(QtLocalInclude)QtWidgets&quot; -I&quot;$(QtLocalInclude)QtNetwork&quot;</QtMocIncludes>
   </PropertyGroup>
 
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -74,7 +74,8 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>$(QtEntryPointLib);%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(QtEntryPointLib);delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>$(QtNetworkDll);%(DelayLoadDLLs)</DelayLoadDLLs>
       <AdditionalOptions>/MANIFESTINPUT:&quot;$(MSBuildProjectDirectory)\app.manifest&quot; %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
@@ -100,7 +101,8 @@
       <EnableUAC>false</EnableUAC>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalDependencies>$(QtEntryPointLib);%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(QtEntryPointLib);delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>$(QtNetworkDll);%(DelayLoadDLLs)</DelayLoadDLLs>
       <AdditionalOptions>/MANIFESTINPUT:&quot;$(MSBuildProjectDirectory)\app.manifest&quot; %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
@@ -108,6 +110,7 @@
   <ItemGroup>
     <ClCompile Include="ActiveSignalItemWidget.cpp" />
     <ClCompile Include="ActiveSignalListWidget.cpp" />
+    <ClCompile Include="AgentRpcServer.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="MainWindow.cpp" />
     <ClCompile Include="WaveBlockCacheLoader.cpp" />
@@ -123,6 +126,7 @@
   <ItemGroup>
     <ClInclude Include="ActiveSignalItemWidget.h" />
     <ClInclude Include="ActiveSignalListWidget.h" />
+    <ClInclude Include="AgentRpcServer.h" />
     <ClInclude Include="MainWindow.h" />
     <ClInclude Include="WaveBlockCacheLoader.h" />
     <ClInclude Include="WaveCanvas.h" />
@@ -156,7 +160,7 @@
 
   <Target Name="DeployQtRuntime" AfterTargets="Build">
     <MakeDir Directories="$(OutDir)platforms\" />
-    <Copy SourceFiles="$(QtLocalBin)$(QtCoreDll);$(QtLocalBin)$(QtGuiDll);$(QtLocalBin)$(QtWidgetsDll)"
+    <Copy SourceFiles="$(QtLocalBin)$(QtCoreDll);$(QtLocalBin)$(QtGuiDll);$(QtLocalBin)$(QtWidgetsDll);$(QtLocalBin)$(QtNetworkDll)"
           DestinationFolder="$(OutDir)"
           SkipUnchangedFiles="true"
           Condition="Exists('$(QtLocalBin)$(QtCoreDll)')" />

@@ -66,7 +66,7 @@ using u8  = std::uint8_t;
 static const u32 kFormatVersion = 15;
 static const u8 kSignalFlagStorageOnly = 1u << 0;
 static const u32 kMaxScalarBytes = 8;
-static const u32 kLodLevelCount = 3;
+static const u32 kLodLevelCount = 4;
 // v4 adds numeric array-index node names to layout frames.
 static const u32 kWriterProcessProtocolVersion = 5;
 
@@ -367,12 +367,12 @@ struct WriterOptions {
     // stress runs when first-open/on-demand parser behavior is the target.
     bool enable_lod_tables = true;
     // Number of writer ticks in one logical cycle used by the fixed
-    // LOD10/LOD100/LOD1000 levels. Direct Writer users normally keep 1.
+    // LOD10/LOD100/LOD1000/LOD10000 levels. Direct Writer users normally keep 1.
     // PathStableWvz4Recorder sets this to clk_period_ticks so the public LOD
     // names retain business-cycle semantics.
     u64 lod_bucket_cycle_scale = 1;
-    // Legacy serialized option. v15 writers use RAW as level 1 and store three
-    // independent LOD streams (10/100/1000 cycles).
+    // Legacy serialized option. Current writers use RAW as level 1 and store
+    // four independent LOD streams (10/100/1000/10000 cycles).
     bool enable_residual_lod_tables = false;
 
     // Emit a sidecar text report at close. Empty path means <wvz4-file>.log.
@@ -1535,6 +1535,7 @@ private:
         lod_bucket_cycles_.push_back(10u * options_.lod_bucket_cycle_scale);
         lod_bucket_cycles_.push_back(100u * options_.lod_bucket_cycle_scale);
         lod_bucket_cycles_.push_back(1000u * options_.lod_bucket_cycle_scale);
+        lod_bucket_cycles_.push_back(10000u * options_.lod_bucket_cycle_scale);
     }
 
     void initialize_lod_storage() {
@@ -1670,7 +1671,23 @@ private:
         return out;
     }
 
-    static std::vector<LodValidRange> materialize_lod_level_valid_ranges(const LodLevelState& lod_level) {
+    std::vector<LodValidRange> materialize_lod_level_valid_ranges(const LodLevelState& lod_level) const {
+        if (!residual_lod_enabled()) {
+            std::vector<LodValidRange> full;
+            if (lod_level_materialized_count(lod_level) == 0) return full;
+            LodValidRange range;
+            if (options_.implicit_zero_initial_values) {
+                range.start_cycle = 0;
+            } else if (!lod_level.transitions.empty()) {
+                range.start_cycle = lod_level.transitions.front().cycle;
+            } else {
+                range.start_cycle = lod_level.pending_transition.cycle;
+            }
+            range.end_cycle = (std::numeric_limits<i64>::max)();
+            if (range.end_cycle > range.start_cycle) full.push_back(range);
+            return full;
+        }
+
         std::vector<LodValidRange> out = lod_level.valid_ranges;
         if (lod_level.has_open_valid_range && lod_level.open_valid_end > lod_level.open_valid_start) {
             LodValidRange range;
@@ -6954,7 +6971,7 @@ public:
               const WriterOptions& options,
               std::string& error,
               const std::string& helper_exe_path = std::string(),
-              DWORD connect_timeout_ms = 10000) {
+              std::uint32_t connect_timeout_ms = 10000) {
 #if !defined(_WIN32)
         (void)output_path; (void)layout; (void)options; (void)helper_exe_path; (void)connect_timeout_ms;
         error = "WVZ4 writer helper process is only implemented on Windows";

@@ -83,6 +83,10 @@ function New-CompleteConfigText {
   "wave_ptr_members": [
     {"class": "OldClass", "member": "old_ptr", "reflect": false},
     {"class": "Root", "member": "alias_ptr", "reflect": true},
+    {"class": "Root", "member": "annotated_array", "reflect": true},
+    {"class": "Root", "member": "annotated_ptr", "reflect": true},
+    {"class": "Root", "member": "annotated_shared", "reflect": true},
+    {"class": "Root", "member": "annotated_weak", "reflect": true},
     {"class": "Root", "member": "direct_ptr", "reflect": $directValue},
     {"class": "alpha::Box", "member": "enabled_ptr", "reflect": true},
     {"class": "alpha::Box", "member": "template_ptr", "reflect": $templateValue},
@@ -108,7 +112,7 @@ $singleRoot = Join-Path $BuildRoot "single\WaveTracer"
 $singleOut = Join-Path $singleRoot "generated_reflect\input_reflect.h"
 $singleConfig = Join-Path $singleRoot "wavetrace_config.json"
 
-Write-Host "[1/11] Missing entries default to true; templates and aliases are discovered"
+Write-Host "[1/12] Missing entries default to true; templates and aliases are discovered"
 $freshLog = Invoke-ReflectGen @(
     $inputHeader, "-o", $singleOut,
     "--header-include", "input.hpp",
@@ -116,22 +120,23 @@ $freshLog = Invoke-ReflectGen @(
     "--main-file-only", "--", "-x", "c++", "-std=c++14"
 )
 $entries = Read-ConfigEntries $singleConfig
-Assert-True ($entries.Count -eq 5) "expected exactly five unique WavePtr member entries, got $($entries.Count)"
+Assert-True ($entries.Count -eq 9) "expected exactly nine unique pointer member entries, got $($entries.Count)"
 $freshConfigText = Get-Content -LiteralPath $singleConfig -Raw
 Assert-True (-not $freshConfigText.Contains('"WaveTraceDirtyArrayStats"')) "default false DirtyArrayStats should be omitted"
 Assert-True (-not $freshConfigText.Contains('"WaveTraceDirtyArrayMarks"')) "default false DirtyArrayMarks should be omitted"
 Assert-True (-not $freshConfigText.Contains('"WaveTraceMemoryUsage"')) "default false MemoryUsage should be omitted"
 Assert-True (@(Find-Entry $entries "alpha::Box" "template_ptr").Count -eq 1) "template instances must share alpha::Box::template_ptr"
-Assert-True (@(Find-Entry $entries "Root" "alias_ptr").Count -eq 1) "WavePtr alias field was not discovered"
+Assert-True (@(Find-Entry $entries "Root" "alias_ptr").Count -eq 1) "annotated pointer alias field was not discovered"
 foreach ($entry in $entries) {
     Assert-True ([bool]$entry.reflect) "new entry $($entry.class)::$($entry.member) did not default to true"
 }
 $singleText = Get-Content -LiteralPath $singleOut -Raw
-foreach ($member in @("template_ptr", "enabled_ptr", "other_ptr", "direct_ptr", "alias_ptr")) {
+foreach ($member in @("template_ptr", "enabled_ptr", "other_ptr", "direct_ptr", "alias_ptr",
+                      "annotated_ptr", "annotated_array", "annotated_shared", "annotated_weak")) {
     Assert-GeneratedMember $singleText $member $true
 }
 
-Write-Host "[2/11] false is applied during AST collection, while another class remains enabled"
+Write-Host "[2/12] false remains generated for runtime filtering"
 Write-Utf8NoBom $singleConfig (New-CompleteConfigText -TemplatePtr $false -DirectPtr $false)
 $disabledLog = Invoke-ReflectGen @(
     $inputHeader, "-o", $singleOut,
@@ -139,18 +144,16 @@ $disabledLog = Invoke-ReflectGen @(
     "--wavetrace-config", $singleConfig,
     "--main-file-only", "--", "-x", "c++", "-std=c++14"
 )
-Assert-True ($disabledLog.Contains("skipped during AST collection class=alpha::Box member=template_ptr")) "template_ptr was not skipped during AST collection"
-Assert-True ($disabledLog.Contains("skipped during AST collection class=Root member=direct_ptr")) "direct_ptr was not skipped during AST collection"
 $singleText = Get-Content -LiteralPath $singleOut -Raw
-Assert-GeneratedMember $singleText "template_ptr" $false
-Assert-GeneratedMember $singleText "direct_ptr" $false
+Assert-GeneratedMember $singleText "template_ptr" $true
+Assert-GeneratedMember $singleText "direct_ptr" $true
 Assert-GeneratedMember $singleText "other_ptr" $true
 Assert-GeneratedMember $singleText "alias_ptr" $true
 $entries = Read-ConfigEntries $singleConfig
 $oldEntries = @(Find-Entry $entries "OldClass" "old_ptr")
 Assert-True ($oldEntries.Count -eq 1 -and $oldEntries[0].reflect -eq $false) "stale explicit false entry was not preserved"
 
-Write-Host "[3/11] Batch root-closure mode obeys the same switches"
+Write-Host "[3/12] Batch root-closure mode retains runtime-switchable members"
 $batchInputDir = Join-Path $BuildRoot "batch_input"
 New-Item -ItemType Directory -Force -Path $batchInputDir | Out-Null
 Copy-Item -LiteralPath $inputHeader -Destination (Join-Path $batchInputDir "input.hpp") -Force
@@ -164,8 +167,8 @@ $batchLog = Invoke-ReflectGen @(
 )
 $closureHeader = Join-Path $batchOut "root_class_closure_reflect_auto.h"
 $closureText = Get-Content -LiteralPath $closureHeader -Raw
-Assert-GeneratedMember $closureText "template_ptr" $false
-Assert-GeneratedMember $closureText "direct_ptr" $false
+Assert-GeneratedMember $closureText "template_ptr" $true
+Assert-GeneratedMember $closureText "direct_ptr" $true
 Assert-GeneratedMember $closureText "enabled_ptr" $true
 Assert-GeneratedMember $closureText "other_ptr" $true
 Assert-True (-not $closureText.Contains("ReflectAccess<std::")) "root closure emitted ReflectAccess for a standard-library wrapper"
@@ -174,7 +177,7 @@ Assert-True (-not $closureText.Contains("reflected_visitor<std::")) "root closur
 Assert-True ($closureText.Contains("ReflectAccess<struct PayloadA>")) "std wrapper traversal did not retain PayloadA"
 Assert-True ($closureText.Contains("ReflectAccess<struct PayloadB>")) "std wrapper traversal did not retain PayloadB"
 
-Write-Host "[4/11] Malformed JSON fails before replacing generated output"
+Write-Host "[4/12] Malformed JSON fails before replacing generated output"
 $beforeHash = (Get-FileHash -LiteralPath $singleOut -Algorithm SHA256).Hash
 Write-Utf8NoBom $singleConfig '{"wave_ptr_members":['
 $malformedLog = Invoke-ReflectGen @(
@@ -186,7 +189,7 @@ $afterHash = (Get-FileHash -LiteralPath $singleOut -Algorithm SHA256).Hash
 Assert-True ($beforeHash -eq $afterHash) "malformed JSON changed an existing generated header"
 Assert-True ($malformedLog.Contains("invalid JSON")) "malformed JSON did not produce a clear diagnostic"
 
-Write-Host "[5/11] Duplicate class/member entries are rejected"
+Write-Host "[5/12] Duplicate class/member entries are rejected"
 $duplicate = @"
 {
   "wave_ptr_members": [
@@ -203,7 +206,7 @@ $duplicateLog = Invoke-ReflectGen @(
 ) 2
 Assert-True ($duplicateLog.Contains("duplicate wave_ptr_members class/member entry")) "duplicate entry was not diagnosed"
 
-Write-Host "[6/11] CMake runner is incremental and reacts to config changes"
+Write-Host "[6/12] CMake runner always delegates policy to ReflectGen"
 Write-Utf8NoBom $singleConfig (New-CompleteConfigText -TemplatePtr $false -DirectPtr $false)
 $cmakeOut = (Join-Path $BuildRoot "cmake\WaveTracer\generated_reflect").Replace('\', '/')
 $cmakeLog = "$cmakeOut/reflectgen.log"
@@ -226,24 +229,29 @@ Start-Sleep -Milliseconds 1200
 & cmake @cmakeArgs | Out-Host
 Assert-True ($LASTEXITCODE -eq 0) "second CMake runner invocation failed"
 $settledTime = (Get-Item -LiteralPath $aggregate).LastWriteTimeUtc
-Assert-True ($firstTime -eq $settledTime) "successful config update caused a redundant second regeneration"
+Assert-True ($settledTime -gt $firstTime) "second runner invocation did not execute ReflectGen"
 Start-Sleep -Milliseconds 1200
 & cmake @cmakeArgs | Out-Host
 Assert-True ($LASTEXITCODE -eq 0) "third CMake runner invocation failed"
 $unchangedTime = (Get-Item -LiteralPath $aggregate).LastWriteTimeUtc
-Assert-True ($settledTime -eq $unchangedTime) "unchanged config regenerated the aggregate header"
+Assert-True ($unchangedTime -gt $settledTime) "third runner invocation did not execute ReflectGen"
 
 Start-Sleep -Milliseconds 1200
 Write-Utf8NoBom $singleConfig (New-CompleteConfigText -TemplatePtr $false -DirectPtr $true)
 & cmake @cmakeArgs | Out-Host
 Assert-True ($LASTEXITCODE -eq 0) "CMake runner failed after config change"
 $changedTime = (Get-Item -LiteralPath $aggregate).LastWriteTimeUtc
-Assert-True ($changedTime -gt $unchangedTime) "config change did not regenerate the aggregate header"
+Assert-True ($changedTime -gt $unchangedTime) "runtime-only config edit was filtered by the CMake runner"
 $cmakeClosure = Get-Content -LiteralPath (Join-Path $cmakeOut "root_class_closure_reflect_auto.h") -Raw
 Assert-GeneratedMember $cmakeClosure "direct_ptr" $true
-Assert-GeneratedMember $cmakeClosure "template_ptr" $false
+Assert-GeneratedMember $cmakeClosure "template_ptr" $true
 
-Write-Host "[7/11] Final deterministic rerun"
+Write-Host "[7/12] Final deterministic rerun"
+$settleLog = Invoke-ReflectGen @(
+    $inputHeader, "-o", $singleOut,
+    "--wavetrace-config", $singleConfig,
+    "--main-file-only", "--", "-x", "c++", "-std=c++14"
+)
 $configBefore = Get-Content -LiteralPath $singleConfig -Raw
 $finalLog = Invoke-ReflectGen @(
     $inputHeader, "-o", $singleOut,
@@ -254,7 +262,7 @@ $configAfter = Get-Content -LiteralPath $singleConfig -Raw
 Assert-True ($configBefore -eq $configAfter) "deterministic rerun rewrote config contents"
 Assert-True ($finalLog.Contains("unchanged:")) "deterministic rerun did not report unchanged config"
 
-Write-Host "[8/11] A changed read-only config is forcibly replaced and remains read-only"
+Write-Host "[8/12] A changed read-only config is forcibly replaced and remains read-only"
 Write-Utf8NoBom $singleConfig '{"wave_ptr_members":[]}'
 $configItem = Get-Item -LiteralPath $singleConfig
 $configItem.IsReadOnly = $true
@@ -266,7 +274,7 @@ try {
         "--main-file-only", "--", "-x", "c++", "-std=c++14"
     )
     $readOnlyEntries = Read-ConfigEntries $singleConfig
-    Assert-True ($readOnlyEntries.Count -eq 5) "read-only config was not populated by forced replacement"
+    Assert-True ($readOnlyEntries.Count -eq 9) "read-only config was not populated by forced replacement"
     Assert-True ((Get-Item -LiteralPath $singleConfig).IsReadOnly) "read-only attribute was not restored after replacement"
     Assert-True ($readOnlyLog.Contains("temporarily cleared protected attributes")) "read-only replacement path was not exercised"
 }
@@ -274,7 +282,7 @@ finally {
     (Get-Item -LiteralPath $singleConfig).IsReadOnly = $false
 }
 
-Write-Host "[9/11] An exclusively opened config does not fail reflection or corrupt JSON"
+Write-Host "[9/12] An exclusively opened config does not fail reflection or corrupt JSON"
 Write-Utf8NoBom $singleConfig '{"wave_ptr_members":[]}'
 $lockedBefore = Get-Content -LiteralPath $singleConfig -Raw
 $lockedStream = [IO.File]::Open($singleConfig, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
@@ -296,7 +304,7 @@ $lockedGenerated = Get-Content -LiteralPath $singleOut -Raw
 Assert-GeneratedMember $lockedGenerated "direct_ptr" $true
 Assert-GeneratedMember $lockedGenerated "template_ptr" $true
 
-Write-Host "[10/11] The next unlocked run persists the previously discovered table"
+Write-Host "[10/12] The next unlocked run persists the previously discovered table"
 $recoveryLog = Invoke-ReflectGen @(
     $inputHeader, "-o", $singleOut,
     "--header-include", "input.hpp",
@@ -304,10 +312,10 @@ $recoveryLog = Invoke-ReflectGen @(
     "--main-file-only", "--", "-x", "c++", "-std=c++14"
 )
 $recoveredEntries = Read-ConfigEntries $singleConfig
-Assert-True ($recoveredEntries.Count -eq 5) "unlocked recovery run did not persist the discovered table"
+Assert-True ($recoveredEntries.Count -eq 9) "unlocked recovery run did not persist the discovered table"
 Assert-True ($recoveryLog.Contains("updated:")) "unlocked recovery run did not report a persisted update"
 
-Write-Host "[11/11] WaveTrace=false skips AST work and emits stable placeholder headers"
+Write-Host "[11/12] WaveTrace=false is decided inside ReflectGen"
 $configAfter = Get-Content -LiteralPath $singleConfig -Raw
 $disabledConfigText = $configAfter.Replace('"WaveTrace": true', '"WaveTrace": false')
 Assert-True ($disabledConfigText -ne $configAfter) "serialized config did not contain the WaveTrace switch"
@@ -319,12 +327,27 @@ $disabledAllLog = Invoke-ReflectGen @(
     "-o", $batchOut, "--aggregate-header", "project_reflect_auto.h",
     "--", "-x", "c++", "-std=c++14"
 )
-Assert-True ($disabledAllLog.Contains("skipped libclang/AST reflection")) "WaveTrace=false did not take the pre-AST fast path"
+Assert-True ($disabledAllLog.Contains("skipped libclang/AST reflection")) "ReflectGen did not select its WaveTrace=false path"
 $disabledAggregate = Get-Content -LiteralPath (Join-Path $batchOut "project_reflect_auto.h") -Raw
 $disabledClosure = Get-Content -LiteralPath (Join-Path $batchOut "root_class_closure_reflect_auto.h") -Raw
-Assert-True (-not $disabledAggregate.Contains("ReflectAccess<")) "disabled aggregate contains reflected records"
-Assert-True (-not $disabledClosure.Contains("ReflectAccess<")) "disabled closure contains reflected records"
+Assert-True (-not $disabledClosure.Contains("ReflectAccess<")) "WaveTrace=false did not emit empty reflection"
+Assert-GeneratedMember $disabledClosure "direct_ptr" $false
+Assert-GeneratedMember $disabledClosure "template_ptr" $false
 $disabledEntries = Read-ConfigEntries $singleConfig
-Assert-True ($disabledEntries.Count -ge 5) "WaveTrace=false discarded the maintained WavePtr member table"
+Assert-True ($disabledEntries.Count -ge 9) "WaveTrace=false discarded the maintained pointer member table"
 
-Write-Host "PASS: all ReflectGen WavePtr configuration cases passed"
+Write-Host "[12/12] Invalid pointer annotations fail with field-specific diagnostics"
+$invalidInput = Join-Path $fixtureDir "invalid_input.fixture"
+$invalidOut = Join-Path $BuildRoot "invalid\invalid_reflect.h"
+$invalidConfig = Join-Path $BuildRoot "invalid\wavetrace_config.json"
+$invalidLog = Invoke-ReflectGen @(
+    $invalidInput, "-o", $invalidOut,
+    "--header-include", "invalid_input.fixture",
+    "--wavetrace-config", $invalidConfig,
+    "--main-file-only", "--", "-x", "c++", "-std=c++14"
+) 3
+Assert-True ($invalidLog.Contains("WAVE_PTR/WAVE_PTR_ARRAY requires")) "non-pointer WAVE_PTR was not rejected"
+Assert-True ($invalidLog.Contains("WAVE_PTR_ARRAY does not support std::weak_ptr")) "weak pointer array was not rejected"
+Assert-True ($invalidLog.Contains("length must be an integer literal or member identifier")) "unstable array length expression was not rejected"
+
+Write-Host "PASS: all ReflectGen pointer configuration cases passed"

@@ -64,21 +64,18 @@ static const std::size_t kWavePtrArrayCount = 4u;
 static const std::size_t kWavePtrElementsPerArray = 65536u;
 
 struct WavePtrTop {
-    wave::WavePtr<WavePtrElement*> bank0;
-    wave::WavePtr<WavePtrElement*> bank1;
-    wave::WavePtr<WavePtrElement*> bank2;
-    wave::WavePtr<WavePtrElement*> bank3;
+    std::size_t bank_count;
+    WAVE_PTR_ARRAY(bank_count) WavePtrElement* bank0;
+    WAVE_PTR_ARRAY(bank_count) WavePtrElement* bank1;
+    WAVE_PTR_ARRAY(bank_count) WavePtrElement* bank2;
+    WAVE_PTR_ARRAY(bank_count) WavePtrElement* bank3;
 
     explicit WavePtrTop(WavePtrElement* data)
-        : bank0(data),
+        : bank_count(kWavePtrElementsPerArray),
+          bank0(data),
           bank1(data + kWavePtrElementsPerArray),
           bank2(data + 2u * kWavePtrElementsPerArray),
-          bank3(data + 3u * kWavePtrElementsPerArray) {
-        bank0.declareSize(kWavePtrElementsPerArray);
-        bank1.declareSize(kWavePtrElementsPerArray);
-        bank2.declareSize(kWavePtrElementsPerArray);
-        bank3.declareSize(kWavePtrElementsPerArray);
-    }
+          bank3(data + 3u * kWavePtrElementsPerArray) {}
 };
 
 } // namespace
@@ -160,10 +157,10 @@ template<> struct reflected_visitor<WavePtrTop> {
     template<class P, class V, class G>
     static void visit(const WavePtrTop* obj, P&& on_ptr, V&&, G&&) {
         const void* id = ::wave::GeneratedMemberNameTable<WavePtrTop>::class_id();
-        ::wave::detail::invoke_ptr_visitor(on_ptr, "bank0", std::addressof(obj->bank0), ::wave::detail::GeneratedMemberId(id, 0u));
-        ::wave::detail::invoke_ptr_visitor(on_ptr, "bank1", std::addressof(obj->bank1), ::wave::detail::GeneratedMemberId(id, 1u));
-        ::wave::detail::invoke_ptr_visitor(on_ptr, "bank2", std::addressof(obj->bank2), ::wave::detail::GeneratedMemberId(id, 2u));
-        ::wave::detail::invoke_ptr_visitor(on_ptr, "bank3", std::addressof(obj->bank3), ::wave::detail::GeneratedMemberId(id, 3u));
+        ::wave::detail::invoke_annotated_ptr_visitor(on_ptr, "bank0", obj->bank0, obj->bank_count, ::wave::detail::GeneratedMemberId(id, 0u));
+        ::wave::detail::invoke_annotated_ptr_visitor(on_ptr, "bank1", obj->bank1, obj->bank_count, ::wave::detail::GeneratedMemberId(id, 1u));
+        ::wave::detail::invoke_annotated_ptr_visitor(on_ptr, "bank2", obj->bank2, obj->bank_count, ::wave::detail::GeneratedMemberId(id, 2u));
+        ::wave::detail::invoke_annotated_ptr_visitor(on_ptr, "bank3", obj->bank3, obj->bank_count, ::wave::detail::GeneratedMemberId(id, 3u));
     }
 };
 

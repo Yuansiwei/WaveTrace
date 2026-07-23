@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <iostream>
 #include <set>
+#include <stdexcept>
 #include <string>
 
 struct PeekPayload {
@@ -232,15 +233,33 @@ public:
     }
 };
 
-struct SystemCWaveSampler : sc_core::sc_module {
+class ThrowingPathStableWvz4Recorder : public PathStableWvz4Recorder {
+public:
+    void on_track_declared(const wave::TrackDecl&) override {
+        throw std::runtime_error("injected topology declaration failure");
+    }
+
+    void on_track_declared_fast(wave::TrackId,
+                                wave::TrackId,
+                                wave::NodeId,
+                                wave::ValueKind,
+                                std::uint32_t,
+                                std::uint32_t,
+                                bool,
+                                const std::string&) override {
+        throw std::runtime_error("injected topology declaration failure");
+    }
+};
+
+struct SystemCWaveStopper : sc_core::sc_module {
     sc_core::sc_in<bool> clk;
     wave::WaveTap& tap;
     int cycles_to_sample;
     std::string* error;
 
-    SC_HAS_PROCESS(SystemCWaveSampler);
+    SC_HAS_PROCESS(SystemCWaveStopper);
 
-    SystemCWaveSampler(sc_core::sc_module_name name,
+    SystemCWaveStopper(sc_core::sc_module_name name,
                        wave::WaveTap& wave_tap,
                        int cycles,
                        std::string* error_out)
@@ -254,10 +273,17 @@ struct SystemCWaveSampler : sc_core::sc_module {
 
     void run() {
         for (int i = 0; i < cycles_to_sample; ++i) {
-            wait(clk.posedge_event());
+            wait(clk.negedge_event());
             wait(sc_core::SC_ZERO_TIME);
-            if (!tap.sample_one_cycle()) {
+            if (!tap.last_error().empty()) {
                 if (error) *error = tap.last_error();
+                sc_core::sc_stop();
+                return;
+            }
+            if (tap.next_cycle() != static_cast<wave::Cycle>(i + 2)) {
+                if (error) {
+                    *error = "WaveTap did not sample exactly once at start and once on the falling edge";
+                }
                 sc_core::sc_stop();
                 return;
             }
@@ -324,9 +350,27 @@ int sc_main(int argc, char* argv[]) {
     wave::Tracer tracer(recorder, opt);
     tracer.add_root("dut", &dut);
 
-    wave::WaveTap tap(tracer, recorder);
-    SystemCWaveSampler sampler("wave_sampler", tap, cycles, &error);
-    sampler.clk(clk);
+    // A WaveTrace exception must be converted into a fatal WaveTap error and
+    // must never cross the SystemC callback boundary as E549.
+    ThrowingPathStableWvz4Recorder throwing_recorder;
+    wave::Tracer throwing_tracer(throwing_recorder, opt);
+    std::uint32_t throwing_root = 0x1234u;
+    throwing_tracer.add_root("throwing_root", &throwing_root);
+    wave::WaveTap throwing_tap(
+        "throwing_wave_tap", throwing_tracer, throwing_recorder, clk);
+    if (throwing_tap.sample_one_cycle() ||
+        !throwing_tap.has_fatal_error() ||
+        throwing_tap.next_cycle() != 0u ||
+        throwing_tap.last_error().find("injected topology declaration failure") ==
+            std::string::npos) {
+        std::cerr << "WaveTap exception boundary did not latch the injected failure: "
+                  << throwing_tap.last_error() << "\n";
+        return 6;
+    }
+
+    wave::WaveTap tap("wave_tap", tracer, recorder, clk);
+    SystemCWaveStopper stopper("wave_stopper", tap, cycles, &error);
+    stopper.clk(clk);
 
     sc_core::sc_start();
 
@@ -358,6 +402,7 @@ int sc_main(int argc, char* argv[]) {
               << " peek_delta=" << peek_channel.value.peek_delta
               << " dynamic_count=" << dynamic_channel.value.dynamic_count
               << " dynamic_delta=" << dynamic_channel.value.dynamic_delta
+              << " sampled_cycles=" << tap.next_cycle()
               << " sim_time=" << sc_core::sc_time_stamp() << "\n";
     return 0;
 }

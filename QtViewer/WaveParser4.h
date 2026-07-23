@@ -109,6 +109,14 @@ public:
                        qint64 timeStart,
                        qint64 timeEnd,
                        qint64 targetBucketCycles) const;
+    bool findRawSignalEvent(const QVector<int>& signalIds,
+                            qint64 timeStart,
+                            qint64 timeEnd,
+                            bool firstEvent,
+                            int& resultSignalId,
+                            qint64& resultTime,
+                            QString& error,
+                            quint64 maxDecodedSamples = 0) const;
     QVector<DataBlockDescriptor> dataBlocks() const;
     bool loadDataBlock(const DataBlockDescriptor& block,
                        WaveFile& outWave,

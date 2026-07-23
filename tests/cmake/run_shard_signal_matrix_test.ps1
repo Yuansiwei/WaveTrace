@@ -9,6 +9,7 @@ $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $probeSource = Join-Path $repo 'tests\cmake\shard_signal_matrix_probe'
 $inputHeader = Join-Path $probeSource 'signal_matrix_input.h'
+$businessHeader = Join-Path $probeSource 'business_complex_types.h'
 $reflectGen = Join-Path $repo 'tools\bin\wavetrace_reflectgen.exe'
 $runner = Join-Path $repo 'cmake\run_reflectgen.cmake'
 $testRoot = Join-Path $repo 'build\shard_signal_matrix'
@@ -38,7 +39,11 @@ foreach ($shards in $ShardCounts) {
     New-Item -ItemType Directory -Path $caseRoot -Force | Out-Null
 
     $inputForCMake = $inputHeader -replace '\\', '/'
-    Set-Content -LiteralPath $targets -Encoding Ascii -Value ('"' + $inputForCMake + '"')
+    $businessForCMake = $businessHeader -replace '\\', '/'
+    Set-Content -LiteralPath $targets -Encoding Ascii -Value @(
+        ('"' + $inputForCMake + '"'),
+        ('"' + $businessForCMake + '"')
+    )
     Set-Content -LiteralPath $config -Encoding Ascii -Value @"
 {
   "WaveTrace": true,
@@ -72,7 +77,8 @@ foreach ($shards in $ShardCounts) {
         '-A', 'x64',
         "-DWAVETRACE_ROOT=$repo",
         "-DSHARD_DIR=$generated",
-        "-DSHARD_COUNT=$shards"
+        "-DSHARD_COUNT=$shards",
+        "-DWAVETRACE_RUNTIME_CONFIG=$config"
     )
     & cmake @configureArgs
     if ($LASTEXITCODE -ne 0) { throw "CMake configure failed for shard count $shards" }

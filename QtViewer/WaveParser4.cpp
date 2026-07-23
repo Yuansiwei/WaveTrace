@@ -1,6 +1,7 @@
 #include "WaveParser4.h"
 
 #include <QByteArray>
+#include <QBitArray>
 #include <QFile>
 #include <QFileInfo>
 #include <QSet>
@@ -298,6 +299,56 @@ inline void directIntListMapAppend(QVector<QVector<int>>& map, int key, int valu
 inline const QVector<int>* directIntListMapValue(const QVector<QVector<int>>& map, int key) {
     if (key < 0 || key >= map.size()) return nullptr;
     return &map[key];
+}
+
+bool applyProceduralClockDefinitions(const QVector<ClockRec>& clocks,
+                                     const QVector<int>& outputIndexBySignalId,
+                                     QVector<WaveSignal>& outputSignals,
+                                     bool requireAllClockSignals,
+                                     QString& error) {
+    for (const ClockRec& clock : clocks) {
+        const int outputIndex =
+            directIntMapValue(outputIndexBySignalId, int(clock.signalId), -1);
+        if (outputIndex < 0 || outputIndex >= outputSignals.size()) {
+            if (requireAllClockSignals) {
+                error = QStringLiteral("WVZ4 CLKD references missing visible signal_id %1")
+                            .arg(int(clock.signalId));
+                return false;
+            }
+            continue;
+        }
+
+        WaveSignal& signal = outputSignals[outputIndex];
+        if (signal.proceduralClock) {
+            error = QStringLiteral("WVZ4 CLKD contains duplicate signal_id %1")
+                        .arg(int(clock.signalId));
+            return false;
+        }
+        if (signal.kind != SignalKind::Bit || signal.width != 1 ||
+            clock.periodTicks == 0) {
+            error = QStringLiteral("WVZ4 CLKD signal_id %1 is not a valid 1-bit periodic clock")
+                        .arg(int(clock.signalId));
+            return false;
+        }
+
+        signal.proceduralClock = true;
+        signal.clockInitialValue = clock.initialValue;
+        signal.clockTogglePeriodTicks = clock.periodTicks;
+        signal.samplesLoaded = true;
+        signal.samples.clear();
+        signal.rawLoadedRanges.clear();
+        signal.changeTimes.clear();
+        signal.changeTimesReady = false;
+        signal.lodLevels.clear();
+    }
+    return true;
+}
+
+QSet<int> proceduralClockSignalIds(const QVector<ClockRec>& clocks) {
+    QSet<int> ids;
+    ids.reserve(clocks.size() * 2 + 1);
+    for (const ClockRec& clock : clocks) ids.insert(int(clock.signalId));
+    return ids;
 }
 
 class SpanReader {
@@ -997,6 +1048,12 @@ bool readFooterScalarBits(SpanReader& r, int byteWidth, quint64& out) {
 
 struct RawLeftAnchorState;
 
+struct RawDecodeObserver {
+    using Callback = bool (*)(qint64 sampleTime, void* context);
+    Callback callback = nullptr;
+    void* context = nullptr;
+};
+
 bool decodeSignalRecord(SpanReader& rr,
                         bool hasValueCodec,
                         bool useDeltaTimes,
@@ -1012,7 +1069,8 @@ bool decodeSignalRecord(SpanReader& rr,
                         qint64 windowEnd,
                         bool compactSamples,
                         RawLeftAnchorState* leftAnchors,
-                        QString& error);
+                        QString& error,
+                        const RawDecodeObserver* observer = nullptr);
 
 bool decodeLodTransitionStreamPayload(const char* payload,
                                       int payloadSize,
@@ -1987,6 +2045,7 @@ bool appendImplicitZeroSamplesForSelectedSignals(const QSet<int>& selectedIds,
     for (int outputIndex = 0; outputIndex < outputSignals.size(); ++outputIndex) {
         const WaveSignal& sig = outputSignals.at(outputIndex);
         if (!allSelected && !selectedIds.contains(sig.signalId)) continue;
+        if (sig.proceduralClock) continue;
         if (outputIndex < 0 || outputIndex >= samplesByOutputIndex.size()) continue;
 
         WaveSample sample;
@@ -2007,70 +2066,6 @@ bool appendImplicitZeroSamplesForSelectedSignals(const QSet<int>& selectedIds,
     return true;
 }
 
-void appendClockSamplesForLoadedSignals(const QVector<ClockRec>& clocks,
-                                        const QVector<int>& outputIndexBySignalId,
-                                        qint64 windowStart,
-                                        qint64 windowEnd,
-                                        QVector<WaveSignal>& outputSignals,
-                                        QVector<QVector<WaveSample>>& samplesByOutputIndex,
-                                        qint64& minTime,
-                                        qint64& maxTime) {
-    static const qint64 kMaxSynthClockSamplesPerSignal = 1000000;
-    if (clocks.isEmpty()) return;
-
-    // Footer block times are absolute. A file recorded from WaveTraceStart=N
-    // must therefore present N (scaled to writer ticks) as its left edge; do
-    // not synthesize a clock sample at zero and accidentally widen the viewer.
-    const qint64 traceStart = (minTime == std::numeric_limits<qint64>::max())
-        ? 0
-        : qMax<qint64>(0, minTime);
-    qint64 endTime = maxTime;
-    if (windowEnd >= windowStart) endTime = qMin(endTime, windowEnd);
-    if (endTime < traceStart) return;
-
-    const qint64 startWindow = (windowEnd >= windowStart)
-        ? qMax(traceStart, windowStart)
-        : traceStart;
-    for (int i = 0; i < clocks.size(); ++i) {
-        const ClockRec& c = clocks.at(i);
-        const int outputIndex = directIntMapValue(outputIndexBySignalId, int(c.signalId), -1);
-        if (outputIndex < 0 || outputIndex >= outputSignals.size() || outputIndex >= samplesByOutputIndex.size()) continue;
-        if (!outputSignals.at(outputIndex).samplesLoaded) continue;
-
-        const qint64 period = c.periodTicks > u64(std::numeric_limits<qint64>::max())
-            ? std::numeric_limits<qint64>::max()
-            : qint64(c.periodTicks);
-        if (period <= 0) continue;
-
-        auto appendClockSample = [&](qint64 t, bool value) {
-            if (!sampleInWindow(t, windowStart, windowEnd)) return;
-            char byte = value ? 1 : 0;
-            QString ignored;
-            appendDecodedSample(outputIndex, &byte, 1, t, outputSignals, samplesByOutputIndex, true, ignored);
-            minTime = qMin(minTime, t);
-            maxTime = qMax(maxTime, t);
-        };
-
-        const qint64 anchorToggleIndex = startWindow / period;
-        const bool anchorValue = (anchorToggleIndex & 1) ? !c.initialValue : c.initialValue;
-        appendClockSample(startWindow, anchorValue);
-
-        const qint64 completedPeriods = startWindow / period;
-        if (completedPeriods >= std::numeric_limits<qint64>::max() / period) continue;
-        qint64 firstToggle = (completedPeriods + 1) * period;
-
-        qint64 count = 0;
-        for (qint64 t = firstToggle; t <= endTime && count < kMaxSynthClockSamplesPerSignal; ) {
-            const qint64 toggleIndex = t / period;
-            const bool value = (toggleIndex & 1) ? !c.initialValue : c.initialValue;
-            appendClockSample(t, value);
-            ++count;
-            if (period > std::numeric_limits<qint64>::max() - t) break;
-            t += period;
-        }
-    }
-}
-
 bool appendDecodedRecordValue(const QVector<int>& outputIndexes,
                               const char value[8],
                               int byteWidth,
@@ -2081,7 +2076,8 @@ bool appendDecodedRecordValue(const QVector<int>& outputIndexes,
                               QVector<QVector<WaveSample>>& samplesByOutputIndex,
                               bool compactSamples,
                               RawLeftAnchorState* leftAnchors,
-                              QString& error);
+                              QString& error,
+                              const RawDecodeObserver* observer);
 
 bool validateRawBlockHeader(u64 blockId,
                             i64 blockStart,
@@ -2211,7 +2207,12 @@ bool appendDecodedRecordValue(const QVector<int>& outputIndexes,
                               QVector<QVector<WaveSample>>& samplesByOutputIndex,
                               bool compactSamples,
                               RawLeftAnchorState* leftAnchors,
-                              QString& error) {
+                              QString& error,
+                              const RawDecodeObserver* observer) {
+    if (observer && observer->callback &&
+        !observer->callback(sampleTime, observer->context)) {
+        return false;
+    }
     if (windowEnd >= windowStart && sampleTime < windowStart) {
         if (leftAnchors) {
             for (int i = 0; i < outputIndexes.size(); ++i) {
@@ -2250,7 +2251,8 @@ bool decodeSignalRecord(SpanReader& rr,
                         qint64 windowEnd,
                         bool compactSamples,
                         RawLeftAnchorState* leftAnchors,
-                        QString& error) {
+                        QString& error,
+                        const RawDecodeObserver* observer) {
     u8 codecByte = static_cast<u8>(ValueRecordCodec::FullValues);
     if (hasValueCodec && !rr.readU8(codecByte)) {
         error = QStringLiteral("WVZ4 WDAT signal record missing value codec");
@@ -2286,7 +2288,7 @@ bool decodeSignalRecord(SpanReader& rr,
             if (!readRecordTime(sampleTime)) return false;
             if (!readFullValue(rr, value, byteWidth, error, "WDAT full-value record")) return false;
             if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime, windowStart, windowEnd,
-                                          outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error)) return false;
+                                          outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error, observer)) return false;
         }
         return true;
     }
@@ -2302,7 +2304,7 @@ bool decodeSignalRecord(SpanReader& rr,
             if (!resolveStrideRecordTime(firstRel, stride, ti, blockStart, blockEnd, sampleTime, error, "WDAT full-stride record")) return false;
             if (!readFullValue(rr, value, byteWidth, error, "WDAT full-stride record")) return false;
             if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime, windowStart, windowEnd,
-                                          outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error)) return false;
+                                          outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error, observer)) return false;
         }
         return true;
     }
@@ -2318,7 +2320,7 @@ bool decodeSignalRecord(SpanReader& rr,
             if (!readRecordTime(sampleTime)) return false;
             value[0] = (ti == 0) ? (initial ? 1 : 0) : (value[0] ? 0 : 1);
             if (!appendDecodedRecordValue(outputIndexes, value, 1, sampleTime, windowStart, windowEnd,
-                                          outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error)) return false;
+                                          outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error, observer)) return false;
         }
         return true;
     }
@@ -2340,7 +2342,7 @@ bool decodeSignalRecord(SpanReader& rr,
             if (!resolveStrideRecordTime(firstRel, stride, ti, blockStart, blockEnd, sampleTime, error, "WDAT bool-toggle-stride record")) return false;
             value[0] = (ti == 0) ? (initial ? 1 : 0) : (value[0] ? 0 : 1);
             if (!appendDecodedRecordValue(outputIndexes, value, 1, sampleTime, windowStart, windowEnd,
-                                          outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error)) return false;
+                                          outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error, observer)) return false;
         }
         return true;
     }
@@ -2350,7 +2352,7 @@ bool decodeSignalRecord(SpanReader& rr,
         if (!readRecordTime(sampleTime)) return false;
         if (!readFullValue(rr, value, byteWidth, error, "WDAT byte-mask record")) return false;
         if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime, windowStart, windowEnd,
-                                      outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error)) return false;
+                                      outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error, observer)) return false;
         for (u64 ti = 1; ti < transitionCount; ++ti) {
             if (!readRecordTime(sampleTime)) return false;
             u8 mask = 0;
@@ -2360,7 +2362,7 @@ bool decodeSignalRecord(SpanReader& rr,
             }
             if (!applyChangedByteMask(rr, value, byteWidth, mask, error, "WDAT byte-mask record")) return false;
             if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime, windowStart, windowEnd,
-                                          outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error)) return false;
+                                          outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error, observer)) return false;
         }
         return true;
     }
@@ -2375,7 +2377,7 @@ bool decodeSignalRecord(SpanReader& rr,
         if (!resolveStrideRecordTime(firstRel, stride, 0, blockStart, blockEnd, sampleTime, error, "WDAT byte-mask-stride record")) return false;
         if (!readFullValue(rr, value, byteWidth, error, "WDAT byte-mask-stride record")) return false;
         if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime, windowStart, windowEnd,
-                                      outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error)) return false;
+                                      outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error, observer)) return false;
         for (u64 ti = 1; ti < transitionCount; ++ti) {
             u8 mask = 0;
             if (!rr.readU8(mask)) {
@@ -2385,7 +2387,7 @@ bool decodeSignalRecord(SpanReader& rr,
             if (!resolveStrideRecordTime(firstRel, stride, ti, blockStart, blockEnd, sampleTime, error, "WDAT byte-mask-stride record")) return false;
             if (!applyChangedByteMask(rr, value, byteWidth, mask, error, "WDAT byte-mask-stride record")) return false;
             if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime, windowStart, windowEnd,
-                                          outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error)) return false;
+                                          outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error, observer)) return false;
         }
         return true;
     }
@@ -2395,7 +2397,7 @@ bool decodeSignalRecord(SpanReader& rr,
         if (!readRecordTime(sampleTime)) return false;
         if (!readFullValue(rr, value, byteWidth, error, "WDAT nibble-mask record")) return false;
         if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime, windowStart, windowEnd,
-                                      outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error)) return false;
+                                      outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error, observer)) return false;
         for (u64 ti = 1; ti < transitionCount; ti += 2) {
             qint64 sampleTime0 = 0;
             if (!readRecordTime(sampleTime0)) return false;
@@ -2409,11 +2411,11 @@ bool decodeSignalRecord(SpanReader& rr,
             }
             if (!applyChangedByteMask(rr, value, byteWidth, static_cast<u8>(packedMask & 0x0f), error, "WDAT nibble-mask record")) return false;
             if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime0, windowStart, windowEnd,
-                                          outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error)) return false;
+                                          outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error, observer)) return false;
             if (haveSecond) {
                 if (!applyChangedByteMask(rr, value, byteWidth, static_cast<u8>((packedMask >> 4) & 0x0f), error, "WDAT nibble-mask record")) return false;
                 if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime1, windowStart, windowEnd,
-                                              outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error)) return false;
+                                              outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error, observer)) return false;
             } else if ((packedMask & 0xf0u) != 0) {
                 error = QStringLiteral("WVZ4 WDAT nibble-mask record has dangling high mask");
                 return false;
@@ -2432,7 +2434,7 @@ bool decodeSignalRecord(SpanReader& rr,
         if (!resolveStrideRecordTime(firstRel, stride, 0, blockStart, blockEnd, sampleTime, error, "WDAT nibble-mask-stride record")) return false;
         if (!readFullValue(rr, value, byteWidth, error, "WDAT nibble-mask-stride record")) return false;
         if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime, windowStart, windowEnd,
-                                      outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error)) return false;
+                                      outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error, observer)) return false;
         for (u64 ti = 1; ti < transitionCount; ti += 2) {
             u8 packedMask = 0;
             if (!rr.readU8(packedMask)) {
@@ -2443,13 +2445,13 @@ bool decodeSignalRecord(SpanReader& rr,
             if (!resolveStrideRecordTime(firstRel, stride, ti, blockStart, blockEnd, sampleTime0, error, "WDAT nibble-mask-stride record")) return false;
             if (!applyChangedByteMask(rr, value, byteWidth, static_cast<u8>(packedMask & 0x0f), error, "WDAT nibble-mask-stride record")) return false;
             if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime0, windowStart, windowEnd,
-                                          outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error)) return false;
+                                          outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error, observer)) return false;
             if (ti + 1 < transitionCount) {
                 qint64 sampleTime1 = 0;
                 if (!resolveStrideRecordTime(firstRel, stride, ti + 1, blockStart, blockEnd, sampleTime1, error, "WDAT nibble-mask-stride record")) return false;
                 if (!applyChangedByteMask(rr, value, byteWidth, static_cast<u8>((packedMask >> 4) & 0x0f), error, "WDAT nibble-mask-stride record")) return false;
                 if (!appendDecodedRecordValue(outputIndexes, value, byteWidth, sampleTime1, windowStart, windowEnd,
-                                              outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error)) return false;
+                                              outputSignals, samplesByOutputIndex, compactSamples, leftAnchors, error, observer)) return false;
             } else if ((packedMask & 0xf0u) != 0) {
                 error = QStringLiteral("WVZ4 WDAT nibble-mask-stride record has dangling high mask");
                 return false;
@@ -2530,7 +2532,8 @@ bool decodeRawWaveTile(const QByteArray& rawPayload,
                          qint64& minTime,
                          qint64& maxTime,
                          RawLeftAnchorState* leftAnchors,
-                         QString& error) {
+                         QString& error,
+                         const RawDecodeObserver* observer = nullptr) {
     SpanReader r(rawPayload);
 
     u64 blockId = 0;
@@ -2748,13 +2751,15 @@ bool decodeRawWaveTile(const QByteArray& rawPayload,
                 return false;
             }
             const QVector<int>* outputIndexes = directIntListMapValue(outputIndexesByStorageId, sid);
-            if (!outputIndexes || outputIndexes->isEmpty()) continue;
+            if ((!outputIndexes || outputIndexes->isEmpty()) && !observer) continue;
+            static const QVector<int> emptyOutputIndexes;
 
             SpanReader rr(recordsBlob + int(beginOff64), int(endOff64 - beginOff64));
             if (!decodeSignalRecord(rr, hasValueCodec, useDeltaTimes, useSharedTimeTable, sharedTimes,
-                                    blockStart, blockEnd, byteWidth, *outputIndexes,
+                                    blockStart, blockEnd, byteWidth,
+                                    outputIndexes ? *outputIndexes : emptyOutputIndexes,
                                     outputSignals, samplesByOutputIndex, windowStart, windowEnd,
-                                    true, leftAnchors, error)) {
+                                    true, leftAnchors, error, observer)) {
                 return false;
             }
             if (!rr.eof()) {
@@ -2785,13 +2790,15 @@ bool decodeRawWaveTile(const QByteArray& rawPayload,
             return false;
         }
         const QVector<int>* outputIndexes = directIntListMapValue(outputIndexesByStorageId, sid);
-        if (!outputIndexes || outputIndexes->isEmpty()) continue;
+        if ((!outputIndexes || outputIndexes->isEmpty()) && !observer) continue;
+        static const QVector<int> emptyOutputIndexes;
 
         SpanReader rr(recordsBlob + int(beginOff64), int(endOff64 - beginOff64));
         if (!decodeSignalRecord(rr, hasValueCodec, useDeltaTimes, useSharedTimeTable, sharedTimes,
-                                blockStart, blockEnd, byteWidth, *outputIndexes,
+                                blockStart, blockEnd, byteWidth,
+                                outputIndexes ? *outputIndexes : emptyOutputIndexes,
                                 outputSignals, samplesByOutputIndex, windowStart, windowEnd,
-                                true, leftAnchors, error)) {
+                                true, leftAnchors, error, observer)) {
             return false;
         }
 
@@ -2870,7 +2877,8 @@ bool decodeWdatSectionStreaming(QFile& file,
                                 qint64& maxTime,
                                 QString& error,
                                 RawLeftAnchorState* leftAnchors = nullptr,
-                                const BlockIndexRec* expectedIndex = nullptr) {
+                                const BlockIndexRec* expectedIndex = nullptr,
+                                const RawDecodeObserver* observer = nullptr) {
     const qint64 sectionEnd = section.payloadOffset + qint64(section.size);
     if (sectionEnd < section.payloadOffset || sectionEnd > file.size()) {
         error = QStringLiteral("WVZ4 WDAT section range is invalid");
@@ -2987,7 +2995,8 @@ bool decodeWdatSectionStreaming(QFile& file,
                              signalChunkId, firstSignalId, signalCount,
                                selectedIds, allSelected, outputIndexesByStorageId,
                                byteWidthBySignalId, outputSignals, samplesByOutputIndex,
-                               windowStart, windowEnd, minTime, maxTime, leftAnchors, error);
+                               windowStart, windowEnd, minTime, maxTime,
+                               leftAnchors, error, observer);
 }
 
 
@@ -3143,7 +3152,14 @@ bool collectFooterBlockIndexesForSelection(const QVector<BlockIndexRec>& footerB
             return false;
         }
         const BlockIndexRec& b = footerBlocks.at(i);
-        if (!blockOverlapsWindow(b.start, b.end, windowStart, windowEnd)) continue;
+        // A range decode must also recover the exact value entering the
+        // window.  A signal can remain unchanged for arbitrarily many WDAT
+        // blocks, so selecting only overlapping blocks silently falls back to
+        // the implicit zero value.  Keep preceding blocks for the selected
+        // signal chunks; the streaming decoder reduces them to one latest
+        // left-anchor sample per output signal.
+        const bool needLeftAnchor = windowEnd >= windowStart && b.start < windowStart;
+        if (!blockOverlapsWindow(b.start, b.end, windowStart, windowEnd) && !needLeftAnchor) continue;
         if (b.firstSignalId == 0 || b.signalCount == 0 ||
             b.firstSignalId > u64(std::numeric_limits<int>::max()) ||
             b.signalCount > u64(std::numeric_limits<int>::max()) ||
@@ -3201,7 +3217,14 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
 
     const unsigned hw = std::thread::hardware_concurrency();
     const int detectedWorkers = int(hw == 0 ? 4 : hw);
-    const int workerCount = qBound(1, qMin(detectedWorkers, selectedBlockIndexes.size()), 32);
+    bool configuredWorkerCountOk = false;
+    const int configuredWorkerCount =
+        qEnvironmentVariable("WV_VIEWER_RAW_DECODE_WORKERS").toInt(&configuredWorkerCountOk);
+    const int desiredWorkerCount = configuredWorkerCountOk
+        ? qMax(1, configuredWorkerCount)
+        : qMin(detectedWorkers, 4);
+    const int workerCount =
+        qBound(1, qMin(desiredWorkerCount, selectedBlockIndexes.size()), 32);
     if (workerCount <= 1 || selectedBlockIndexes.size() < 4) {
         QFile file(filePath);
         if (!file.open(QIODevice::ReadOnly)) {
@@ -4345,6 +4368,18 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
         error = QStringLiteral("WVZ4 missing SIGD section or signal table is empty");
         return false;
     }
+    QVector<int> directoryOutputIndexBySignalId =
+        next->directoryWave.tree.signalIndexBySignalId;
+    for (int& encodedIndex : directoryOutputIndexBySignalId) {
+        encodedIndex = encodedIndex > 0 ? encodedIndex - 1 : -1;
+    }
+    if (!applyProceduralClockDefinitions(next->clocks,
+                                         directoryOutputIndexBySignalId,
+                                         next->directoryWave.signalList,
+                                         true,
+                                         error)) {
+        return false;
+    }
 
     qint64 minTime = std::numeric_limits<qint64>::max();
     qint64 maxTime = 0;
@@ -4379,10 +4414,12 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
     selectedStorageIds.reserve(signalIds.size() * 2 + 1);
     QSet<int> emittedSignalIds;
     emittedSignalIds.reserve(signalIds.size() * 2 + 1);
+    const QSet<int> clockSignalIds = proceduralClockSignalIds(d->clocks);
     for (int sid : signalIds) {
         if (sid <= 0 || sid > d->sigs.size()) continue;
         const SigRec& s = d->sigs.at(sid - 1);
         if (s.signalId != u32(sid)) continue;
+        if (clockSignalIds.contains(sid)) continue;
         const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
         if (storageId > 0) selectedStorageIds.insert(storageId);
     }
@@ -4401,8 +4438,17 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
         const int idx = outputSignals.size();
         outputSignals.push_back(makeWaveSignalFromRec(s, true));
         directIntMapSet(outputIndexBySignalId, int(s.signalId), idx);
-        const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
-        directIntListMapAppend(outputIndexesByStorageId, storageId, idx);
+        if (!clockSignalIds.contains(sid)) {
+            const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
+            directIntListMapAppend(outputIndexesByStorageId, storageId, idx);
+        }
+    }
+    if (!applyProceduralClockDefinitions(d->clocks,
+                                         outputIndexBySignalId,
+                                         outputSignals,
+                                         false,
+                                         error)) {
+        return false;
     }
 
     QVector<QVector<WaveSample>> samplesByOutputIndex;
@@ -4454,10 +4500,6 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
     }
 
     expandTimeRangeFromFooterBlocks(d->footerBlocks, minTime, maxTime);
-    appendClockSamplesForLoadedSignals(d->clocks, outputIndexBySignalId,
-                                       timeStart, timeEnd,
-                                       outputSignals, samplesByOutputIndex,
-                                       minTime, maxTime);
 
     for (int i = 0; i < outputSignals.size(); ++i) {
         outputSignals[i].samples = std::move(samplesByOutputIndex[i]);
@@ -4478,6 +4520,219 @@ bool WaveParser4Reader::loadSignalLod(const QVector<int>& signalIds,
                                       qint64 targetBucketCycles) const {
     return loadSignalLodImpl(signalIds, outWave, error, timeStart, timeEnd,
                              targetBucketCycles, false, -1);
+}
+
+bool WaveParser4Reader::findRawSignalEvent(const QVector<int>& signalIds,
+                                           qint64 timeStart,
+                                           qint64 timeEnd,
+                                           bool firstEvent,
+                                           int& resultSignalId,
+                                           qint64& resultTime,
+                                           QString& error,
+                                           quint64 maxDecodedSamples) const {
+    resultSignalId = -1;
+    resultTime = -1;
+    error.clear();
+    if (!d || !d->opened) {
+        error = QStringLiteral("WVZ4 reader is not open");
+        return false;
+    }
+    if (signalIds.isEmpty() || timeEnd <= timeStart) return true;
+
+    // Very large constant-only trees are common in generated hierarchy
+    // probes. Prove the no-event case without materializing one WaveSignal and
+    // one implicit WaveSample per selected signal. This decoder still parses
+    // and validates every selected raw record; it succeeds only when every
+    // transition in the entire file collapses at the trace start.
+    bool thresholdOk = false;
+    const int configuredThreshold =
+        qEnvironmentVariable("WV_VIEWER_TREE_EVENT_REDUCE_THRESHOLD").toInt(&thresholdOk);
+    const int reductionThreshold = thresholdOk ? qMax(1, configuredThreshold) : 65536;
+    if (signalIds.size() > reductionThreshold && !d->residualLodTables) {
+        QBitArray selectedSignalIds(d->sigs.size() + 1, false);
+        int selectedVisibleCount = 0;
+        for (int signalId : signalIds) {
+            if (signalId <= 0 || signalId > d->sigs.size() ||
+                selectedSignalIds.testBit(signalId)) {
+                continue;
+            }
+            const SigRec& signal = d->sigs.at(signalId - 1);
+            if (signal.signalId != u32(signalId) || !isVisibleSignalRec(signal)) continue;
+            selectedSignalIds.setBit(signalId);
+            ++selectedVisibleCount;
+        }
+
+        bool selectedClock = false;
+        for (const ClockRec& clock : d->clocks) {
+            const int signalId = int(clock.signalId);
+            if (signalId > 0 && signalId < selectedSignalIds.size() &&
+                selectedSignalIds.testBit(signalId)) {
+                selectedClock = true;
+                break;
+            }
+        }
+
+        if (selectedVisibleCount > 0 && !selectedClock) {
+            const bool allSelectedStorage =
+                selectedVisibleCount == d->directoryWave.signalList.size();
+            QSet<int> selectedStorageIds;
+            if (!allSelectedStorage) {
+                selectedStorageIds.reserve(selectedVisibleCount * 2 + 1);
+                for (int signalId = 1; signalId < selectedSignalIds.size(); ++signalId) {
+                    if (!selectedSignalIds.testBit(signalId)) continue;
+                    const SigRec& signal = d->sigs.at(signalId - 1);
+                    const int storageId = int(signal.storageId != 0
+                        ? signal.storageId : signal.signalId);
+                    if (storageId > 0) selectedStorageIds.insert(storageId);
+                }
+            }
+
+            struct StartOnlyObserverState {
+                qint64 traceStart = 0;
+                bool sawOtherTime = false;
+            } observerState;
+            observerState.traceStart = d->directoryWave.meta.start;
+            RawDecodeObserver observer;
+            observer.context = &observerState;
+            observer.callback = [](qint64 sampleTime, void* context) {
+                StartOnlyObserverState* state =
+                    static_cast<StartOnlyObserverState*>(context);
+                if (sampleTime == state->traceStart) return true;
+                state->sawOtherTime = true;
+                return false;
+            };
+
+            QFile file(d->filePath);
+            if (!file.open(QIODevice::ReadOnly)) {
+                error = QStringLiteral("Cannot open WVZ4 file: %1").arg(d->filePath);
+                return false;
+            }
+            const QVector<QVector<int>> noOutputIndexes;
+            const QVector<WaveSignal> noOutputSignals;
+            QVector<QVector<WaveSample>> noOutputSamples;
+            qint64 ignoredMinTime = std::numeric_limits<qint64>::max();
+            qint64 ignoredMaxTime = 0;
+            bool proofComplete = true;
+            for (const BlockIndexRec& block : d->footerBlocks) {
+                if (!signalRangeIntersectsSelection(
+                        selectedStorageIds, allSelectedStorage,
+                        int(block.firstSignalId), int(block.signalCount))) {
+                    continue;
+                }
+                if (block.fileOffset > u64(std::numeric_limits<qint64>::max()) ||
+                    !file.seek(qint64(block.fileOffset))) {
+                    error = QStringLiteral("WVZ4 failed to seek to WDAT block %1 from FOOT index")
+                        .arg(block.blockId);
+                    return false;
+                }
+                SectionHeader section;
+                if (!readSectionHeader(file, section, error)) {
+                    if (error.isEmpty()) {
+                        error = QStringLiteral("WVZ4 FOOT block %1 points past end of file")
+                            .arg(block.blockId);
+                    }
+                    return false;
+                }
+                if (section.tag != "WDAT") {
+                    error = QStringLiteral("WVZ4 FOOT block %1 does not point to a WDAT section")
+                        .arg(block.blockId);
+                    return false;
+                }
+                if (!decodeWdatSectionStreaming(
+                        file, section, selectedStorageIds, allSelectedStorage,
+                        noOutputIndexes, d->byteWidthByStorageId,
+                        noOutputSignals, noOutputSamples,
+                        std::numeric_limits<qint64>::min(),
+                        std::numeric_limits<qint64>::max(),
+                        ignoredMinTime, ignoredMaxTime, error,
+                        nullptr, &block, &observer)) {
+                    if (!error.isEmpty()) return false;
+                    proofComplete = false;
+                    break;
+                }
+            }
+            if (proofComplete && !observerState.sawOtherTime) return true;
+        }
+    }
+
+    // Keep raw decoding in the parser so the jump path can reduce the result
+    // to one event without installing every selected signal's samples and
+    // derived caches into the viewer. loadSignals remains the single source
+    // of truth for implicit values, clock records, aliases/slices, residual
+    // LOD records, range anchors, and sample compaction.
+    WaveFile loadedWave;
+    if (!loadSignals(signalIds, loadedWave, error, maxDecodedSamples,
+                     timeStart, timeEnd)) {
+        return false;
+    }
+
+    QVector<int> ordinalBySignalId(d->sigs.size() + 1, -1);
+    for (int ordinal = 0; ordinal < signalIds.size(); ++ordinal) {
+        const int signalId = signalIds.at(ordinal);
+        if (signalId > 0 && signalId < ordinalBySignalId.size() &&
+            ordinalBySignalId.at(signalId) < 0) {
+            ordinalBySignalId[signalId] = ordinal;
+        }
+    }
+
+    int resultOrdinal = (std::numeric_limits<int>::max)();
+    auto lowerSample = [](const QVector<WaveSample>& samples, qint64 time) {
+        int lo = 0;
+        int hi = samples.size();
+        while (lo < hi) {
+            const int mid = lo + (hi - lo) / 2;
+            if (samples.at(mid).time < time) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    };
+
+    for (const WaveSignal& signal : loadedWave.signalList) {
+        qint64 eventTime = -1;
+        if (signal.proceduralClock) {
+            eventTime = firstEvent
+                ? waveProceduralClockTransitionAtOrAfter(signal, timeStart)
+                : waveProceduralClockPreviousTransition(signal, timeEnd);
+            if (eventTime < timeStart || eventTime >= timeEnd) eventTime = -1;
+        } else if (signal.samples.size() < 2) {
+            continue;
+        } else if (firstEvent) {
+            const int begin = qMax(1, lowerSample(signal.samples, timeStart));
+            for (int i = begin; i < signal.samples.size(); ++i) {
+                const qint64 time = signal.samples.at(i).time;
+                if (time >= timeEnd) break;
+                if (!waveSamplesEquivalent(signal.samples.at(i), signal.samples.at(i - 1))) {
+                    eventTime = time;
+                    break;
+                }
+            }
+        } else {
+            int i = qMin(lowerSample(signal.samples, timeEnd) - 1,
+                         signal.samples.size() - 1);
+            for (; i >= 1; --i) {
+                const qint64 time = signal.samples.at(i).time;
+                if (time < timeStart) break;
+                if (!waveSamplesEquivalent(signal.samples.at(i), signal.samples.at(i - 1))) {
+                    eventTime = time;
+                    break;
+                }
+            }
+        }
+        if (eventTime < 0) continue;
+
+        const int ordinal =
+            signal.signalId > 0 && signal.signalId < ordinalBySignalId.size()
+                ? ordinalBySignalId.at(signal.signalId)
+                : (std::numeric_limits<int>::max)();
+        if (resultTime < 0 ||
+            (firstEvent ? eventTime < resultTime : eventTime > resultTime) ||
+            (eventTime == resultTime && ordinal < resultOrdinal)) {
+            resultSignalId = signal.signalId;
+            resultTime = eventTime;
+            resultOrdinal = ordinal;
+        }
+    }
+    return true;
 }
 
 bool WaveParser4Reader::loadSignalLodImpl(const QVector<int>& signalIds,
@@ -4502,16 +4757,29 @@ bool WaveParser4Reader::loadSignalLodImpl(const QVector<int>& signalIds,
     QSet<int> emittedSignalIds;
     selectedStorageIds.reserve(signalIds.size() * 2 + 1);
     emittedSignalIds.reserve(signalIds.size() * 2 + 1);
+    const QSet<int> clockSignalIds = proceduralClockSignalIds(d->clocks);
     QVector<WaveSignal> outputSignals;
+    QVector<int> outputIndexBySignalId;
     outputSignals.reserve(signalIds.size());
+    outputIndexBySignalId.reserve(signalIds.size());
     for (int sid : signalIds) {
         if (sid <= 0 || sid > d->sigs.size() || emittedSignalIds.contains(sid)) continue;
         const SigRec& s = d->sigs.at(sid - 1);
         if (s.signalId != u32(sid) || !isVisibleSignalRec(s)) continue;
         emittedSignalIds.insert(sid);
-        const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
-        if (storageId > 0) selectedStorageIds.insert(storageId);
+        if (!clockSignalIds.contains(sid)) {
+            const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
+            if (storageId > 0) selectedStorageIds.insert(storageId);
+        }
+        directIntMapSet(outputIndexBySignalId, sid, outputSignals.size());
         outputSignals.push_back(makeWaveSignalFromRec(s, false));
+    }
+    if (!applyProceduralClockDefinitions(d->clocks,
+                                         outputIndexBySignalId,
+                                         outputSignals,
+                                         false,
+                                         error)) {
+        return false;
     }
     if (outputSignals.isEmpty() || selectedStorageIds.isEmpty()) {
         outWave.signalList = std::move(outputSignals);
@@ -4937,6 +5205,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
         selectedIds.clear();
         selectedStorageIds.clear();
         lodSelectedStorageIds.clear();
+        const QSet<int> clockSignalIds = proceduralClockSignalIds(clocks);
         auto isVisibleSignal = [](const SigRec& s) -> bool {
             return !s.storageOnly;
         };
@@ -5001,6 +5270,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
         }
         if (!allSelectedStorageIds) {
             for (QSet<int>::const_iterator it = selectedIds.constBegin(); it != selectedIds.constEnd(); ++it) {
+                if (clockSignalIds.contains(*it)) continue;
                 const int storageId = directIntMapValue(storageIdBySignalId, *it, -1);
                 if (storageId > 0) selectedStorageIds.insert(storageId);
             }
@@ -5012,6 +5282,10 @@ bool WaveParser4::loadFromFile(const QString& filePath,
             int loaded = 0;
             for (int i = 0; i < sigs.size() && loaded < options.autoLoadFirstSignalLodCount; ++i) {
                 if (!isVisibleSignal(sigs.at(i))) continue;
+                if (clockSignalIds.contains(int(sigs.at(i).signalId))) {
+                    ++loaded;
+                    continue;
+                }
                 const int storageId = directIntMapValue(storageIdBySignalId, int(sigs.at(i).signalId), -1);
                 if (storageId > 0) lodSelectedStorageIds.insert(storageId);
                 ++loaded;
@@ -5052,7 +5326,8 @@ bool WaveParser4::loadFromFile(const QString& filePath,
                     (allSelectedSignalIds || selectedIds.contains(int(s.signalId)));
                 outputSignals.push_back(makeWaveSignal(s, rawSelected));
                 directIntMapSet(outputIndexBySignalId, int(s.signalId), idx);
-                if (outputSignals.at(idx).samplesLoaded) {
+                if (outputSignals.at(idx).samplesLoaded &&
+                    !clockSignalIds.contains(int(s.signalId))) {
                     const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
                     directIntListMapAppend(outputIndexesByStorageId, storageId, idx);
                 }
@@ -5067,11 +5342,20 @@ bool WaveParser4::loadFromFile(const QString& filePath,
                 const int idx = outputSignals.size();
                 outputSignals.push_back(makeWaveSignal(s, options.loadRawSamples));
                 directIntMapSet(outputIndexBySignalId, int(s.signalId), idx);
-                if (options.loadRawSamples) {
+                if (options.loadRawSamples &&
+                    !clockSignalIds.contains(int(s.signalId))) {
                     const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
                     directIntListMapAppend(outputIndexesByStorageId, storageId, idx);
                 }
             }
+        }
+
+        if (!applyProceduralClockDefinitions(clocks,
+                                             outputIndexBySignalId,
+                                             outputSignals,
+                                             options.includeAllSignalDefinitions,
+                                             error)) {
+            return false;
         }
 
         samplesByOutputIndex.resize(outputSignals.size());
@@ -5303,13 +5587,6 @@ bool WaveParser4::loadFromFile(const QString& filePath,
             }
             minTime = footerStart;
         }
-    }
-
-    if (options.loadRawSamples) {
-        appendClockSamplesForLoadedSignals(clocks, outputIndexBySignalId,
-                                           options.timeStart, options.timeEnd,
-                                           outputSignals, samplesByOutputIndex,
-                                           minTime, maxTime);
     }
 
     for (int i = 0; i < outputSignals.size(); ++i) {

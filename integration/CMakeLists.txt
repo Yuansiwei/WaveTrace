@@ -116,7 +116,7 @@ if(ENABLE_WAVETRACE)
 
 	set(WAVETRACE_BUILD_TOP_DIR "${CMAKE_BINARY_DIR}/WaveTracer")
 	set(WAVETRACE_GEN_DIR "${WAVETRACE_ROOT}/generated_reflect")
-	set(WAVETRACE_CONFIG_FILE "${WAVETRACE_ROOT}/wavetrace_config.json" CACHE FILEPATH "WaveTrace reflection/runtime configuration and WavePtr switches")
+	set(WAVETRACE_CONFIG_FILE "${WAVETRACE_ROOT}/wavetrace_config.json" CACHE FILEPATH "WaveTrace reflection/runtime configuration and pointer-target switches")
 	if(NOT EXISTS "${WAVETRACE_CONFIG_FILE}")
 		get_filename_component(_wavetrace_config_dir "${WAVETRACE_CONFIG_FILE}" DIRECTORY)
 		file(MAKE_DIRECTORY "${_wavetrace_config_dir}")
@@ -155,12 +155,6 @@ if(ENABLE_WAVETRACE)
 			message(FATAL_ERROR "WaveTrace ReflectGen runtime dependency was not found: '${WAVETRACE_TOOL_DIR}/libclang.dll'")
 		endif()
 	endif()
-endif()
-set(WAVETRACE_CMODEL_FORCE_INCLUDE_MSVC)
-set(WAVETRACE_CMODEL_FORCE_INCLUDE_CLANG)
-if(ENABLE_WAVETRACE)
-	set(WAVETRACE_CMODEL_FORCE_INCLUDE_MSVC "/FI${WAVETRACE_ROOT}/reflect_macro.h")
-	set(WAVETRACE_CMODEL_FORCE_INCLUDE_CLANG -include "${WAVETRACE_ROOT}/reflect_macro.h")
 endif()
 # Collect all source files
 set(ALL_SOURCES)
@@ -252,8 +246,7 @@ if(WIN32)
 	string(REPLACE "\\" "/" CMODEL_PATH "${AQARCH}/cmodel")
 	target_compile_options(cmodel PUBLIC -DAQ2_DMA=1 -DXAQ2=1 -DEMULATOR -DPATH_TO_CMODEL="${CMODEL_PATH}" $<$<CONFIG:Debug>:-DUSE_PRINTF> $<$<CONFIG:Debug>:-D_DEBUG> $<$<BOOL:${DV_DUMP}>:-DDV_DUMP=1> $<$<BOOL:${ISAMODEL}>:-DgcdMODELING_MODE=2>)
 	if (MSVC)
-		target_compile_options(cmodel PRIVATE ${WAVETRACE_CMODEL_FORCE_INCLUDE_MSVC}
-											/FI${AQARCH}/cmodel/inc/vsiPrecomp.h
+		target_compile_options(cmodel PRIVATE
 											/vmg -Zm300 /bigobj -D_CRT_SECURE_NO_WARNINGS
 											/MP${WAVETRACE_MSVC_MP_COUNT}
 											"$<$<AND:$<BOOL:${WAVETRACE_RELEASE_DEBUG_INFO}>,$<CONFIG:Release>>:/Z7>"
@@ -276,7 +269,6 @@ if(WIN32)
 			"$<$<CONFIG:Profile>:/OPT:ICF>"
 			"$<$<CONFIG:Profile>:/INCREMENTAL:NO>")
 	else()
-		target_compile_options(cmodel PRIVATE ${WAVETRACE_CMODEL_FORCE_INCLUDE_CLANG} -include ${AQARCH}/cmodel/inc/vsiPrecomp.h)
 		#target_compile_options(cmodel PRIVATE -flto)
 		target_link_libraries(cmodel PRIVATE winpthread)
 	endif()
@@ -428,13 +420,11 @@ elseif(UNIX)
     -DvsidUSE_VSI_HEADERS=1)
 	target_compile_definitions(cmodel PRIVATE PATH_TO_CMODEL="${AQARCH}/cmodel")
 	if (MSVC)
-		target_compile_options(cmodel PRIVATE ${WAVETRACE_CMODEL_FORCE_INCLUDE_MSVC}
-											/FI${AQARCH}/cmodel/inc/vsiPrecomp.h
+		target_compile_options(cmodel PRIVATE
 											/vmg -Zm300 /bigobj)
 		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-return-type -fPIC -g")
     else()
 		set_target_properties(cmodel PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON)
-        target_compile_options(cmodel PRIVATE ${WAVETRACE_CMODEL_FORCE_INCLUDE_CLANG} -include ${AQARCH}/cmodel/inc/vsiPrecomp.h)
 		if(DV_DUMP)
 			set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-return-type -fPIC -g")
 		endif()
@@ -650,7 +640,6 @@ if(ENABLE_WAVETRACE)
 	endforeach()
 
 	set(WAVETRACE_REFLECT_DEPENDS ${WAVETRACE_REFLECTGEN_DEPENDS} "${WAVETRACE_REFLECT_TARGET_LIST}" ${ALL_HEADERS})
-	list(APPEND WAVETRACE_REFLECT_DEPENDS "${WAVETRACE_CONFIG_FILE}")
 	if(DEFINED CMODEL_REGGEN_STAMP)
 		list(APPEND WAVETRACE_REFLECT_DEPENDS "${CMODEL_REGGEN_STAMP}")
 	endif()

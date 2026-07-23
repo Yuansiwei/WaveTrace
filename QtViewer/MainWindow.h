@@ -7,8 +7,11 @@
 #include <QString>
 #include <QSet>
 #include <QVector>
+#include <QJsonObject>
+#include <QJsonValue>
 #include <atomic>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -20,6 +23,7 @@ class QDragMoveEvent;
 class QDropEvent;
 class QEvent;
 class QLineEdit;
+class QComboBox;
 class QPushButton;
 class QIcon;
 class QSplitter;
@@ -33,6 +37,7 @@ class WaveCanvas;
 class WaveParser4Reader;
 class WaveBlockCacheLoader;
 class ActiveSignalListWidget;
+class AgentRpcServer;
 struct SignalLogicTree;
 
 class MainWindow : public QMainWindow {
@@ -42,6 +47,12 @@ public:
     ~MainWindow() override;
     bool openWaveFilePath(const QString& path, bool showError = true);
     void activateFirstSignalsForBenchmark(int count);
+    void jumpSelectedTreeSignalToViewportEventForBenchmark(bool firstEvent);
+    bool runValueFindForBenchmark(const QString& targetText,
+                                  int activeSignalCount,
+                                  int* hitCount,
+                                  quint64* resultChecksum,
+                                  qint64* elapsedMs);
     void selectViewportRangeForBenchmark(qint64 start, qint64 end);
     void resetViewForBenchmark();
     bool benchmarkActiveViewportCoverage(int* covered, int* total) const;
@@ -53,6 +64,10 @@ public:
                               QString* errorMessage = nullptr,
                               qint64* elapsedMs = nullptr,
                               int* resultSignalCount = nullptr);
+    QJsonValue handleAgentRpc(const QString& method,
+                              const QJsonObject& params,
+                              int* errorCode,
+                              QString* errorMessage);
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -70,6 +85,7 @@ private:
     void jumpToPrevChange();
     void jumpToNextChange();
     void jumpToTime();
+    void applyWindowRangeInput();
     void openDerivedSignalDialog();
     void openValueFindDialog();
     void runValueFind();
@@ -114,10 +130,10 @@ private:
     QVector<int> m_signalIndexBySignalId;
 
     QWidget* m_central = nullptr;
-    QLabel* m_metaLabel = nullptr;
     QLabel* m_cursorLabel = nullptr;
     QLabel* m_hoverLabel = nullptr;
-    QLabel* m_windowLabel = nullptr;
+    QLineEdit* m_windowRangeStartEdit = nullptr;
+    QLineEdit* m_windowRangeEndEdit = nullptr;
     QLineEdit* m_treeSearchEdit = nullptr;
     QPushButton* m_treeSearchCaseButton = nullptr;
     QPushButton* m_treeSearchRegexButton = nullptr;
@@ -134,6 +150,7 @@ private:
     QTimer* m_viewportLoadTimer = nullptr;
     QDialog* m_valueFindDialog = nullptr;
     QLineEdit* m_valueFindEdit = nullptr;
+    QComboBox* m_valueFindRangeCombo = nullptr;
     QLabel* m_valueFindSummaryLabel = nullptr;
     QTreeWidget* m_valueFindResults = nullptr;
     QPushButton* m_valueFindPrevButton = nullptr;
@@ -141,8 +158,11 @@ private:
     QVector<ValueFindHit> m_valueFindHits;
     QList<int> m_valueFindSignalIndexes;
     QString m_valueFindSummaryBase;
+    qint64 m_valueFindRangeStart = 0;
+    qint64 m_valueFindRangeEnd = 0;
     int m_valueFindCurrentHit = -1;
     std::unique_ptr<SignalLogicTree> m_signalTreeModel;
+    std::unique_ptr<AgentRpcServer> m_agentRpcServer;
     std::thread m_treeWarmupThread;
     std::thread m_viewportLoadThread;
     std::shared_ptr<std::atomic_bool> m_treeWarmupCancel;
@@ -202,9 +222,20 @@ private:
     bool selectActiveSignalByIndex(int signalIndex);
     bool canDeferSamplesWithLod(const WaveSignal& sig) const;
     bool ensureSignalLodLoaded(const QList<int>& signalIndexes);
-    bool ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool allowLodDefer = true, bool viewportRaw = false, bool quiet = false);
+    bool ensureSignalSamplesLoaded(const QList<int>& signalIndexes,
+                                   bool allowLodDefer = true,
+                                   bool viewportRaw = false,
+                                   bool quiet = false,
+                                   qint64 requestedRawStart = std::numeric_limits<qint64>::min(),
+                                   qint64 requestedRawEnd = std::numeric_limits<qint64>::min());
+    bool ensureAgentSignalRangeLoaded(int signalIndex, qint64 start, qint64 end, QString* error);
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-    bool ensureSignalSamplesLoaded(const QVector<int>& signalIndexes, bool allowLodDefer = true, bool viewportRaw = false, bool quiet = false);
+    bool ensureSignalSamplesLoaded(const QVector<int>& signalIndexes,
+                                   bool allowLodDefer = true,
+                                   bool viewportRaw = false,
+                                   bool quiet = false,
+                                   qint64 requestedRawStart = std::numeric_limits<qint64>::min(),
+                                   qint64 requestedRawEnd = std::numeric_limits<qint64>::min());
 #endif
     bool createDerivedSignal(const QString& name, const QString& expression, int widthOverride);
 

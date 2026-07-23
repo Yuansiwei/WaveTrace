@@ -70,11 +70,11 @@ struct GuardedDirtySlot {
 };
 
 struct GuardedDirtyTop {
-    wave::WavePtr<GuardedDirtySlot*> slots;
+    std::size_t slot_count;
+    WAVE_PTR_ARRAY(slot_count) GuardedDirtySlot* slots;
 
-    GuardedDirtyTop(GuardedDirtySlot* data, std::size_t count) : slots(data) {
-        slots.declareSize(count);
-    }
+    GuardedDirtyTop(GuardedDirtySlot* data, std::size_t count)
+        : slot_count(count), slots(data) {}
 };
 
 struct GuardedDynamicValue : wave::DynamicTraceTargetFor<GuardedDynamicValue> {
@@ -93,11 +93,11 @@ struct GuardedHookSlot {
 };
 
 struct GuardedHookTop {
-    wave::WavePtr<GuardedHookSlot*> slots;
+    std::size_t slot_count;
+    WAVE_PTR_ARRAY(slot_count) GuardedHookSlot* slots;
 
-    GuardedHookTop(GuardedHookSlot* data, std::size_t count) : slots(data) {
-        slots.declareSize(count);
-    }
+    GuardedHookTop(GuardedHookSlot* data, std::size_t count)
+        : slot_count(count), slots(data) {}
 };
 
 struct WideSlot {
@@ -107,11 +107,11 @@ struct WideSlot {
 };
 
 struct WideTop {
-    wave::WavePtr<WideSlot*> slots;
+    std::size_t slot_count;
+    WAVE_PTR_ARRAY(slot_count) WideSlot* slots;
 
-    WideTop(WideSlot* data, std::size_t count) : slots(data) {
-        slots.declareSize(count);
-    }
+    WideTop(WideSlot* data, std::size_t count)
+        : slot_count(count), slots(data) {}
 };
 
 struct RuntimeNamedFields {
@@ -121,11 +121,11 @@ struct RuntimeNamedFields {
 };
 
 struct Top {
-    wave::WavePtr<Slot*> slots;
+    std::size_t slot_count;
+    WAVE_PTR_ARRAY(slot_count) Slot* slots;
 
-    Top(Slot* data, std::size_t count) : slots(data) {
-        slots.declareSize(count);
-    }
+    Top(Slot* data, std::size_t count)
+        : slot_count(count), slots(data) {}
 };
 
 namespace reflect {
@@ -163,7 +163,8 @@ template<> struct reflected_visitor<Top> {
     template<class P, class V, class G>
     static void visit(const Top* obj, P&& on_ptr, V&&, G&&) {
         ++g_top_visits;
-        on_ptr("slots", std::addressof(obj->slots));
+        ::wave::detail::invoke_annotated_ptr_visitor(
+            on_ptr, "slots", obj->slots, obj->slot_count);
     }
 };
 
@@ -180,7 +181,8 @@ template<> struct is_reflected<GuardedDirtyTop> : std::true_type {};
 template<> struct reflected_visitor<GuardedDirtyTop> {
     template<class P, class V, class G>
     static void visit(const GuardedDirtyTop* obj, P&& on_ptr, V&&, G&&) {
-        on_ptr("slots", std::addressof(obj->slots));
+        ::wave::detail::invoke_annotated_ptr_visitor(
+            on_ptr, "slots", obj->slots, obj->slot_count);
     }
 };
 
@@ -204,7 +206,8 @@ template<> struct is_reflected<GuardedHookTop> : std::true_type {};
 template<> struct reflected_visitor<GuardedHookTop> {
     template<class P, class V, class G>
     static void visit(const GuardedHookTop* obj, P&& on_ptr, V&&, G&&) {
-        on_ptr("slots", std::addressof(obj->slots));
+        ::wave::detail::invoke_annotated_ptr_visitor(
+            on_ptr, "slots", obj->slots, obj->slot_count);
     }
 };
 
@@ -220,7 +223,8 @@ template<> struct is_reflected<WideTop> : std::true_type {};
 template<> struct reflected_visitor<WideTop> {
     template<class P, class V, class G>
     static void visit(const WideTop* obj, P&& on_ptr, V&&, G&&) {
-        on_ptr("slots", std::addressof(obj->slots));
+        ::wave::detail::invoke_annotated_ptr_visitor(
+            on_ptr, "slots", obj->slots, obj->slot_count);
     }
 };
 

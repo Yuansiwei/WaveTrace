@@ -14,7 +14,7 @@
     <WaveTraceReflectRootClass Condition="'$(WaveTraceReflectRootClass)'==''">cmoTopLevel</WaveTraceReflectRootClass>
     <WaveTraceReflectBatchDir Condition="'$(WaveTraceReflectBatchDir)'==''">$(ProjectDir)</WaveTraceReflectBatchDir>
     <WaveTraceReflectExtraArgs Condition="'$(WaveTraceReflectExtraArgs)'==''">--allow-errors</WaveTraceReflectExtraArgs>
-    <WaveTraceReflectClangArgs Condition="'$(WaveTraceReflectClangArgs)'==''">-std=c++14 -ferror-limit=0 -DANON(x)= -I&quot;$(ProjectDir)&quot; -I&quot;$(WaveTraceRoot)&quot; -I&quot;$(WaveTraceRoot)\third_party\zstd\include&quot; -resource-dir=&quot;$(WaveTraceRoot)\tools\lib\clang\22&quot; -include &quot;$(WaveTraceRoot)\reflect_macro.h&quot;</WaveTraceReflectClangArgs>
+    <WaveTraceReflectClangArgs Condition="'$(WaveTraceReflectClangArgs)'==''">-std=c++14 -ferror-limit=0 -DANON(x)= -I&quot;$(ProjectDir)&quot; -I&quot;$(WaveTraceRoot)&quot; -I&quot;$(WaveTraceRoot)\third_party\zstd\include&quot; -resource-dir=&quot;$(WaveTraceRoot)\tools\lib\clang\22&quot;</WaveTraceReflectClangArgs>
     <WaveTraceReflectCoreInputs>$(WaveTraceReflectGenExe);$(MSBuildProjectFullPath);$(WaveTraceConfigFile);$(WaveTraceRoot)\reflect_macro.h;$(WaveTraceRoot)\reflect_runtime.h;$(WaveTraceRoot)\wave_runtime.h;$(WaveTraceRoot)\wavetrace_config.h</WaveTraceReflectCoreInputs>
   </PropertyGroup>
 
@@ -27,7 +27,6 @@
   <ItemDefinitionGroup>
     <ClCompile>
       <AdditionalIncludeDirectories>$(WaveTraceReflectGenDir);$(WaveTraceRoot);$(WaveTraceRoot)\third_party\zstd\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <ForcedIncludeFiles>$(WaveTraceRoot)\reflect_macro.h;%(ForcedIncludeFiles)</ForcedIncludeFiles>
       <PreprocessorDefinitions>WAVETRACE_CONFIG_PATH=&quot;$(WaveTraceConfigPathForCpp)&quot;;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>

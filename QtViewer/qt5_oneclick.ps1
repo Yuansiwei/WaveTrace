@@ -245,11 +245,12 @@ function WriteQtLocalProps($file,$localQt,$debug){
     $r=Rel $base $localQt
     if(!$r.EndsWith("\")){$r+="\"}
 
-    $dCore=""; $dGui=""; $dWid=""; $dEnt=""
+    $dCore=""; $dGui=""; $dWid=""; $dNet=""; $dEnt=""
     if($debug){
         $dCore="<QtCoreLib Condition=`"'`$(Configuration)'=='Debug' and Exists('`$(QtLocalLib)Qt5Cored.lib')`">Qt5Cored.lib</QtCoreLib>"
         $dGui="<QtGuiLib Condition=`"'`$(Configuration)'=='Debug' and Exists('`$(QtLocalLib)Qt5Guid.lib')`">Qt5Guid.lib</QtGuiLib>"
         $dWid="<QtWidgetsLib Condition=`"'`$(Configuration)'=='Debug' and Exists('`$(QtLocalLib)Qt5Widgetsd.lib')`">Qt5Widgetsd.lib</QtWidgetsLib>"
+        $dNet="<QtNetworkLib Condition=`"'`$(Configuration)'=='Debug' and Exists('`$(QtLocalLib)Qt5Networkd.lib')`">Qt5Networkd.lib</QtNetworkLib>"
         $dEnt="<QtEntryPointLib Condition=`"'`$(Configuration)'=='Debug' and Exists('`$(QtLocalLib)qtdmain.lib')`">qtdmain.lib</QtEntryPointLib>"
     }
 
@@ -280,17 +281,19 @@ function WriteQtLocalProps($file,$localQt,$debug){
     <QtGuiLib Condition="'`$(QtGuiLib)'==''">Qt5Gui.lib</QtGuiLib>
     $dWid
     <QtWidgetsLib Condition="'`$(QtWidgetsLib)'==''">Qt5Widgets.lib</QtWidgetsLib>
+    $dNet
+    <QtNetworkLib Condition="'`$(QtNetworkLib)'==''">Qt5Network.lib</QtNetworkLib>
     $dEnt
     <QtEntryPointLib Condition="'`$(QtEntryPointLib)'==''">qtmain.lib</QtEntryPointLib>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>`$(QtLocalInclude);`$(QtLocalInclude)QtCore;`$(QtLocalInclude)QtGui;`$(QtLocalInclude)QtWidgets;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>QT_WIDGETS_LIB;QT_GUI_LIB;QT_CORE_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>`$(QtLocalInclude);`$(QtLocalInclude)QtCore;`$(QtLocalInclude)QtGui;`$(QtLocalInclude)QtWidgets;`$(QtLocalInclude)QtNetwork;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>QT_WIDGETS_LIB;QT_GUI_LIB;QT_NETWORK_LIB;QT_CORE_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <AdditionalLibraryDirectories>`$(QtLocalLib);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>`$(QtWidgetsLib);`$(QtGuiLib);`$(QtCoreLib);`$(QtEntryPointLib);%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>`$(QtWidgetsLib);`$(QtGuiLib);`$(QtNetworkLib);`$(QtCoreLib);`$(QtEntryPointLib);%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 </Project>
@@ -356,7 +359,7 @@ function DeployRuntime($root,$localQt){
     $exe=@("x64\Release\QtSingalViewer.exe","x64\Debug\QtSingalViewer.exe","Release\QtSingalViewer.exe","Debug\QtSingalViewer.exe") | ForEach-Object{Join-Path $root $_} | Where-Object{Test-Path -LiteralPath $_} | Select-Object -First 1
     if(!$exe){W "No exe found. Build first, then rerun with -DeployRuntime."; return}
     $dir=Split-Path -Parent $exe; $bin=Join-Path $localQt "bin"
-    foreach($dll in @("Qt5Core.dll","Qt5Gui.dll","Qt5Widgets.dll")){CpFile (Join-Path $bin $dll) $dir}
+    foreach($dll in @("Qt5Core.dll","Qt5Gui.dll","Qt5Widgets.dll","Qt5Network.dll")){CpFile (Join-Path $bin $dll) $dir}
     foreach($pat in @("icudt*.dll","icuin*.dll","icuuc*.dll","pcre2*.dll","zlib*.dll","double-conversion*.dll","harfbuzz*.dll","freetype*.dll","png*.dll","brotli*.dll","bz2*.dll","zstd*.dll","lib*.dll","libEGL*.dll","libGLESv2*.dll","d3dcompiler*.dll","opengl32sw.dll")){CpGlob (Join-Path $bin $pat) $dir}
     $sp=Join-Path $localQt "plugins"; $dp=Join-Path $dir "plugins"
     foreach($pl in @("platforms","styles","imageformats","iconengines","platformthemes","tls","bearer")){CpDir (Join-Path $sp $pl) (Join-Path $dp $pl)}

@@ -18,7 +18,7 @@
 
 | 文件 | 用途 |
 | --- | --- |
-| `reflect_macro.h` | 反射标记、`WaveValue`、`WavePtr`、`wave::array`、dirty/dynamic 接口 |
+| `reflect_macro.h` | 反射标记、`WaveValue`、`WAVE_PTR`、`wave::array`、dirty/dynamic 接口 |
 | `reflect_runtime.h` | 生成代码使用的反射运行时 |
 | `wave_runtime.h` | 拓扑、物理 storage、采样与并行运行时 |
 | `wave_tap.h` | 对外周期采样入口 |
@@ -69,6 +69,7 @@ private:
 ### 2.3 创建 recorder、tracer 和 tap
 
 ```cpp
+#include <systemc>
 #include "wave_tap.h"
 #include "project_reflect_auto.h"
 
@@ -85,17 +86,11 @@ int run_model(GpuState& gpu) {
     wave::BuildOptions options;
     wave::Tracer tracer(recorder, options);
     tracer.add_root("gpu", &gpu);
-    wave::WaveTap tap(tracer, recorder);
+    sc_core::sc_clock clk("clk", sc_core::sc_time(1, sc_core::SC_NS));
+    wave::WaveTap tap("wave_tap", tracer, recorder, clk);
 
-    for (int i = 0; i != 100; ++i) {
-        // 完成本周期业务计算，并等待所有写线程到达屏障。
-        gpu.cycle = static_cast<std::uint32_t>(i);
-        if (!tap.sample_one_cycle()) {
-            error = tap.last_error();
-            recorder.close(error);
-            return 2;
-        }
-    }
+    sc_core::sc_start();
+    if (!tap.last_error().empty()) return 2;
 
     return recorder.close(error) ? 0 : 3;
 }
@@ -106,15 +101,15 @@ int run_model(GpuState& gpu) {
 1. 构造并初始化业务对象。
 2. `recorder.open()`。
 3. 构造 `Tracer`，调用 `tracer.add_root()`。
-4. 构造 `WaveTap`。
-5. 每个稳定业务周期调用一次 `tap.sample_one_cycle()`。
+4. 用模块名、`Tracer`、recorder 和业务 `sc_clock` 构造 `WaveTap`。
+5. 启动 SystemC；`WaveTap` 在仿真开始前采一次初始态，之后在每个时钟下降沿自动采样。
 6. 正常结束时调用 `recorder.close()`。
 
-`sample_one_cycle()` 是业务代码唯一应使用的周期采样入口。不要自行组合 `prepare_topology()`、`begin_cycle()`、`sample()` 和 `end_cycle()`，也不要手工传 cycle。
+业务代码不再需要逐周期调用采样接口。不要自行组合 `prepare_topology()`、`begin_cycle()`、`sample()` 和 `end_cycle()`，也不要手工传 cycle。
 
 ## 3. 周期与稳定拓扑
 
-第一次 `sample_one_cycle()` 会延迟完成：
+`start_of_simulation()` 中的初始采样会延迟完成：
 
 1. 展开所有 root，建立节点、逻辑信号和物理 storage。
 2. 冻结稳定拓扑，建立 flat、dirty 和 memory-block 索引。
@@ -126,13 +121,13 @@ int run_model(GpuState& gpu) {
 writer 打开后禁止改变拓扑。以下操作必须在第一次采样前完成：
 
 - 添加全部 root。
-- 给 `WavePtr` 设置目标指针和 `declareSize()`。
+- 给 `WAVE_PTR` 设置目标指针，并给 `WAVE_PTR_ARRAY` 设置运行期长度成员。
 - 注册 dynamic/peek 目标类型。
 - 完成决定对象结构和指针目标的初始化。
 
 第一次采样后修改普通值是允许的；替换被追踪指针或改变声明长度，不会自动重建波形树。
 
-`sample_one_cycle()` 不是并发快照。业务写线程必须先到达 barrier/join 点，采样完成后才能开始下一周期写入，否则会产生不一致值或数据竞争。
+下降沿采样不是并发快照。业务写线程必须在下降沿前完成本周期写入；不要让其他 process 在同一个下降沿并发修改被追踪对象，否则 SystemC 的同一 evaluation phase 内没有可靠的先后保证。
 
 ## 4. 类型、路径与物理 storage
 
@@ -142,7 +137,7 @@ writer 打开后禁止改变拓扑。以下操作必须在第一次采样前完�
 - 普通 class/struct 及其继承层次。
 - C 数组、`std::array`、`wave::array`。
 - 当前生成器支持的标准容器和业务包装器。
-- `WavePtr` 指向的单对象或连续对象数组。
+- `WAVE_PTR` / `WAVE_PTR_ARRAY` 标记的单对象或连续对象数组。
 - `WaveValue`、dirty peek 和 dynamic target。
 
 路径由 root 名、成员名和数组索引组成：
@@ -164,18 +159,19 @@ options.enable_bitfield_fields = true;
 
 ## 5. 指针策略
 
-裸指针默认不递归展开，避免误追踪临时地址、外部所有权和动态对象图。需要追踪目标时使用显式 `WavePtr`，支持 `T*`、`std::unique_ptr<T,D>` 和 `std::shared_ptr<T>`：
+裸指针默认不递归展开，避免误追踪临时地址、外部所有权和动态对象图。需要追踪目标时使用 `WAVE_PTR`，支持 `T*`、`std::unique_ptr<T,D>`、`std::shared_ptr<T>` 和 `std::weak_ptr<T>`：
 
 ```cpp
-wave::WavePtr<MyNode*> node;
+WAVE_PTR MyNode* node;
 node = &owned_node;
 
-wave::WavePtr<MyNode*> nodes;
+std::size_t count = 0;
+WAVE_PTR_ARRAY(count) MyNode* nodes;
 nodes = buffer;
-nodes.declareSize(count); // 首次采样前
+count = buffer_count; // 首次采样前
 ```
 
-`declareSize(n)` 表示展开 `ptr[0]` 到 `ptr[n-1]`。首次拓扑冻结后再替换指针不会重建拓扑。
+`WAVE_PTR_ARRAY(count)` 表示展开 `ptr[0]` 到 `ptr[count-1]`。首次拓扑冻结后再替换指针不会重建拓扑。
 
 ## 6. `WaveValue<T>`
 
@@ -285,7 +281,7 @@ wave::ensure_dynamic_type_registered<Payload>();
 | `emit_only_on_change` | `true` | 只提交变化值 |
 | `enable_flat_leaf_fast_table` | `true` | 稳定拓扑 flat 快路径 |
 | `enable_node_name_interning` | `true` | 重复局部节点名驻留 |
-| `enable_parallel_topology_expansion` | `true` | 大型 `WavePtr<T[]>` 并行展开 |
+| `enable_parallel_topology_expansion` | `true` | 大型 `WAVE_PTR_ARRAY` 并行展开 |
 | `topology_expansion_threads` | `16` | 拓扑展开线程数；实测通常在 8 到 16 线程趋于内存带宽饱和 |
 | `parallel_topology_min_work_items_per_element` | `32` | 单元素至少包含的物理叶子数；手写 visitor 以首元素实际 track 数估算 |
 | `parallel_topology_batch_elements` | `131072` | 每轮 fragment 展开的最大元素数 |
@@ -377,9 +373,9 @@ helper 只保证已完整接收的 cycle frame 可恢复。业务进程或 helpe
 
 ## 11. SystemC
 
-包含 `systemc.h` 时，`wave_tap.h` 提供 `SystemCStartSampler`，用于在 `start_of_simulation()` 采一次初始稳定状态。一般仿真循环仍应在明确的周期完成点调用 `sample_one_cycle()`。
+包含 SystemC 时，`WaveTap` 本身就是 `sc_module`。构造函数接收一个 `sc_clock`，在 `start_of_simulation()` 自动采初始态，并通过静态敏感表在每个 `negedge_event()` 自动采样。下降沿进程使用 `dont_initialize()`，不会和启动采样重复。旧的 `SystemCStartSampler` 已删除。
 
-若调度中有多个写线程或 process，仍需确保采样时本周期所有相关更新已完成。不要把 `WaveTap` 当作异步观察器。
+若调度中有多个写线程或 process，仍需确保所有相关更新在下降沿之前完成。不要把 `WaveTap` 当作异步观察器。
 
 ## 12. 使用 QtViewer
 
@@ -465,14 +461,14 @@ set WVZ4_BACKLOG_LOG_MAX_LINES=1024
 3. 大数组优先用元素写入口；只有确实会任意写整段时才调用非 const `data()/begin()`。
 4. 确认线程安全后再开启并行采样，并用 1、4、8、16、32 总线程实测。
 5. 默认保留 memory-block SIMD/byte-map；不要拆成大量过小任务。
-6. 大型 `WavePtr<T[]>` 默认可并行展开；真实跨元素物理 alias 会拒绝并行片段并串行重建，保持一个 storage 只有一个 owner。
+6. 大型 `WAVE_PTR_ARRAY` 默认可并行展开；真实跨元素物理 alias 会拒绝并行片段并串行重建，保持一个 storage 只有一个 owner。
 7. 内存阶跃优先检查 cycle 0 worker event buffer、LOD 表和 writer pipeline 队列。
 8. 大规模写入关注 `<file>.writer.log` 的布局传输、server open、首帧、压缩和队列等待分解。
 
 ## 16. 发布前检查
 
 - ReflectGen 输出随目标头时间戳增量更新。
-- root、`WavePtr::declareSize()`、动态类型注册都在 cycle 0 前完成。
+- root、`WAVE_PTR_ARRAY` 的指针与长度、动态类型注册都在 cycle 0 前完成。
 - 所有写线程在采样点有明确屏障。
 - dirty 写线程已 attach。
 - cycle 0、无变化 cycle、单字段变化、整数组入口、nested array、peek、dynamic 都有测试。

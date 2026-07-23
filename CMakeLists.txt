@@ -104,7 +104,7 @@ set(WAVETRACE_REFLECT_BATCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH "Direct
 set(WAVETRACE_REFLECT_EXTRA_ARGS "" CACHE STRING "Extra ReflectGen arguments, for example --allow-errors")
 set(WAVETRACE_REFLECT_EXTRA_CLANG_ARGS "" CACHE STRING "Extra clang parse arguments for ReflectGen, for example -Ipath -DMACRO=1")
 set(WAVETRACE_REFLECT_VERBOSE OFF CACHE BOOL "Print full WaveTrace ReflectGen stdout/stderr/log on successful builds")
-set(WAVETRACE_REFLECT_COMPILE_SHARDS "8" CACHE STRING "Number of independently compiled WaveTrace reflection shards; 0 disables")
+set(WAVETRACE_REFLECT_COMPILE_SHARDS "4" CACHE STRING "Number of independently compiled WaveTrace reflection shards; 0 disables")
 if(NOT WAVETRACE_REFLECT_COMPILE_SHARDS MATCHES "^[0-9]+$" OR WAVETRACE_REFLECT_COMPILE_SHARDS GREATER 64)
 	message(FATAL_ERROR "WAVETRACE_REFLECT_COMPILE_SHARDS must be an integer from 0 through 64")
 endif()
@@ -135,7 +135,7 @@ if(WAVETRACE_ENABLED)
 	# User-owned outputs stay in the original WaveTracer source package. Only
 	# transient argument/input lists remain under the CMake build tree.
 	set(WAVETRACE_GEN_DIR "${WAVETRACE_ROOT}/generated_reflect")
-	set(WAVETRACE_CONFIG_FILE "${WAVETRACE_ROOT}/wavetrace_config.json" CACHE FILEPATH "WaveTrace reflection/runtime configuration and WavePtr switches")
+	set(WAVETRACE_CONFIG_FILE "${WAVETRACE_ROOT}/wavetrace_config.json" CACHE FILEPATH "WaveTrace reflection/runtime configuration and pointer-target switches")
 	if(NOT EXISTS "${WAVETRACE_CONFIG_FILE}")
 		get_filename_component(_wavetrace_config_dir "${WAVETRACE_CONFIG_FILE}" DIRECTORY)
 		file(MAKE_DIRECTORY "${_wavetrace_config_dir}")
@@ -174,16 +174,6 @@ if(WAVETRACE_ENABLED)
 			message(FATAL_ERROR "WaveTrace ReflectGen runtime dependency was not found: '${WAVETRACE_TOOL_DIR}/libclang.dll'")
 		endif()
 	endif()
-endif()
-set(WAVETRACE_CMODEL_FORCE_INCLUDE_MSVC)
-set(WAVETRACE_CMODEL_FORCE_INCLUDE_CLANG)
-if(WAVETRACE_API_COMPAT_ENABLED)
-	set(WAVETRACE_CMODEL_FORCE_INCLUDE_MSVC "/FI${WAVETRACE_ROOT}/reflect_macro.h")
-	# Keep the option and its argument as one de-duplication unit.  CMake may
-	# otherwise turn two "-include <header>" pairs into one -include followed by
-	# a bare header path, which GCC then treats as a second input file.
-	set(WAVETRACE_CMODEL_FORCE_INCLUDE_CLANG
-		"SHELL:-include \"${WAVETRACE_ROOT}/reflect_macro.h\"")
 endif()
 # Collect all source files
 set(ALL_SOURCES)
@@ -259,8 +249,38 @@ endif()
 
 if(WAVETRACE_API_COMPAT_ENABLED)
 	target_include_directories(cmodel PUBLIC "${WAVETRACE_ROOT}")
+	if(NOT WAVETRACE_ENABLED)
+		# Linux and other API-compat-only builds do not run ReflectGen, but
+		# business code may still include project_reflect_auto.h. Generate a
+		# content-stable placeholder in the writable build tree so clean builds
+		# and read-only source checkouts behave the same way.
+		set(WAVETRACE_PLACEHOLDER_GEN_DIR
+			"${CMAKE_BINARY_DIR}/WaveTracer/generated_reflect")
+		set(WAVETRACE_PLACEHOLDER_CLOSURE_HEADER
+			"${WAVETRACE_PLACEHOLDER_GEN_DIR}/root_class_closure_reflect_auto.h")
+		set(WAVETRACE_PLACEHOLDER_PROJECT_HEADER
+			"${WAVETRACE_PLACEHOLDER_GEN_DIR}/project_reflect_auto.h")
+		file(MAKE_DIRECTORY "${WAVETRACE_PLACEHOLDER_GEN_DIR}")
+		file(GENERATE
+			OUTPUT "${WAVETRACE_PLACEHOLDER_CLOSURE_HEADER}"
+			CONTENT "#pragma once\n#include \"reflect_macro.h\"\n")
+		file(GENERATE
+			OUTPUT "${WAVETRACE_PLACEHOLDER_PROJECT_HEADER}"
+			CONTENT "#pragma once\n#include \"root_class_closure_reflect_auto.h\"\n")
+		target_include_directories(cmodel PUBLIC "${WAVETRACE_PLACEHOLDER_GEN_DIR}")
+		set_source_files_properties(
+			"${WAVETRACE_PLACEHOLDER_CLOSURE_HEADER}"
+			"${WAVETRACE_PLACEHOLDER_PROJECT_HEADER}"
+			PROPERTIES GENERATED TRUE HEADER_FILE_ONLY TRUE)
+		target_sources(cmodel PRIVATE
+			"${WAVETRACE_PLACEHOLDER_CLOSURE_HEADER}"
+			"${WAVETRACE_PLACEHOLDER_PROJECT_HEADER}")
+	endif()
 endif()
 
+# reflect_macro.h is included normally by the business umbrella header.  Do
+# not inject it through a compiler forced include or through CMake's PCH.
+# Preserve only the pre-existing public business PCH contract.
 target_precompile_headers(cmodel PUBLIC inc/vsiPrecomp.h)
 if(MSVC)
 	set_target_properties(cmodel PROPERTIES OUTPUT_NAME "arch.cmodel")
@@ -280,8 +300,7 @@ if(WIN32)
 	string(REPLACE "\\" "/" CMODEL_PATH "${AQARCH}/cmodel")
 	target_compile_options(cmodel PUBLIC -DAQ2_DMA=1 -DXAQ2=1 -DEMULATOR -DPATH_TO_CMODEL="${CMODEL_PATH}" $<$<CONFIG:Debug>:-DUSE_PRINTF> $<$<CONFIG:Debug>:-D_DEBUG> $<$<BOOL:${DV_DUMP}>:-DDV_DUMP=1> $<$<BOOL:${ISAMODEL}>:-DgcdMODELING_MODE=2>)
 	if (MSVC)
-		target_compile_options(cmodel PRIVATE ${WAVETRACE_CMODEL_FORCE_INCLUDE_MSVC}
-											/FI${AQARCH}/cmodel/inc/vsiPrecomp.h
+		target_compile_options(cmodel PRIVATE
 											/vmg -Zm300 /bigobj -D_CRT_SECURE_NO_WARNINGS
 											/MP${CMODEL_MSVC_MP_COUNT}
 											"$<$<AND:$<BOOL:${CMODEL_RELEASE_DEBUG_INFO}>,$<CONFIG:Release>>:/Z7>"
@@ -305,7 +324,6 @@ if(WIN32)
 			"$<$<CONFIG:Profile>:/INCREMENTAL:NO>")
 	else()
 		# vsiPrecomp.h is already supplied by target_precompile_headers().
-		target_compile_options(cmodel PRIVATE ${WAVETRACE_CMODEL_FORCE_INCLUDE_CLANG})
 		#target_compile_options(cmodel PRIVATE -flto)
 		target_link_libraries(cmodel PRIVATE winpthread)
 	endif()
@@ -401,14 +419,12 @@ elseif(UNIX)
     -DvsidUSE_VSI_HEADERS=1)
 	target_compile_definitions(cmodel PRIVATE PATH_TO_CMODEL="${AQARCH}/cmodel")
 	if (MSVC)
-		target_compile_options(cmodel PRIVATE ${WAVETRACE_CMODEL_FORCE_INCLUDE_MSVC}
-											/FI${AQARCH}/cmodel/inc/vsiPrecomp.h
+		target_compile_options(cmodel PRIVATE
 											/vmg -Zm300 /bigobj)
 		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-return-type -fPIC -g")
     else()
 		set_target_properties(cmodel PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON)
 		# vsiPrecomp.h is already supplied by target_precompile_headers().
-		target_compile_options(cmodel PRIVATE ${WAVETRACE_CMODEL_FORCE_INCLUDE_CLANG})
 		if(DV_DUMP)
 			set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-return-type -fPIC -g")
 		endif()
@@ -630,6 +646,8 @@ if(WAVETRACE_ENABLED)
 	file(GENERATE
 		OUTPUT "${WAVETRACE_REFLECT_SETTINGS_FILE}"
 		CONTENT "${_wavetrace_reflect_settings_content}")
+	set(WAVETRACE_REFLECT_BUILD_STAMP
+		"${WAVETRACE_BUILD_TOP_DIR}/wavetrace_reflect_build.stamp")
 
 	set(WAVETRACE_REFLECT_DEPENDS ${WAVETRACE_REFLECTGEN_DEPENDS} "${WAVETRACE_REFLECT_TARGET_LIST}" ${ALL_HEADERS})
 	set(WAVETRACE_REFLECT_INPUT_LIST "${WAVETRACE_BUILD_TOP_DIR}/wavetrace_reflect_inputs.txt")
@@ -642,7 +660,6 @@ if(WAVETRACE_ENABLED)
 		endif()
 	endforeach()
 	list(APPEND WAVETRACE_REFLECT_DEPENDS "${WAVETRACE_REFLECT_INPUT_LIST}")
-	list(APPEND WAVETRACE_REFLECT_DEPENDS "${WAVETRACE_CONFIG_FILE}")
 	list(APPEND WAVETRACE_REFLECT_DEPENDS "${WAVETRACE_REFLECT_CLANG_ARGS_FILE}")
 
 	set(WAVETRACE_RUN_REFLECTGEN_SCRIPT "${WAVETRACE_ROOT}/cmake/run_reflectgen.cmake")
@@ -651,7 +668,8 @@ if(WAVETRACE_ENABLED)
 	endif()
 	list(APPEND WAVETRACE_REFLECT_DEPENDS
 		"${WAVETRACE_RUN_REFLECTGEN_SCRIPT}"
-		"${WAVETRACE_REFLECT_SETTINGS_FILE}")
+		"${WAVETRACE_REFLECT_SETTINGS_FILE}"
+		"${WAVETRACE_CONFIG_FILE}")
 
 	set(WAVETRACE_REFLECT_SHARD_SOURCES)
 	set(WAVETRACE_REFLECT_SHARD_HEADERS)
@@ -677,12 +695,8 @@ if(WAVETRACE_ENABLED)
 			"${WAVETRACE_GEN_DIR}/root_class_closure_shards_registry.h")
 	endif()
 
-	add_custom_command(
-		OUTPUT "${WAVETRACE_GEN_DIR}/project_reflect_auto.h"
-		BYPRODUCTS
-			"${WAVETRACE_GEN_DIR}/root_class_closure_reflect_auto.h"
-			${WAVETRACE_REFLECT_SHARD_BYPRODUCTS}
-		COMMAND ${CMAKE_COMMAND}
+	set(_WAVETRACE_REFLECT_COMMAND
+		${CMAKE_COMMAND}
 			"-DWAVETRACE_REFLECTGEN_EXE=${WAVETRACE_REFLECTGEN_EXE}"
 			"-DWAVETRACE_REFLECT_BATCH_DIR=${WAVETRACE_REFLECT_BATCH_DIR}"
 			"-DWAVETRACE_REFLECT_TARGET_LIST=${WAVETRACE_REFLECT_TARGET_LIST}"
@@ -696,14 +710,34 @@ if(WAVETRACE_ENABLED)
 			"-DWAVETRACE_CONFIG_FILE=${WAVETRACE_CONFIG_FILE}"
 			"-DWAVETRACE_REFLECT_CLANG_ARGS_FILE=${WAVETRACE_REFLECT_CLANG_ARGS_FILE}"
 			"-DWAVETRACE_REFLECT_SETTINGS_FILE=${WAVETRACE_REFLECT_SETTINGS_FILE}"
+			"-DWAVETRACE_REFLECT_BUILD_STAMP=${WAVETRACE_REFLECT_BUILD_STAMP}"
 			"-DWAVETRACE_REFLECT_VERBOSE=${WAVETRACE_REFLECT_VERBOSE}"
-			-P "${WAVETRACE_RUN_REFLECTGEN_SCRIPT}"
-		DEPENDS ${WAVETRACE_REFLECT_DEPENDS}
-		VERBATIM
-	)
-	# project_reflect_auto.h is added directly to cmodel below.  Attaching the
-	# custom-command output to the real target keeps generation incremental while
-	# avoiding a separate wavetrace_generate_reflection project in VS solutions.
+			-P "${WAVETRACE_RUN_REFLECTGEN_SCRIPT}")
+	set(_WAVETRACE_REFLECT_BYPRODUCTS
+		"${WAVETRACE_GEN_DIR}/project_reflect_auto.h"
+		"${WAVETRACE_GEN_DIR}/root_class_closure_reflect_auto.h"
+		${WAVETRACE_REFLECT_SHARD_BYPRODUCTS})
+	if(CMAKE_GENERATOR MATCHES "^Visual Studio")
+		# PRE_BUILD is a real pre-compile event in Visual Studio. It executes on
+		# every cmodel build, creates missing generated .cpp files before ClCompile,
+		# and does not add a separate WaveTrace utility project to the solution.
+		add_custom_command(
+			TARGET cmodel PRE_BUILD
+			BYPRODUCTS ${_WAVETRACE_REFLECT_BYPRODUCTS}
+			COMMAND ${_WAVETRACE_REFLECT_COMMAND}
+			VERBATIM)
+	else()
+		# Other generators do not guarantee PRE_BUILD ordering. Keep the regular
+		# generated-source dependency rule there so clean builds remain correct.
+		add_custom_command(
+			OUTPUT "${WAVETRACE_REFLECT_BUILD_STAMP}"
+			BYPRODUCTS ${_WAVETRACE_REFLECT_BYPRODUCTS}
+			COMMAND ${_WAVETRACE_REFLECT_COMMAND}
+			DEPENDS ${WAVETRACE_REFLECT_DEPENDS}
+			VERBATIM)
+	endif()
+	# ReflectGen alone applies JSON policy; the CMake runner never inspects
+	# WaveTrace or wave_ptr_members.
 
 	target_include_directories(cmodel PUBLIC
 		"${WAVETRACE_ROOT}"
@@ -745,7 +779,12 @@ if(WAVETRACE_ENABLED)
 			"${WAVETRACE_GEN_DIR}/root_class_closure_shards_registry.h"
 			${WAVETRACE_REFLECT_SHARD_HEADERS})
 	endif()
-	set_source_files_properties(${WAVETRACE_GENERATED_HEADERS} PROPERTIES GENERATED TRUE HEADER_FILE_ONLY TRUE)
+	set_source_files_properties(
+		${WAVETRACE_GENERATED_HEADERS}
+		PROPERTIES GENERATED TRUE HEADER_FILE_ONLY TRUE)
+	set_source_files_properties(
+		"${WAVETRACE_REFLECT_BUILD_STAMP}"
+		PROPERTIES GENERATED TRUE HEADER_FILE_ONLY TRUE)
 	if(WAVETRACE_REFLECT_SHARD_SOURCES)
 		set_source_files_properties(${WAVETRACE_REFLECT_SHARD_SOURCES} PROPERTIES GENERATED TRUE)
 	endif()
@@ -756,7 +795,13 @@ if(WAVETRACE_ENABLED)
 		set_source_files_properties(${WAVETRACE_IDE_HEADERS} PROPERTIES HEADER_FILE_ONLY TRUE)
 		source_group("WaveTracer" FILES ${WAVETRACE_IDE_HEADERS})
 	endif()
-	source_group("WaveTracer\\Generated" FILES ${WAVETRACE_GENERATED_HEADERS})
+	source_group("WaveTracer\\Generated" FILES
+		${WAVETRACE_GENERATED_HEADERS}
+		"${WAVETRACE_REFLECT_BUILD_STAMP}")
 	source_group("WaveTracer\\Generated\\CompileShards" FILES ${WAVETRACE_REFLECT_SHARD_SOURCES})
-	target_sources(cmodel PRIVATE ${WAVETRACE_IDE_HEADERS} ${WAVETRACE_GENERATED_HEADERS} ${WAVETRACE_REFLECT_SHARD_SOURCES})
+	target_sources(cmodel PRIVATE
+		${WAVETRACE_IDE_HEADERS}
+		${WAVETRACE_GENERATED_HEADERS}
+		${WAVETRACE_REFLECT_SHARD_SOURCES}
+		"${WAVETRACE_REFLECT_BUILD_STAMP}")
 endif()

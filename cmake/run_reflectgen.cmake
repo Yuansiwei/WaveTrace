@@ -21,6 +21,28 @@ endif()
 
 file(MAKE_DIRECTORY "${WAVETRACE_REFLECT_OUTPUT_DIR}")
 
+# CMake only schedules this runner when its declared build dependencies say the
+# reflection step is due.  Once scheduled, always launch ReflectGen.  JSON policy
+# (including WaveTrace=false) belongs to ReflectGen; duplicating it here caused
+# the build wrapper to skip pointer-table synchronization.
+
+function(_wavetrace_reflect_finalize_success)
+    if(DEFINED WAVETRACE_REFLECT_BUILD_STAMP AND
+            NOT "${WAVETRACE_REFLECT_BUILD_STAMP}" STREQUAL "")
+        get_filename_component(_wavetrace_reflect_stamp_dir
+            "${WAVETRACE_REFLECT_BUILD_STAMP}" DIRECTORY)
+        file(MAKE_DIRECTORY "${_wavetrace_reflect_stamp_dir}")
+        execute_process(
+            COMMAND "${CMAKE_COMMAND}" -E touch
+                "${WAVETRACE_REFLECT_BUILD_STAMP}"
+            RESULT_VARIABLE _wavetrace_reflect_stamp_result)
+        if(NOT _wavetrace_reflect_stamp_result EQUAL 0)
+            message(FATAL_ERROR
+                "Failed to update WaveTrace reflection build stamp: ${WAVETRACE_REFLECT_BUILD_STAMP}")
+        endif()
+    endif()
+endfunction()
+
 if(DEFINED WAVETRACE_REFLECT_CLANG_ARGS_FILE AND
         NOT "${WAVETRACE_REFLECT_CLANG_ARGS_FILE}" STREQUAL "")
     if(NOT EXISTS "${WAVETRACE_REFLECT_CLANG_ARGS_FILE}")
@@ -85,70 +107,6 @@ foreach(_arg IN LISTS WAVETRACE_REFLECT_CLANG_ARGS)
 endforeach()
 
 set(_wavetrace_reflect_aggregate_output "${WAVETRACE_REFLECT_OUTPUT_DIR}/${WAVETRACE_REFLECT_AGGREGATE_HEADER}")
-set(_wavetrace_reflect_inputs "${WAVETRACE_REFLECTGEN_EXE}")
-if(DEFINED WAVETRACE_CONFIG_FILE AND EXISTS "${WAVETRACE_CONFIG_FILE}")
-    list(APPEND _wavetrace_reflect_inputs "${WAVETRACE_CONFIG_FILE}")
-endif()
-if(DEFINED WAVETRACE_REFLECT_SETTINGS_FILE AND
-        NOT "${WAVETRACE_REFLECT_SETTINGS_FILE}" STREQUAL "" AND
-        EXISTS "${WAVETRACE_REFLECT_SETTINGS_FILE}")
-    list(APPEND _wavetrace_reflect_inputs "${WAVETRACE_REFLECT_SETTINGS_FILE}")
-endif()
-foreach(_wavetrace_reflect_list_file WAVETRACE_REFLECT_TARGET_LIST WAVETRACE_REFLECT_INPUT_LIST)
-    if(DEFINED ${_wavetrace_reflect_list_file} AND EXISTS "${${_wavetrace_reflect_list_file}}")
-        list(APPEND _wavetrace_reflect_inputs "${${_wavetrace_reflect_list_file}}")
-        file(STRINGS "${${_wavetrace_reflect_list_file}}" _wavetrace_reflect_list_entries)
-        foreach(_wavetrace_reflect_list_entry IN LISTS _wavetrace_reflect_list_entries)
-            string(STRIP "${_wavetrace_reflect_list_entry}" _wavetrace_reflect_list_entry)
-            string(REGEX REPLACE "^\"(.*)\"$" "\\1" _wavetrace_reflect_list_entry "${_wavetrace_reflect_list_entry}")
-            if(NOT "${_wavetrace_reflect_list_entry}" STREQUAL "")
-                list(APPEND _wavetrace_reflect_inputs "${_wavetrace_reflect_list_entry}")
-            endif()
-        endforeach()
-    endif()
-endforeach()
-
-set(_wavetrace_reflect_need_run FALSE)
-if(NOT EXISTS "${_wavetrace_reflect_aggregate_output}")
-    set(_wavetrace_reflect_need_run TRUE)
-endif()
-
-# A previous unsharded (or differently sharded) generation may leave a fresh
-# aggregate header while the newly declared shard sources do not exist.  Do not
-# let that aggregate-only timestamp suppress regeneration.
-if(DEFINED WAVETRACE_REFLECT_COMPILE_SHARDS AND WAVETRACE_REFLECT_COMPILE_SHARDS GREATER 0)
-    set(_wavetrace_reflect_expected_shard_outputs
-        "${WAVETRACE_REFLECT_OUTPUT_DIR}/root_class_closure_root_input.h"
-        "${WAVETRACE_REFLECT_OUTPUT_DIR}/root_class_closure_shards_registry.h")
-    math(EXPR _wavetrace_reflect_last_shard "${WAVETRACE_REFLECT_COMPILE_SHARDS} - 1")
-    foreach(_wavetrace_reflect_shard_index RANGE 0 ${_wavetrace_reflect_last_shard})
-        if(_wavetrace_reflect_shard_index LESS 10)
-            set(_wavetrace_reflect_shard_tag "0${_wavetrace_reflect_shard_index}")
-        else()
-            set(_wavetrace_reflect_shard_tag "${_wavetrace_reflect_shard_index}")
-        endif()
-        set(_wavetrace_reflect_shard_base
-            "${WAVETRACE_REFLECT_OUTPUT_DIR}/root_class_closure_shard_${_wavetrace_reflect_shard_tag}")
-        list(APPEND _wavetrace_reflect_expected_shard_outputs
-            "${_wavetrace_reflect_shard_base}.cpp"
-            "${_wavetrace_reflect_shard_base}_input.h"
-            "${_wavetrace_reflect_shard_base}_reflect_auto.h")
-    endforeach()
-    foreach(_wavetrace_reflect_expected_output IN LISTS _wavetrace_reflect_expected_shard_outputs)
-        if(NOT EXISTS "${_wavetrace_reflect_expected_output}")
-            set(_wavetrace_reflect_need_run TRUE)
-            break()
-        endif()
-    endforeach()
-endif()
-foreach(_wavetrace_reflect_input IN LISTS _wavetrace_reflect_inputs)
-    if(EXISTS "${_wavetrace_reflect_input}" AND "${_wavetrace_reflect_input}" IS_NEWER_THAN "${_wavetrace_reflect_aggregate_output}")
-        set(_wavetrace_reflect_need_run TRUE)
-    endif()
-endforeach()
-if(NOT _wavetrace_reflect_need_run)
-    return()
-endif()
 
 message(STATUS "WaveTrace ReflectGen: ${WAVETRACE_REFLECTGEN_EXE}")
 message(STATUS "WaveTrace ReflectGen root: ${WAVETRACE_REFLECT_ROOT_CLASS}")
@@ -178,19 +136,10 @@ elseif(NOT EXISTS "${_wavetrace_reflect_aggregate_output}")
         "ReflectGen exited successfully but did not create ${_wavetrace_reflect_aggregate_output}")
 endif()
 
-# ReflectGen atomically updates wavetrace_config.json after emitting headers.
-# Keep the declared output newest so that this generated input does not cause one
-# redundant build immediately after a successful discovery/update pass.
+# ReflectGen owns both JSON policy and generated-output decisions.  Mark the
+# custom-command stamp only after it has completed successfully.
 if(NOT _wavetrace_reflect_failed)
-    execute_process(
-        COMMAND "${CMAKE_COMMAND}" -E touch "${_wavetrace_reflect_aggregate_output}"
-        RESULT_VARIABLE _wavetrace_reflect_touch_result
-    )
-    if(NOT _wavetrace_reflect_touch_result EQUAL 0)
-        set(_wavetrace_reflect_failed ON)
-        set(_wavetrace_reflect_failure_reason
-            "failed to finalize aggregate output timestamp: ${_wavetrace_reflect_aggregate_output}")
-    endif()
+    _wavetrace_reflect_finalize_success()
 endif()
 
 set(_wavetrace_reflect_dump_output OFF)

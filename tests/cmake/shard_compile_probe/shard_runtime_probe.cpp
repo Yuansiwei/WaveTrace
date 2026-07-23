@@ -20,8 +20,8 @@ struct ProbePeekSource : wave::PeekTraceSourceFor<ProbePeekSource, Dependency06>
 int main() {
     const std::size_t element_count = 9000u;
     std::vector<Dependency00> storage(element_count);
-    wave::WavePtr<Dependency00*> reflected_array(storage.data());
-    reflected_array.declareSize(element_count);
+    wave::detail::AnnotatedWavePtrView<Dependency00> reflected_array(
+        storage.data(), element_count);
 
     Dependency02 direct_root = {};
     std::array<Dependency03, 2> std_array = {};
@@ -64,7 +64,7 @@ int main() {
     if ((tracer.parallel_topology_batches() == 0u ||
          tracer.parallel_topology_expanded_elements() == 0u) &&
         tracer.direct_topology_cloned_elements() == 0u) {
-        std::cerr << "compiled-shard WavePtr array did not use the registered batch entry"
+        std::cerr << "compiled-shard pointer array did not use the registered batch entry"
                   << " fallback_batches=" << tracer.parallel_topology_fallback_batches()
                   << " entry_attempts=" << tracer.dynamic_array_entry_attempts()
                   << " entry_successes=" << tracer.dynamic_array_entry_successes()

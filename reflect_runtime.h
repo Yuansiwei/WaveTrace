@@ -58,6 +58,14 @@ struct reflected_visitor;
 template <typename T>
 struct is_reflected : std::false_type {};
 
+// Compile-shard mode normally routes class fields through the dynamic registry,
+// because a generated specialization may be visible in only one translation
+// unit.  Primary-template reflection support is emitted identically into every
+// generated TU that can instantiate it, so those specializations are safe to
+// dispatch directly without a concrete-instantiation registry entry.
+template <typename T>
+struct is_compile_shard_visible_reflected : std::false_type {};
+
 struct TopologyTypeEstimate {
     std::size_t estimated_leaves;
     bool fixed_extent;
@@ -190,17 +198,6 @@ struct topology_type_estimate< ::wave::array<T, N>, void> {
             detail::saturating_leaf_multiply(N, nested.estimated_leaves),
             nested.fixed_extent,
             nested.dynamic_extent);
-    }
-};
-
-template <typename PtrT>
-struct topology_type_estimate< ::wave::WavePtr<PtrT>, void> {
-    static constexpr bool generated = false;
-    static TopologyTypeEstimate get() noexcept {
-        typedef typename ::wave::WavePtr<PtrT>::element_type Element;
-        const TopologyTypeEstimate nested = topology_type_estimate<
-            typename std::remove_cv<Element>::type>::get();
-        return TopologyTypeEstimate(nested.estimated_leaves, false, true);
     }
 };
 

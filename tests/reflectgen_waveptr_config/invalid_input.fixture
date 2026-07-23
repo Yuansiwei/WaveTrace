@@ -1,0 +1,17 @@
+#include <cstddef>
+#include <memory>
+
+#if defined(__clang__)
+#define WAVE_PTR __attribute__((annotate("wavetrace.ptr")))
+#define WAVE_PTR_ARRAY(count) __attribute__((annotate("wavetrace.ptr_array:" #count)))
+#else
+#define WAVE_PTR
+#define WAVE_PTR_ARRAY(count)
+#endif
+
+struct InvalidAnnotatedPointers {
+    std::size_t count;
+    WAVE_PTR int not_a_pointer;
+    WAVE_PTR_ARRAY(count) std::weak_ptr<int> weak_pointer_array;
+    WAVE_PTR_ARRAY(count + 1) int* non_stable_count;
+};

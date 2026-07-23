@@ -105,6 +105,12 @@ struct WaveSignal {
     ValueRadix defaultRadix = ValueRadix::Bin;
     ValueRadix currentRadix = ValueRadix::Bin;
     bool supportsZState = false;
+    // Periodic clocks are stored by WVZ4 CLKD as a formula rather than WDAT
+    // transitions. Keep that formula all the way through the Viewer instead
+    // of expanding an arbitrarily large temporary sample vector.
+    bool proceduralClock = false;
+    bool clockInitialValue = false;
+    quint64 clockTogglePeriodTicks = 0;
     // True means samples already cover the whole file time range for this signal.
     // Directory-only and partial v15 loads leave this false.
     bool samplesLoaded = true;
@@ -128,7 +134,63 @@ struct WaveSignal {
     QVector<WaveLodLevel> lodLevels;
 };
 
+inline bool waveProceduralClockValueAtTime(const WaveSignal& sig, qint64 time) {
+    if (!sig.proceduralClock || sig.clockTogglePeriodTicks == 0) {
+        return sig.clockInitialValue;
+    }
+    const quint64 nonNegativeTime = time > 0 ? quint64(time) : 0u;
+    const bool oddToggle = ((nonNegativeTime / sig.clockTogglePeriodTicks) & 1u) != 0u;
+    return oddToggle ? !sig.clockInitialValue : sig.clockInitialValue;
+}
+
+inline WaveSample waveProceduralClockSampleAtTime(const WaveSignal& sig, qint64 time) {
+    WaveSample sample;
+    sample.time = time;
+    sample.rawBits = waveProceduralClockValueAtTime(sig, time) ? 1u : 0u;
+    sample.rawFieldsReady = true;
+    return sample;
+}
+
+// Returns the first clock transition at or after time. Transitions occur at
+// positive multiples of clockTogglePeriodTicks; -1 means no representable
+// transition exists in the qint64 time domain.
+inline qint64 waveProceduralClockTransitionAtOrAfter(const WaveSignal& sig, qint64 time) {
+    if (!sig.proceduralClock || sig.clockTogglePeriodTicks == 0) return -1;
+    const quint64 period = sig.clockTogglePeriodTicks;
+    quint64 multiple = 1u;
+    if (time > 0) {
+        const quint64 t = quint64(time);
+        multiple = t / period;
+        if ((t % period) != 0u) ++multiple;
+        if (multiple == 0u) multiple = 1u;
+    }
+    const quint64 maxTime = quint64((std::numeric_limits<qint64>::max)());
+    if (multiple > maxTime / period) return -1;
+    return qint64(multiple * period);
+}
+
+inline qint64 waveProceduralClockNextTransition(const WaveSignal& sig, qint64 time) {
+    if (!sig.proceduralClock || sig.clockTogglePeriodTicks == 0) return -1;
+    const quint64 period = sig.clockTogglePeriodTicks;
+    quint64 multiple = 1u;
+    if (time >= 0) {
+        const quint64 t = quint64(time);
+        multiple = t / period + 1u;
+    }
+    const quint64 maxTime = quint64((std::numeric_limits<qint64>::max)());
+    if (multiple == 0u || multiple > maxTime / period) return -1;
+    return qint64(multiple * period);
+}
+
+inline qint64 waveProceduralClockPreviousTransition(const WaveSignal& sig, qint64 time) {
+    if (!sig.proceduralClock || sig.clockTogglePeriodTicks == 0 || time <= 0) return -1;
+    const quint64 period = sig.clockTogglePeriodTicks;
+    const quint64 multiple = quint64(time - 1) / period;
+    return multiple == 0u ? -1 : qint64(multiple * period);
+}
+
 inline bool waveSignalRawSamplesCoverRange(const WaveSignal& sig, qint64 start, qint64 end) {
+    if (sig.proceduralClock) return true;
     if (sig.samplesLoaded) return true;
     if (end <= start) return true;
     qint64 cursor = start;

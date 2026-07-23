@@ -31,7 +31,7 @@ WaveTrace 的反射系统不是简单把 C++ 对象打印成文本，而是把�
 - `WAVE_REFLECT_FRIEND`：允许反射生成器访问 private/protected 成员。
 - `wave::WaveValue<T>`：尺寸保持的可追踪标量封装，赋值时通知 tracer。
 - `wave::array<T,N>`：尺寸保持的数组封装，支持元素级 dirty。
-- `wave::WavePtr<PtrT>`：显式声明要展开的指针/数组目标。
+- `WAVE_PTR` / `WAVE_PTR_ARRAY`：显式声明要展开的指针/数组目标，不改变成员原生类型。
 - `wave::WaveDirtyHook`：业务对象主动通知“我变了”。
 - `wave::DirectReflectPointerTarget`：允许指针目标被直接展开的显式基类。
 - `wave::DynamicTraceTarget` / `wave::PeekTraceSource`：运行时类型对象和 peek 值源接入。
@@ -95,7 +95,7 @@ wave::WaveDirtyHook* wave_dirty_hook();
 wave::DirectReflectPointerTarget
 ```
 
-或者业务侧使用 `wave::WavePtr` 显式声明目标和数组长度。
+或者业务侧使用 `WAVE_PTR` / `WAVE_PTR_ARRAY` 显式声明目标和数组长度。
 
 ### 3.2 运行 ReflectGen
 
@@ -149,7 +149,7 @@ sample(cycle)
 | `std::pair` | 展开 `first` / `second` |
 | `wave::WaveValue<T>` | 建 leaf track，并建立 WaveValue dirty 地址映射 |
 | `wave::array<T,N>` | 建 aggregate node，建立元素级 dirty group |
-| `wave::WavePtr` | 按声明 size 展开目标对象或数组 |
+| `WAVE_PTR` / `WAVE_PTR_ARRAY` | 按标记和长度成员展开目标对象或数组 |
 | 普通指针/智能指针 | 只有目标类型显式继承 `DirectReflectPointerTarget` 才展开 |
 | `PeekTraceSource` | 通过 peek 取稳定值地址，再展开值对象 |
 | SystemC/VSIP 端口 | 延迟到安全时机，通过端口/peek 读到绑定对象 |
@@ -293,9 +293,9 @@ slots[2].active
 - storage alias
 - dirty/peek 分组
 
-### 11.2 WavePtr 大数组批量预留
+### 11.2 指针目标大数组批量预留
 
-`WavePtr<T*>` 展开大数组前会按元素数量预留拓扑容器容量：
+`WAVE_PTR_ARRAY` 展开大数组前会按元素数量预留拓扑容器容量：
 
 ```text
 nodes_
@@ -340,7 +340,7 @@ bitfield_storage_created_keys_
 - 第一次 sample 后要求 `Slot` visitor 调用 8 次，证明同类型拓扑缓存已经撤回。
 - 同时验证 `top.slots.[3].count` 的声明和后续采样事件正确。
 
-`smoke_reflect_topology_cache_stress.cpp` 现在作为大规模一致性压测使用：同一批重复 `Slot` 对象分别关闭/开启“节点名池 + WavePtr 批量预留”，逐条比较 `NodeDecl`、`TrackDecl` 和 `TrackEvent`，要求完全一致。
+`smoke_reflect_topology_cache_stress.cpp` 现在作为大规模一致性压测使用：同一批重复 `Slot` 对象分别关闭/开启“节点名池 + 指针数组批量预留”，逐条比较 `NodeDecl`、`TrackDecl` 和 `TrackEvent`，要求完全一致。
 
 ## 12. WaveTraceLevel
 
@@ -423,9 +423,9 @@ build_vs\smoke_systemc_wvz4\Release\smoke_systemc_wvz4.exe
 
 关键结果：
 
-- `smoke_markers_pointer_dirty`：通过，覆盖 private 反射、DirectReflectPointerTarget、WavePtr、peek、VSIP/SystemC 风格端口、WaveValue、wave::array、BoolStorage。
+- `smoke_markers_pointer_dirty`：通过，覆盖 private 反射、DirectReflectPointerTarget、指针标记、peek、VSIP/SystemC 风格端口、WaveValue、wave::array、BoolStorage。
 - `smoke_bool_storage`：通过，且验证 `Slot` 类型 visitor 调用 8 次，证明同类型拓扑缓存已撤回；同时覆盖 bool storage、C 数组嵌套反射和更新事件。
-- `smoke_reflect_topology_cache_stress`：通过。它用同一批重复 `Slot` 对象分别关闭/开启节点名池和 WavePtr 批量预留，逐条比较 `NodeDecl`、`TrackDecl` 和 `TrackEvent`，要求完全一致；同时输出 baseline/optimized 耗时。
+- `smoke_reflect_topology_cache_stress`：通过。它用同一批重复 `Slot` 对象分别关闭/开启节点名池和指针数组批量预留，逐条比较 `NodeDecl`、`TrackDecl` 和 `TrackEvent`，要求完全一致；同时输出 baseline/optimized 耗时。
 - `smoke_systemc_wvz4`：通过，输出 `systemc_wvz4_ok cycles=32`。
 - storage alias 和 bitfield writer smoke 均能生成文件。
 
@@ -451,13 +451,13 @@ build_vs\smoke_systemc_wvz4\Release\smoke_systemc_wvz4.exe
 
 1. 看 `ensure_flat_leaf_fast_table()` 和 flat memory block 相关逻辑。
 2. 看 dirty peek / dirty wave value / dirty wave array 的 group、range、leaf 表。
-3. 节点名池和 WavePtr 批量预留只影响建拓扑，不直接影响每 cycle 采样热路径。
+3. 节点名池和指针数组批量预留只影响建拓扑，不直接影响每 cycle 采样热路径。
 
 ## 17. 当前边界
 
 - 当前没有同类型反射拓扑缓存；反射 visitor 仍按实例执行。
 - 节点名池只复用局部名字，不复用 Node/Track。
 - 动态指针目标、运行时绑定端口、peek 值源仍按每个实例的当前地址处理。
-- WavePtr 批量预留只预留容量，不改变拓扑创建顺序。
+- 指针数组批量预留只预留容量，不改变拓扑创建顺序。
 - WaveTraceLevel、union 开关、bitfield 开关仍在最终展开时生效。
 - 改动不要求重新生成已有反射头；运行时层即可生效。

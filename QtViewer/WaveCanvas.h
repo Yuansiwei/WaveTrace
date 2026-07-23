@@ -21,6 +21,7 @@ public:
     int firstVisibleEntryIndex() const { return m_firstVisibleEntryIndex; }
     void setSelectedEntryIndex(int index);
     void setSelectedEntryIndexes(const QSet<int>& indexes);
+    void setAllEntriesSelected();
     void invalidateSignalSampleCaches(const QVector<int>& signalIndexes);
 
     void resetView();
@@ -68,6 +69,7 @@ private:
     QVector<ActiveSignalRef> m_visibleEntries;
     int m_selectedEntryIndex = -1;
     QSet<int> m_selectedEntryIndexes;
+    bool m_allEntriesSelected = false;
     int m_firstVisibleEntryIndex = 0;
     int m_visibleEntryCountLimit = -1;
 
