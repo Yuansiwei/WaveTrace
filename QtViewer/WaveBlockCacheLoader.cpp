@@ -750,6 +750,28 @@ void WaveBlockCacheLoader::stop() {
     if (d->backgroundWorker.joinable()) d->backgroundWorker.join();
 }
 
+void WaveBlockCacheLoader::pauseBackground() {
+    if (!d) return;
+    {
+        std::lock_guard<std::mutex> lock(d->mutex);
+        if (d->stopping) return;
+        d->backgroundPaused = true;
+    }
+    d->cv.notify_all();
+}
+
+void WaveBlockCacheLoader::resumeBackground() {
+    if (!d) return;
+    {
+        std::lock_guard<std::mutex> lock(d->mutex);
+        if (d->stopping) return;
+        d->backgroundPaused = false;
+        d->backgroundNotBefore =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    }
+    d->cv.notify_all();
+}
+
 void WaveBlockCacheLoader::requestViewport(const QVector<int>& signalIds,
                                            qint64 viewStart,
                                            qint64 viewEnd,

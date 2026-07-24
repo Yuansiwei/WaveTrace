@@ -92,8 +92,14 @@ namespace
         int bitWidth = -1;
         long long bitOffset = -1;
         long long unionStorageBytes = -1;
+        // Addressable expression path from the owning object to the beginning
+        // of the union that owns this field.  Anonymous-union bit offsets are
+        // relative to that union, not to the containing class.
+        std::string unionBaseAccessPath;
+        bool unionBaseIsSelf = false;
         AnnotatedPointerKind annotatedPointerKind = AnnotatedPointerKind::None;
         std::string annotatedPointerCountExpr;
+        bool annotatedPointerTargetArray = false;
         bool annotatedPointerStorageArray = false;
     };
 
@@ -124,8 +130,6 @@ namespace
         // the parent.
         std::string semanticParentQualifiedName;
         bool accessPathPublic = true;
-        bool useReflectAccessAlias = false;
-        std::string reflectAccessAliasName;
         bool isStruct = false;
         bool isUnion = false;
         // True only for C-style anonymous typedef records such as:
@@ -322,29 +326,11 @@ namespace
 
     static const char* kReflectFriendMarkerTypeAliasName = "wave_reflect_friend_marker_do_not_use";
 
-    struct SourceOffsetLocation
-    {
-        std::string filePath;
-        unsigned offset = 0;
-        bool valid = false;
-    };
-
-    struct ReflectFriendMacroExpansionRange
-    {
-        std::string filePath;
-        unsigned beginOffset = 0;
-        unsigned endOffset = 0;
-        std::string macroName;
-    };
-
-    // Hot-path caches. The friend check is called for records, nested records,
-    // and access-path checks. Without these caches, the macro-owner fallback can
-    // rescan all preprocessing cursors for every record and repeatedly normalize
-    // the same file paths.
+    // Hot-path caches for repeated source-path, source-text, and record-access
+    // checks during one aggregate parse.
     std::map<std::string, std::string> gCanonicalSourcePathCache;
     std::map<std::string, std::string> gSourceFileTextCache;
     std::map<std::string, bool> gReflectFriendCursorCache;
-    std::map<const void*, std::vector<ReflectFriendMacroExpansionRange> > gReflectFriendMacroRangeCache;
 
     struct EmittedMember
     {
@@ -355,10 +341,14 @@ namespace
         int bitWidth = -1;
         long long bitOffset = -1;
         long long unionStorageBytes = -1;
+        std::string unionBaseConstExpr;
+        std::string unionBaseMutExpr;
+        bool unionBaseIsSelf = false;
         bool exprIsPointerAlready = false;
         bool asBoolStorage = false;
         AnnotatedPointerKind annotatedPointerKind = AnnotatedPointerKind::None;
         std::string annotatedPointerCountExpr;
+        bool annotatedPointerTargetArray = false;
         bool annotatedPointerStorageArray = false;
         std::string annotatedPointerClassName;
         std::string annotatedPointerMemberName;
@@ -386,8 +376,6 @@ namespace
     std::string Trim(const std::string& s);
 
     bool ConsumePrefix(std::string& s, const std::string& prefix);
-
-    std::string NormalizeBaseDisplayName(std::string name);
 
     std::string CanonicalRecordLookupKey(std::string typeName);
 
@@ -417,42 +405,11 @@ namespace
 
     bool CursorHasReflectFriendMarkerDecl(CXCursor cursor);
 
-    bool SourceLocationExpansionOffset(CXSourceLocation loc,
-                                       std::string* filePath,
-                                       unsigned* offset);
-
-    bool SourceRangeContainsExpansionLocation(CXSourceRange range,
-                                              CXSourceLocation loc);
-
-    bool FillSourceOffsetLocation(CXSourceLocation loc, SourceOffsetLocation* out);
-
-    bool SourceOffsetInRange(const SourceOffsetLocation& loc,
-                             const ReflectFriendMacroExpansionRange& range);
-
     std::string CursorReflectFriendCacheKey(CXTranslationUnit tu, CXCursor cursor);
-
-    const std::vector<ReflectFriendMacroExpansionRange>& GetReflectFriendMacroExpansionRanges(CXTranslationUnit tu);
-
-    bool MacroDefinitionAllowsReflectFriend(CXTranslationUnit tu, CXCursor macroDef);
-
-    bool CursorOwningMacroExpansionAllowsReflectFriend(CXTranslationUnit tu, CXCursor recordCursor);
 
     bool FriendDeclAllowsReflectAccess(CXTranslationUnit tu, CXCursor cursor);
 
-    bool TextHasReflectFriendMacroOutsideCommentsAndLiterals(const std::string& text);
-
-    std::string GetCursorRawSourceTextFromFile(CXCursor cursor);
-
     const std::string& GetSourceFileTextCached(const std::string& path);
-
-    std::size_t FindNextCharOutsideCommentsAndLiterals(const std::string& text,
-                                                       std::size_t start,
-                                                       char target);
-
-    std::size_t FindMatchingBraceOutsideCommentsAndLiterals(const std::string& text,
-                                                            std::size_t openBrace);
-
-    bool CursorBodySourceHasReflectFriend(CXCursor cursor, std::string* matchedToken);
 
     bool CursorExpansionLocationIsFromMainFile(CXTranslationUnit tu, CXCursor cursor);
 
@@ -478,10 +435,6 @@ namespace
 
     bool IsRecordLikeCursorKind(CXCursorKind kind);
 
-    bool IsNestedInsideRecordLike(CXCursor cursor, CXCursor* parentOut);
-
-    bool IsUnionCursorKind(CXCursorKind kind);
-
     bool IsInsideUnionByParentChain(CXCursor cursor, bool semantic);
 
     bool IsInsideUnion(CXCursor cursor);
@@ -489,10 +442,6 @@ namespace
     CXCursor FindEnclosingUnionCursor(CXCursor cursor);
 
     long long AnonymousUnionStorageBytesForField(CXCursor fieldCursor, CXCursor ownerRecordCursor, bool ownerIsUnion);
-
-    bool IsUnionTypeCursor(CXCursor cursor);
-
-    bool IsUnionFieldCursor(CXCursor fieldCursor);
 
     bool CursorAccessPathIsPublicOrTopLevel(CXCursor cursor);
 
@@ -555,8 +504,6 @@ namespace
     bool IsSystemCBaseInfo(const BaseInfo& b);
 
     bool IsExplicitTemplateSpecialization(CXCursor cursor);
-
-    bool ShouldSkipRecord(CXCursor cursor, const CollectContext& ctx);
 
     void CollectRecordBody(CXTranslationUnit tu, CXCursor recordCursor, RecordInfo& rec, CollectContext* ctx);
 
@@ -630,14 +577,6 @@ namespace
 
     const RecordInfo* FindRecord(const std::map<std::string, const RecordInfo*>& byName, const std::string& typeName);
 
-    const RecordInfo* FindRecordForBase(const std::map<std::string, const RecordInfo*>& byName, const BaseInfo& base);
-
-    std::string StripClassKeyQualifiersFromTypeSpelling(std::string name);
-
-    std::string BuildActualBaseTypeNameGlobal(const BaseInfo& base);
-
-    std::string BuildBaseTypeForEmission(const BaseInfo& base, const RecordInfo* baseRec);
-
     void CollectMembersRecursive(
         const Options& opt,
         const RecordInfo& rec,
@@ -651,11 +590,7 @@ namespace
 
     std::string BuildTemplatePrefix(const RecordInfo& rec);
 
-    std::string BuildTemplateArgList(const RecordInfo& rec);
-
     std::string BuildClassSpecializationPrefix(const RecordInfo& rec);
-
-    std::string BuildVisitObjectTemplatePrefix(const RecordInfo& rec);
 
     std::string BuildBitGetterName(const std::string& fieldDisplayName);
 
@@ -690,8 +625,6 @@ namespace
     bool IsGeneratedReflectHeaderName(const std::string& lowerFileName);
 
     bool IsReflectionSystemHeaderCandidate(const std::string& path);
-
-    std::string ReplaceHeaderExtensionWithReflectAuto(const std::string& rel);
 
     bool StartsWithPathPrefix(const std::string& path, const std::string& prefix);
 
@@ -764,8 +697,6 @@ namespace
 
     bool ContainsAnyUnexpandedVariable(const std::string& s);
 
-    bool IsClangSeparateValueOption(const std::string& arg);
-
     bool IsPathLikeClangArg(const std::string& arg);
 
     std::string ExpandUserClangArg(std::string arg);
@@ -775,8 +706,6 @@ namespace
     void AddExpandedUserClangArgs(std::vector<std::string>& merged, const std::vector<std::string>& userArgs);
 
     bool HasArgPrefix(const std::vector<std::string>& args, const std::string& prefix);
-
-    bool HasExactArg(const std::vector<std::string>& args, const std::string& exact);
 
     void AddUniqueArg(std::vector<std::string>& args, const std::string& arg);
 
@@ -1329,6 +1258,7 @@ namespace
         field.annotatedPointerKind = AnnotatedPointerKind::Strong;
         field.annotatedPointerCountExpr = "1";
         const bool annotatedArray = annotation.compare(0, 20, "wavetrace.ptr_array:") == 0;
+        field.annotatedPointerTargetArray = annotatedArray;
         if (annotatedArray)
         {
             field.annotatedPointerCountExpr = Trim(annotation.substr(20));
@@ -1988,33 +1918,6 @@ namespace
         return false;
     }
 
-    std::string NormalizeBaseDisplayName(std::string name)
-    {
-        name = Trim(name);
-
-        bool changed = true;
-        while (changed)
-        {
-            changed = false;
-            changed = ConsumePrefix(name, "::") || changed;
-            changed = ConsumePrefix(name, "class ") || changed;
-            changed = ConsumePrefix(name, "struct ") || changed;
-            changed = ConsumePrefix(name, "const ") || changed;
-            changed = ConsumePrefix(name, "volatile ") || changed;
-            changed = ConsumePrefix(name, "enum ") || changed;
-            name = Trim(name);
-        }
-
-        std::string out;
-        out.reserve(name.size());
-        for (char c : name)
-        {
-            if (!std::isspace(static_cast<unsigned char>(c))) out += c;
-        }
-        if (out.empty()) out = "Base";
-        return out;
-    }
-
     std::string CanonicalRecordLookupKey(std::string typeName)
     {
         typeName = Trim(typeName);
@@ -2194,78 +2097,6 @@ namespace
                                           matchedToken);
     }
 
-    bool FillSourceOffsetLocation(CXSourceLocation loc, SourceOffsetLocation* out)
-    {
-        if (!out) return false;
-        out->filePath.clear();
-        out->offset = 0;
-        out->valid = false;
-
-        CXFile file = NULL;
-        unsigned line = 0;
-        unsigned column = 0;
-        unsigned off = 0;
-        clang_getExpansionLocation(loc, &file, &line, &column, &off);
-        if (!file) return false;
-
-        const std::string path = CanonicalSourcePathKey(ToStdString(clang_getFileName(file)));
-        if (path.empty()) return false;
-
-        out->filePath = path;
-        out->offset = off;
-        out->valid = true;
-        return true;
-    }
-
-    bool SourceLocationExpansionOffset(CXSourceLocation loc,
-                                       std::string* filePath,
-                                       unsigned* offset)
-    {
-        SourceOffsetLocation info;
-        if (!FillSourceOffsetLocation(loc, &info)) return false;
-        if (filePath) *filePath = info.filePath;
-        if (offset) *offset = info.offset;
-        return true;
-    }
-
-    bool SourceOffsetInRange(const SourceOffsetLocation& loc,
-                             const ReflectFriendMacroExpansionRange& range)
-    {
-        if (!loc.valid) return false;
-        if (loc.filePath.empty() || loc.filePath != range.filePath) return false;
-        if (range.endOffset <= range.beginOffset) return loc.offset == range.beginOffset;
-        return loc.offset >= range.beginOffset && loc.offset < range.endOffset;
-    }
-
-    bool SourceRangeContainsExpansionLocation(CXSourceRange range,
-                                              CXSourceLocation loc)
-    {
-        ReflectFriendMacroExpansionRange r;
-        SourceOffsetLocation beginInfo;
-        SourceOffsetLocation endInfo;
-        SourceOffsetLocation locInfo;
-        if (!FillSourceOffsetLocation(clang_getRangeStart(range), &beginInfo)) return false;
-        if (!FillSourceOffsetLocation(clang_getRangeEnd(range), &endInfo)) return false;
-        if (!FillSourceOffsetLocation(loc, &locInfo)) return false;
-        if (beginInfo.filePath.empty() || beginInfo.filePath != endInfo.filePath) return false;
-        r.filePath = beginInfo.filePath;
-        r.beginOffset = beginInfo.offset;
-        r.endOffset = endInfo.offset;
-        return SourceOffsetInRange(locInfo, r);
-    }
-
-    bool MacroDefinitionAllowsReflectFriend(CXTranslationUnit tu, CXCursor macroDef)
-    {
-        if (clang_Cursor_isNull(macroDef)) return false;
-        if (clang_getCursorKind(macroDef) != CXCursor_MacroDefinition) return false;
-
-        std::string matched;
-        if (CursorTokensHaveReflectFriend(tu, macroDef, true, &matched)) return true;
-
-        const std::string rawText = GetCursorRawSourceTextFromFile(macroDef);
-        return TextHasReflectFriendMacroOutsideCommentsAndLiterals(rawText);
-    }
-
     std::string CursorReflectFriendCacheKey(CXTranslationUnit tu, CXCursor cursor)
     {
         std::ostringstream oss;
@@ -2288,252 +2119,12 @@ namespace
         return oss.str();
     }
 
-    const std::vector<ReflectFriendMacroExpansionRange>& GetReflectFriendMacroExpansionRanges(CXTranslationUnit tu)
-    {
-        const void* tuKey = static_cast<const void*>(tu);
-        std::map<const void*, std::vector<ReflectFriendMacroExpansionRange> >::iterator it =
-            gReflectFriendMacroRangeCache.find(tuKey);
-        if (it != gReflectFriendMacroRangeCache.end()) return it->second;
-
-        std::vector<ReflectFriendMacroExpansionRange> ranges;
-        if (!tu)
-        {
-            gReflectFriendMacroRangeCache[tuKey] = ranges;
-            return gReflectFriendMacroRangeCache[tuKey];
-        }
-
-        struct Payload
-        {
-            CXTranslationUnit tu;
-            std::vector<ReflectFriendMacroExpansionRange>* ranges;
-            std::map<std::string, bool> macroAllowCache;
-        } payload;
-        payload.tu = tu;
-        payload.ranges = &ranges;
-
-        CXCursor root = clang_getTranslationUnitCursor(tu);
-        clang_visitChildren(
-            root,
-            [](CXCursor child, CXCursor, CXClientData clientData) {
-                Payload* p = static_cast<Payload*>(clientData);
-                if (clang_getCursorKind(child) != CXCursor_MacroExpansion)
-                {
-                    return CXChildVisit_Recurse;
-                }
-
-                CXCursor macroDef = clang_getCursorReferenced(child);
-                if (clang_Cursor_isNull(macroDef)) return CXChildVisit_Continue;
-
-                std::string macroKey;
-                SourceOffsetLocation defLoc;
-                if (FillSourceOffsetLocation(clang_getCursorLocation(macroDef), &defLoc))
-                {
-                    std::ostringstream oss;
-                    oss << defLoc.filePath << ':' << defLoc.offset << ':'
-                        << ToStdString(clang_getCursorSpelling(macroDef));
-                    macroKey = oss.str();
-                }
-                else
-                {
-                    macroKey = ToStdString(clang_getCursorSpelling(macroDef));
-                }
-
-                bool macroAllows = false;
-                std::map<std::string, bool>::iterator mit = p->macroAllowCache.find(macroKey);
-                if (mit != p->macroAllowCache.end()) macroAllows = mit->second;
-                else
-                {
-                    macroAllows = MacroDefinitionAllowsReflectFriend(p->tu, macroDef);
-                    p->macroAllowCache[macroKey] = macroAllows;
-                }
-                if (!macroAllows) return CXChildVisit_Continue;
-
-                SourceOffsetLocation beginInfo;
-                SourceOffsetLocation endInfo;
-                const CXSourceRange range = clang_getCursorExtent(child);
-                if (!FillSourceOffsetLocation(clang_getRangeStart(range), &beginInfo)) return CXChildVisit_Continue;
-                if (!FillSourceOffsetLocation(clang_getRangeEnd(range), &endInfo)) return CXChildVisit_Continue;
-                if (beginInfo.filePath.empty() || beginInfo.filePath != endInfo.filePath) return CXChildVisit_Continue;
-
-                ReflectFriendMacroExpansionRange outRange;
-                outRange.filePath = beginInfo.filePath;
-                outRange.beginOffset = beginInfo.offset;
-                outRange.endOffset = endInfo.offset;
-                outRange.macroName = ToStdString(clang_getCursorSpelling(child));
-                p->ranges->push_back(outRange);
-                return CXChildVisit_Continue;
-            },
-            &payload);
-
-        gReflectFriendMacroRangeCache[tuKey] = ranges;
-        return gReflectFriendMacroRangeCache[tuKey];
-    }
-
-    bool CursorOwningMacroExpansionAllowsReflectFriend(CXTranslationUnit tu, CXCursor recordCursor)
-    {
-        if (!tu) return false;
-        const std::vector<ReflectFriendMacroExpansionRange>& ranges = GetReflectFriendMacroExpansionRanges(tu);
-        if (ranges.empty()) return false;
-
-        SourceOffsetLocation recordLoc;
-        SourceOffsetLocation recordBegin;
-        FillSourceOffsetLocation(clang_getCursorLocation(recordCursor), &recordLoc);
-        FillSourceOffsetLocation(clang_getRangeStart(clang_getCursorExtent(recordCursor)), &recordBegin);
-
-        for (std::size_t i = 0; i < ranges.size(); ++i)
-        {
-            if (SourceOffsetInRange(recordLoc, ranges[i]) || SourceOffsetInRange(recordBegin, ranges[i]))
-            {
-                std::cerr << "[friend kept] record macro-expansion contains WAVE_REFLECT_FRIEND macro=["
-                          << ranges[i].macroName << "]\n";
-                return true;
-            }
-        }
-        return false;
-    }
-
     bool FriendDeclAllowsReflectAccess(CXTranslationUnit tu, CXCursor cursor)
     {
         // A real FriendDecl may contain the expanded friend type name
         // (::wave::ReflectAccess) or, depending on macro handling, the macro token.
         std::string matched;
         return CursorTokensHaveReflectFriend(tu, cursor, true, &matched);
-    }
-
-    bool TextHasReflectFriendMacroOutsideCommentsAndLiterals(const std::string& text)
-    {
-        // Last-resort source fallback for cases where the target header contains
-        // WAVE_REFLECT_FRIEND but libclang does not materialize a FriendDecl and
-        // tokenization of the cursor extent is degraded by earlier parse errors
-        // or by macro configuration.  We still avoid comments and literals so a
-        // commented marker does not enable private reflection.
-        enum State
-        {
-            Normal,
-            LineComment,
-            BlockComment,
-            StringLiteral,
-            CharLiteral
-        } state = Normal;
-
-        std::string ident;
-        auto flushIdent = [&]() -> bool {
-            if (ident.empty()) return false;
-            const bool matched = IsReflectFriendIdentifier(ident, false);
-            ident.clear();
-            return matched;
-        };
-
-        for (std::size_t i = 0; i < text.size(); ++i)
-        {
-            const char c = text[i];
-            const char n = (i + 1 < text.size()) ? text[i + 1] : '\0';
-
-            switch (state)
-            {
-            case Normal:
-                if (c == '/' && n == '/')
-                {
-                    if (flushIdent()) return true;
-                    state = LineComment;
-                    ++i;
-                    continue;
-                }
-                if (c == '/' && n == '*')
-                {
-                    if (flushIdent()) return true;
-                    state = BlockComment;
-                    ++i;
-                    continue;
-                }
-                if (c == '"')
-                {
-                    if (flushIdent()) return true;
-                    state = StringLiteral;
-                    continue;
-                }
-                if (c == '\'')
-                {
-                    if (flushIdent()) return true;
-                    state = CharLiteral;
-                    continue;
-                }
-                if ((c == '_') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                    (!ident.empty() && c >= '0' && c <= '9'))
-                {
-                    ident.push_back(c);
-                    continue;
-                }
-                if (flushIdent()) return true;
-                break;
-
-            case LineComment:
-                if (c == '\n' || c == '\r') state = Normal;
-                break;
-
-            case BlockComment:
-                if (c == '*' && n == '/')
-                {
-                    state = Normal;
-                    ++i;
-                }
-                break;
-
-            case StringLiteral:
-                if (c == '\\')
-                {
-                    ++i;
-                    continue;
-                }
-                if (c == '"') state = Normal;
-                break;
-
-            case CharLiteral:
-                if (c == '\\')
-                {
-                    ++i;
-                    continue;
-                }
-                if (c == '\'') state = Normal;
-                break;
-            }
-        }
-
-        return flushIdent();
-    }
-
-    std::string GetCursorRawSourceTextFromFile(CXCursor cursor)
-    {
-        CXSourceRange range = clang_getCursorExtent(cursor);
-        CXSourceLocation beginLoc = clang_getRangeStart(range);
-        CXSourceLocation endLoc = clang_getRangeEnd(range);
-
-        CXFile beginFile = NULL;
-        CXFile endFile = NULL;
-        unsigned beginOffset = 0;
-        unsigned endOffset = 0;
-        clang_getFileLocation(beginLoc, &beginFile, NULL, NULL, &beginOffset);
-        clang_getFileLocation(endLoc, &endFile, NULL, NULL, &endOffset);
-        if (beginFile == NULL || endFile == NULL) return std::string();
-        const std::string beginPath = ToStdString(clang_getFileName(beginFile));
-        const std::string endPath = ToStdString(clang_getFileName(endFile));
-        if (beginPath.empty() || beginPath != endPath) return std::string();
-        if (endOffset <= beginOffset) return std::string();
-
-        std::ifstream in(beginPath.c_str(), std::ios::binary);
-        if (!in) return std::string();
-        in.seekg(0, std::ios::end);
-        const std::streamoff fileSize = in.tellg();
-        if (fileSize <= 0) return std::string();
-        if (static_cast<unsigned long long>(beginOffset) >= static_cast<unsigned long long>(fileSize)) return std::string();
-        if (static_cast<unsigned long long>(endOffset) > static_cast<unsigned long long>(fileSize)) return std::string();
-
-        const std::size_t len = static_cast<std::size_t>(endOffset - beginOffset);
-        std::string out(len, '\0');
-        in.seekg(beginOffset, std::ios::beg);
-        in.read(&out[0], static_cast<std::streamsize>(len));
-        if (!in) return std::string();
-        return out;
     }
 
     const std::string& GetSourceFileTextCached(const std::string& path)
@@ -2554,230 +2145,6 @@ namespace
         gSourceFileTextCache[key] = ss.str();
         return gSourceFileTextCache[key];
     }
-
-    std::size_t FindNextCharOutsideCommentsAndLiterals(const std::string& text,
-                                                       std::size_t start,
-                                                       char target)
-    {
-        enum State
-        {
-            Normal,
-            LineComment,
-            BlockComment,
-            StringLiteral,
-            CharLiteral
-        } state = Normal;
-
-        for (std::size_t i = start; i < text.size(); ++i)
-        {
-            const char c = text[i];
-            const char n = (i + 1 < text.size()) ? text[i + 1] : '\0';
-
-            switch (state)
-            {
-            case Normal:
-                if (c == target) return i;
-                if (c == '/' && n == '/')
-                {
-                    state = LineComment;
-                    ++i;
-                    continue;
-                }
-                if (c == '/' && n == '*')
-                {
-                    state = BlockComment;
-                    ++i;
-                    continue;
-                }
-                if (c == '"')
-                {
-                    state = StringLiteral;
-                    continue;
-                }
-                if (c == '\'')
-                {
-                    state = CharLiteral;
-                    continue;
-                }
-                break;
-
-            case LineComment:
-                if (c == '\n' || c == '\r') state = Normal;
-                break;
-
-            case BlockComment:
-                if (c == '*' && n == '/')
-                {
-                    state = Normal;
-                    ++i;
-                }
-                break;
-
-            case StringLiteral:
-                if (c == '\\')
-                {
-                    ++i;
-                    continue;
-                }
-                if (c == '"') state = Normal;
-                break;
-
-            case CharLiteral:
-                if (c == '\\')
-                {
-                    ++i;
-                    continue;
-                }
-                if (c == '\'') state = Normal;
-                break;
-            }
-        }
-        return std::string::npos;
-    }
-
-    std::size_t FindMatchingBraceOutsideCommentsAndLiterals(const std::string& text,
-                                                            std::size_t openBrace)
-    {
-        if (openBrace >= text.size() || text[openBrace] != '{') return std::string::npos;
-
-        enum State
-        {
-            Normal,
-            LineComment,
-            BlockComment,
-            StringLiteral,
-            CharLiteral
-        } state = Normal;
-
-        unsigned depth = 0;
-        for (std::size_t i = openBrace; i < text.size(); ++i)
-        {
-            const char c = text[i];
-            const char n = (i + 1 < text.size()) ? text[i + 1] : '\0';
-
-            switch (state)
-            {
-            case Normal:
-                if (c == '/' && n == '/')
-                {
-                    state = LineComment;
-                    ++i;
-                    continue;
-                }
-                if (c == '/' && n == '*')
-                {
-                    state = BlockComment;
-                    ++i;
-                    continue;
-                }
-                if (c == '"')
-                {
-                    state = StringLiteral;
-                    continue;
-                }
-                if (c == '\'')
-                {
-                    state = CharLiteral;
-                    continue;
-                }
-                if (c == '{')
-                {
-                    ++depth;
-                    continue;
-                }
-                if (c == '}')
-                {
-                    if (depth == 0) return std::string::npos;
-                    --depth;
-                    if (depth == 0) return i;
-                    continue;
-                }
-                break;
-
-            case LineComment:
-                if (c == '\n' || c == '\r') state = Normal;
-                break;
-
-            case BlockComment:
-                if (c == '*' && n == '/')
-                {
-                    state = Normal;
-                    ++i;
-                }
-                break;
-
-            case StringLiteral:
-                if (c == '\\')
-                {
-                    ++i;
-                    continue;
-                }
-                if (c == '"') state = Normal;
-                break;
-
-            case CharLiteral:
-                if (c == '\\')
-                {
-                    ++i;
-                    continue;
-                }
-                if (c == '\'') state = Normal;
-                break;
-            }
-        }
-        return std::string::npos;
-    }
-
-    bool CursorBodySourceHasReflectFriend(CXCursor cursor, std::string* matchedToken)
-    {
-        if (matchedToken) matchedToken->clear();
-
-        CXFile file = NULL;
-        unsigned line = 0;
-        unsigned column = 0;
-        unsigned offset = 0;
-        clang_getExpansionLocation(clang_getCursorLocation(cursor), &file, &line, &column, &offset);
-        if (!file) return false;
-
-        const std::string filePath = ToStdString(clang_getFileName(file));
-        if (filePath.empty()) return false;
-
-        const std::string& text = GetSourceFileTextCached(filePath);
-        if (text.empty()) return false;
-        if (static_cast<unsigned long long>(offset) >= static_cast<unsigned long long>(text.size())) return false;
-
-        // Macro-wrapped class heads such as
-        //   MY_CLASS_MACRO(Foo)
-        //   {
-        //       WAVE_REFLECT_FRIEND
-        //       ...
-        //   };
-        // often give libclang a cursor extent that starts in the macro definition
-        // rather than in the body file.  Instead of walking every macro expansion
-        // in the TU, scan only the lexical class body immediately following the
-        // cursor's expansion location.  This is O(class-body-size), cached per
-        // cursor by CursorHasReflectAccessFriend(), and does not create temp files.
-        const std::size_t start = static_cast<std::size_t>(offset);
-        const std::size_t openBrace = FindNextCharOutsideCommentsAndLiterals(text, start, '{');
-        if (openBrace == std::string::npos) return false;
-
-        std::size_t closeBrace = FindMatchingBraceOutsideCommentsAndLiterals(text, openBrace);
-        if (closeBrace == std::string::npos)
-        {
-            closeBrace = text.size() - 1;
-        }
-        if (closeBrace <= openBrace) return false;
-
-        const std::size_t len = closeBrace - openBrace + 1;
-        const std::string body = text.substr(openBrace, len);
-        if (TextHasReflectFriendMacroOutsideCommentsAndLiterals(body))
-        {
-            if (matchedToken) *matchedToken = "WAVE_REFLECT_FRIEND";
-            return true;
-        }
-        return false;
-    }
-
 
     bool CursorHasReflectFriendMarkerDecl(CXCursor cursor)
     {
@@ -2939,7 +2306,7 @@ namespace
             << "    --debug-ast    print per-cursor AST logs and verbose clang/probe args\n"
             << "    --allow-errors continue generation even if libclang reports error/fatal diagnostics\n"
             << "    --show-function-diagnostics print function/default-argument redefinition diagnostics\n"
-            << "    --no-expanded-friend-scan disable clang++ -E fallback friend detection\n"
+            << "    --expanded-friend-scan enable the optional clang++ -E friend-detection fallback\n"
             << "  This imports AdditionalIncludeDirectories, PreprocessorDefinitions,\n"
             << "  ForcedIncludeFiles and LanguageStandard as libclang arguments.\n"
             << "\n"
@@ -3257,21 +2624,6 @@ namespace
             kind == CXCursor_ClassTemplate;
     }
 
-    bool IsNestedInsideRecordLike(CXCursor cursor, CXCursor* parentOut = NULL)
-    {
-        CXCursor parent = clang_getCursorSemanticParent(cursor);
-        if (clang_Cursor_isNull(parent)) return false;
-        const CXCursorKind pk = clang_getCursorKind(parent);
-        if (!IsRecordLikeCursorKind(pk)) return false;
-        if (parentOut) *parentOut = parent;
-        return true;
-    }
-
-    bool IsUnionCursorKind(CXCursorKind kind)
-    {
-        return kind == CXCursor_UnionDecl;
-    }
-
     bool IsInsideUnionByParentChain(CXCursor cursor, bool semantic)
     {
         CXCursor cur = semantic ? clang_getCursorSemanticParent(cursor) : clang_getCursorLexicalParent(cursor);
@@ -3352,6 +2704,51 @@ namespace
         return payload.name;
     }
 
+    std::string FindAddressableUnionBaseField(CXCursor unionCursor)
+    {
+        struct Payload
+        {
+            std::string name;
+            long long size = -1;
+        } payload;
+
+        clang_visitChildren(
+            unionCursor,
+            [](CXCursor child, CXCursor, CXClientData clientData) {
+                Payload* payload = static_cast<Payload*>(clientData);
+                if (clang_getCursorKind(child) != CXCursor_FieldDecl) {
+                    return CXChildVisit_Continue;
+                }
+                if (clang_Cursor_isBitField(child) != 0) {
+                    return CXChildVisit_Continue;
+                }
+                const std::string name = ToStdString(clang_getCursorSpelling(child));
+                if (name.empty()) return CXChildVisit_Continue;
+                const long long size = clang_Type_getSizeOf(clang_getCursorType(child));
+                // Any union alternative has the union's address, but for
+                // dependent anonymous unions the generated code also uses
+                // sizeof(base) as the only available storage-size expression.
+                // Prefer the widest known alternative instead of whichever
+                // declaration happens to appear first.
+                if (payload->name.empty() || size > payload->size)
+                {
+                    payload->name = name;
+                    payload->size = size;
+                }
+                return CXChildVisit_Continue;
+            },
+            &payload);
+
+        return payload.name;
+    }
+
+    std::string AnonymousUnionBaseAccessPath(CXCursor ownerRecordCursor, CXCursor unionCursor)
+    {
+        const std::string holder = FindNamedFieldForAnonymousUnion(ownerRecordCursor, unionCursor);
+        if (!holder.empty()) return holder;
+        return FindAddressableUnionBaseField(unionCursor);
+    }
+
     CXCursor FindEnclosingUnionCursor(CXCursor cursor)
     {
         for (CXCursor cur = clang_getCursorLexicalParent(cursor);
@@ -3397,27 +2794,6 @@ namespace
 
         const long long size = clang_Type_getSizeOf(clang_getCursorType(unionCursor));
         return size > 0 ? size : -1;
-    }
-
-    bool IsUnionTypeCursor(CXCursor cursor)
-    {
-        if (clang_Cursor_isNull(cursor)) return false;
-        const CXCursorKind k = clang_getCursorKind(cursor);
-        return k == CXCursor_UnionDecl;
-    }
-
-    bool IsUnionFieldCursor(CXCursor fieldCursor)
-    {
-        if (clang_getCursorKind(fieldCursor) != CXCursor_FieldDecl) return false;
-        CXType fieldType = clang_getCursorType(fieldCursor);
-        CXCursor typeDecl = clang_getTypeDeclaration(fieldType);
-        if (!clang_Cursor_isNull(typeDecl))
-        {
-            CXCursor def = clang_getCursorDefinition(typeDecl);
-            if (!clang_Cursor_isNull(def)) typeDecl = def;
-            if (IsUnionTypeCursor(typeDecl)) return true;
-        }
-        return false;
     }
 
     bool CursorAccessPathIsPublicOrTopLevel(CXCursor cursor)
@@ -3968,11 +3344,6 @@ namespace
         return sk == CXCursor_ClassTemplate || IsRecordKind(sk);
     }
 
-    bool ShouldSkipRecord(CXCursor cursor, const CollectContext& ctx)
-    {
-        return !GetRecordSkipReason(cursor, ctx).empty();
-    }
-
     bool RecordHasCollectedFieldName(const RecordInfo& rec, const std::string& name)
     {
         for (std::size_t i = 0; i < rec.fields.size(); ++i)
@@ -4004,15 +3375,23 @@ namespace
 
         const std::string namedUnionField = FindNamedFieldForAnonymousUnion(ownerRecordCursor, unionCursor);
         const std::string accessPrefix = namedUnionField.empty() ? std::string() : (namedUnionField + ".");
+        const std::string unionBaseAccessPath =
+            namedUnionField.empty() ? FindAddressableUnionBaseField(unionCursor) : namedUnionField;
         const CX_CXXAccessSpecifier unionAccess =
             NormalizeAccess(clang_getCXXAccessSpecifier(unionCursor), rec.isStruct);
 
         const long long unionStorageBytes = clang_Type_getSizeOf(clang_getCursorType(unionCursor));
-        if (unionStorageBytes <= 0)
+        // libclang reports an unavailable size for anonymous unions nested in
+        // class templates even when the concrete storage member is a fixed
+        // scalar.  Preserve those fields and let generated C++ evaluate
+        // sizeof(the addressable union-base member) per instantiation.
+        const long long emittedUnionStorageBytes =
+            unionStorageBytes > 0 ? unionStorageBytes : -2;
+        if (unionStorageBytes <= 0 && unionBaseAccessPath.empty())
         {
             if (ctx) ++ctx->fieldsSkippedSystemC;
             PrintCursorDebugLine("[anonymous union skipped]", unionCursor,
-                "reason=storage-size-unavailable owner=[" + rec.qualifiedName + "]");
+                "reason=storage-size-unavailable-and-no-addressable-base owner=[" + rec.qualifiedName + "]");
             return;
         }
 
@@ -4025,8 +3404,11 @@ namespace
             bool* foundBody;
             long long unionStorageBytes;
             std::string accessPrefix;
+            std::string unionBaseAccessPath;
             CX_CXXAccessSpecifier unionAccess;
-        } payload{ tu, ownerRecordCursor, &rec, ctx, foundBody, unionStorageBytes, accessPrefix, unionAccess };
+            std::map<std::string, long long> fallbackBitOffsetsByParent;
+            std::map<std::string, long long> fallbackBitUnitBitsByParent;
+        } payload{ tu, ownerRecordCursor, &rec, ctx, foundBody, emittedUnionStorageBytes, accessPrefix, unionBaseAccessPath, unionAccess };
 
         clang_visitChildren(
             unionCursor,
@@ -4063,6 +3445,73 @@ namespace
                     return CXChildVisit_Continue;
                 }
 
+                const bool childIsBitField = clang_Cursor_isBitField(child) != 0;
+                const CXType fieldType = clang_getCursorType(child);
+                const int childBitWidth =
+                    childIsBitField ? clang_getFieldDeclBitWidth(child) : -1;
+                long long fallbackBitOffset = -1;
+                if (childIsBitField)
+                {
+                    CXCursor bitParent = clang_getCursorLexicalParent(child);
+                    const CXCursorKind parentKind =
+                        clang_Cursor_isNull(bitParent)
+                            ? CXCursor_FirstInvalid
+                            : clang_getCursorKind(bitParent);
+                    if (parentKind == CXCursor_UnionDecl)
+                    {
+                        // Direct union alternatives all start at bit zero.
+                        if (childBitWidth > 0) fallbackBitOffset = 0;
+                    }
+                    else
+                    {
+                        std::string parentKey = GetQualifiedName(bitParent);
+                        if (parentKey.empty())
+                        {
+                            parentKey = ToStdString(clang_getCursorUSR(bitParent));
+                        }
+                        if (parentKey.empty())
+                        {
+                            parentKey = "cursor:" +
+                                std::to_string(static_cast<unsigned long long>(
+                                    clang_hashCursor(bitParent)));
+                        }
+                        long long& next =
+                            payload->fallbackBitOffsetsByParent[parentKey];
+                        long long& previousUnitBits =
+                            payload->fallbackBitUnitBitsByParent[parentKey];
+                        long long unitBits =
+                            clang_Type_getSizeOf(fieldType);
+                        unitBits = unitBits > 0 ? unitBits * 8 : 0;
+                        const auto alignToUnit = [](long long value, long long unit) {
+                            if (unit <= 0) return value;
+                            const long long remainder = value % unit;
+                            return remainder == 0 ? value : value + unit - remainder;
+                        };
+                        if (unitBits > 0 && previousUnitBits > 0 &&
+                            previousUnitBits != unitBits)
+                        {
+                            next = alignToUnit(next, unitBits);
+                        }
+                        if (unitBits > 0) previousUnitBits = unitBits;
+                        if (childBitWidth == 0)
+                        {
+                            next = alignToUnit(next, unitBits);
+                        }
+                        else if (childBitWidth > 0)
+                        {
+                            if (unitBits > 0 &&
+                                (next % unitBits) + childBitWidth > unitBits)
+                            {
+                                next = alignToUnit(next, unitBits);
+                            }
+                            fallbackBitOffset = next;
+                            // Unnamed padding fields must advance the fallback
+                            // cursor even though they are not emitted.
+                            next += static_cast<long long>(childBitWidth);
+                        }
+                    }
+                }
+
                 FieldInfo f;
                 const std::string rawFieldName = ToStdString(clang_getCursorSpelling(child));
                 if (rawFieldName.empty())
@@ -4079,7 +3528,6 @@ namespace
                 }
                 f.accessPath = f.name;
 
-                CXType fieldType = clang_getCursorType(child);
                 f.typeName = ToStdString(clang_getTypeSpelling(fieldType));
                 f.canonicalTypeName = ToStdString(clang_getTypeSpelling(clang_getCanonicalType(fieldType)));
                 f.declQualifiedName = GetTypeDeclarationQualifiedName(fieldType);
@@ -4106,13 +3554,25 @@ namespace
                 f.access = MoreRestrictiveAccess(
                     payload->unionAccess,
                     NormalizeAccess(clang_getCXXAccessSpecifier(child), true));
-                f.isBitField = clang_Cursor_isBitField(child) != 0;
+                f.isBitField = childIsBitField;
                 f.isUnionField = true;
                 f.unionStorageBytes = payload->unionStorageBytes;
+                f.unionBaseAccessPath = payload->unionBaseAccessPath;
                 if (f.isBitField)
                 {
-                    f.bitWidth = clang_getFieldDeclBitWidth(child);
+                    f.bitWidth = childBitWidth;
                     f.bitOffset = clang_Cursor_getOffsetOfField(child);
+                    if (f.bitOffset < 0 && f.bitWidth > 0)
+                    {
+                        f.bitOffset = fallbackBitOffset;
+                        PrintCursorDebugLine(
+                            "[bitfield offset recovered]",
+                            child,
+                            "owner=[" + out->qualifiedName +
+                            "] field=[" + f.name +
+                            "] offset=" + std::to_string(f.bitOffset) +
+                            " width=" + std::to_string(f.bitWidth));
+                    }
                 }
                 CollectAnnotatedPointerMetadata(child, *out, f, ctx);
                 if (!ShouldCollectReflectedField(*out, f, ctx))
@@ -4272,6 +3732,16 @@ namespace
                     f.isBitField = clang_Cursor_isBitField(child) != 0;
                     f.isUnionField = out->isUnion || anonymousUnionStorageBytes > 0;
                     f.unionStorageBytes = anonymousUnionStorageBytes;
+                    f.unionBaseIsSelf = out->isUnion;
+                    if (anonymousUnionInjectedField)
+                    {
+                        const CXCursor unionCursor = FindEnclosingUnionCursor(child);
+                        if (!clang_Cursor_isNull(unionCursor))
+                        {
+                            f.unionBaseAccessPath =
+                                AnonymousUnionBaseAccessPath(payload->recordCursor, unionCursor);
+                        }
+                    }
                     if (f.isBitField)
                     {
                         f.bitWidth = clang_getFieldDeclBitWidth(child);
@@ -4438,6 +3908,28 @@ namespace
                     return CXChildVisit_Continue;
                 }
 
+                // A direct anonymous union is a data-member container, not a
+                // nested template type.  Handle it before the generic record
+                // branch; otherwise ClassTemplate ASTs discard all injected
+                // union fields as "nested-record-not-template-body".
+                if (!*usedNestedRecord && kind == CXCursor_UnionDecl)
+                {
+                    const std::string unionName =
+                        ToStdString(clang_getCursorSpelling(child));
+                    if (unionName.empty() ||
+                        LooksLikeLibclangAnonymousName(unionName))
+                    {
+                        CollectAnonymousUnionFields(
+                            payload->tu,
+                            payload->recordCursor,
+                            child,
+                            *out,
+                            payload->ctx,
+                            foundBody);
+                        return CXChildVisit_Continue;
+                    }
+                }
+
                 if (IsRecordKind(kind))
                 {
                     if (IsInsideUnion(child))
@@ -4590,6 +4082,16 @@ namespace
                         f.isBitField = clang_Cursor_isBitField(child) != 0;
                         f.isUnionField = out->isUnion || anonymousUnionStorageBytes > 0;
                         f.unionStorageBytes = anonymousUnionStorageBytes;
+                        f.unionBaseIsSelf = out->isUnion;
+                        if (anonymousUnionInjectedField)
+                        {
+                            const CXCursor unionCursor = FindEnclosingUnionCursor(child);
+                            if (!clang_Cursor_isNull(unionCursor))
+                            {
+                                f.unionBaseAccessPath =
+                                    AnonymousUnionBaseAccessPath(payload->recordCursor, unionCursor);
+                            }
+                        }
                         if (f.isBitField)
                         {
                             f.bitWidth = clang_getFieldDeclBitWidth(child);
@@ -5621,92 +5123,6 @@ namespace
         return it == byName.end() ? NULL : it->second;
     }
 
-    const RecordInfo* FindRecordForBase(const std::map<std::string, const RecordInfo*>& byName, const BaseInfo& base)
-    {
-        if (!base.qualifiedTypeName.empty())
-        {
-            const RecordInfo* rec = FindRecord(byName, base.qualifiedTypeName);
-            if (rec) return rec;
-        }
-        return FindRecord(byName, base.typeName);
-    }
-
-    std::string StripClassKeyQualifiersFromTypeSpelling(std::string name)
-    {
-        name = Trim(name);
-        bool changed = true;
-        while (changed)
-        {
-            changed = false;
-            changed = ConsumePrefix(name, "::") || changed;
-            changed = ConsumePrefix(name, "class ") || changed;
-            changed = ConsumePrefix(name, "struct ") || changed;
-            changed = ConsumePrefix(name, "union ") || changed;
-            changed = ConsumePrefix(name, "const ") || changed;
-            changed = ConsumePrefix(name, "volatile ") || changed;
-            name = Trim(name);
-        }
-
-        // Some libclang/MSVC configurations include elaborated class keys inside
-        // template arguments, e.g. Base<class ns::Arg>.  Those spellings are noisy
-        // and can break generated code under MSVC.  Remove them as token prefixes.
-        const char* keys[] = { "class ", "struct ", "union " };
-        for (std::size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); ++k)
-        {
-            const std::string key(keys[k]);
-            std::size_t pos = 0;
-            while ((pos = name.find(key, pos)) != std::string::npos)
-            {
-                const bool atTokenBoundary = (pos == 0) ||
-                    !(std::isalnum(static_cast<unsigned char>(name[pos - 1])) || name[pos - 1] == '_');
-                if (atTokenBoundary) name.erase(pos, key.size());
-                else pos += key.size();
-            }
-        }
-        return Trim(name);
-    }
-
-    std::string BuildActualBaseTypeNameGlobal(const BaseInfo& base)
-    {
-        std::string actual = StripClassKeyQualifiersFromTypeSpelling(base.typeName);
-        std::string qname = StripClassKeyQualifiersFromTypeSpelling(base.qualifiedTypeName);
-
-        // Critical case:
-        //   struct Derived : Base<int> { ... };
-        // clang_getTypeDeclaration(baseType) resolves to the primary template Base,
-        // so qualifiedTypeName is "ns::Base" and loses the concrete "<int>".
-        // The static_cast must use the actual base specialization, i.e.
-        //   static_cast<const ::ns::Base<int>*>(obj)
-        // not
-        //   static_cast<const ::ns::Base<T>*>(obj)
-        // and not just ::ns::Base.
-        const std::size_t lt = actual.find('<');
-        if (!qname.empty())
-        {
-            if (lt != std::string::npos)
-            {
-                return EnsureGlobalQualifiedType(qname + actual.substr(lt));
-            }
-            return EnsureGlobalQualifiedType(qname);
-        }
-
-        return EnsureGlobalQualifiedType(actual);
-    }
-
-    std::string BuildBaseTypeForEmission(const BaseInfo& base, const RecordInfo* baseRec)
-    {
-        // For a template base instance, baseRec describes the primary template and
-        // BuildElaboratedReflectedTypeNameGlobal(*baseRec) would produce something
-        // like Base<T>, which is invalid in a non-template derived specialization
-        // and wrong for static_cast.  Always prefer the actual base-specifier type
-        // spelling when the base is a template instance.
-        const std::string actualBaseType = StripLeadingGlobalQualifier(BuildActualBaseTypeNameGlobal(base));
-        if (actualBaseType.find('<') != std::string::npos) return actualBaseType;
-
-        if (baseRec) return BuildElaboratedReflectedTypeNameGlobal(*baseRec);
-        return actualBaseType;
-    }
-
     void CollectMembersRecursive(
         const Options& opt,
         const RecordInfo& rec,
@@ -5742,10 +5158,12 @@ namespace
             m.bitWidth = f.bitWidth;
             m.bitOffset = f.bitOffset;
             m.unionStorageBytes = f.unionStorageBytes;
+            m.unionBaseIsSelf = f.unionBaseIsSelf;
             m.exprIsPointerAlready = false;
             m.asBoolStorage = !f.isBitField && IsBoolStorageTypedefSpelling(opt, f.typeName);
             m.annotatedPointerKind = f.annotatedPointerKind;
             m.annotatedPointerCountExpr = f.annotatedPointerCountExpr;
+            m.annotatedPointerTargetArray = f.annotatedPointerTargetArray;
             m.annotatedPointerStorageArray = f.annotatedPointerStorageArray;
             if (f.annotatedPointerKind != AnnotatedPointerKind::None)
             {
@@ -5756,6 +5174,11 @@ namespace
             const std::string accessPath = f.accessPath.empty() ? f.name : f.accessPath;
             m.constExpr = constObjExpr + "->" + accessPath;
             m.mutExpr = mutObjExpr + "->" + accessPath;
+            if (!f.unionBaseAccessPath.empty())
+            {
+                m.unionBaseConstExpr = constObjExpr + "->" + f.unionBaseAccessPath;
+                m.unionBaseMutExpr = mutObjExpr + "->" + f.unionBaseAccessPath;
+            }
             out.push_back(m);
             directNames.insert(m.displayName);
             if (gDebugAst)
@@ -5797,6 +5220,211 @@ namespace
         return out;
     }
 
+    std::string StripFixedArrayExtents(std::string typeName)
+    {
+        typeName = Trim(typeName);
+        for (;;)
+        {
+            const std::size_t close = typeName.find_last_not_of(" \t\r\n");
+            if (close == std::string::npos || typeName[close] != ']') break;
+            const std::size_t open = typeName.rfind('[', close);
+            if (open == std::string::npos) break;
+            const std::string extent = Trim(typeName.substr(open + 1, close - open - 1));
+            if (extent.empty()) return std::string();
+            typeName = Trim(typeName.substr(0, open));
+        }
+        return typeName;
+    }
+
+    bool ExtractTemplateArguments(const std::string& typeName,
+                                  std::string* templateName,
+                                  std::vector<std::string>* arguments)
+    {
+        if (!templateName || !arguments) return false;
+        const std::size_t open = typeName.find('<');
+        if (open == std::string::npos) return false;
+        int depth = 0;
+        std::size_t argumentBegin = open + 1;
+        std::size_t close = std::string::npos;
+        arguments->clear();
+        for (std::size_t i = open; i < typeName.size(); ++i)
+        {
+            const char c = typeName[i];
+            if (c == '<')
+            {
+                ++depth;
+            }
+            else if (c == '>')
+            {
+                --depth;
+                if (depth == 0)
+                {
+                    arguments->push_back(Trim(typeName.substr(argumentBegin, i - argumentBegin)));
+                    close = i;
+                    break;
+                }
+            }
+            else if (c == ',' && depth == 1)
+            {
+                arguments->push_back(Trim(typeName.substr(argumentBegin, i - argumentBegin)));
+                argumentBegin = i + 1;
+            }
+        }
+        if (close == std::string::npos) return false;
+        if (!Trim(typeName.substr(close + 1)).empty()) return false;
+        *templateName = Trim(typeName.substr(0, open));
+        return !arguments->empty();
+    }
+
+    std::string NormalizeScalarTypeSpelling(std::string typeName)
+    {
+        typeName = StripFixedArrayExtents(typeName);
+        if (typeName.empty()) return typeName;
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+            changed = ConsumePrefix(typeName, "::") || changed;
+            changed = ConsumePrefix(typeName, "const ") || changed;
+            changed = ConsumePrefix(typeName, "volatile ") || changed;
+            typeName = Trim(typeName);
+        }
+        const char* suffixes[] = { " const", " volatile" };
+        for (std::size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); ++i)
+        {
+            const std::string suffix(suffixes[i]);
+            if (typeName.size() >= suffix.size() &&
+                typeName.compare(typeName.size() - suffix.size(), suffix.size(), suffix) == 0)
+            {
+                typeName = Trim(typeName.substr(0, typeName.size() - suffix.size()));
+            }
+        }
+        return typeName;
+    }
+
+    bool IsBuiltinRelocationSafeType(std::string typeName)
+    {
+        typeName = NormalizeScalarTypeSpelling(typeName);
+        if (typeName.empty() || typeName.find('*') != std::string::npos ||
+            typeName.find('&') != std::string::npos) return false;
+        if (typeName.compare(0, 5, "enum ") == 0) return true;
+
+        static const char* const kScalarTypes[] = {
+            "bool", "char", "signed char", "unsigned char", "wchar_t", "char16_t", "char32_t",
+            "short", "short int", "signed short", "signed short int",
+            "unsigned short", "unsigned short int",
+            "int", "signed", "signed int", "unsigned", "unsigned int",
+            "long", "long int", "signed long", "signed long int",
+            "unsigned long", "unsigned long int",
+            "long long", "long long int", "signed long long", "signed long long int",
+            "unsigned long long", "unsigned long long int",
+            "float", "double", "long double",
+            "int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t",
+            "int64_t", "uint64_t", "std::int8_t", "std::uint8_t", "std::int16_t",
+            "std::uint16_t", "std::int32_t", "std::uint32_t", "std::int64_t",
+            "std::uint64_t", "size_t", "std::size_t", "ptrdiff_t", "std::ptrdiff_t"
+        };
+        for (std::size_t i = 0; i < sizeof(kScalarTypes) / sizeof(kScalarTypes[0]); ++i)
+        {
+            if (typeName == kScalarTypes[i]) return true;
+        }
+        return false;
+    }
+
+    bool IsRecordTopologyRelocationSafe(
+        const Options& opt,
+        const RecordInfo& rec,
+        const std::map<std::string, const RecordInfo*>& byName,
+        std::map<std::string, bool>& memo,
+        std::set<std::string>& active);
+
+    bool IsFieldTopologyRelocationSafe(
+        const Options& opt,
+        const FieldInfo& field,
+        const std::map<std::string, const RecordInfo*>& byName,
+        std::map<std::string, bool>& memo,
+        std::set<std::string>& active)
+    {
+        if (field.isBitField || field.isUnionField ||
+            field.annotatedPointerKind != AnnotatedPointerKind::None) return false;
+        if (IsBoolStorageTypedefSpelling(opt, field.typeName)) return true;
+
+        std::string typeName = StripFixedArrayExtents(
+            !field.canonicalTypeName.empty() ? field.canonicalTypeName : field.typeName);
+        if (typeName.empty() || typeName.find('*') != std::string::npos ||
+            typeName.find('&') != std::string::npos) return false;
+        if (IsBuiltinRelocationSafeType(typeName)) return true;
+
+        std::string templateName;
+        std::vector<std::string> arguments;
+        if (ExtractTemplateArguments(typeName, &templateName, &arguments))
+        {
+            const std::string templateKey = CanonicalRecordLookupKey(templateName);
+            if ((templateKey == "std::array" || templateKey == "array") &&
+                arguments.size() == 2u)
+            {
+                FieldInfo elementField;
+                elementField.typeName = arguments[0];
+                elementField.canonicalTypeName = arguments[0];
+                return IsFieldTopologyRelocationSafe(opt, elementField, byName, memo, active);
+            }
+            if ((templateKey == "std::pair" || templateKey == "pair") &&
+                arguments.size() == 2u)
+            {
+                FieldInfo firstField;
+                firstField.typeName = arguments[0];
+                firstField.canonicalTypeName = arguments[0];
+                FieldInfo secondField;
+                secondField.typeName = arguments[1];
+                secondField.canonicalTypeName = arguments[1];
+                return IsFieldTopologyRelocationSafe(opt, firstField, byName, memo, active) &&
+                    IsFieldTopologyRelocationSafe(opt, secondField, byName, memo, active);
+            }
+            // wave::array/WaveValue, smart pointers, and unknown wrappers own
+            // element-specific state or have expansion semantics that cannot be
+            // proven relocatable from the declaration alone.
+            return false;
+        }
+
+        const RecordInfo* dependency = NULL;
+        if (!field.declQualifiedName.empty()) dependency = FindRecord(byName, field.declQualifiedName);
+        if (!dependency && !field.canonicalTypeName.empty()) dependency = FindRecord(byName, field.canonicalTypeName);
+        if (!dependency) dependency = FindRecord(byName, field.typeName);
+        return dependency &&
+            IsRecordTopologyRelocationSafe(opt, *dependency, byName, memo, active);
+    }
+
+    bool IsRecordTopologyRelocationSafe(
+        const Options& opt,
+        const RecordInfo& rec,
+        const std::map<std::string, const RecordInfo*>& byName,
+        std::map<std::string, bool>& memo,
+        std::set<std::string>& active)
+    {
+        const std::string key = CanonicalRecordLookupKey(rec.qualifiedName);
+        std::map<std::string, bool>::const_iterator cached = memo.find(key);
+        if (cached != memo.end()) return cached->second;
+        if (!active.insert(key).second) return false;
+
+        bool safe = !rec.isUnion;
+        for (std::size_t bi = 0; safe && bi < rec.bases.size(); ++bi)
+        {
+            const BaseInfo& base = rec.bases[bi];
+            const std::string baseText =
+                base.typeName + " " + base.canonicalTypeName + " " + base.qualifiedTypeName;
+            if (baseText.find("PeekTraceSourceFor") != std::string::npos) safe = false;
+        }
+        for (std::size_t fi = 0; safe && fi < rec.fields.size(); ++fi)
+        {
+            const FieldInfo& field = rec.fields[fi];
+            if (!RecordAllowsAccess(rec, field.access)) continue;
+            safe = IsFieldTopologyRelocationSafe(opt, field, byName, memo, active);
+        }
+        active.erase(key);
+        memo[key] = safe;
+        return safe;
+    }
+
     std::string BuildTemplatePrefix(const RecordInfo& rec)
     {
         if (rec.templateKind == RecordTemplateKind::None) return std::string();
@@ -5808,20 +5436,6 @@ namespace
             oss << rec.templateParams[i].declText;
         }
         oss << ">\n";
-        return oss.str();
-    }
-
-    std::string BuildTemplateArgList(const RecordInfo& rec)
-    {
-        if (rec.templateKind == RecordTemplateKind::None) return std::string();
-        std::ostringstream oss;
-        oss << "<";
-        for (std::size_t i = 0; i < rec.templateParams.size(); ++i)
-        {
-            if (i) oss << ", ";
-            oss << rec.templateParams[i].argText;
-        }
-        oss << ">";
         return oss.str();
     }
 
@@ -5839,25 +5453,6 @@ namespace
         return std::string();
     }
 
-    std::string BuildVisitObjectTemplatePrefix(const RecordInfo& rec)
-    {
-        std::ostringstream oss;
-        oss << "template <";
-        bool first = true;
-        if (rec.templateKind == RecordTemplateKind::Primary)
-        {
-            for (std::size_t i = 0; i < rec.templateParams.size(); ++i)
-            {
-                if (!first) oss << ", ";
-                oss << rec.templateParams[i].declText;
-                first = false;
-            }
-        }
-        if (!first) oss << ", ";
-        oss << "typename PtrVisitor, typename ValueVisitor>\n";
-        return oss.str();
-    }
-
     std::string BuildBitGetterName(const std::string& fieldDisplayName)
     {
         std::string out = "get_";
@@ -5872,24 +5467,6 @@ namespace
     std::string BuildReflectedType(const RecordInfo& rec)
     {
         return BuildElaboratedReflectedTypeNameGlobal(rec);
-    }
-
-    bool IsDynamicTraceTargetMarkerType(const std::string& typeName)
-    {
-        const std::string key = TopLevelTypeKeyForClosure(typeName);
-        const char* markers[] = { "DynamicTraceTargetFor", "DynamicTraceTarget" };
-        for (std::size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i)
-        {
-            const std::string marker(markers[i]);
-            if (key == marker) return true;
-            if (key.size() > marker.size() + 1u &&
-                key.compare(key.size() - marker.size(), marker.size(), marker) == 0 &&
-                key[key.size() - marker.size() - 1u] == ':')
-            {
-                return true;
-            }
-        }
-        return false;
     }
 
     std::string StripExtension(const std::string& path)
@@ -6052,17 +5629,6 @@ namespace
         if (file == "wvz4_lod_residual_experiment.h" || file == "wvz4_lod_residual_experiment.hpp") return true;
 
         return false;
-    }
-
-    std::string ReplaceHeaderExtensionWithReflectAuto(const std::string& rel)
-    {
-        const std::string n = NormalizePathSlashes(rel);
-        const std::size_t p = n.find_last_of('.');
-        if (p == std::string::npos) return n + "_reflect_auto.h";
-        std::string ext = n.substr(p);
-        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (ext != ".h" && ext != ".hpp" && ext != ".hh" && ext != ".hxx") ext = ".h";
-        return n.substr(0, p) + "_reflect_auto" + ext;
     }
 
     bool StartsWithPathPrefix(const std::string& path, const std::string& prefix)
@@ -6694,17 +6260,6 @@ namespace
         return ContainsUnexpandedMacro(s) || ContainsUnexpandedPercentEnv(s);
     }
 
-    bool IsClangSeparateValueOption(const std::string& arg)
-    {
-        return arg == "-include" || arg == "--include" ||
-            arg == "-I" || arg == "/I" ||
-            arg == "-isystem" || arg == "-imsvc" ||
-            arg == "-idirafter" || arg == "-iquote" ||
-            arg == "-D" || arg == "/D" ||
-            arg == "-U" || arg == "/U" ||
-            arg == "-x" || arg == "/FI";
-    }
-
     bool IsPathLikeClangArg(const std::string& arg)
     {
         if (arg.empty()) return false;
@@ -6834,11 +6389,6 @@ namespace
             if (args[i].compare(0, prefix.size(), prefix) == 0) return true;
         }
         return false;
-    }
-
-    bool HasExactArg(const std::vector<std::string>& args, const std::string& exact)
-    {
-        return std::find(args.begin(), args.end(), exact) != args.end();
     }
 
     void AddUniqueArg(std::vector<std::string>& args, const std::string& arg)
@@ -7500,6 +7050,8 @@ namespace
             byName[CanonicalRecordLookupKey(records[i].simpleName)] = &records[i];
             if (!records[i].explicitReflectedType.empty()) byName[CanonicalRecordLookupKey(records[i].explicitReflectedType)] = &records[i];
         }
+        std::map<std::string, bool> relocationSafeByRecord;
+        std::set<std::string> relocationSafeActive;
 
         // Emit parent records before nested records.  Private/protected nested types
         // are named through public aliases emitted inside wave::ReflectAccess<Parent>,
@@ -7649,7 +7201,28 @@ namespace
                 {
                     usedGetterConst = true;
                     const std::string getterName = BuildBitGetterName(m.displayName);
-                    os << "        ::wave::detail::invoke_getter_visitor(on_getter, \"" << EscapeString(m.displayName) << "\", &::wave::ReflectAccess<" << recType << ">::" << getterName << ", " << m.bitWidth << ", " << m.bitOffset << ", ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                    os << "        ::wave::detail::invoke_getter_visitor(on_getter, \"" << EscapeString(m.displayName) << "\", &::wave::ReflectAccess<" << recType << ">::" << getterName << ", " << m.bitWidth << ", " << m.bitOffset;
+                    if (m.isUnionField)
+                    {
+                        const std::string unionBytes =
+                            m.unionStorageBytes > 0
+                                ? std::to_string(m.unionStorageBytes)
+                                : (m.unionStorageBytes == -2 &&
+                                   !m.unionBaseConstExpr.empty()
+                                    ? ("sizeof(" + m.unionBaseConstExpr + ")")
+                                    : std::string("sizeof(Self)"));
+                        const std::string unionBase = m.unionBaseIsSelf
+                            ? std::string("obj")
+                            : (m.unionBaseConstExpr.empty()
+                                ? std::string()
+                                : ("std::addressof(" + m.unionBaseConstExpr + ")"));
+                        if (!unionBase.empty())
+                        {
+                            os << ", ::wave::detail::UnionFieldTag(), " << unionBytes
+                               << ", ::wave::detail::UnionFieldBase(" << unionBase << ")";
+                        }
+                    }
+                    os << ", ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                 }
                 else
                 {
@@ -7663,11 +7236,11 @@ namespace
                     }
                     else if (m.annotatedPointerKind == AnnotatedPointerKind::Strong && m.annotatedPointerStorageArray)
                     {
-                        os << "        ::wave::detail::invoke_annotated_ptr_storage_array_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.constExpr << ", " << BuildAnnotatedPointerCountExpression(m, "obj") << ", ::wave::detail::AnnotatedPointerMemberKey(\"" << EscapeString(m.annotatedPointerClassName) << "\", \"" << EscapeString(m.annotatedPointerMemberName) << "\"), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                        os << "        ::wave::detail::" << (m.annotatedPointerTargetArray ? "invoke_annotated_ptr_array_storage_array_visitor" : "invoke_annotated_ptr_storage_array_visitor") << "(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.constExpr << ", " << BuildAnnotatedPointerCountExpression(m, "obj") << ", ::wave::detail::AnnotatedPointerMemberKey(\"" << EscapeString(m.annotatedPointerClassName) << "\", \"" << EscapeString(m.annotatedPointerMemberName) << "\"), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
                     else if (m.annotatedPointerKind == AnnotatedPointerKind::Strong)
                     {
-                        os << "        ::wave::detail::invoke_annotated_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.constExpr << ", " << BuildAnnotatedPointerCountExpression(m, "obj") << ", ::wave::detail::AnnotatedPointerMemberKey(\"" << EscapeString(m.annotatedPointerClassName) << "\", \"" << EscapeString(m.annotatedPointerMemberName) << "\"), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                        os << "        ::wave::detail::" << (m.annotatedPointerTargetArray ? "invoke_annotated_ptr_array_visitor" : "invoke_annotated_ptr_visitor") << "(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.constExpr << ", " << BuildAnnotatedPointerCountExpression(m, "obj") << ", ::wave::detail::AnnotatedPointerMemberKey(\"" << EscapeString(m.annotatedPointerClassName) << "\", \"" << EscapeString(m.annotatedPointerMemberName) << "\"), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
                     else if (m.asBoolStorage)
                     {
@@ -7678,6 +7251,11 @@ namespace
                         if (m.unionStorageBytes > 0)
                         {
                             os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.constExpr << "), ::wave::detail::UnionFieldTag(), " << m.unionStorageBytes << ", ::wave::detail::UnionFieldBase(std::addressof(" << m.constExpr << ")), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                        }
+                        else if (m.unionStorageBytes == -2 &&
+                                 !m.unionBaseConstExpr.empty())
+                        {
+                            os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.constExpr << "), ::wave::detail::UnionFieldTag(), sizeof(" << m.unionBaseConstExpr << "), ::wave::detail::UnionFieldBase(std::addressof(" << m.unionBaseConstExpr << ")), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                         }
                         else
                         {
@@ -7715,7 +7293,28 @@ namespace
                 {
                     usedGetterMut = true;
                     const std::string getterName = BuildBitGetterName(m.displayName);
-                    os << "        ::wave::detail::invoke_getter_visitor(on_getter, \"" << EscapeString(m.displayName) << "\", &::wave::ReflectAccess<" << recType << ">::" << getterName << ", " << m.bitWidth << ", " << m.bitOffset << ", ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                    os << "        ::wave::detail::invoke_getter_visitor(on_getter, \"" << EscapeString(m.displayName) << "\", &::wave::ReflectAccess<" << recType << ">::" << getterName << ", " << m.bitWidth << ", " << m.bitOffset;
+                    if (m.isUnionField)
+                    {
+                        const std::string unionBytes =
+                            m.unionStorageBytes > 0
+                                ? std::to_string(m.unionStorageBytes)
+                                : (m.unionStorageBytes == -2 &&
+                                   !m.unionBaseMutExpr.empty()
+                                    ? ("sizeof(" + m.unionBaseMutExpr + ")")
+                                    : std::string("sizeof(Self)"));
+                        const std::string unionBase = m.unionBaseIsSelf
+                            ? std::string("obj")
+                            : (m.unionBaseMutExpr.empty()
+                                ? std::string()
+                                : ("std::addressof(" + m.unionBaseMutExpr + ")"));
+                        if (!unionBase.empty())
+                        {
+                            os << ", ::wave::detail::UnionFieldTag(), " << unionBytes
+                               << ", ::wave::detail::UnionFieldBase(" << unionBase << ")";
+                        }
+                    }
+                    os << ", ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                 }
                 else
                 {
@@ -7729,11 +7328,11 @@ namespace
                     }
                     else if (m.annotatedPointerKind == AnnotatedPointerKind::Strong && m.annotatedPointerStorageArray)
                     {
-                        os << "        ::wave::detail::invoke_annotated_ptr_storage_array_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.mutExpr << ", " << BuildAnnotatedPointerCountExpression(m, "obj") << ", ::wave::detail::AnnotatedPointerMemberKey(\"" << EscapeString(m.annotatedPointerClassName) << "\", \"" << EscapeString(m.annotatedPointerMemberName) << "\"), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                        os << "        ::wave::detail::" << (m.annotatedPointerTargetArray ? "invoke_annotated_ptr_array_storage_array_visitor" : "invoke_annotated_ptr_storage_array_visitor") << "(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.mutExpr << ", " << BuildAnnotatedPointerCountExpression(m, "obj") << ", ::wave::detail::AnnotatedPointerMemberKey(\"" << EscapeString(m.annotatedPointerClassName) << "\", \"" << EscapeString(m.annotatedPointerMemberName) << "\"), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
                     else if (m.annotatedPointerKind == AnnotatedPointerKind::Strong)
                     {
-                        os << "        ::wave::detail::invoke_annotated_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.mutExpr << ", " << BuildAnnotatedPointerCountExpression(m, "obj") << ", ::wave::detail::AnnotatedPointerMemberKey(\"" << EscapeString(m.annotatedPointerClassName) << "\", \"" << EscapeString(m.annotatedPointerMemberName) << "\"), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                        os << "        ::wave::detail::" << (m.annotatedPointerTargetArray ? "invoke_annotated_ptr_array_visitor" : "invoke_annotated_ptr_visitor") << "(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.mutExpr << ", " << BuildAnnotatedPointerCountExpression(m, "obj") << ", ::wave::detail::AnnotatedPointerMemberKey(\"" << EscapeString(m.annotatedPointerClassName) << "\", \"" << EscapeString(m.annotatedPointerMemberName) << "\"), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
                     else if (m.asBoolStorage)
                     {
@@ -7744,6 +7343,11 @@ namespace
                         if (m.unionStorageBytes > 0)
                         {
                             os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.mutExpr << "), ::wave::detail::UnionFieldTag(), " << m.unionStorageBytes << ", ::wave::detail::UnionFieldBase(std::addressof(" << m.mutExpr << ")), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                        }
+                        else if (m.unionStorageBytes == -2 &&
+                                 !m.unionBaseMutExpr.empty())
+                        {
+                            os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.mutExpr << "), ::wave::detail::UnionFieldTag(), sizeof(" << m.unionBaseMutExpr << "), ::wave::detail::UnionFieldBase(std::addressof(" << m.unionBaseMutExpr << ")), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                         }
                         else
                         {
@@ -7840,6 +7444,8 @@ namespace
             const RecordInfo& rec = *emitOrder[oi];
             const std::string recType = emittedTypeByQName[rec.qualifiedName];
             const std::vector<EmittedMember> members = BuildFlattenedMembers(opt, rec, byName);
+            const bool generatedRelocationSafe = IsRecordTopologyRelocationSafe(
+                opt, rec, byName, relocationSafeByRecord, relocationSafeActive);
             bool isTypedPeekSource = false;
             for (std::size_t bi = 0; bi < rec.bases.size(); ++bi)
             {
@@ -7858,15 +7464,26 @@ namespace
             if (opt.compileShardCount != 0)
             {
                 // Cross-shard reflected child specializations deliberately are not
-                // visible here.  Avoid instantiating their primary estimate template
-                // before the explicit specialization in another translation unit.
-                os << "    return ::reflect::TopologyTypeEstimate(" << members.size() << "u, false, true);\n";
+                // visible here.  Resolve relocation safety from the complete AST
+                // closure instead of instantiating a child estimate specialization
+                // from another generated translation unit.
+                if (generatedRelocationSafe)
+                {
+                    // Zero means "use the exact first-element track count" when
+                    // evaluating the clone threshold.
+                    os << "    return ::reflect::TopologyTypeEstimate(0u, true, false, true);\n";
+                }
+                else
+                {
+                    os << "    return ::reflect::TopologyTypeEstimate(" << members.size()
+                       << "u, false, true, false);\n";
+                }
             }
             else
             {
                 os << "    ::reflect::detail::TopologyEstimateRecursionGuard recursion_guard(::reflect::type_tag_of<Self>());\n";
-                os << "    if (!recursion_guard.entered()) return ::reflect::TopologyTypeEstimate(0, false, true);\n";
-                os << "    ::reflect::TopologyTypeEstimate estimate(0, true, false);\n";
+                os << "    if (!recursion_guard.entered()) return ::reflect::TopologyTypeEstimate(0, false, true, false);\n";
+                os << "    ::reflect::TopologyTypeEstimate estimate(0, true, false, true);\n";
                 if (isTypedPeekSource)
                 {
                     os << "    typedef typename Self::wave_trace_peek_value_type EstimatePeekValue;\n";
@@ -7920,7 +7537,7 @@ namespace
                             {
                                 os << "estimate_pointee" << mi << ".estimated_leaves";
                             }
-                            os << ", false, true));\n";
+                            os << ", false, true, false));\n";
                         }
                         else
                         {
@@ -8925,34 +8542,6 @@ namespace
             result.shardWeights[best] += groups[gi].weight;
         }
         return result;
-    }
-
-    std::vector<std::string> SelectCompileShardInputHeaders(const std::vector<RecordInfo>& records,
-        const std::vector<std::string>& aggregateInputs,
-        const std::vector<std::string>& aggregateIncludePaths)
-    {
-        std::set<std::string> needed;
-        for (std::size_t i = 0; i < records.size(); ++i)
-        {
-            const std::string key = CanonicalSourcePathKey(records[i].sourcePath);
-            if (!key.empty()) needed.insert(key);
-        }
-
-        std::vector<std::string> selected;
-        std::set<std::string> emitted;
-        for (std::size_t i = 0; i < aggregateInputs.size() && i < aggregateIncludePaths.size(); ++i)
-        {
-            const std::string key = CanonicalSourcePathKey(aggregateInputs[i]);
-            if (needed.find(key) != needed.end() && emitted.insert(key).second)
-                selected.push_back(aggregateIncludePaths[i]);
-        }
-        for (std::size_t i = 0; i < records.size(); ++i)
-        {
-            const std::string key = CanonicalSourcePathKey(records[i].sourcePath);
-            if (!key.empty() && emitted.insert(key).second)
-                selected.push_back(NormalizePathSlashes(records[i].sourcePath));
-        }
-        return selected;
     }
 
     bool WriteBatchAggregateInputHeader(const std::string& path, const std::vector<std::string>& headers)

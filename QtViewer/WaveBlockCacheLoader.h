@@ -34,6 +34,8 @@ public:
                const WaveFile& directory,
                quint64 totalBudgetBytes = 32ull * 1024ull * 1024ull * 1024ull);
     void stop();
+    void pauseBackground();
+    void resumeBackground();
 
     void requestViewport(const QVector<int>& signalIds,
                          qint64 viewStart,

@@ -24,6 +24,7 @@ class QDropEvent;
 class QEvent;
 class QLineEdit;
 class QComboBox;
+class QCheckBox;
 class QPushButton;
 class QIcon;
 class QSplitter;
@@ -33,6 +34,8 @@ class QModelIndex;
 class QTreeView;
 class QTreeWidget;
 class QTreeWidgetItem;
+class QVBoxLayout;
+class QWidget;
 class WaveCanvas;
 class WaveParser4Reader;
 class WaveBlockCacheLoader;
@@ -52,7 +55,9 @@ public:
                                   int activeSignalCount,
                                   int* hitCount,
                                   quint64* resultChecksum,
-                                  qint64* elapsedMs);
+                                  qint64* elapsedMs,
+                                  qint64 rangeStart = 0,
+                                  qint64 rangeEnd = 0);
     void selectViewportRangeForBenchmark(qint64 start, qint64 end);
     void resetViewForBenchmark();
     bool benchmarkActiveViewportCoverage(int* covered, int* total) const;
@@ -88,6 +93,9 @@ private:
     void applyWindowRangeInput();
     void openDerivedSignalDialog();
     void openValueFindDialog();
+    void openSignalConditionSearchDialog();
+    void startSignalConditionSearch();
+    void cancelSignalConditionSearch();
     void runValueFind();
     void jumpToPreviousValueFindHit();
     void jumpToNextValueFindHit();
@@ -119,6 +127,13 @@ private:
         int sampleIndex = -1;
         qint64 time = -1;
         qint64 duration = 0;
+    };
+
+    struct SignalConditionValueRow {
+        QWidget* widget = nullptr;
+        QLineEdit* valueEdit = nullptr;
+        QLineEdit* ratioEdit = nullptr;
+        QPushButton* removeButton = nullptr;
     };
 
     WaveFile m_wave;
@@ -161,6 +176,21 @@ private:
     qint64 m_valueFindRangeStart = 0;
     qint64 m_valueFindRangeEnd = 0;
     int m_valueFindCurrentHit = -1;
+    QDialog* m_signalConditionSearchDialog = nullptr;
+    QCheckBox* m_signalConditionScopeCheck = nullptr;
+    QLineEdit* m_signalConditionNameEdit = nullptr;
+    QCheckBox* m_signalConditionRegexCheck = nullptr;
+    QCheckBox* m_signalConditionCaseCheck = nullptr;
+    QLineEdit* m_signalConditionChangeMinEdit = nullptr;
+    QLineEdit* m_signalConditionChangeMaxEdit = nullptr;
+    QVBoxLayout* m_signalConditionValueRowsLayout = nullptr;
+    QLabel* m_signalConditionStatusLabel = nullptr;
+    QPushButton* m_signalConditionSearchButton = nullptr;
+    QPushButton* m_signalConditionCancelButton = nullptr;
+    QVector<SignalConditionValueRow> m_signalConditionValueRows;
+    std::thread m_signalConditionSearchThread;
+    std::shared_ptr<std::atomic_bool> m_signalConditionSearchCancel;
+    quint64 m_signalConditionSearchGeneration = 0;
     std::unique_ptr<SignalLogicTree> m_signalTreeModel;
     std::unique_ptr<AgentRpcServer> m_agentRpcServer;
     std::thread m_treeWarmupThread;
@@ -203,6 +233,18 @@ private:
     void jumpToValueFindHit(int hitIndex);
     void jumpToAdjacentValueFindHit(bool forward);
     void jumpSelectedTreeSignalToViewportEvent(bool firstEvent);
+    void addSignalConditionValueRow(const QString& valueText = QString(),
+                                    const QString& ratioText = QString());
+    void removeSignalConditionValueRow(QWidget* rowWidget);
+    void loadSignalConditionSearchSettings();
+    void saveSignalConditionSearchSettings() const;
+    void stopSignalConditionSearch();
+    void applySignalConditionSearchResults(const QVector<int>& matchedNodeIds,
+                                           qint64 examinedSignals,
+                                           qint64 nameCandidates,
+                                           qint64 elapsedMs,
+                                           bool truncated,
+                                           const QString& error);
     void showTreeSearchResults(const QString& query);
     void rebuildActiveListRows();
     void rebuildVisibleSignals();

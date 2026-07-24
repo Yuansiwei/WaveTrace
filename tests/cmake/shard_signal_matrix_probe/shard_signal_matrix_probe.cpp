@@ -2,6 +2,7 @@
 #include "project_reflect_auto.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -92,6 +93,44 @@ wave::TrackId track_id_for_path(const StrictSink& sink, const std::string& wante
         if (path_for_node(sink, decl.node_id) == wanted) return decl.track_id;
     }
     return static_cast<wave::TrackId>(-1);
+}
+
+const wave::TrackDecl* track_decl_for_path(const StrictSink& sink,
+                                           const std::string& wanted) {
+    for (std::size_t i = 0; i < sink.declarations.size(); ++i) {
+        if (path_for_node(sink, sink.declarations[i].node_id) == wanted) {
+            return &sink.declarations[i];
+        }
+    }
+    return NULL;
+}
+
+wave::TrackId effective_storage_id(const wave::TrackDecl& decl) {
+    return decl.storage_id != 0 ? decl.storage_id : decl.track_id;
+}
+
+bool require_storage_relation(const StrictSink& sink,
+                              const std::string& lhs_path,
+                              const std::string& rhs_path,
+                              bool expect_same) {
+    const wave::TrackDecl* lhs = track_decl_for_path(sink, lhs_path);
+    const wave::TrackDecl* rhs = track_decl_for_path(sink, rhs_path);
+    if (!lhs || !rhs) {
+        std::cerr << "storage relation declaration missing lhs=" << lhs_path
+                  << " rhs=" << rhs_path << "\n";
+        return false;
+    }
+    const wave::TrackId lhs_storage = effective_storage_id(*lhs);
+    const wave::TrackId rhs_storage = effective_storage_id(*rhs);
+    if ((lhs_storage == rhs_storage) != expect_same) {
+        std::cerr << "storage relation mismatch lhs=" << lhs_path
+                  << " lhs_storage=" << lhs_storage
+                  << " rhs=" << rhs_path
+                  << " rhs_storage=" << rhs_storage
+                  << " expect_same=" << expect_same << "\n";
+        return false;
+    }
+    return true;
 }
 
 bool require_u64_sample(const StrictSink& sink,
@@ -389,6 +428,8 @@ int main(int argc, char** argv) {
     ShardSmallLeaf hidden_dynamic_leaf = {};
     ShardTemplateDynamicWaveTarget<ShardSmallLeaf> template_dynamic_ptr_target;
     ShardTemplateDynamicWaveTarget<ShardSmallLeaf> template_dynamic_erased_target;
+    ShardUnionDynamicTarget union_dynamic_target;
+    ShardMixedSizeUnion mixed_union_ptr_storage;
     ShardSmallLeaf template_dynamic_inline_payload = {};
     ShardSmallLeaf template_dynamic_ptr_payload = {};
     ShardSmallLeaf template_dynamic_erased_payload = {};
@@ -412,9 +453,20 @@ int main(int argc, char** argv) {
     std::array<std::shared_ptr<ShardSmallLeaf>, 2> pointer_shared_owners;
     std::array<std::shared_ptr<ShardSmallLeaf>, 2> pointer_weak_owners;
     ShardSmallLeaf pointer_span_storage[2][2] = {};
+    std::vector<ShardRelocationSafeLeaf> relocation_safe(element_count);
+    for (std::size_t i = 0; i < relocation_safe.size(); ++i) {
+        relocation_safe[i].value = static_cast<std::uint32_t>(0x51000000u + i);
+        relocation_safe[i].valid = (i & 1u) != 0u;
+        for (std::size_t lane = 0; lane < relocation_safe[i].lanes.size(); ++lane) {
+            relocation_safe[i].lanes[lane] =
+                static_cast<std::uint16_t>((i * 7u + lane) & 0xFFFFu);
+        }
+    }
     ShardSignalMatrixRoot root;
     root.bulk_count = element_count;
     root.bulk = bulk.data();
+    root.relocation_safe_count = relocation_safe.size();
+    root.relocation_safe = relocation_safe.data();
     root.alias_a = &alias_storage;
     root.alias_b = &alias_storage;
     root.owning_wave_ptr = std::unique_ptr<ShardSmallLeaf>(new ShardSmallLeaf());
@@ -476,6 +528,43 @@ int main(int argc, char** argv) {
     root.middle_empty_array_count = middle_empty_array.size();
     root.middle_empty_array = middle_empty_array.data();
     root.nested_anonymous_union.initialize(0xA5123456789ABCDFull, true);
+    root.multiple_anonymous_unions.initialize(
+        0x13579BDF2468ACE0ull, 0xA5A55A5Au, 0xFEDCBA9876543210ull, true);
+    root.variant.u32_value = 0x3F800000u;
+    root.direct_bitfield_union.raw = 0x89ABCDEFu;
+    root.named_anonymous_union.initialize(0xA1B2C3D4u, 0x10203040u);
+    root.exotic_bitfield_unions.initialize(0x89ABCDEFu, 0x3u, 0xA55Fu);
+    root.padded_template_union.initialize(0x12345678ABCDEF0Full);
+    root.mixed_size_union.wide_value = 0x1122334455667788ull;
+    for (std::size_t i = 0; i < 3u; ++i) {
+        root.mixed_union_c_array[i].wide_value =
+            0x2100000000000000ull + static_cast<std::uint64_t>(i);
+        root.mixed_union_std_array[i].wide_value =
+            0x3100000000000000ull + static_cast<std::uint64_t>(i);
+    }
+    mixed_union_ptr_storage.wide_value = 0x8877665544332211ull;
+    root.mixed_union_ptr = &mixed_union_ptr_storage;
+    root.protected_union_base.initialize_base(0xA65Cu);
+    root.protected_union.initialize(0xB5A3u, 0x76543210u, 0x5Au);
+    root.template_union.initialize(0x123456789ABCDEF0ull);
+    for (std::size_t i = 0; i < 2u; ++i) {
+        root.union_c_array[i].initialize(
+            static_cast<std::uint32_t>(0x11000000u + i), 0x1100u + static_cast<std::uint32_t>(i));
+        root.union_std_array[i].initialize(
+            static_cast<std::uint32_t>(0x22000000u + i), 0x2200u + static_cast<std::uint32_t>(i));
+        root.union_wave_array[i].initialize(
+            static_cast<std::uint32_t>(0x33000000u + i), 0x3300u + static_cast<std::uint32_t>(i));
+        for (std::size_t j = 0; j < 2u; ++j) {
+            root.union_wave_matrix[i][j].initialize(
+                0x4400000000000000ull +
+                static_cast<std::uint64_t>(i * 0x10u + j));
+        }
+    }
+    root.union_dynamic_inline.initialize(0xD1A2B3C4u, 0xD5E6F708u);
+    union_dynamic_target.initialize(0xE1A2B3C4u, 0xE5E6F708u);
+    root.union_dynamic_ptr = &union_dynamic_target;
+    root.union_peek_inline.initialize(0xC1A2B3C4u);
+    root.union_peek_erased = &root.union_peek_inline;
     root.dynamic_inline.initialize(0xD101u, &dynamic_inline_leaf);
     dynamic_ptr_target.initialize(0xD201u, &dynamic_ptr_leaf, &dynamic_next_target);
     dynamic_next_target.initialize(0xD301u, &dynamic_next_leaf, &dynamic_ptr_target);
@@ -594,7 +683,19 @@ int main(int argc, char** argv) {
         return 25;
     }
     options.enable_parallel_topology_expansion = true;
-    options.topology_expansion_threads = 8u;
+    options.enable_fixed_repeated_topology_clone =
+        std::getenv("WAVETRACE_PROBE_DISABLE_CLONE") == NULL;
+    const char* topology_threads_env = std::getenv("WAVETRACE_PROBE_THREADS");
+    const std::size_t topology_threads =
+        topology_threads_env && *topology_threads_env
+            ? static_cast<std::size_t>(
+                  std::strtoull(topology_threads_env, NULL, 10))
+            : 8u;
+    if (topology_threads == 0u || topology_threads > 32u) {
+        std::cerr << "WAVETRACE_PROBE_THREADS must be within [1, 32]\n";
+        return 66;
+    }
+    options.topology_expansion_threads = topology_threads;
     options.parallel_topology_min_elements = 2u;
     options.parallel_topology_min_work_items_per_element = 1u;
     options.dump_leaf_distribution_after_topology = false;
@@ -617,17 +718,25 @@ int main(int argc, char** argv) {
     const wave::DynamicTypeOps template_dynamic_ops_before_topology =
         wave::find_dynamic_type_ops(
             reflect::type_tag_of<ShardTemplateDynamicWaveTarget<ShardSmallLeaf> >());
+    const wave::DynamicTypeOps named_union_ops_before_topology =
+        wave::find_dynamic_type_ops(
+            reflect::type_tag_of<ShardNamedAnonymousUnionHolder>());
     if (!dynamic_ops_before_topology.reflected ||
-        !template_dynamic_ops_before_topology.reflected) {
+        !template_dynamic_ops_before_topology.reflected ||
+        !named_union_ops_before_topology.reflected) {
         std::cerr << "dynamic registration incomplete before topology"
                   << " ordinary=" << dynamic_ops_before_topology.reflected
                   << " template=" << template_dynamic_ops_before_topology.reflected
+                  << " named_union=" << named_union_ops_before_topology.reflected
                   << " ordinary_one=" << (dynamic_ops_before_topology.expand_one != NULL)
                   << " template_one=" << (template_dynamic_ops_before_topology.expand_one != NULL)
+                  << " named_union_one=" << (named_union_ops_before_topology.expand_one != NULL)
                   << "\n";
         return 18;
     }
 #endif
+    const std::chrono::steady_clock::time_point topology_begin =
+        std::chrono::steady_clock::now();
     try {
         tracer.prepare_topology(0);
     } catch (const std::exception& ex) {
@@ -637,6 +746,9 @@ int main(int argc, char** argv) {
         std::cerr << "topology preparation failed with a non-standard exception\n";
         return 20;
     }
+    const double topology_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - topology_begin).count();
     annotated_weak_owner.reset();
     if (root.annotated_weak.expired()) {
         std::cerr << "WAVE_PTR weak target was not retained after topology expansion\n";
@@ -696,10 +808,124 @@ int main(int argc, char** argv) {
     required_ok &= require_path(paths, "top.nested_anonymous_union.call_depth_");
     required_ok &= require_path(paths, "top.nested_anonymous_union.raw_");
     required_ok &= require_path(paths, "top.nested_anonymous_union.is_64bit_");
+    required_ok &= require_path(paths, "top.multiple_anonymous_unions.first_low_");
+    required_ok &= require_path(paths, "top.multiple_anonymous_unions.first_high_");
+    required_ok &= require_path(paths, "top.multiple_anonymous_unions.first_raw_");
+    required_ok &= require_path(paths, "top.multiple_anonymous_unions.separator_");
+    required_ok &= require_path(paths, "top.multiple_anonymous_unions.second_low_");
+    required_ok &= require_path(paths, "top.multiple_anonymous_unions.second_high_");
+    required_ok &= require_path(paths, "top.multiple_anonymous_unions.second_raw_");
+    required_ok &= require_path(paths, "top.multiple_anonymous_unions.tail_");
+    required_ok &= require_path(paths, "top.direct_bitfield_union.low5");
+    required_ok &= require_path(paths, "top.direct_bitfield_union.low13");
+    required_ok &= require_path(paths, "top.direct_bitfield_union.raw");
+    required_ok &= require_path(paths, "top.named_anonymous_union.payload_.low_");
+    required_ok &= require_path(paths, "top.named_anonymous_union.payload_.middle_");
+    required_ok &= require_path(paths, "top.named_anonymous_union.payload_.high_");
+    required_ok &= require_path(paths, "top.named_anonymous_union.payload_.raw_");
+    required_ok &= require_path(
+        paths, "top.exotic_bitfield_unions.signed_payload_.signed_low_");
+    required_ok &= require_path(
+        paths, "top.exotic_bitfield_unions.signed_payload_.unsigned_middle_");
+    required_ok &= require_path(
+        paths, "top.exotic_bitfield_unions.signed_payload_.signed_high_");
+    required_ok &= require_path(
+        paths, "top.exotic_bitfield_unions.bool_payload_.first_");
+    required_ok &= require_path(
+        paths, "top.exotic_bitfield_unions.bool_payload_.second_");
+    required_ok &= require_path(
+        paths, "top.exotic_bitfield_unions.enum_payload_.mode_");
+    required_ok &= require_path(
+        paths, "top.exotic_bitfield_unions.enum_payload_.tail_");
+    required_ok &= require_path(paths, "top.padded_template_union.low_");
+    required_ok &= require_path(paths, "top.padded_template_union.middle_");
+    required_ok &= require_path(paths, "top.padded_template_union.high_");
+    required_ok &= require_path(paths, "top.padded_template_union.raw_");
+    required_ok &= require_path(paths, "top.mixed_size_union.byte_value");
+    required_ok &= require_path(paths, "top.mixed_size_union.half_value");
+    required_ok &= require_path(paths, "top.mixed_size_union.word_value");
+    required_ok &= require_path(paths, "top.mixed_size_union.wide_value");
+    required_ok &= require_path(paths, "top.mixed_size_union.bytes[0]");
+    required_ok &= require_path(paths, "top.mixed_size_union.bytes[7]");
+    required_ok &= require_path(paths, "top.mixed_union_c_array[2].wide_value");
+    required_ok &= require_path(paths, "top.mixed_union_std_array[2].wide_value");
+    required_ok &= require_path(paths, "top.mixed_union_ptr.wide_value");
+    required_ok &= require_path(paths, "top.protected_union_base.protected_low_");
+    required_ok &= require_path(paths, "top.protected_union_base.protected_high_");
+    required_ok &= require_path(paths, "top.protected_union_base.protected_raw_");
+    required_ok &= require_path(paths, "top.protected_union.nested_.payload_.raw_");
+    required_ok &= require_path(paths, "top.protected_union.tail_");
+    required_ok &= require_path(paths, "top.template_union.low_");
+    required_ok &= require_path(paths, "top.template_union.high_");
+    required_ok &= require_path(paths, "top.template_union.raw_");
+    required_ok &= require_path(paths, "top.union_c_array[1].payload_.raw_");
+    required_ok &= require_path(paths, "top.union_std_array[1].payload_.raw_");
+    required_ok &= require_path(paths, "top.union_wave_array[1].payload_.raw_");
+    required_ok &= require_path(paths, "top.union_wave_matrix[1][1].raw_");
+    required_ok &= require_path(paths, "top.union_dynamic_inline.value_.payload_.raw_");
+    required_ok &= require_path(paths, "top.union_dynamic_inline.direct_.raw");
+    required_ok &= require_path(paths, "top.union_dynamic_ptr.value_.payload_.raw_");
+    required_ok &= require_path(paths, "top.union_peek_inline.payload_.raw_");
+    required_ok &= require_path(paths, "top.union_peek_erased.payload_.raw_");
     required_ok &= require_path(paths, "top.bulk[0].scalars.u32_value");
     required_ok &= require_path(paths, "top.bulk[0].wave_array[1].dirty");
     required_ok &= require_path(paths, "top.bulk[" + std::to_string(element_count - 1u) + "].deep.own");
     required_ok &= require_path(paths, "top.alias_a.value");
+    required_ok &= require_storage_relation(
+        sink,
+        "top.multiple_anonymous_unions.first_low_",
+        "top.multiple_anonymous_unions.first_raw_",
+        true);
+    required_ok &= require_storage_relation(
+        sink,
+        "top.multiple_anonymous_unions.second_high_",
+        "top.multiple_anonymous_unions.second_raw_",
+        true);
+    required_ok &= require_storage_relation(
+        sink,
+        "top.multiple_anonymous_unions.first_raw_",
+        "top.multiple_anonymous_unions.second_raw_",
+        false);
+    required_ok &= require_storage_relation(
+        sink,
+        "top.named_anonymous_union.payload_.low_",
+        "top.named_anonymous_union.payload_.raw_",
+        true);
+    required_ok &= require_storage_relation(
+        sink,
+        "top.template_union.high_",
+        "top.template_union.raw_",
+        true);
+    required_ok &= require_storage_relation(
+        sink,
+        "top.direct_bitfield_union.low5",
+        "top.direct_bitfield_union.raw",
+        true);
+    required_ok &= require_storage_relation(
+        sink,
+        "top.exotic_bitfield_unions.signed_payload_.signed_low_",
+        "top.exotic_bitfield_unions.signed_payload_.raw_",
+        true);
+    required_ok &= require_storage_relation(
+        sink,
+        "top.exotic_bitfield_unions.signed_payload_.raw_",
+        "top.exotic_bitfield_unions.bool_payload_.raw_",
+        false);
+    required_ok &= require_storage_relation(
+        sink,
+        "top.padded_template_union.high_",
+        "top.padded_template_union.raw_",
+        true);
+    required_ok &= require_storage_relation(
+        sink,
+        "top.mixed_size_union.byte_value",
+        "top.mixed_size_union.wide_value",
+        true);
+    required_ok &= require_storage_relation(
+        sink,
+        "top.mixed_size_union.bytes[7]",
+        "top.mixed_size_union.wide_value",
+        true);
     if (!expect_alias_b_disabled) {
         required_ok &= require_path(paths, "top.alias_b.value");
     } else {
@@ -974,14 +1200,256 @@ int main(int argc, char** argv) {
             sink, "top.nested_anonymous_union.pc_", 0x3456789ABCDFull, 48u, 0u) ||
         !require_path_u64_storage_slice(
             sink, "top.nested_anonymous_union.call_depth_", 0xA512u, 16u, 48u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.nested_anonymous_union.raw_", 0xA5123456789ABCDFull, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.variant.u32_value", 0x3F800000u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.variant.f32_value", 0x3F800000u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.multiple_anonymous_unions.first_raw_",
+            0x13579BDF2468ACE0ull, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.multiple_anonymous_unions.first_low_",
+            0x8ACE0ull, 20u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.multiple_anonymous_unions.first_high_",
+            0x13579BDF246ull, 44u, 20u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.multiple_anonymous_unions.second_raw_",
+            0xFEDCBA9876543210ull, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.multiple_anonymous_unions.second_low_",
+            0x876543210ull, 36u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.multiple_anonymous_unions.second_high_",
+            0xFEDCBA9ull, 28u, 36u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.direct_bitfield_union.low5", 0xFu, 5u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.direct_bitfield_union.low13", 0xDEFu, 13u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.direct_bitfield_union.raw", 0x89ABCDEFu, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.named_anonymous_union.payload_.low_", 0x54u, 7u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.named_anonymous_union.payload_.middle_", 0x187u, 9u, 7u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.named_anonymous_union.payload_.high_", 0xA1B2u, 16u, 16u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.named_anonymous_union.payload_.raw_", 0xA1B2C3D4u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.exotic_bitfield_unions.signed_payload_.signed_low_",
+            0xFu, 5u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.exotic_bitfield_unions.signed_payload_.unsigned_middle_",
+            0x66Fu, 11u, 5u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.exotic_bitfield_unions.signed_payload_.signed_high_",
+            0x89ABu, 16u, 16u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.exotic_bitfield_unions.bool_payload_.first_",
+            0x1u, 1u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.exotic_bitfield_unions.bool_payload_.second_",
+            0x1u, 1u, 1u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.exotic_bitfield_unions.enum_payload_.mode_",
+            0x7u, 3u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.exotic_bitfield_unions.enum_payload_.tail_",
+            0x14ABu, 13u, 3u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.padded_template_union.low_", 0xFu, 4u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.padded_template_union.middle_", 0x1Eu, 5u, 7u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.padded_template_union.high_", 0x38u, 6u, 32u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.padded_template_union.raw_",
+            0x12345678ABCDEF0Full, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.mixed_size_union.byte_value", 0x88u, 8u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.mixed_size_union.half_value", 0x7788u, 16u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.mixed_size_union.word_value", 0x55667788u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.mixed_size_union.wide_value",
+            0x1122334455667788ull, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.mixed_size_union.bytes[0]", 0x88u, 8u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.mixed_size_union.bytes[7]", 0x11u, 8u, 56u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.mixed_union_c_array[2].wide_value",
+            0x2100000000000002ull, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.mixed_union_std_array[2].wide_value",
+            0x3100000000000002ull, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.mixed_union_ptr.wide_value",
+            0x8877665544332211ull, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.protected_union_base.protected_low_", 0x1Cu, 6u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.protected_union_base.protected_high_", 0x299u, 10u, 6u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.protected_union_base.protected_raw_", 0xA65Cu, 16u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.template_union.low_", 0xDEF0u, 17u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.template_union.high_", 0x91A2B3C4D5Eull, 47u, 17u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.template_union.raw_", 0x123456789ABCDEF0ull, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_c_array[1].payload_.raw_", 0x11000001u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_std_array[1].payload_.raw_", 0x22000001u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_wave_array[1].payload_.raw_", 0x33000001u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_wave_matrix[1][1].raw_", 0x4400000000000011ull, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_dynamic_inline.value_.payload_.raw_", 0xD1A2B3C4u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_dynamic_inline.direct_.raw", 0xD5E6F708u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_dynamic_ptr.value_.payload_.raw_", 0xE1A2B3C4u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_peek_inline.payload_.raw_", 0xC1A2B3C4u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_peek_erased.payload_.raw_", 0xC1A2B3C4u, 32u, 0u) ||
         !require_path_bool_sample(
             sink, "top.nested_anonymous_union.is_64bit_", true)) {
         return 16;
     }
 
     const std::size_t samples_after_initial = sink.samples.size();
+    root.nested_anonymous_union.initialize(0x1234FEDCBA987654ull, false);
+    root.multiple_anonymous_unions.initialize(
+        0x1111222233334444ull, 0xCAFED00Du, 0xAAAABBBBCCCCDDDDull, false);
+    root.variant.u32_value = 0x40000000u;
+    root.direct_bitfield_union.raw = 0x12345678u;
+    root.named_anonymous_union.initialize(0x55667788u, 0x50607080u);
+    root.exotic_bitfield_unions.initialize(0x12345678u, 0x1u, 0x1357u);
+    root.padded_template_union.initialize(0x0FEDCBA987654321ull);
+    root.mixed_size_union.wide_value = 0xFFEEDDCCBBAA0099ull;
+    root.mixed_union_c_array[2].wide_value = 0x22000000000000F2ull;
+    root.mixed_union_std_array[2].wide_value = 0x32000000000000F2ull;
+    mixed_union_ptr_storage.wide_value = 0x1020304050607080ull;
+    root.protected_union_base.initialize_base(0x1234u);
+    root.protected_union.initialize(0x4321u, 0x88776655u, 0xA5u);
+    root.template_union.initialize(0x0FEDCBA987654321ull);
+    root.union_c_array[1].initialize(0x11998877u, 0x1111u);
+    root.union_std_array[1].initialize(0x22998877u, 0x2222u);
+    root.union_wave_array[1].initialize(0x33998877u, 0x3333u);
+    root.union_wave_matrix[1][1].initialize(0x4499887766554433ull);
+    root.union_dynamic_inline.initialize(0xD1998877u, 0xD5665544u);
+    union_dynamic_target.initialize(0xE1998877u, 0xE5665544u);
+    root.union_peek_inline.initialize(0xC1998877u);
     frozen_replacement_storage.value = 0xCAFEBABEu;
     tracer.sample(1);
+    if (!require_path_u64_storage_slice(
+            sink, "top.nested_anonymous_union.pc_", 0xFEDCBA987654ull, 48u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.nested_anonymous_union.call_depth_", 0x1234u, 16u, 48u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.nested_anonymous_union.raw_", 0x1234FEDCBA987654ull, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.variant.u32_value", 0x40000000u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.variant.f32_value", 0x40000000u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.multiple_anonymous_unions.first_low_", 0x34444u, 20u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.multiple_anonymous_unions.first_high_", 0x11112222333ull, 44u, 20u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.multiple_anonymous_unions.second_low_", 0xBCCCCDDDDull, 36u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.multiple_anonymous_unions.second_high_", 0xAAAABBBu, 28u, 36u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.direct_bitfield_union.low5", 0x18u, 5u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.direct_bitfield_union.low13", 0x1678u, 13u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.named_anonymous_union.payload_.low_", 0x8u, 7u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.named_anonymous_union.payload_.middle_", 0xEFu, 9u, 7u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.named_anonymous_union.payload_.high_", 0x5566u, 16u, 16u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.exotic_bitfield_unions.signed_payload_.signed_low_",
+            0x18u, 5u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.exotic_bitfield_unions.signed_payload_.unsigned_middle_",
+            0x2B3u, 11u, 5u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.exotic_bitfield_unions.signed_payload_.signed_high_",
+            0x1234u, 16u, 16u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.exotic_bitfield_unions.bool_payload_.first_",
+            0x1u, 1u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.exotic_bitfield_unions.bool_payload_.second_",
+            0x0u, 1u, 1u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.exotic_bitfield_unions.enum_payload_.mode_",
+            0x7u, 3u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.exotic_bitfield_unions.enum_payload_.tail_",
+            0x26Au, 13u, 3u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.padded_template_union.low_", 0x1u, 4u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.padded_template_union.middle_", 0x6u, 5u, 7u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.padded_template_union.high_", 0x29u, 6u, 32u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.padded_template_union.raw_",
+            0x0FEDCBA987654321ull, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.mixed_size_union.wide_value",
+            0xFFEEDDCCBBAA0099ull, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.mixed_size_union.bytes[0]", 0x99u, 8u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.mixed_size_union.bytes[7]", 0xFFu, 8u, 56u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.mixed_union_c_array[2].wide_value",
+            0x22000000000000F2ull, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.mixed_union_std_array[2].wide_value",
+            0x32000000000000F2ull, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.mixed_union_ptr.wide_value",
+            0x1020304050607080ull, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.protected_union_base.protected_raw_", 0x1234u, 16u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.template_union.low_", 0x14321u, 17u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.template_union.high_", 0x7F6E5D4C3B2ull, 47u, 17u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_c_array[1].payload_.raw_", 0x11998877u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_std_array[1].payload_.raw_", 0x22998877u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_wave_array[1].payload_.raw_", 0x33998877u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_wave_matrix[1][1].raw_", 0x4499887766554433ull, 64u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_dynamic_inline.value_.payload_.raw_", 0xD1998877u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_dynamic_ptr.value_.payload_.raw_", 0xE1998877u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_peek_inline.payload_.raw_", 0xC1998877u, 32u, 0u) ||
+        !require_path_u64_storage_slice(
+            sink, "top.union_peek_erased.payload_.raw_", 0xC1998877u, 32u, 0u) ||
+        !require_path_bool_sample(
+            sink, "top.nested_anonymous_union.is_64bit_", false)) {
+        return 28;
+    }
     for (std::size_t i = samples_after_initial; i < sink.samples.size(); ++i) {
         if (sink.samples[i].track_id == frozen_value_track) {
             std::cerr << "replacement-only mutation emitted a frozen pointer sample\n";
@@ -1034,6 +1502,8 @@ int main(int argc, char** argv) {
               << " nodes=" << sink.node_count
               << " samples=" << sink.sample_count
               << " bulk_tracks=" << actual_bulk_tracks
+              << " topology_threads=" << topology_threads
+              << " topology_ms=" << topology_ms
               << " parallel_batches=" << tracer.parallel_topology_batches()
               << " parallel_elements=" << tracer.parallel_topology_expanded_elements()
               << " cloned_elements=" << tracer.direct_topology_cloned_elements()

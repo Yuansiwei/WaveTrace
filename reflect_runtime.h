@@ -70,11 +70,22 @@ struct TopologyTypeEstimate {
     std::size_t estimated_leaves;
     bool fixed_extent;
     bool dynamic_extent;
+    // True only when one fully-expanded object topology can be copied to the
+    // next contiguous object by applying a constant address delta.
+    //
+    // Keep this independent from fixed_extent: a type may have a fixed number
+    // of leaves but still own element-specific side state (getters, pointer
+    // targets, dirty-value groups, and so on) that must be constructed.
+    bool relocation_safe;
 
     constexpr TopologyTypeEstimate(std::size_t leaves = 0,
                                    bool fixed = false,
-                                   bool dynamic = false) noexcept
-        : estimated_leaves(leaves), fixed_extent(fixed), dynamic_extent(dynamic) {}
+                                   bool dynamic = false,
+                                   bool relocatable = false) noexcept
+        : estimated_leaves(leaves),
+          fixed_extent(fixed),
+          dynamic_extent(dynamic),
+          relocation_safe(relocatable) {}
 };
 
 namespace detail {
@@ -96,7 +107,8 @@ constexpr TopologyTypeEstimate combine_topology_estimates(TopologyTypeEstimate l
     return TopologyTypeEstimate(
         saturating_leaf_add(lhs.estimated_leaves, rhs.estimated_leaves),
         lhs.fixed_extent && rhs.fixed_extent,
-        lhs.dynamic_extent || rhs.dynamic_extent);
+        lhs.dynamic_extent || rhs.dynamic_extent,
+        lhs.relocation_safe && rhs.relocation_safe);
 }
 
 constexpr TopologyTypeEstimate repeat_topology_estimate(TopologyTypeEstimate value,
@@ -104,7 +116,8 @@ constexpr TopologyTypeEstimate repeat_topology_estimate(TopologyTypeEstimate val
     return TopologyTypeEstimate(
         saturating_leaf_multiply(count, value.estimated_leaves),
         value.fixed_extent,
-        value.dynamic_extent);
+        value.dynamic_extent,
+        value.relocation_safe);
 }
 
 inline std::vector<const void*>& active_topology_estimate_types() {
@@ -152,7 +165,7 @@ struct topology_type_estimate<T, typename std::enable_if<
     std::is_enum<typename std::remove_cv<T>::type>::value>::type> {
     static constexpr bool generated = false;
     static constexpr TopologyTypeEstimate get() noexcept {
-        return TopologyTypeEstimate(1, true, false);
+        return TopologyTypeEstimate(1, true, false, true);
     }
 };
 
@@ -185,7 +198,9 @@ template <typename T>
 struct topology_type_estimate< ::wave::WaveValue<T>, void> {
     static constexpr bool generated = false;
     static constexpr TopologyTypeEstimate get() noexcept {
-        return TopologyTypeEstimate(1, true, false);
+        // WaveValue owns per-object dirty tracking state, so its topology is
+        // fixed but cannot be reproduced by a plain address relocation.
+        return TopologyTypeEstimate(1, true, false, false);
     }
 };
 
@@ -197,7 +212,8 @@ struct topology_type_estimate< ::wave::array<T, N>, void> {
         return TopologyTypeEstimate(
             detail::saturating_leaf_multiply(N, nested.estimated_leaves),
             nested.fixed_extent,
-            nested.dynamic_extent);
+            nested.dynamic_extent,
+            false);
     }
 };
 

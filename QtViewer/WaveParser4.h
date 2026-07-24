@@ -60,6 +60,17 @@ public:
 
 class WaveParser4Reader {
 public:
+    struct SignalValueMatchRequest {
+        int signalId = -1;
+        quint64 targetBits = 0;
+    };
+
+    struct SignalValueMatchSegment {
+        int signalId = -1;
+        qint64 start = 0;
+        qint64 end = 0;
+    };
+
     struct DataBlockDescriptor {
         enum class Kind {
             Raw,
@@ -117,6 +128,13 @@ public:
                             qint64& resultTime,
                             QString& error,
                             quint64 maxDecodedSamples = 0) const;
+    bool findSignalValueMatches(
+        const QVector<SignalValueMatchRequest>& requests,
+        qint64 timeStart,
+        qint64 timeEnd,
+        QVector<SignalValueMatchSegment>& matches,
+        QString& error,
+        quint64 maxDecodedSamples = 0) const;
     QVector<DataBlockDescriptor> dataBlocks() const;
     bool loadDataBlock(const DataBlockDescriptor& block,
                        WaveFile& outWave,

@@ -391,7 +391,6 @@ struct BuildOptions {
     // scalar leaves through the recorder/writer on every cycle.  Set false only
     // when a debugging sink really needs a keep-alive event for every track.
     bool emit_only_on_change = true;
-    bool emit_pointer_address_track = false;
     // Anonymous/named union members and bit-fields are part of the ordinary
     // reflected object shape.  Keeping these disabled by default made a
     // correctly generated private anonymous union silently disappear unless
@@ -412,6 +411,12 @@ struct BuildOptions {
     // where every element has fields named "valid", "state", etc.
     bool enable_node_name_interning = true;
 
+    // Snapshot mode: at Cycle 0, reduce every
+    // C/std::array/wave::array/WAVE_PTR_ARRAY topology to element zero. The
+    // array aggregate node is annotated with its original logical size, e.g.
+    // "items[size=4096]". Later cycles emit no waveform samples.
+    bool trace_array_first_element_only = false;
+
     // Reserve topology storage in bulk before expanding large pointer arrays.
     // This keeps the semantic path unchanged while avoiding repeated vector and
     // hash-table growth in the common "many objects of the same type" case.
@@ -423,6 +428,10 @@ struct BuildOptions {
     // Real cross-fragment aliases reject the speculative batch and rerun it
     // serially so one physical storage still has exactly one owner.
     bool enable_parallel_topology_expansion = true;
+    // For a reflector-proven relocation-safe contiguous object array, expand
+    // element zero once and clone its topology descriptors with an address
+    // delta.  The first element still passes the runtime side-metadata proof.
+    bool enable_fixed_repeated_topology_clone = true;
     std::size_t topology_expansion_threads = 16;
     std::size_t parallel_topology_min_elements = 8192;
     std::size_t parallel_topology_min_work_items_per_element = 32;
@@ -437,9 +446,6 @@ struct BuildOptions {
     bool enable_dirty_peek_groups = false;
     bool enable_dirty_peek_parallel_sampling = true;
     std::size_t dirty_peek_parallel_threshold = 64;
-    // Legacy compatibility knob. Dirty-peek sampling now always expands hooks
-    // to block-range work items and balances by byte count.
-    bool dirty_peek_balance_by_leaf_count = false;
 
     // WaveValue<T> dirty-scalar optimization.  WaveValue<T> is a size-preserving
     // scalar wrapper that reports its own address when modified.  The tracer
@@ -470,7 +476,6 @@ struct BuildOptions {
     // block byte ranges.
     bool enable_wave_array_memory_block_precheck = true;
     std::size_t wave_array_memory_block_max_gap = 7;
-    std::size_t wave_array_memory_block_max_bytes = 0;
     bool enable_wave_array_memory_block_simd_mask = true;
     std::size_t wave_array_memory_block_simd_min_bytes = 64;
     bool enable_wave_array_memory_block_byte_map = true;
@@ -486,9 +491,6 @@ struct BuildOptions {
     // limiter around SetConsoleTitleA.
     bool print_cycle_progress = false;
     Cycle print_cycle_progress_period = 1;
-
-    bool emit_unsupported_marker = true;
-    bool emit_recursive_cut_marker = true;
 
     // Diagnostic logging for runtime tree construction and invalidation.
     // Keep disabled in long production runs. Enable temporarily when checking why
@@ -510,7 +512,6 @@ struct BuildOptions {
     bool leaf_distribution_dirty_safe_only = true;
     bool debug_log_dirty_wave_array_stats = false;
     bool debug_log_dirty_wave_array_marks = false;
-    std::size_t debug_log_dirty_wave_array_mark_limit = 64;
     bool debug_log_duplicate_sample_stack = false;
     std::size_t debug_log_duplicate_sample_stack_frames = 12;
 
@@ -598,8 +599,6 @@ struct BuildOptions {
     // the traced object.  Leaves without physical storage are not sampled here.
     bool enable_dirty_peek_memory_block_precheck = true;
     std::size_t dirty_peek_memory_block_max_gap = 7;
-    std::size_t dirty_peek_memory_block_min_leaf_count = 1;
-    std::size_t dirty_peek_memory_block_max_bytes = 0;
     bool enable_dirty_peek_memory_block_simd_mask = true;
     std::size_t dirty_peek_memory_block_simd_min_bytes = 64;
     // Fast changed-byte to leaf mapping for dirty-peek memory blocks.  When a
@@ -645,11 +644,6 @@ inline std::size_t wave_trace_dot_count(const std::string& path) {
 inline bool wave_trace_leaf_path_allowed(const std::string& path) {
     const WaveTraceLevelLimit& limit = wave_trace_level_limit();
     return !limit.enabled || wave_trace_dot_count(path) <= limit.max_dot_count;
-}
-
-inline bool wave_trace_descend_path_allowed(const std::string& path) {
-    const WaveTraceLevelLimit& limit = wave_trace_level_limit();
-    return !limit.enabled || wave_trace_dot_count(path) < limit.max_dot_count;
 }
 
 struct WaveCpuFeatures {
@@ -774,17 +768,6 @@ inline std::string compose_child_path(const std::string& parent, const std::stri
         out.push_back('.');
         out.append(child);
     }
-    return out;
-}
-
-inline std::string compose_index_path(const std::string& parent, std::size_t index) {
-    const std::string idx = std::to_string(index);
-    std::string out;
-    out.reserve(parent.size() + idx.size() + 2);
-    out.append(parent);
-    out.push_back('[');
-    out.append(idx);
-    out.push_back(']');
     return out;
 }
 
@@ -1252,11 +1235,6 @@ template <typename T>
 struct is_vsip_peek_port : std::integral_constant<bool,
     !std::is_void<typename vsip_port_value_type<typename remove_cvref<T>::type>::type>::value> {};
 
-// Backward-compatible internal alias name: older code paths used
-// is_vsip_read_port. The behavior is now peek()-based.
-template <typename T>
-struct is_vsip_read_port : is_vsip_peek_port<T> {};
-
 // STL blacklist (except string/array/pair and smart pointers)
 template <typename T>
 struct is_blacklisted_stl : std::false_type {};
@@ -1352,7 +1330,7 @@ struct sc_generic_port_iface_type {
 template <typename T>
 struct is_sc_port : std::integral_constant<bool,
     !is_peek_trace_source<typename remove_cvref<T>::type>::value &&
-    !is_vsip_read_port<typename remove_cvref<T>::type>::value &&
+    !is_vsip_peek_port<typename remove_cvref<T>::type>::value &&
     !is_sc_in<typename remove_cvref<T>::type>::value &&
     !is_sc_out<typename remove_cvref<T>::type>::value &&
     !is_sc_inout<typename remove_cvref<T>::type>::value &&
@@ -1719,10 +1697,6 @@ inline void register_dynamic_type_ops(const void* type_tag, const DynamicTypeOps
     it->second.reflected = it->second.reflected || ops.reflected;
 }
 
-inline void register_dynamic_expander(const void* type_tag, DynamicExpandFn fn) {
-    register_dynamic_type_ops(type_tag, DynamicTypeOps(fn, NULL, false));
-}
-
 inline DynamicTypeOps find_dynamic_type_ops(const void* type_tag) {
     std::unordered_map<const void*, DynamicTypeOps>& registry = dynamic_expand_registry();
     std::unordered_map<const void*, DynamicTypeOps>::const_iterator it = registry.find(type_tag);
@@ -1733,13 +1707,13 @@ inline DynamicExpandFn find_dynamic_expander(const void* type_tag) {
     return find_dynamic_type_ops(type_tag).expand_one;
 }
 
-template <typename T>
+template <typename T, typename RegistrationPolicy = void>
 struct DynamicTypeRegistration {
     DynamicTypeRegistration() {
         register_dynamic_type_ops(
             reflect::type_tag_of<T>(),
-            DynamicTypeOps(&dynamic_expand_bridge<T>,
-                           &dynamic_expand_array_bridge<T>,
+            DynamicTypeOps(&dynamic_expand_policy_bridge<T, RegistrationPolicy>,
+                           &dynamic_expand_array_policy_bridge<T, RegistrationPolicy>,
                            reflect::is_reflected<T>::value));
     }
 };
@@ -1778,7 +1752,12 @@ template <typename T, typename RegistrationPolicy>
 inline void register_peek_value_type() {
     typedef typename std::remove_cv<
         typename std::remove_reference<T>::type>::type CleanT;
-    static DynamicTypeRegistration<CleanT> registration;
+    // RegistrationPolicy is part of the type on purpose.  In compiled-shard
+    // mode the business TU and the owning shard TU see different
+    // is_reflected<CleanT> values.  Sharing DynamicTypeRegistration<CleanT>
+    // between them creates an ODR/COMDAT collision whose selected constructor
+    // can incorrectly publish an unreflected bridge.
+    static DynamicTypeRegistration<CleanT, RegistrationPolicy> registration;
     (void)registration;
     register_dynamic_types_in<CleanT, RegistrationPolicy>();
 }
@@ -1792,7 +1771,7 @@ struct dynamic_registration_leaf {
 template <typename T, typename RegistrationPolicy>
 struct dynamic_registration_leaf<T, RegistrationPolicy, true> {
     static void run() {
-        static DynamicTypeRegistration<T> registration;
+        static DynamicTypeRegistration<T, RegistrationPolicy> registration;
         (void)registration;
     }
 };
@@ -2159,6 +2138,9 @@ class Tracer {
             if (config.memory_usage) {
                 options_.dump_memory_usage_after_topology = true;
             }
+            if (config.wave_trace_array_first_only) {
+                options_.trace_array_first_element_only = true;
+            }
         }
         node_name_hot_cache_.reserve(128u);
         open_debug_log();
@@ -2326,7 +2308,13 @@ public:
 
     void sample(Cycle cycle) {
         if (!::wave::config::cycle_in_range(static_cast<std::uint64_t>(cycle))) return;
-        maybe_print_cycle_progress(cycle);
+        const bool snapshot_complete =
+            options_.trace_array_first_element_only && cycle != 0;
+        maybe_print_cycle_progress(cycle, !snapshot_complete);
+        // ArrayFirstOnly is a topology/snapshot mode: retain the shape and
+        // element-zero values captured at business Cycle 0, but never append
+        // later-cycle value records.
+        if (snapshot_complete) return;
         if (options_.debug_log) debug_log_msg(std::string("sample begin cycle=") + detail::to_string_unsigned(cycle));
         prepare_topology(cycle);
         begin_sample_submit_epoch_();
@@ -2373,6 +2361,10 @@ public:
         maybe_trim_parallel_event_buffers_after_sample_();
 
         if (options_.debug_log) debug_log_msg(std::string("sample end cycle=") + detail::to_string_unsigned(cycle));
+    }
+
+    bool trace_cycle_zero_only() const noexcept {
+        return options_.trace_array_first_element_only;
     }
 
     // Optional pre-elaboration for WVZ4/stable-topology mode.  This builds the
@@ -2512,8 +2504,6 @@ public:
         append_hash_memory_row_(os, "bitfield_storage_by_key", bitfield_storage_by_key_, total);
         append_vector_memory_row_(os, "all_track_ids", all_track_ids_, total);
         append_vector_memory_row_(os, "parallel_track_ids", parallel_track_ids_, total);
-        append_vector_memory_row_(os, "main_thread_track_ids", main_thread_track_ids_, total);
-
         append_vector_memory_row_(os, "flat_leaf_fast_table", flat_leaf_fast_table_, total);
         append_vector_memory_row_(os, "flat_memory_blocks", flat_memory_blocks_, total);
         append_vector_memory_row_(os, "flat_memory_leaf_refs", flat_memory_leaf_refs_, total);
@@ -2553,7 +2543,6 @@ public:
         append_vector_memory_row_(os, "dirty_wave_array_memory_byte_to_leaf_refs", dirty_wave_array_memory_byte_to_leaf_refs_, total);
         append_vector_memory_row_(os, "dirty_wave_array_memory_shadow_bytes", dirty_wave_array_memory_shadow_bytes_, total);
         append_vector_memory_row_(os, "dirty_wave_array_work_items", dirty_wave_array_work_items_, total);
-        append_vector_memory_row_(os, "dirty_wave_array_work_weight_prefix", dirty_wave_array_work_weight_prefix_, total);
         append_vector_memory_row_(os, "dirty_wave_array_rebalanced_work_items", dirty_wave_array_rebalanced_work_items_, total);
         append_vector_memory_row_(os, "dirty_wave_array_submit_storage_epochs", dirty_wave_array_submit_storage_epochs_, total);
 
@@ -3293,7 +3282,6 @@ private:
     std::vector<std::unique_ptr<SampleWorker> > parallel_workers_;
     std::vector<TrackId> all_track_ids_;
     std::vector<TrackId> parallel_track_ids_;
-    std::vector<TrackId> main_thread_track_ids_;
 
     struct FlatLeafFast {
         const void* sample_ctx;
@@ -3581,8 +3569,6 @@ private:
     std::vector<std::uint32_t> dirty_worker_plan_end_;
     std::uint32_t global_dirty_group_count_ = 0;
     std::uint32_t dirty_epoch_ = 1;
-    std::uint32_t dirty_wave_array_mark_log_epoch_ = 0;
-    std::size_t dirty_wave_array_mark_log_count_ = 0;
     bool dirty_peek_initial_sample_done_ = false;
     std::uint32_t active_dirty_peek_group_id_ = kInvalidIndex;
     std::uint32_t active_dirty_peek_range_id_ = kInvalidIndex;
@@ -3682,7 +3668,6 @@ private:
     std::vector<std::uint32_t> retired_dirty_wave_value_group_ids_;
     std::uint32_t global_dirty_wave_value_group_count_ = 0;
     bool dirty_wave_value_initial_sample_done_ = false;
-    std::uint32_t active_dirty_wave_value_group_id_ = kInvalidIndex;
     std::uint32_t active_dirty_wave_value_range_id_ = kInvalidIndex;
 
     struct DirtyWaveArraySliceKey {
@@ -3884,7 +3869,6 @@ private:
     std::vector<std::uint32_t> dirty_wave_array_memory_byte_to_leaf_refs_;
     std::vector<unsigned char> dirty_wave_array_memory_shadow_bytes_;
     std::vector<DirtyWaveArrayWorkItem> dirty_wave_array_work_items_;
-    std::vector<std::uint64_t> dirty_wave_array_work_weight_prefix_;
     std::vector<DirtyWaveArrayWorkItem> dirty_wave_array_rebalanced_work_items_;
     std::vector<std::uint32_t> dirty_wave_array_work_owner_scratch_;
     std::vector<std::uint32_t> dirty_wave_array_work_count_scratch_;
@@ -6040,22 +6024,6 @@ private:
         retired_dirty_group_ids_.clear();
     }
 
-    void invalidate_dirty_peek_memory_blocks() noexcept {
-        // Dirty-peek blocks are append-only topology-time physical storage
-        // ranges.  This invalidation remains only for rollback/error paths; new
-        // groups do not invalidate existing block cursors.
-        dirty_peek_memory_blocks_valid_ = false;
-        dirty_peek_memory_blocks_complete_ = false;
-    }
-
-    void invalidate_dirty_wave_array_memory_blocks() noexcept {
-        // Topology-build path only.  Existing memory blocks stay append-only;
-        // a successfully expanded wave::array records its own block range
-        // before it can be used by bulk dirty notification.
-        dirty_wave_array_memory_blocks_valid_ = false;
-        dirty_wave_array_memory_blocks_complete_ = false;
-    }
-
     void collect_dirty_peek_groups_from_tls() {
         global_dirty_group_count_ = 0;
         if (global_dirty_group_ids_.size() < dirty_peek_groups_.size()) {
@@ -6237,15 +6205,6 @@ private:
         if (global_dirty_wave_value_group_count_ < global_dirty_wave_value_group_ids_.size()) {
             global_dirty_wave_value_group_ids_[global_dirty_wave_value_group_count_++] = group_id;
         }
-    }
-
-    static bool address_range_overlaps_(const void* a, std::size_t asz, const void* b, std::size_t bsz) noexcept {
-        if (!a || !b || asz == 0 || bsz == 0) return false;
-        const std::uintptr_t ab = reinterpret_cast<std::uintptr_t>(a);
-        const std::uintptr_t bb = reinterpret_cast<std::uintptr_t>(b);
-        const std::uintptr_t ae = ab + asz;
-        const std::uintptr_t be = bb + bsz;
-        return ab < be && bb < ae;
     }
 
     void drain_retired_dirty_wave_value_groups_() {
@@ -6554,36 +6513,6 @@ private:
             os << "    physical_ownership=diagnostic_exception what=" << ex.what() << '\n';
         } catch (...) {
             os << "    physical_ownership=diagnostic_exception what=unknown\n";
-        }
-    }
-
-    void dump_dirty_wave_array_block_leaf_context_(std::ostream& os,
-                                                   std::uint32_t block_id,
-                                                   std::size_t max_leaf_refs) const {
-        if (block_id >= dirty_wave_array_memory_blocks_.size()) return;
-        const DirtyWaveArrayMemoryBlock& block = dirty_wave_array_memory_blocks_[block_id];
-        const std::size_t ref_begin = static_cast<std::size_t>(block.first_leaf_ref);
-        std::size_t ref_end = ref_begin + static_cast<std::size_t>(block.leaf_count);
-        if (ref_end < ref_begin || ref_end > dirty_wave_array_memory_leaf_refs_.size()) {
-            ref_end = dirty_wave_array_memory_leaf_refs_.size();
-        }
-        std::size_t dumped = 0;
-        for (std::size_t r = ref_begin; r < ref_end && dumped < max_leaf_refs; ++r, ++dumped) {
-            const DirtyWaveArrayMemoryLeafRef& ref = dirty_wave_array_memory_leaf_refs_[r];
-            os << "      leaf_ref[" << static_cast<unsigned long long>(r)
-               << "] dirty_leaf=" << static_cast<unsigned long long>(ref.dirty_leaf_index)
-               << " offset=" << static_cast<unsigned long long>(ref.offset)
-               << " bytes=" << static_cast<unsigned long long>(ref.byte_count);
-            if (ref.dirty_leaf_index < dirty_wave_array_leaves_.size()) {
-                const DirtyWaveArrayLeaf& leaf = dirty_wave_array_leaves_[ref.dirty_leaf_index];
-                os << " track=" << static_cast<unsigned long long>(leaf.track_id)
-                   << " storage=" << static_cast<unsigned long long>(leaf.storage_id)
-                   << " path=" << track_path_for_dump_(leaf.track_id);
-            }
-            os << '\n';
-        }
-        if (ref_end > ref_begin + dumped) {
-            os << "      leaf_ref_more=" << static_cast<unsigned long long>(ref_end - ref_begin - dumped) << '\n';
         }
     }
 
@@ -6922,18 +6851,6 @@ private:
             tls->wave_array_bulk_range_count = 0;
         });
         drain_retired_dirty_wave_array_ranges_();
-    }
-
-    void append_initial_dirty_wave_array_ranges() {
-        if (dirty_wave_array_initial_sample_done_) return;
-        if (global_dirty_wave_array_bulk_range_ids_.size() < dirty_wave_array_bulk_ranges_.size()) {
-            global_dirty_wave_array_bulk_range_ids_.resize(dirty_wave_array_bulk_ranges_.size());
-        }
-        for (std::uint32_t range_id = 0; range_id < dirty_wave_array_bulk_ranges_.size(); ++range_id) {
-            if (!dirty_wave_array_bulk_ranges_[range_id].bulk_key_valid) continue;
-            queue_dirty_wave_array_bulk_range_once(range_id);
-        }
-        dirty_wave_array_initial_sample_done_ = true;
     }
 
     const TrackDesc* compact_dirty_leaf_track_(std::uint32_t track_id) const noexcept {
@@ -8368,9 +8285,6 @@ private:
 
     void rebuild_dirty_wave_array_work_items_for_current_ranges_() {
         dirty_wave_array_work_items_.clear();
-        dirty_wave_array_work_weight_prefix_.clear();
-        dirty_wave_array_work_weight_prefix_.push_back(0u);
-        std::uint64_t acc = 0;
 
         const bool use_memory_blocks =
             dirty_wave_array_memory_blocks_valid_ && options_.enable_wave_array_memory_block_precheck;
@@ -8402,8 +8316,6 @@ private:
                                            byte_begin,
                                            static_cast<std::uint32_t>(safe_end),
                                            weight == 0 ? static_cast<std::uint64_t>(1) : weight));
-                acc += weight;
-                dirty_wave_array_work_weight_prefix_.push_back(acc);
             };
 
             if (range.begin.block_id == range.end.block_id) {
@@ -8469,14 +8381,10 @@ private:
             dirty_wave_array_work_items_[write++] = current;
         }
         dirty_wave_array_work_items_.resize(write);
-        rebuild_dirty_wave_array_work_weight_prefix_();
     }
 
     void rebuild_dirty_wave_array_work_items_for_all_blocks_() {
         dirty_wave_array_work_items_.clear();
-        dirty_wave_array_work_weight_prefix_.clear();
-        dirty_wave_array_work_weight_prefix_.push_back(0u);
-        std::uint64_t acc = 0;
 
         for (std::uint32_t block_id = 0;
              block_id < dirty_wave_array_memory_blocks_.size();
@@ -8496,28 +8404,11 @@ private:
                                        0,
                                        byte_end,
                                        weight == 0 ? static_cast<std::uint64_t>(1) : weight));
-            acc += weight;
-            dirty_wave_array_work_weight_prefix_.push_back(acc);
         }
     }
 
     std::uint64_t dirty_wave_array_work_item_byte_weight_(const DirtyWaveArrayWorkItem& item) const noexcept {
         return item.weight == 0 ? static_cast<std::uint64_t>(1) : item.weight;
-    }
-
-    void rebuild_dirty_wave_array_work_weight_prefix_() {
-        dirty_wave_array_work_weight_prefix_.clear();
-        dirty_wave_array_work_weight_prefix_.push_back(0u);
-        std::uint64_t acc = 0;
-        for (std::size_t i = 0; i < dirty_wave_array_work_items_.size(); ++i) {
-            const std::uint64_t weight = dirty_wave_array_work_item_byte_weight_(dirty_wave_array_work_items_[i]);
-            if (weight > (std::numeric_limits<std::uint64_t>::max)() - acc) {
-                acc = (std::numeric_limits<std::uint64_t>::max)();
-            } else {
-                acc += weight;
-            }
-            dirty_wave_array_work_weight_prefix_.push_back(acc);
-        }
     }
 
     void rebalance_dirty_wave_array_work_items_by_bytecount_(std::size_t participants) {
@@ -8531,8 +8422,6 @@ private:
                 dirty_worker_plan_begin_[i] = 0;
                 dirty_worker_plan_end_[i] = 0;
             }
-            dirty_wave_array_work_weight_prefix_.clear();
-            dirty_wave_array_work_weight_prefix_.push_back(0u);
             return;
         }
 
@@ -8585,7 +8474,6 @@ private:
 
         dirty_wave_array_work_items_.swap(dirty_wave_array_rebalanced_work_items_);
         dirty_wave_array_rebalanced_work_items_.clear();
-        rebuild_dirty_wave_array_work_weight_prefix_();
     }
 
     void log_dirty_wave_array_worker_plan_(Cycle cycle, std::size_t participants) {
@@ -8612,32 +8500,6 @@ private:
 
     std::size_t dirty_wave_array_work_item_count_() const noexcept {
         return dirty_wave_array_work_items_.size();
-    }
-
-    std::uint64_t dirty_wave_array_work_weight_total_() const noexcept {
-        return dirty_wave_array_work_weight_prefix_.empty()
-            ? static_cast<std::uint64_t>(dirty_wave_array_work_items_.size())
-            : dirty_wave_array_work_weight_prefix_.back();
-    }
-
-    std::size_t dirty_wave_array_work_pos_for_weight_(std::uint64_t weight) const {
-        const std::size_t total = dirty_wave_array_work_items_.size();
-        if (total == 0) return 0;
-        if (dirty_wave_array_work_weight_prefix_.size() != total + 1u) {
-            return weight >= static_cast<std::uint64_t>(total)
-                ? total
-                : static_cast<std::size_t>(weight);
-        }
-        const std::uint64_t max_weight = dirty_wave_array_work_weight_prefix_.back();
-        if (weight == 0) return 0;
-        if (weight >= max_weight) return total;
-        std::vector<std::uint64_t>::const_iterator it =
-            std::lower_bound(dirty_wave_array_work_weight_prefix_.begin(),
-                             dirty_wave_array_work_weight_prefix_.end(),
-                             weight);
-        std::size_t pos = static_cast<std::size_t>(it - dirty_wave_array_work_weight_prefix_.begin());
-        if (pos > total) pos = total;
-        return pos;
     }
 
     std::size_t dirty_wave_array_work_slice_event_capacity_(std::size_t begin_pos,
@@ -8684,16 +8546,6 @@ private:
         for (std::size_t pos = begin_pos; pos < end_pos; ++pos) {
             sample_dirty_wave_array_work_item_to_buffer_(dirty_wave_array_work_items_[pos], cycle, out);
         }
-    }
-
-    void sample_dirty_wave_array_work_slice_to_sink_(Cycle cycle,
-                                                     std::size_t begin_pos,
-                                                     std::size_t end_pos) {
-        const std::size_t expected = dirty_wave_array_work_slice_event_capacity_(begin_pos, end_pos);
-        reserve_event_buffer_capacity_(caller_parallel_events_, expected);
-        caller_parallel_events_.clear();
-        sample_dirty_wave_array_work_slice_to_buffer_(cycle, begin_pos, end_pos, caller_parallel_events_);
-        (void)submit_dirty_wave_array_events_once_(caller_parallel_events_);
     }
 
     void begin_dirty_wave_array_submit_storage_epoch_() {
@@ -9292,15 +9144,6 @@ private:
         }
     }
 
-    static std::string event_value_for_debug(const TrackEvent& ev) {
-        if (ev.value && ev.value[0] != '\0') return std::string(ev.value);
-        if (ev.has_bool) return ev.bool_value ? "true" : "false";
-        if (ev.has_i64) return detail::scalar_to_string(ev.i64_value);
-        if (ev.has_u64) return detail::to_string_unsigned(ev.u64_value);
-        if (ev.has_f64) return detail::scalar_to_string(ev.f64_value);
-        return std::string();
-    }
-
     void open_debug_log() {
         if (!options_.debug_log &&
             !options_.debug_log_root_expand_stats &&
@@ -9475,7 +9318,6 @@ private:
         std::size_t lazy_value_watches_size;
         std::size_t all_track_ids_size;
         std::size_t parallel_track_ids_size;
-        std::size_t main_thread_track_ids_size;
         std::size_t dirty_peek_groups_size;
         std::size_t dirty_peek_ranges_size;
         std::size_t dirty_peek_leaves_size;
@@ -9535,7 +9377,6 @@ private:
         cp.lazy_value_watches_size = lazy_value_watches_.size();
         cp.all_track_ids_size = all_track_ids_.size();
         cp.parallel_track_ids_size = parallel_track_ids_.size();
-        cp.main_thread_track_ids_size = main_thread_track_ids_.size();
         cp.dirty_peek_groups_size = dirty_peek_groups_.size();
         cp.dirty_peek_ranges_size = dirty_peek_ranges_.size();
         cp.dirty_peek_leaves_size = dirty_peek_leaves_.size();
@@ -9881,7 +9722,6 @@ private:
         lazy_value_watches_.resize(cp.lazy_value_watches_size);
         all_track_ids_.resize(cp.all_track_ids_size);
         parallel_track_ids_.resize(cp.parallel_track_ids_size);
-        main_thread_track_ids_.resize(cp.main_thread_track_ids_size);
         while (bound_dirty_hooks_.size() > cp.bound_dirty_hooks_size) {
             WaveDirtyHook* hook = bound_dirty_hooks_.back();
             if (hook && hook->tracer == this) hook->clear();
@@ -10727,6 +10567,25 @@ private:
         return out;
     }
 
+    std::size_t traced_array_element_count_(std::size_t logical_count) const noexcept {
+        return options_.trace_array_first_element_only && logical_count != 0u
+            ? 1u
+            : logical_count;
+    }
+
+    const std::string& make_array_container_path_(const std::string& path,
+                                                  std::size_t logical_count,
+                                                  std::string& annotated_path) const {
+        if (!options_.trace_array_first_element_only) return path;
+        const std::string count = detail::to_string_unsigned(logical_count);
+        annotated_path.assign(path);
+        annotated_path.reserve(annotated_path.size() + count.size() + 7u);
+        annotated_path.append("[size=");
+        annotated_path.append(count);
+        annotated_path.push_back(']');
+        return annotated_path;
+    }
+
     void export_node_declarations_once() {
         if (nodes_exported_) return;
         const bool direct_name_refs = sink_.accepts_node_name_table_fast();
@@ -11006,12 +10865,6 @@ private:
     }
 
 
-    bool is_live_node(NodeId node_id) const {
-        const NodeDesc* node = find_node(node_id);
-        return node && node->alive;
-    }
-
-
     void assign_track_storage_id_(TrackDesc& track) {
         if (track.id == 0) return;
         if (track.storage_id != 0) return;
@@ -11064,10 +10917,9 @@ private:
         }
 
         all_track_ids_.push_back(track.id);
-        // High-performance mode: every track is scheduled through the parallel
-        // track-id list. Scalar tracks take the scalar fast path; custom/string/
-        // SystemC/VSIP/value-source tracks are sampled by worker threads as custom
-        // samplers. main_thread_track_ids_ is kept only for source compatibility.
+        // Every physical sample owner is scheduled through the parallel track-id
+        // list. Scalar tracks take the scalar fast path; custom/string/SystemC/
+        // VSIP/value-source tracks are sampled by worker threads as custom samplers.
         if (track_is_physical_sample_owner_(track)) {
             parallel_track_ids_.push_back(track.id);
         }
@@ -11296,25 +11148,6 @@ private:
         for (std::size_t i = first_group; i < dirty_peek_groups_.size(); ++i) {
             refresh_dirty_peek_group_safety(dirty_peek_groups_[i]);
         }
-    }
-
-    void rebuild_dirty_wave_value_group_range_links() {
-        for (std::size_t i = 0; i < dirty_wave_value_groups_.size(); ++i) {
-            dirty_wave_value_groups_[i].first_range = kInvalidIndex;
-            dirty_wave_value_groups_[i].total_leaf_count = 0;
-        }
-        for (std::uint32_t range_id = 0; range_id < dirty_wave_value_ranges_.size(); ++range_id) {
-            DirtyWaveValueRange& range = dirty_wave_value_ranges_[range_id];
-            const std::uint32_t group_id = range.group_id;
-            if (group_id == kInvalidIndex || group_id >= dirty_wave_value_groups_.size()) {
-                range.next_sibling = kInvalidIndex;
-                continue;
-            }
-            range.next_sibling = dirty_wave_value_groups_[group_id].first_range;
-            dirty_wave_value_groups_[group_id].first_range = range_id;
-            dirty_wave_value_groups_[group_id].total_leaf_count += range.leaf_count;
-        }
-        invalidate_dirty_wave_value_addr_lookup();
     }
 
     void record_dirty_peek_leaf_for_track(TrackId track_id) {
@@ -12304,10 +12137,6 @@ private:
             fragment.parallel_track_ids_[i] = compact_topology_id_(
                 result.track_base + fragment.parallel_track_ids_[i], "parallel sampled track id");
         }
-        for (std::size_t i = 0; i < fragment.main_thread_track_ids_.size(); ++i) {
-            fragment.main_thread_track_ids_[i] = compact_topology_id_(
-                result.track_base + fragment.main_thread_track_ids_[i], "parallel main track id");
-        }
         for (typename std::unordered_map<BitfieldStorageKey, TrackId, BitfieldStorageKeyHash>::iterator it =
                  fragment.bitfield_storage_by_key_.begin();
              it != fragment.bitfield_storage_by_key_.end(); ++it) {
@@ -12815,9 +12644,6 @@ private:
                               fragment.all_track_ids_.begin(), fragment.all_track_ids_.end());
         parallel_track_ids_.insert(parallel_track_ids_.end(),
                                    fragment.parallel_track_ids_.begin(), fragment.parallel_track_ids_.end());
-        main_thread_track_ids_.insert(main_thread_track_ids_.end(),
-                                      fragment.main_thread_track_ids_.begin(),
-                                      fragment.main_thread_track_ids_.end());
         for (typename std::unordered_map<BitfieldStorageKey, TrackId, BitfieldStorageKeyHash>::const_iterator it =
                  fragment.bitfield_storage_by_key_.begin();
              it != fragment.bitfield_storage_by_key_.end(); ++it) {
@@ -12888,7 +12714,6 @@ private:
         std::size_t lazy_value_watches;
         std::size_t all_track_ids;
         std::size_t parallel_track_ids;
-        std::size_t main_thread_track_ids;
         std::size_t dirty_peek_groups;
         std::size_t dirty_peek_ranges;
         std::size_t dirty_peek_leaves;
@@ -12921,7 +12746,6 @@ private:
         out.lazy_value_watches = lazy_value_watches_.size();
         out.all_track_ids = all_track_ids_.size();
         out.parallel_track_ids = parallel_track_ids_.size();
-        out.main_thread_track_ids = main_thread_track_ids_.size();
         out.dirty_peek_groups = dirty_peek_groups_.size();
         out.dirty_peek_ranges = dirty_peek_ranges_.size();
         out.dirty_peek_leaves = dirty_peek_leaves_.size();
@@ -12979,7 +12803,6 @@ private:
         reserve_repeated_vector_delta_(lazy_value_watches_, before.lazy_value_watches, remaining_elements);
         reserve_repeated_vector_delta_(all_track_ids_, before.all_track_ids, remaining_elements);
         reserve_repeated_vector_delta_(parallel_track_ids_, before.parallel_track_ids, remaining_elements);
-        reserve_repeated_vector_delta_(main_thread_track_ids_, before.main_thread_track_ids, remaining_elements);
         reserve_repeated_vector_delta_(dirty_peek_groups_, before.dirty_peek_groups, remaining_elements);
         reserve_repeated_vector_delta_(dirty_peek_ranges_, before.dirty_peek_ranges, remaining_elements);
         reserve_repeated_vector_delta_(dirty_peek_leaves_, before.dirty_peek_leaves, remaining_elements);
@@ -13479,6 +13302,39 @@ public:
             typename detail::is_dynamic_trace_target<T>::type());
     }
 
+    template <typename T, typename RegistrationPolicy>
+    NodeId expand_registered_dynamic_policy_impl_(const std::string& path,
+                                                  NodeId parent_id,
+                                                  const T* ptr,
+                                                  std::true_type) {
+        (void)sizeof(RegistrationPolicy*);
+        // The owning compiled shard has the complete reflected_visitor<T>.
+        // Enter it directly instead of instantiating the ordinary SFINAE
+        // dispatch, whose false business-TU specialization has the same
+        // COMDAT name on MSVC.
+        return expand_reflected_field_cached_or_direct_<T>(path, parent_id, ptr);
+    }
+
+    template <typename T, typename RegistrationPolicy>
+    NodeId expand_registered_dynamic_policy_impl_(const std::string& path,
+                                                  NodeId parent_id,
+                                                  const T* ptr,
+                                                  std::false_type) {
+        (void)sizeof(RegistrationPolicy*);
+        return expand_registered_dynamic<T>(path, parent_id, ptr);
+    }
+
+    template <typename T, typename RegistrationPolicy>
+    NodeId expand_registered_dynamic_policy(const std::string& path,
+                                            NodeId parent_id,
+                                            const T* ptr) {
+        return expand_registered_dynamic_policy_impl_<T, RegistrationPolicy>(
+            path,
+            parent_id,
+            ptr,
+            std::integral_constant<bool, reflect::is_reflected<T>::value>());
+    }
+
     static std::size_t parallel_batch_reserve_target_(std::size_t current,
                                                        std::size_t add) {
 #if defined(WAVE_RUNTIME_BENCH_LEGACY_PARALLEL_BATCH_RESERVE)
@@ -13522,11 +13378,33 @@ public:
         return expand_member_clean_dispatch<T>(path, parent_id, ptr);
     }
 
-    template <typename T>
-    bool expand_registered_dynamic_array(NodeId parent_id,
-                                         const T* objects,
-                                         std::size_t count) {
+    template <typename T, typename RegistrationPolicy>
+    bool expand_registered_dynamic_array_policy_impl_(NodeId parent_id,
+                                                       const T* objects,
+                                                       std::size_t count,
+                                                       std::true_type) {
+        (void)sizeof(RegistrationPolicy*);
         return expand_wave_ptr_array_fast_if_possible_<T>(parent_id, objects, count);
+    }
+
+    template <typename T, typename RegistrationPolicy>
+    bool expand_registered_dynamic_array_policy_impl_(NodeId,
+                                                       const T*,
+                                                       std::size_t,
+                                                       std::false_type) {
+        (void)sizeof(RegistrationPolicy*);
+        return false;
+    }
+
+    template <typename T, typename RegistrationPolicy>
+    bool expand_registered_dynamic_array_policy(NodeId parent_id,
+                                                const T* objects,
+                                                std::size_t count) {
+        return expand_registered_dynamic_array_policy_impl_<T, RegistrationPolicy>(
+            parent_id,
+            objects,
+            count,
+            std::integral_constant<bool, reflect::is_reflected<T>::value>());
     }
 
 private:
@@ -14190,7 +14068,9 @@ private:
                               const Obj* obj,
                               T (*getter)(const Obj*),
                               std::uint32_t explicit_bit_width,
-                              long long field_bit_offset) {
+                              long long field_bit_offset,
+                              const void* explicit_union_base = NULL,
+                              std::size_t explicit_union_bytes = 0) {
         if (!options_.enable_bitfield_fields) {
             if (options_.debug_log) debug_log_msg(std::string("bitfield skipped path=") + path);
             return 0;
@@ -14198,11 +14078,25 @@ private:
         if (!obj || !getter) return 0;
         if (!detail::wave_trace_leaf_path_allowed(path)) return 0;
         BitfieldStorageRange range;
-        if (!choose_bitfield_storage_range<Obj>(field_bit_offset, explicit_bit_width, range)) {
+        const bool has_explicit_union =
+            explicit_union_base != NULL && explicit_union_bytes != 0;
+        const bool range_ok = has_explicit_union
+            ? choose_union_alias_storage_range(
+                explicit_union_bytes, field_bit_offset, explicit_bit_width, range)
+            : choose_bitfield_storage_range<Obj>(
+                field_bit_offset, explicit_bit_width, range);
+        if (!range_ok) {
             if (options_.debug_log) debug_log_msg(std::string("bitfield getter without physical storage skipped path=") + path);
             return 0;
         }
-        const TrackId storage_id = get_or_create_bitfield_storage_track_<Obj>(path, obj, range);
+        const TrackId storage_id = has_explicit_union
+            ? get_or_create_raw_storage_track_(
+                path,
+                explicit_union_base,
+                reflect::type_tag_of<Obj>(),
+                reinterpret_cast<const unsigned char*>(explicit_union_base),
+                range)
+            : get_or_create_bitfield_storage_track_<Obj>(path, obj, range);
         if (storage_id == 0) {
             if (options_.debug_log) debug_log_msg(std::string("bitfield getter storage unavailable path=") + path);
             return 0;
@@ -14237,7 +14131,7 @@ private:
 
     template <typename Obj, typename T>
     typename std::enable_if<!detail::is_leaf_scalar<T>::value || detail::is_std_string<T>::value, NodeId>::type
-    add_bitfield_range_signal(const std::string& path, NodeId parent_id, const Obj* obj, T (*getter)(const Obj*), std::uint32_t explicit_bit_width, long long) {
+    add_bitfield_range_signal(const std::string& path, NodeId parent_id, const Obj* obj, T (*getter)(const Obj*), std::uint32_t explicit_bit_width, long long, const void* = NULL, std::size_t = 0) {
         (void)parent_id;
         (void)obj;
         (void)getter;
@@ -14257,11 +14151,27 @@ private:
                                      const Obj* obj,
                                      T (*getter)(const Obj*),
                                      std::uint32_t explicit_bit_width,
-                                     long long field_bit_offset) {
+                                     long long field_bit_offset,
+                                     const void* explicit_union_base = NULL,
+                                     std::size_t explicit_union_bytes = 0) {
         if (!options_.enable_bitfield_fields || !obj || !getter) return 0;
         BitfieldStorageRange range;
-        if (!choose_bitfield_storage_range<Obj>(field_bit_offset, explicit_bit_width, range)) return 0;
-        const TrackId storage_id = get_or_create_bitfield_storage_track_<Obj>(empty_node_string(), obj, range);
+        const bool has_explicit_union =
+            explicit_union_base != NULL && explicit_union_bytes != 0;
+        const bool range_ok = has_explicit_union
+            ? choose_union_alias_storage_range(
+                explicit_union_bytes, field_bit_offset, explicit_bit_width, range)
+            : choose_bitfield_storage_range<Obj>(
+                field_bit_offset, explicit_bit_width, range);
+        if (!range_ok) return 0;
+        const TrackId storage_id = has_explicit_union
+            ? get_or_create_raw_storage_track_(
+                empty_node_string(),
+                explicit_union_base,
+                reflect::type_tag_of<Obj>(),
+                reinterpret_cast<const unsigned char*>(explicit_union_base),
+                range)
+            : get_or_create_bitfield_storage_track_<Obj>(empty_node_string(), obj, range);
         if (storage_id == 0) return 0;
 
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
@@ -14286,16 +14196,7 @@ private:
 
     template <typename Obj, typename T>
     typename std::enable_if<!detail::is_leaf_scalar<T>::value || detail::is_std_string<T>::value, NodeId>::type
-    add_bitfield_range_signal_named_(const char*, NodeId, const Obj*, T (*)(const Obj*), std::uint32_t, long long) {
-        return 0;
-    }
-
-    NodeId add_marker(const std::string& path, NodeId parent_id, InvalidKind invalid, const std::string& suffix) {
-        if (options_.debug_log) debug_log_msg(std::string("marker skipped path=") + path +
-                      " suffix=" + suffix +
-                      " invalid=" + invalid_kind_name(invalid) +
-                      " parent=" + detail::to_string_unsigned(parent_id));
-        (void)suffix;
+    add_bitfield_range_signal_named_(const char*, NodeId, const Obj*, T (*)(const Obj*), std::uint32_t, long long, const void* = NULL, std::size_t = 0) {
         return 0;
     }
 
@@ -14319,14 +14220,23 @@ private:
     typename std::enable_if<detail::is_wave_array<ArrT>::value, NodeId>::type
     expand_wave_array_field_impl(const std::string& path, NodeId parent_id, const ArrT* ptr) {
         if (!ptr) return 0;
+        const std::size_t logical_count = wave_array_traits<ArrT>::size;
+        const std::size_t traced_count = traced_array_element_count_(logical_count);
+        std::string annotated_array_path;
+        const std::string& array_path =
+            make_array_container_path_(path, logical_count, annotated_array_path);
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
-        const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
+        const NodeId node_id = create_node(parent_id, array_path, NodeKind::Aggregate, 0);
         if (node_id == 0) {
             rollback_topology_to(cp);
             return 0;
         }
         typedef typename wave_array_traits<ArrT>::element_type ElemT;
-        const bool capture_wave_array = options_.enable_wave_array_dirty;
+        // A first-element-only array is sampled as an ordinary leaf/subtree.
+        // Registering the full dirty range would make writes to intentionally
+        // untracked elements schedule work for topology that does not exist.
+        const bool capture_wave_array =
+            options_.enable_wave_array_dirty && !options_.trace_array_first_element_only;
         const std::uint32_t prev_capture_depth = active_dirty_wave_array_capture_depth_;
         DirtyWaveArrayBlockCursor array_begin;
         if (capture_wave_array) {
@@ -14345,8 +14255,8 @@ private:
         std::size_t chunk_first_index = 0;
         DirtyWaveArrayBlockCursor chunk_begin = array_begin;
 
-        for (std::size_t i = 0; i < wave_array_traits<ArrT>::size; ++i) {
-            const std::string child_path = make_index_child_path_(path, i);
+        for (std::size_t i = 0; i < traced_count; ++i) {
+            const std::string child_path = make_index_child_path_(array_path, i);
             TopologyCheckpoint elem_cp = make_topology_checkpoint(node_id);
             const ElemT* elem = std::addressof((*ptr)[i]);
             const NodeId child_node = expand_member_clean_dispatch<ElemT>(
@@ -14359,7 +14269,7 @@ private:
             if (capture_wave_array) {
                 const std::size_t chunk_element_count = i + 1u - chunk_first_index;
                 if (chunk_element_count >= chunk_element_capacity ||
-                    i + 1u == wave_array_traits<ArrT>::size) {
+                    i + 1u == traced_count) {
                     const DirtyWaveArrayBlockCursor chunk_end = dirty_wave_array_current_block_cursor_();
                     if (dirty_wave_array_cursor_less_(chunk_begin, chunk_end)) {
                         const ElemT* first_chunk_elem = std::addressof((*ptr)[chunk_first_index]);
@@ -14386,13 +14296,13 @@ private:
             }
         }
         const NodeId kept = keep_node_or_rollback(cp, node_id);
-        if (kept != 0 && options_.enable_wave_array_dirty && wave_array_traits<ArrT>::size != 0) {
+        if (kept != 0 && capture_wave_array && logical_count != 0) {
             const ElemT* first_elem = std::addressof((*ptr)[0]);
             const WaveArrayBulkMarkKey bulk_key(
                 static_cast<const void*>(first_elem),
                 reflect::type_tag_of<ElemT>(),
                 sizeof(ElemT),
-                wave_array_traits<ArrT>::size);
+                logical_count);
             const std::uint32_t bulk_range_id =
                 register_dirty_wave_array_slice_(DirtyWaveArraySliceKey(), &bulk_key, array_begin, array_end);
             if (bulk_range_id == kInvalidIndex || bulk_range_id >= dirty_wave_array_bulk_ranges_.size()) {
@@ -14400,7 +14310,7 @@ private:
                                                    static_cast<const void*>(first_elem),
                                                    reflect::type_tag_of<ElemT>(),
                                                    sizeof(ElemT),
-                                                   wave_array_traits<ArrT>::size);
+                                                   logical_count);
             }
             dirty_wave_array_memory_blocks_valid_ = true;
             dirty_wave_array_memory_blocks_complete_ = true;
@@ -14435,16 +14345,21 @@ private:
     NodeId expand_c_array_field_impl(const std::string& path, NodeId parent_id, const ArrT* ptr) {
         static_assert(std::is_array<ArrT>::value, "expand_c_array_field_impl requires a C array type");
         if (!ptr) return 0;
+        const std::size_t logical_count = std::extent<ArrT>::value;
+        const std::size_t traced_count = traced_array_element_count_(logical_count);
+        std::string annotated_array_path;
+        const std::string& array_path =
+            make_array_container_path_(path, logical_count, annotated_array_path);
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
-        const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
+        const NodeId node_id = create_node(parent_id, array_path, NodeKind::Aggregate, 0);
         if (node_id == 0) {
             rollback_topology_to(cp);
             return 0;
         }
         typedef typename std::remove_extent<ArrT>::type ElemT;
-        for (std::size_t i = 0; i < std::extent<ArrT>::value; ++i) {
+        for (std::size_t i = 0; i < traced_count; ++i) {
             expand_c_array_element_<ElemT>(
-                make_index_child_path_(path, i),
+                make_index_child_path_(array_path, i),
                 node_id,
                 std::addressof((*ptr)[i]));
         }
@@ -14461,16 +14376,21 @@ private:
     typename std::enable_if<detail::is_std_array<T>::value, NodeId>::type
     expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
         if (!ptr) return 0;
+        const std::size_t logical_count = ptr->size();
+        const std::size_t traced_count = traced_array_element_count_(logical_count);
+        std::string annotated_array_path;
+        const std::string& array_path =
+            make_array_container_path_(path, logical_count, annotated_array_path);
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
-        const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
+        const NodeId node_id = create_node(parent_id, array_path, NodeKind::Aggregate, 0);
         if (node_id == 0) {
             rollback_topology_to(cp);
             return 0;
         }
-        for (std::size_t i = 0; i < ptr->size(); ++i) {
+        for (std::size_t i = 0; i < traced_count; ++i) {
             typedef typename detail::remove_cvref<decltype((*ptr)[i])>::type ElementT;
             expand_member_clean_dispatch<ElementT>(
-                make_index_child_path_(path, i), node_id, std::addressof((*ptr)[i]));
+                make_index_child_path_(array_path, i), node_id, std::addressof((*ptr)[i]));
         }
         return keep_node_or_rollback(cp, node_id);
     }
@@ -14617,7 +14537,7 @@ private:
     }
 
     template <typename Port, typename V>
-    typename std::enable_if<!detail::is_vsip_exact_port<Port>::value && detail::is_vsip_read_port<Port>::value, const V*>::type
+    typename std::enable_if<!detail::is_vsip_exact_port<Port>::value && detail::is_vsip_peek_port<Port>::value, const V*>::type
     read_vsip_value(const Port* port) const {
         // Legacy explicit trait hook: only types with a custom
         // vsip_port_value_type<T> specialization can arrive here.  Ordinary
@@ -14683,7 +14603,7 @@ private:
     }
 
     template <typename Obj, typename V>
-    typename std::enable_if<!detail::is_vsip_exact_port<Obj>::value && detail::is_vsip_read_port<Obj>::value, WaveDirtyHook*>::type
+    typename std::enable_if<!detail::is_vsip_exact_port<Obj>::value && detail::is_vsip_peek_port<Obj>::value, WaveDirtyHook*>::type
     read_vsip_dirty_hook(const Obj* obj) const {
         // Legacy explicit trait hook: access the object's own dirty hook.
         return detail::maybe_wave_dirty_hook(obj);
@@ -14721,7 +14641,7 @@ private:
     typename std::enable_if<!detail::is_peek_trace_source<T>::value &&
                             !detail::is_dynamic_trace_target<T>::value &&
                             !detail::is_vsip_exact_port<T>::value &&
-                            detail::is_vsip_read_port<T>::value, NodeId>::type
+                            detail::is_vsip_peek_port<T>::value, NodeId>::type
     expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
         typedef typename detail::vsip_port_value_type<T>::type V;
         // Legacy explicit trait hook: peek() returns a stable pointer.  Expand
@@ -14748,16 +14668,21 @@ private:
     typename std::enable_if<detail::is_sc_vector<T>::value, NodeId>::type
     expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
         if (!ptr) return 0;
+        const std::size_t logical_count = ptr->size();
+        const std::size_t traced_count = traced_array_element_count_(logical_count);
+        std::string annotated_array_path;
+        const std::string& array_path =
+            make_array_container_path_(path, logical_count, annotated_array_path);
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
-        const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
+        const NodeId node_id = create_node(parent_id, array_path, NodeKind::Aggregate, 0);
         if (node_id == 0) {
             rollback_topology_to(cp);
             return 0;
         }
         typedef typename detail::remove_cvref<decltype((*ptr)[0])>::type ElementT;
-        for (std::size_t i = 0; i < ptr->size(); ++i) {
+        for (std::size_t i = 0; i < traced_count; ++i) {
             expand_member_clean_dispatch<ElementT>(
-                make_index_child_path_(path, i), node_id, std::addressof((*ptr)[i]));
+                make_index_child_path_(array_path, i), node_id, std::addressof((*ptr)[i]));
         }
         return keep_node_or_rollback(cp, node_id);
     }
@@ -15056,6 +14981,8 @@ private:
                 : 0u;
             detail::call_reflected_visit<T>(
                 ptr,
+                detail::make_annotated_pointer_storage_array_policy_visitor(
+                options_.trace_array_first_element_only,
                 [this, node_id, ptr, generated_name_base, generated_name_count](const char* name, auto child_field_ptr, auto... meta) {
                     const detail::AnnotatedPointerMemberKey pointer_member =
                         detail::annotated_pointer_member_key_or_invalid(meta...);
@@ -15074,7 +15001,7 @@ private:
                             : kInvalidIndex;
                     ScopedGeneratedMemberNameId generated_name_scope(this, generated_name_id);
                     expand_reflected_child_ptr_with_union_meta_named_(name, node_id, child_field_ptr, ptr, union_bytes, union_base);
-                },
+                }),
                 [this, node_id](const char* name, const auto&) {
                     if (!options_.enable_bitfield_fields) return;
                     const std::string bit_path(name ? name : "");
@@ -15091,18 +15018,25 @@ private:
                             ? generated_name_base + member.member_id
                             : kInvalidIndex;
                     ScopedGeneratedMemberNameId generated_name_scope(this, generated_name_id);
+                    const std::size_t union_bytes =
+                        union_field_storage_bytes_or_zero(meta...);
+                    const void* union_base = union_field_base_or_null(meta...);
                     add_bitfield_range_signal_named_<T, GetterValueT>(
                         name,
                         node_id,
                         ptr,
                         getter,
                         getter_bit_width_or_zero(meta...),
-                        getter_bit_offset_or_negative(meta...));
+                        getter_bit_offset_or_negative(meta...),
+                        union_base,
+                        union_bytes);
                 });
             return;
         }
         detail::call_reflected_visit<T>(
             ptr,
+            detail::make_annotated_pointer_storage_array_policy_visitor(
+            options_.trace_array_first_element_only,
             [this, &path, node_id, ptr](const char* name, auto child_field_ptr, auto... meta) {
                 const detail::AnnotatedPointerMemberKey pointer_member =
                     detail::annotated_pointer_member_key_or_invalid(meta...);
@@ -15114,7 +15048,7 @@ private:
                 const std::string child_path = make_child_path_(path, name);
                 const void* union_base = union_field_base_or_null(meta...);
                 expand_reflected_child_ptr_with_union_meta_(child_path, node_id, child_field_ptr, ptr, union_bytes, union_base);
-            },
+            }),
             [this, &path, node_id](const char* name, const auto&) {
                 if (!options_.enable_bitfield_fields) return;
                 const std::string bit_path = make_child_path_(path, name);
@@ -15124,13 +15058,18 @@ private:
                 if (!options_.enable_bitfield_fields) return;
                 typedef typename detail::remove_cvref<decltype(getter(ptr))>::type GetterValueT;
                 const std::string bit_path = make_child_path_(path, name);
+                const std::size_t union_bytes =
+                    union_field_storage_bytes_or_zero(meta...);
+                const void* union_base = union_field_base_or_null(meta...);
                 add_bitfield_range_signal<T, GetterValueT>(
                     bit_path,
                     node_id,
                     ptr,
                     getter,
                     getter_bit_width_or_zero(meta...),
-                    getter_bit_offset_or_negative(meta...));
+                    getter_bit_offset_or_negative(meta...),
+                    union_base,
+                    union_bytes);
             });
     }
 
@@ -15226,12 +15165,14 @@ private:
                                             std::size_t nodes_per_element,
                                             std::size_t tracks_per_element,
                                             std::size_t objects_per_element) {
-        if (declared_count <= 1u || !options_.enable_parallel_topology_expansion ||
+        if (declared_count <= 1u || !options_.enable_fixed_repeated_topology_clone ||
+            !options_.enable_parallel_topology_expansion ||
             options_.topology_expansion_threads < 2u || nodes_per_element == 0u ||
             tracks_per_element == 0u || objects_per_element == 0u) return false;
         const reflect::TopologyTypeEstimate estimate =
             reflect::topology_type_estimate<CleanPointee>::get();
         if (!estimate.fixed_extent || estimate.dynamic_extent ||
+            !estimate.relocation_safe ||
             !should_use_parallel_topology_expansion_<CleanPointee>(
                 declared_count,
                 estimate.estimated_leaves != 0u ? estimate.estimated_leaves : tracks_per_element)) {
@@ -15356,9 +15297,6 @@ private:
             all_track_ids_.begin() + before.all_track_ids_size, all_track_ids_.end());
         const std::vector<TrackId> parallel_ids_template(
             parallel_track_ids_.begin() + before.parallel_track_ids_size, parallel_track_ids_.end());
-        const std::vector<TrackId> main_ids_template(
-            main_thread_track_ids_.begin() + before.main_thread_track_ids_size,
-            main_thread_track_ids_.end());
 
         nodes_.resize(first_node + declared_count * nodes_per_element);
         tracks_.resize(first_track + declared_count * tracks_per_element);
@@ -15385,8 +15323,6 @@ private:
         all_track_ids_.resize(before.all_track_ids_size + declared_count * all_ids_template.size());
         parallel_track_ids_.resize(
             before.parallel_track_ids_size + declared_count * parallel_ids_template.size());
-        main_thread_track_ids_.resize(
-            before.main_thread_track_ids_size + declared_count * main_ids_template.size());
 
         const auto fill_elements = [&](std::size_t begin, std::size_t end) {
             for (std::size_t element = begin; element < end; ++element) {
@@ -15519,11 +15455,6 @@ private:
                                         element * parallel_ids_template.size() + j] =
                         parallel_ids_template[j] + track_delta;
                 }
-                for (std::size_t j = 0; j < main_ids_template.size(); ++j) {
-                    main_thread_track_ids_[before.main_thread_track_ids_size +
-                                           element * main_ids_template.size() + j] =
-                        main_ids_template[j] + track_delta;
-                }
             }
         };
 
@@ -15574,7 +15505,6 @@ private:
             dirty_wave_array_initial_sample_done_ = false;
             dirty_wave_array_work_items_.clear();
             dirty_wave_array_rebalanced_work_items_.clear();
-            dirty_wave_array_work_weight_prefix_.clear();
             dirty_wave_array_memory_blocks_valid_ = true;
             dirty_wave_array_memory_blocks_complete_ = true;
         }
@@ -16245,6 +16175,7 @@ private:
         typedef typename wave_ptr_traits<WavePtrT>::element_type RawPointee;
         typedef typename detail::remove_cvref<RawPointee>::type CleanPointee;
         const std::size_t declared_count = ptr ? wave_ptr_traits<WavePtrT>::declared_size(*ptr) : 0;
+        const bool array_semantics = ptr && wave_ptr_traits<WavePtrT>::array_semantics(*ptr);
         if (declared_count == 0) {
             if (options_.debug_log) debug_log_msg(std::string("wave_ptr empty declared size path=") + path);
             return 0;
@@ -16267,16 +16198,20 @@ private:
                           " declared_size=" + detail::to_string_unsigned(declared_count) +
                           " addr=" + detail::pointer_to_string(detail::pointer_address(target)));
         }
-        if (declared_count == 1) {
+        if (declared_count == 1 && !array_semantics) {
             return finish_wave_ptr_expansion(expand_member_clean_dispatch<CleanPointee>(
                 path,
                 parent_id,
                 static_cast<const CleanPointee*>(target)));
         }
 
-        reserve_wave_ptr_array_expansion_<CleanPointee>(declared_count);
+        const std::size_t traced_count = traced_array_element_count_(declared_count);
+        std::string annotated_array_path;
+        const std::string& array_path =
+            make_array_container_path_(path, declared_count, annotated_array_path);
+        reserve_wave_ptr_array_expansion_<CleanPointee>(traced_count);
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
-        const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
+        const NodeId node_id = create_node(parent_id, array_path, NodeKind::Aggregate, 0);
         if (node_id == 0) {
             rollback_topology_to(cp);
             return finish_wave_ptr_expansion(0);
@@ -16289,7 +16224,7 @@ private:
             if (dynamic_ops.expand_array(*this,
                                          node_id,
                                          static_cast<const void*>(target),
-                                         declared_count)) {
+                                         traced_count)) {
                 ++dynamic_array_entry_successes_;
                 return finish_wave_ptr_expansion(keep_node_or_rollback(cp, node_id));
             }
@@ -16303,17 +16238,17 @@ private:
         if (expand_wave_ptr_array_fast_if_possible_<CleanPointee>(
                 node_id,
                 static_cast<const CleanPointee*>(target),
-                declared_count)) {
+                traced_count)) {
             return finish_wave_ptr_expansion(keep_node_or_rollback(cp, node_id));
         }
 #endif
 
-        for (std::size_t i = 0; i < declared_count; ++i) {
+        for (std::size_t i = 0; i < traced_count; ++i) {
 #if !defined(WAVE_RUNTIME_BENCH_LEGACY_WAVE_PTR_ARRAY_RESERVE)
             RepeatedTopologyCapacitySnapshot capacity_before;
             if (i == 0) capacity_before = repeated_topology_capacity_snapshot_();
 #endif
-            const std::string child_path = make_index_child_path_(path, i);
+            const std::string child_path = make_index_child_path_(array_path, i);
             TopologyCheckpoint elem_cp = make_topology_checkpoint(node_id);
             const CleanPointee* elem = static_cast<const CleanPointee*>(target + i);
             const NodeId child_node = expand_member_clean_dispatch<CleanPointee>(
@@ -16323,9 +16258,9 @@ private:
             if (child_node == 0) {
                 rollback_topology_to(elem_cp);
 #if !defined(WAVE_RUNTIME_BENCH_LEGACY_WAVE_PTR_ARRAY_RESERVE)
-            } else if (i == 0 && declared_count > 1 &&
+            } else if (i == 0 && traced_count > 1 &&
                        (reflect::is_reflected<CleanPointee>::value || dynamic_ops.reflected)) {
-                reserve_repeated_topology_from_first_(capacity_before, declared_count - 1u);
+                reserve_repeated_topology_from_first_(capacity_before, traced_count - 1u);
 #endif
             }
         }
@@ -16388,19 +16323,6 @@ private:
         return this->template expand_field<FieldT>(path, parent_id, clean_ptr);
     }
 
-    template <typename FieldT, typename V, typename IsScalar>
-    NodeId expand_member_vsip_dispatch(const std::string& path,
-                                       NodeId parent_id,
-                                       const FieldT* clean_ptr,
-                                       IsScalar) {
-        (void)sizeof(IsScalar);
-        // Legacy explicit trait hook for non-exact custom wrappers.
-        return add_lazy_value_object<V>(path, parent_id, [this, clean_ptr]() -> const V* {
-            return this->template read_vsip_value<FieldT, V>(clean_ptr);
-        }, this->template read_vsip_dirty_hook<FieldT, V>(clean_ptr),
-           detail::is_vsip_exact_port<FieldT>::value);
-    }
-
     template <typename FieldT>
     NodeId expand_member_clean_dispatch_selected(const std::string& path,
                                                  NodeId parent_id,
@@ -16417,16 +16339,21 @@ private:
                                                  std::integral_constant<int, 8>) {
         if (!clean_ptr) return 0;
         if (options_.debug_log) debug_log_msg(std::string("member dispatch branch=std_array path=") + path);
+        const std::size_t logical_count = clean_ptr->size();
+        const std::size_t traced_count = traced_array_element_count_(logical_count);
+        std::string annotated_array_path;
+        const std::string& array_path =
+            make_array_container_path_(path, logical_count, annotated_array_path);
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
-        const NodeId node_id = create_node(parent_id, path, NodeKind::Aggregate, 0);
+        const NodeId node_id = create_node(parent_id, array_path, NodeKind::Aggregate, 0);
         if (node_id == 0) {
             rollback_topology_to(cp);
             return 0;
         }
-        for (std::size_t i = 0; i < clean_ptr->size(); ++i) {
+        for (std::size_t i = 0; i < traced_count; ++i) {
             typedef typename detail::remove_cvref<decltype((*clean_ptr)[i])>::type ElemT;
             expand_member_clean_dispatch<ElemT>(
-                make_index_child_path_(path, i),
+                make_index_child_path_(array_path, i),
                 node_id,
                 static_cast<const ElemT*>(std::addressof((*clean_ptr)[i])));
         }
@@ -16649,7 +16576,7 @@ private:
                     is_wave_array ? 13 :
                     is_wave_value ? 12 :
                     is_c_string ? 11 :
-                    detail::is_vsip_read_port<FieldT>::value ? 10 :
+                    detail::is_vsip_peek_port<FieldT>::value ? 10 :
                     detail::is_leaf_scalar<FieldT>::value ? 9 :
                     detail::is_std_array<FieldT>::value ? 8 :
                     detail::is_std_pair<FieldT>::value ? 7 :
@@ -16760,7 +16687,7 @@ private:
         !detail::is_wave_ptr<T>::value &&
         !detail::is_peek_trace_source<T>::value &&
         !detail::is_dynamic_trace_target<T>::value &&
-        !detail::is_vsip_read_port<T>::value &&
+        !detail::is_vsip_peek_port<T>::value &&
         !detail::is_sc_in<T>::value &&
         !detail::is_sc_out<T>::value &&
         !detail::is_sc_inout<T>::value &&
@@ -16779,7 +16706,7 @@ private:
     typename std::enable_if<reflect::is_reflected<T>::value &&
                             !detail::is_peek_trace_source<T>::value &&
                             !detail::is_dynamic_trace_target<T>::value &&
-                            !detail::is_vsip_read_port<T>::value &&
+                            !detail::is_vsip_peek_port<T>::value &&
                             !detail::is_sc_in<T>::value &&
                             !detail::is_sc_out<T>::value &&
                             !detail::is_sc_inout<T>::value &&
@@ -16809,7 +16736,7 @@ private:
                             !detail::is_wave_ptr<T>::value &&
                             !detail::is_peek_trace_source<T>::value &&
                             !detail::is_dynamic_trace_target<T>::value &&
-                            !detail::is_vsip_read_port<T>::value &&
+                            !detail::is_vsip_peek_port<T>::value &&
                             !detail::is_sc_in<T>::value &&
                             !detail::is_sc_out<T>::value &&
                             !detail::is_sc_inout<T>::value &&
@@ -16833,9 +16760,13 @@ inline ThreadTraceLocal::~ThreadTraceLocal() noexcept {
     WaveTlsRegistry::instance().unregister_tls(this);
 }
 
-template <typename T>
-NodeId dynamic_expand_bridge(Tracer& tracer, const std::string& path, NodeId parent_id, const void* obj) {
-    return tracer.template expand_registered_dynamic<T>(path, parent_id, static_cast<const T*>(obj));
+template <typename T, typename RegistrationPolicy>
+NodeId dynamic_expand_policy_bridge(Tracer& tracer,
+                                    const std::string& path,
+                                    NodeId parent_id,
+                                    const void* obj) {
+    return tracer.template expand_registered_dynamic_policy<T, RegistrationPolicy>(
+        path, parent_id, static_cast<const T*>(obj));
 }
 
 template <typename T>
@@ -16846,12 +16777,12 @@ NodeId dynamic_expand_fallback_bridge(Tracer& tracer,
     return tracer.template expand_dynamic_fallback<T>(path, parent_id, static_cast<const T*>(obj));
 }
 
-template <typename T>
-bool dynamic_expand_array_bridge(Tracer& tracer,
-                                 NodeId parent_id,
-                                 const void* objects,
-                                 std::size_t count) {
-    return tracer.template expand_registered_dynamic_array<T>(
+template <typename T, typename RegistrationPolicy>
+bool dynamic_expand_array_policy_bridge(Tracer& tracer,
+                                        NodeId parent_id,
+                                        const void* objects,
+                                        std::size_t count) {
+    return tracer.template expand_registered_dynamic_array_policy<T, RegistrationPolicy>(
         parent_id, static_cast<const T*>(objects), count);
 }
 

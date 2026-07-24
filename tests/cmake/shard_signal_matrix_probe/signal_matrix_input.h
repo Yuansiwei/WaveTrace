@@ -40,6 +40,15 @@ struct ShardSmallLeaf {
     wave::WaveValue<std::uint16_t> dirty;
 };
 
+// Deliberately contains only inline, fixed-size state.  ReflectGen should mark
+// this type relocation-safe even when its generated specialization lives in a
+// different compile shard, allowing WAVE_PTR_ARRAY topology cloning.
+struct ShardRelocationSafeLeaf {
+    std::uint32_t value;
+    std::array<std::uint16_t, 64> lanes;
+    bool valid;
+};
+
 struct ShardDeepA {
     ShardSmallLeaf leaf;
     std::int64_t own;
@@ -111,12 +120,223 @@ private:
     bool is_64bit_;
 };
 
+class ShardMultipleAnonymousUnions {
+public:
+    ShardMultipleAnonymousUnions()
+        : first_raw_(0), separator_(0), second_raw_(0), tail_(false) {}
+
+    void initialize(std::uint64_t first,
+                    std::uint32_t separator,
+                    std::uint64_t second,
+                    bool tail) {
+        first_raw_ = first;
+        separator_ = separator;
+        second_raw_ = second;
+        tail_ = tail;
+    }
+
+private:
+    union {
+        struct {
+            std::uint64_t first_low_ : 20;
+            std::uint64_t first_high_ : 44;
+        };
+        std::uint64_t first_raw_;
+    };
+    std::uint32_t separator_;
+    union {
+        struct {
+            std::uint64_t second_low_ : 36;
+            std::uint64_t second_high_ : 28;
+        };
+        std::uint64_t second_raw_;
+    };
+    bool tail_;
+    WAVE_REFLECT_FRIEND;
+};
+
 union ShardVariant {
     std::uint32_t u32_value;
     float f32_value;
     ShardSmallLeaf leaf;
 
     ShardVariant() : u32_value(0) {}
+};
+
+union ShardDirectBitfieldUnion {
+    std::uint32_t low5 : 5;
+    std::uint32_t low13 : 13;
+    std::uint32_t raw;
+
+    ShardDirectBitfieldUnion() : raw(0) {}
+};
+
+class ShardNamedAnonymousUnionHolder {
+public:
+    ShardNamedAnonymousUnionHolder() : payload_{}, ordinary_(0) {}
+
+    void initialize(std::uint32_t raw, std::uint32_t ordinary) {
+        payload_.raw_ = raw;
+        ordinary_ = ordinary;
+    }
+
+private:
+    union {
+        struct {
+            std::uint32_t low_ : 7;
+            std::uint32_t middle_ : 9;
+            std::uint32_t high_ : 16;
+        };
+        std::uint32_t raw_;
+    } payload_;
+    std::uint32_t ordinary_;
+    WAVE_REFLECT_FRIEND;
+};
+
+class ShardExoticBitfieldUnionHolder {
+public:
+    ShardExoticBitfieldUnionHolder()
+        : signed_payload_{}, bool_payload_{}, enum_payload_{} {}
+
+    void initialize(std::uint32_t signed_raw,
+                    std::uint8_t bool_raw,
+                    std::uint16_t enum_raw) {
+        signed_payload_.raw_ = signed_raw;
+        bool_payload_.raw_ = bool_raw;
+        enum_payload_.raw_ = enum_raw;
+    }
+
+private:
+    union {
+        struct {
+            std::int32_t signed_low_ : 5;
+            std::uint32_t unsigned_middle_ : 11;
+            std::int32_t signed_high_ : 16;
+        };
+        std::uint32_t raw_;
+    } signed_payload_;
+    union {
+        struct {
+            bool first_ : 1;
+            bool second_ : 1;
+        };
+        std::uint8_t raw_;
+    } bool_payload_;
+    union {
+        struct {
+            ShardMatrixMode mode_ : 3;
+            std::uint16_t tail_ : 13;
+        };
+        std::uint16_t raw_;
+    } enum_payload_;
+    WAVE_REFLECT_FRIEND;
+};
+
+template <std::size_t Tag>
+class ShardTemplatePaddedUnion {
+public:
+    ShardTemplatePaddedUnion() : raw_(0) {}
+    void initialize(std::uint64_t raw) { raw_ = raw; }
+
+private:
+    union {
+        struct {
+            std::uint32_t low_ : 4;
+            std::uint32_t : 3;
+            std::uint32_t middle_ : 5;
+            std::uint32_t : 0;
+            std::uint32_t high_ : 6;
+        };
+        std::uint64_t raw_;
+    };
+    std::uint32_t tag_ = static_cast<std::uint32_t>(Tag);
+    WAVE_REFLECT_FRIEND;
+};
+
+union ShardMixedSizeUnion {
+    std::uint8_t byte_value;
+    std::uint16_t half_value;
+    std::uint32_t word_value;
+    std::uint64_t wide_value;
+    std::uint8_t bytes[8];
+
+    ShardMixedSizeUnion() : wide_value(0) {}
+};
+
+class ShardProtectedUnionBase {
+protected:
+    union {
+        struct {
+            std::uint16_t protected_low_ : 6;
+            std::uint16_t protected_high_ : 10;
+        };
+        std::uint16_t protected_raw_;
+    };
+    WAVE_REFLECT_FRIEND;
+
+public:
+    ShardProtectedUnionBase() : protected_raw_(0) {}
+    void initialize_base(std::uint16_t raw) { protected_raw_ = raw; }
+};
+
+class ShardProtectedUnionDerived : public ShardProtectedUnionBase {
+private:
+    ShardNamedAnonymousUnionHolder nested_;
+    std::uint8_t tail_ = 0;
+    WAVE_REFLECT_FRIEND;
+
+public:
+    void initialize(std::uint16_t base_raw,
+                    std::uint32_t nested_raw,
+                    std::uint8_t tail) {
+        initialize_base(base_raw);
+        nested_.initialize(nested_raw, 0x55AA55AAu);
+        tail_ = tail;
+    }
+};
+
+template <std::size_t Tag>
+class ShardTemplateUnionCell {
+private:
+    union {
+        struct {
+            std::uint64_t low_ : 17;
+            std::uint64_t high_ : 47;
+        };
+        std::uint64_t raw_;
+    };
+    std::uint32_t tag_ = static_cast<std::uint32_t>(Tag);
+    WAVE_REFLECT_FRIEND;
+
+public:
+    ShardTemplateUnionCell() : raw_(0) {}
+    void initialize(std::uint64_t raw) { raw_ = raw; }
+};
+
+class ShardUnionDynamicTarget
+    : public wave::DynamicTraceTargetFor<ShardUnionDynamicTarget> {
+private:
+    ShardNamedAnonymousUnionHolder value_;
+    ShardDirectBitfieldUnion direct_;
+    WAVE_REFLECT_FRIEND;
+
+public:
+    void initialize(std::uint32_t value, std::uint32_t direct) {
+        value_.initialize(value, 0xD00Du);
+        direct_.raw = direct;
+    }
+};
+
+class ShardUnionPeekSource
+    : public wave::PeekTraceSourceFor<
+          ShardUnionPeekSource, ShardNamedAnonymousUnionHolder> {
+private:
+    ShardNamedAnonymousUnionHolder value_;
+    WAVE_REFLECT_FRIEND;
+
+public:
+    void initialize(std::uint32_t raw) { value_.initialize(raw, 0xC00Cu); }
+    ShardNamedAnonymousUnionHolder* peek() { return &value_; }
 };
 
 struct ShardContainerBundle {
@@ -385,9 +605,32 @@ struct ShardSignalMatrixRoot {
     ShardDerivedLeaf derived;
     ShardBitfieldBundle bitfields;
     ShardPrivateNestedAnonymousUnion nested_anonymous_union;
+    ShardMultipleAnonymousUnions multiple_anonymous_unions;
     ShardVariant variant;
+    ShardDirectBitfieldUnion direct_bitfield_union;
+    ShardNamedAnonymousUnionHolder named_anonymous_union;
+    ShardExoticBitfieldUnionHolder exotic_bitfield_unions;
+    ShardTemplatePaddedUnion<11> padded_template_union;
+    ShardMixedSizeUnion mixed_size_union;
+    ShardMixedSizeUnion mixed_union_c_array[3];
+    std::array<ShardMixedSizeUnion, 3> mixed_union_std_array;
+    WAVE_PTR ShardMixedSizeUnion* mixed_union_ptr = nullptr;
+    ShardProtectedUnionBase protected_union_base;
+    ShardProtectedUnionDerived protected_union;
+    ShardTemplateUnionCell<3> template_union;
+    ShardNamedAnonymousUnionHolder union_c_array[2];
+    std::array<ShardNamedAnonymousUnionHolder, 2> union_std_array;
+    wave::array<ShardNamedAnonymousUnionHolder, 2> union_wave_array;
+    wave::array<wave::array<ShardTemplateUnionCell<7>, 2>, 2>
+        union_wave_matrix;
+    ShardUnionDynamicTarget union_dynamic_inline;
+    WAVE_PTR ShardUnionDynamicTarget* union_dynamic_ptr = nullptr;
+    ShardUnionPeekSource union_peek_inline;
+    WAVE_PTR wave::PeekTraceSource* union_peek_erased = nullptr;
     std::size_t bulk_count = 0;
     WAVE_PTR_ARRAY(bulk_count) ShardStressElement* bulk = nullptr;
+    std::size_t relocation_safe_count = 0;
+    WAVE_PTR_ARRAY(relocation_safe_count) ShardRelocationSafeLeaf* relocation_safe = nullptr;
     WAVE_PTR ShardSmallLeaf* alias_a = nullptr;
     WAVE_PTR ShardSmallLeaf* alias_b = nullptr;
     WAVE_PTR ShardSmallLeaf* null_pointer = nullptr;

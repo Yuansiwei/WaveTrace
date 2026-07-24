@@ -75,13 +75,20 @@ public:
             ::PathStableWvz4Recorder& recorder,
             sc_core::sc_clock& clock)
         : sc_core::sc_module(name), tracer_(&tracer), recorder_(&recorder) {
+        if (tracer_->trace_cycle_zero_only()) {
+            recorder_->disable_lod_tables_for_cycle_zero_snapshot();
+        }
         SC_METHOD(sample_on_clock_falling_edge_);
         sensitive << clock.negedge_event();
         dont_initialize();
     }
 #else
     WaveTap(Tracer& tracer, ::PathStableWvz4Recorder& recorder)
-        : tracer_(&tracer), recorder_(&recorder) {}
+        : tracer_(&tracer), recorder_(&recorder) {
+        if (tracer_->trace_cycle_zero_only()) {
+            recorder_->disable_lod_tables_for_cycle_zero_snapshot();
+        }
+    }
 #endif
 
     ~WaveTap() = default;
@@ -223,7 +230,8 @@ private:
         // business control flow or forces call-site conditionals.
         if (!config.wave_trace ||
             static_cast<std::uint64_t>(cycle) < config.wave_trace_start ||
-            static_cast<std::uint64_t>(cycle) > config.wave_trace_end) {
+            static_cast<std::uint64_t>(cycle) > config.wave_trace_end ||
+            (tracer_->trace_cycle_zero_only() && cycle != 0)) {
             // Tracer::sample() normally owns cycle progress reporting.  This
             // no-op path intentionally bypasses sample(), so report here to
             // keep the business-cycle counter visible even when waveform

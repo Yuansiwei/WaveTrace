@@ -38,6 +38,9 @@ struct RuntimeConfig {
 
     bool wave_trace_level_enabled = false;
     std::size_t wave_trace_level = 0;
+    // When enabled, every array-like value exposes only element [0].  The
+    // aggregate node name carries the original logical size.
+    bool wave_trace_array_first_only = false;
     bool dirty_array_stats = false;
     bool dirty_array_marks = false;
     bool memory_usage = false;
@@ -438,6 +441,7 @@ inline RuntimeConfig load_runtime_config() {
         read_optional_u64(text, "WaveTraceStart", 0, cfg.wave_trace_start) &&
         read_optional_u64(text, "WaveTraceEnd", (std::numeric_limits<std::uint64_t>::max)(), cfg.wave_trace_end) &&
         read_optional_u64(text, "WaveTraceLevel", 0, level) &&
+        read_bool(text, "WaveTraceArrayFirstOnly", cfg.wave_trace_array_first_only) &&
         read_bool(text, "WaveTraceDirtyArrayStats", cfg.dirty_array_stats) &&
         read_bool(text, "WaveTraceDirtyArrayMarks", cfg.dirty_array_marks) &&
         read_bool(text, "WaveTraceMemoryUsage", cfg.memory_usage) &&

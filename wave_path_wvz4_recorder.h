@@ -110,12 +110,25 @@ public:
             return false;
         }
         cfg_.options.initial_cycle = runtime_config.wave_trace_start * cfg_.clk_period_ticks;
+        // Array-first mode is a cycle-zero topology/value snapshot.  Its RAW
+        // record is sufficient at every zoom level, so emitting the same
+        // single transition into every LOD table only duplicates data and
+        // enlarges the footer index.
+        if (runtime_config.wave_trace_array_first_only) {
+            cfg_.options.enable_lod_tables = false;
+        }
         opened_ = true;
         writer_opened_ = false;
         cycle_open_ = false;
         last_error_.clear();
         frame_work_reserved_capacity_ = 0;
         return true;
+    }
+
+    // BuildOptions can enable the same snapshot mode directly (not only via
+    // JSON). WaveTap calls this before the lazily opened writer is created.
+    void disable_lod_tables_for_cycle_zero_snapshot() noexcept {
+        if (!writer_opened_) cfg_.options.enable_lod_tables = false;
     }
 
     bool has_declared_topology() const noexcept {

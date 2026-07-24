@@ -591,14 +591,17 @@ typedef std::uint64_t NodeId;
 typedef NodeId (*DynamicExpandFn)(Tracer&, const std::string&, NodeId, const void*);
 typedef bool (*DynamicExpandArrayFn)(Tracer&, NodeId, const void*, std::size_t);
 
-template <typename T>
-NodeId dynamic_expand_bridge(Tracer& tracer, const std::string& path, NodeId parent_id, const void* obj);
+template <typename T, typename RegistrationPolicy>
+NodeId dynamic_expand_policy_bridge(Tracer& tracer, const std::string& path, NodeId parent_id, const void* obj);
 
 template <typename T>
 NodeId dynamic_expand_fallback_bridge(Tracer& tracer, const std::string& path, NodeId parent_id, const void* obj);
 
-template <typename T>
-bool dynamic_expand_array_bridge(Tracer& tracer, NodeId parent_id, const void* objects, std::size_t count);
+template <typename T, typename RegistrationPolicy>
+bool dynamic_expand_array_policy_bridge(Tracer& tracer,
+                                        NodeId parent_id,
+                                        const void* objects,
+                                        std::size_t count);
 
 static constexpr std::uint32_t kInvalidIndex = 0xFFFFFFFFu;
 
@@ -797,6 +800,74 @@ struct AnnotatedPointerMemberKey {
     const char* class_name;
     const char* member_name;
 };
+
+// Pointer-storage arrays (for example `T* slots[N]`,
+// `std::array<std::shared_ptr<T>, N>`, or nested combinations) are expanded by
+// the generated visitor before Tracer sees an AnnotatedWavePtrView.  Wrap only
+// the reflected pointer callback with the current limit policy: ordinary
+// reflected objects pay no TLS/global-state cost, and nested/parallel tracers
+// cannot leak policy into one another.
+template <typename Visitor>
+class AnnotatedPointerStorageArrayPolicyVisitor {
+public:
+    AnnotatedPointerStorageArrayPolicyVisitor(Visitor visitor, bool first_only)
+        : visitor_(std::move(visitor)), first_only_(first_only) {}
+
+    template <typename... Args>
+    decltype(auto) operator()(Args&&... args) {
+        return visitor_(std::forward<Args>(args)...);
+    }
+
+    std::size_t annotated_pointer_storage_array_trace_count(
+        std::size_t logical_count) const noexcept {
+        return first_only_ && logical_count != 0u ? 1u : logical_count;
+    }
+
+    std::string annotated_pointer_storage_array_child_name(
+        const std::string& base,
+        std::size_t index,
+        std::size_t logical_count) const {
+        if (!first_only_) {
+            return base + "[" + std::to_string(index) + "]";
+        }
+        return base + "[size=" + std::to_string(logical_count) +
+               "].[" + std::to_string(index) + "]";
+    }
+
+private:
+    Visitor visitor_;
+    bool first_only_;
+};
+
+template <typename Visitor>
+AnnotatedPointerStorageArrayPolicyVisitor<
+    typename std::decay<Visitor>::type>
+make_annotated_pointer_storage_array_policy_visitor(
+    bool first_only, Visitor&& visitor) {
+    typedef typename std::decay<Visitor>::type CleanVisitor;
+    return AnnotatedPointerStorageArrayPolicyVisitor<CleanVisitor>(
+        std::forward<Visitor>(visitor), first_only);
+}
+
+template <typename Visitor>
+auto annotated_pointer_storage_array_trace_count_impl(
+    int, Visitor& visitor, std::size_t logical_count)
+    -> decltype(visitor.annotated_pointer_storage_array_trace_count(logical_count)) {
+    return visitor.annotated_pointer_storage_array_trace_count(logical_count);
+}
+
+template <typename Visitor>
+std::size_t annotated_pointer_storage_array_trace_count_impl(
+    long, Visitor&, std::size_t logical_count) noexcept {
+    return logical_count;
+}
+
+template <typename Visitor>
+std::size_t annotated_pointer_storage_array_trace_count(
+    Visitor& visitor, std::size_t logical_count) {
+    return annotated_pointer_storage_array_trace_count_impl(
+        0, visitor, logical_count);
+}
 
 inline AnnotatedPointerMemberKey annotated_pointer_member_key_or_invalid() {
     return AnnotatedPointerMemberKey();
@@ -1310,15 +1381,19 @@ class AnnotatedWavePtrView {
 public:
     typedef T element_type;
 
-    AnnotatedWavePtrView(T* ptr, std::size_t count) noexcept
-        : ptr_(ptr), count_(count) {}
+    AnnotatedWavePtrView(T* ptr,
+                         std::size_t count,
+                         bool array_semantics = false) noexcept
+        : ptr_(ptr), count_(count), array_semantics_(array_semantics) {}
 
     T* get() const noexcept { return ptr_; }
     std::size_t declared_size() const noexcept { return count_; }
+    bool array_semantics() const noexcept { return array_semantics_; }
 
 private:
     T* ptr_;
     std::size_t count_;
+    bool array_semantics_;
 };
 
 template <typename T>
@@ -1326,11 +1401,16 @@ class AnnotatedWeakPtrView {
 public:
     typedef T element_type;
 
-    AnnotatedWeakPtrView(std::shared_ptr<T> locked, std::size_t count) noexcept
-        : locked_(std::move(locked)), count_(count) {}
+    AnnotatedWeakPtrView(std::shared_ptr<T> locked,
+                         std::size_t count,
+                         bool array_semantics = false) noexcept
+        : locked_(std::move(locked)),
+          count_(count),
+          array_semantics_(array_semantics) {}
 
     T* get() const noexcept { return locked_.get(); }
     std::size_t declared_size() const noexcept { return count_; }
+    bool array_semantics() const noexcept { return array_semantics_; }
     std::shared_ptr<const void> keepalive() const noexcept {
         return std::shared_ptr<const void>(locked_);
     }
@@ -1338,6 +1418,7 @@ public:
 private:
     std::shared_ptr<T> locked_;
     std::size_t count_;
+    bool array_semantics_;
 };
 
 template <typename T>
@@ -1482,21 +1563,53 @@ std::size_t normalize_annotated_pointer_count(CountT count) noexcept {
 }
 
 template <typename Visitor, typename StorageT, typename CountT, typename... Meta>
-void invoke_annotated_ptr_visitor(Visitor&& visitor,
-                                  const char* name,
-                                  const StorageT& storage,
-                                  CountT count,
-                                  Meta&&... meta) {
+void invoke_annotated_ptr_visitor_impl(Visitor&& visitor,
+                                       const char* name,
+                                       const StorageT& storage,
+                                       CountT count,
+                                       bool array_semantics,
+                                       Meta&&... meta) {
     typedef typename std::remove_cv<typename std::remove_reference<StorageT>::type>::type CleanStorage;
     typedef annotated_pointer_storage_traits<CleanStorage> StorageTraits;
     typedef typename StorageTraits::element_type Element;
     AnnotatedWavePtrView<Element> view(
         StorageTraits::get(storage),
-        normalize_annotated_pointer_count(count));
+        normalize_annotated_pointer_count(count),
+        array_semantics);
     invoke_ptr_visitor(std::forward<Visitor>(visitor),
                        name,
                        std::addressof(view),
                        std::forward<Meta>(meta)...);
+}
+
+template <typename Visitor, typename StorageT, typename CountT, typename... Meta>
+void invoke_annotated_ptr_visitor(Visitor&& visitor,
+                                  const char* name,
+                                  const StorageT& storage,
+                                  CountT count,
+                                  Meta&&... meta) {
+    invoke_annotated_ptr_visitor_impl(
+        std::forward<Visitor>(visitor),
+        name,
+        storage,
+        count,
+        false,
+        std::forward<Meta>(meta)...);
+}
+
+template <typename Visitor, typename StorageT, typename CountT, typename... Meta>
+void invoke_annotated_ptr_array_visitor(Visitor&& visitor,
+                                        const char* name,
+                                        const StorageT& storage,
+                                        CountT count,
+                                        Meta&&... meta) {
+    invoke_annotated_ptr_visitor_impl(
+        std::forward<Visitor>(visitor),
+        name,
+        storage,
+        count,
+        true,
+        std::forward<Meta>(meta)...);
 }
 
 template <typename Visitor, typename StorageT, typename... Meta>
@@ -1507,7 +1620,7 @@ void invoke_annotated_weak_ptr_visitor(Visitor&& visitor,
     typedef typename std::remove_cv<typename std::remove_reference<StorageT>::type>::type CleanStorage;
     typedef annotated_weak_pointer_storage_traits<CleanStorage> StorageTraits;
     typedef typename StorageTraits::element_type Element;
-    AnnotatedWeakPtrView<Element> view(StorageTraits::lock(storage), 1u);
+    AnnotatedWeakPtrView<Element> view(StorageTraits::lock(storage), 1u, false);
     invoke_ptr_visitor(std::forward<Visitor>(visitor),
                        name,
                        std::addressof(view),
@@ -1519,6 +1632,39 @@ inline std::string annotated_pointer_storage_array_child_name(const std::string&
     return base + "[" + std::to_string(index) + "]";
 }
 
+template <typename Visitor>
+auto annotated_pointer_storage_array_child_name_impl(
+    int,
+    Visitor& visitor,
+    const std::string& base,
+    std::size_t index,
+    std::size_t logical_count)
+    -> decltype(visitor.annotated_pointer_storage_array_child_name(
+        base, index, logical_count)) {
+    return visitor.annotated_pointer_storage_array_child_name(
+        base, index, logical_count);
+}
+
+template <typename Visitor>
+std::string annotated_pointer_storage_array_child_name_impl(
+    long,
+    Visitor&,
+    const std::string& base,
+    std::size_t index,
+    std::size_t) {
+    return annotated_pointer_storage_array_child_name(base, index);
+}
+
+template <typename Visitor>
+std::string annotated_pointer_storage_array_child_name(
+    Visitor& visitor,
+    const std::string& base,
+    std::size_t index,
+    std::size_t logical_count) {
+    return annotated_pointer_storage_array_child_name_impl(
+        0, visitor, base, index, logical_count);
+}
+
 template <typename StorageT>
 struct AnnotatedPointerStorageArrayVisitor {
     template <typename Visitor, typename CountT>
@@ -1526,11 +1672,13 @@ struct AnnotatedPointerStorageArrayVisitor {
                       const std::string& name,
                       const StorageT& storage,
                       CountT count,
+                      bool array_semantics,
                       AnnotatedPointerMemberKey member_key) {
         // Do not forward GeneratedMemberId here: it names the array field, not
         // an individual pointer slot. The indexed name is consumed immediately
         // by Tracer and remains unambiguous for nested C arrays.
-        invoke_annotated_ptr_visitor(visitor, name.c_str(), storage, count, member_key);
+        invoke_annotated_ptr_visitor_impl(
+            visitor, name.c_str(), storage, count, array_semantics, member_key);
     }
 };
 
@@ -1541,13 +1689,17 @@ struct AnnotatedPointerStorageArrayVisitor<StorageT[N]> {
                       const std::string& name,
                       const StorageT (&storage)[N],
                       CountT count,
+                      bool array_semantics,
                       AnnotatedPointerMemberKey member_key) {
-        for (std::size_t i = 0; i < N; ++i) {
+        const std::size_t traced_count =
+            annotated_pointer_storage_array_trace_count(visitor, N);
+        for (std::size_t i = 0; i < traced_count; ++i) {
             AnnotatedPointerStorageArrayVisitor<StorageT>::visit(
                 visitor,
-                annotated_pointer_storage_array_child_name(name, i),
+                annotated_pointer_storage_array_child_name(visitor, name, i, N),
                 storage[i],
                 count,
+                array_semantics,
                 member_key);
         }
     }
@@ -1560,13 +1712,17 @@ struct AnnotatedPointerStorageArrayVisitor<std::array<StorageT, N> > {
                       const std::string& name,
                       const std::array<StorageT, N>& storage,
                       CountT count,
+                      bool array_semantics,
                       AnnotatedPointerMemberKey member_key) {
-        for (std::size_t i = 0; i < N; ++i) {
+        const std::size_t traced_count =
+            annotated_pointer_storage_array_trace_count(visitor, N);
+        for (std::size_t i = 0; i < traced_count; ++i) {
             AnnotatedPointerStorageArrayVisitor<StorageT>::visit(
                 visitor,
-                annotated_pointer_storage_array_child_name(name, i),
+                annotated_pointer_storage_array_child_name(visitor, name, i, N),
                 storage[i],
                 count,
+                array_semantics,
                 member_key);
         }
     }
@@ -1579,13 +1735,17 @@ struct AnnotatedPointerStorageArrayVisitor< ::wave::array<StorageT, N> > {
                       const std::string& name,
                       const ::wave::array<StorageT, N>& storage,
                       CountT count,
+                      bool array_semantics,
                       AnnotatedPointerMemberKey member_key) {
-        for (std::size_t i = 0; i < N; ++i) {
+        const std::size_t traced_count =
+            annotated_pointer_storage_array_trace_count(visitor, N);
+        for (std::size_t i = 0; i < traced_count; ++i) {
             AnnotatedPointerStorageArrayVisitor<StorageT>::visit(
                 visitor,
-                annotated_pointer_storage_array_child_name(name, i),
+                annotated_pointer_storage_array_child_name(visitor, name, i, N),
                 storage[i],
                 count,
+                array_semantics,
                 member_key);
         }
     }
@@ -1609,10 +1769,12 @@ struct AnnotatedWeakPointerStorageArrayVisitor<StorageT[N]> {
                       const std::string& name,
                       const StorageT (&storage)[N],
                       AnnotatedPointerMemberKey member_key) {
-        for (std::size_t i = 0; i < N; ++i) {
+        const std::size_t traced_count =
+            annotated_pointer_storage_array_trace_count(visitor, N);
+        for (std::size_t i = 0; i < traced_count; ++i) {
             AnnotatedWeakPointerStorageArrayVisitor<StorageT>::visit(
                 visitor,
-                annotated_pointer_storage_array_child_name(name, i),
+                annotated_pointer_storage_array_child_name(visitor, name, i, N),
                 storage[i],
                 member_key);
         }
@@ -1626,10 +1788,12 @@ struct AnnotatedWeakPointerStorageArrayVisitor<std::array<StorageT, N> > {
                       const std::string& name,
                       const std::array<StorageT, N>& storage,
                       AnnotatedPointerMemberKey member_key) {
-        for (std::size_t i = 0; i < N; ++i) {
+        const std::size_t traced_count =
+            annotated_pointer_storage_array_trace_count(visitor, N);
+        for (std::size_t i = 0; i < traced_count; ++i) {
             AnnotatedWeakPointerStorageArrayVisitor<StorageT>::visit(
                 visitor,
-                annotated_pointer_storage_array_child_name(name, i),
+                annotated_pointer_storage_array_child_name(visitor, name, i, N),
                 storage[i],
                 member_key);
         }
@@ -1643,10 +1807,12 @@ struct AnnotatedWeakPointerStorageArrayVisitor< ::wave::array<StorageT, N> > {
                       const std::string& name,
                       const ::wave::array<StorageT, N>& storage,
                       AnnotatedPointerMemberKey member_key) {
-        for (std::size_t i = 0; i < N; ++i) {
+        const std::size_t traced_count =
+            annotated_pointer_storage_array_trace_count(visitor, N);
+        for (std::size_t i = 0; i < traced_count; ++i) {
             AnnotatedWeakPointerStorageArrayVisitor<StorageT>::visit(
                 visitor,
-                annotated_pointer_storage_array_child_name(name, i),
+                annotated_pointer_storage_array_child_name(visitor, name, i, N),
                 storage[i],
                 member_key);
         }
@@ -1654,11 +1820,12 @@ struct AnnotatedWeakPointerStorageArrayVisitor< ::wave::array<StorageT, N> > {
 };
 
 template <typename Visitor, typename StorageT, typename CountT, typename... Meta>
-void invoke_annotated_ptr_storage_array_visitor(Visitor&& visitor,
-                                                const char* name,
-                                                const StorageT& storage,
-                                                CountT count,
-                                                Meta&&... meta) {
+void invoke_annotated_ptr_storage_array_visitor_impl(Visitor&& visitor,
+                                                     const char* name,
+                                                     const StorageT& storage,
+                                                     CountT count,
+                                                     bool array_semantics,
+                                                     Meta&&... meta) {
     typedef typename std::remove_cv<typename std::remove_reference<StorageT>::type>::type CleanStorage;
     static_assert(is_annotated_pointer_storage_array<CleanStorage>::value,
                   "annotated pointer storage array helper requires a supported fixed array");
@@ -1667,7 +1834,40 @@ void invoke_annotated_ptr_storage_array_visitor(Visitor&& visitor,
         std::string(name ? name : ""),
         storage,
         count,
+        array_semantics,
         annotated_pointer_member_key_or_invalid(std::forward<Meta>(meta)...));
+}
+
+// Keep the original helper as the scalar-target form so already-generated
+// reflection headers remain source-compatible after a WaveTrace update.
+template <typename Visitor, typename StorageT, typename CountT, typename... Meta>
+void invoke_annotated_ptr_storage_array_visitor(Visitor&& visitor,
+                                                const char* name,
+                                                const StorageT& storage,
+                                                CountT count,
+                                                Meta&&... meta) {
+    invoke_annotated_ptr_storage_array_visitor_impl(
+        std::forward<Visitor>(visitor),
+        name,
+        storage,
+        count,
+        false,
+        std::forward<Meta>(meta)...);
+}
+
+template <typename Visitor, typename StorageT, typename CountT, typename... Meta>
+void invoke_annotated_ptr_array_storage_array_visitor(Visitor&& visitor,
+                                                      const char* name,
+                                                      const StorageT& storage,
+                                                      CountT count,
+                                                      Meta&&... meta) {
+    invoke_annotated_ptr_storage_array_visitor_impl(
+        std::forward<Visitor>(visitor),
+        name,
+        storage,
+        count,
+        true,
+        std::forward<Meta>(meta)...);
 }
 
 template <typename Visitor, typename StorageT, typename... Meta>
@@ -1694,6 +1894,9 @@ struct wave_ptr_traits<detail::AnnotatedWavePtrView<T> > {
     static std::size_t declared_size(const detail::AnnotatedWavePtrView<T>& ptr) noexcept {
         return ptr.declared_size();
     }
+    static bool array_semantics(const detail::AnnotatedWavePtrView<T>& ptr) noexcept {
+        return ptr.array_semantics();
+    }
     static std::shared_ptr<const void> keepalive(const detail::AnnotatedWavePtrView<T>&) noexcept {
         return std::shared_ptr<const void>();
     }
@@ -1705,6 +1908,9 @@ struct wave_ptr_traits<detail::AnnotatedWeakPtrView<T> > {
     typedef T element_type;
     static std::size_t declared_size(const detail::AnnotatedWeakPtrView<T>& ptr) noexcept {
         return ptr.declared_size();
+    }
+    static bool array_semantics(const detail::AnnotatedWeakPtrView<T>& ptr) noexcept {
+        return ptr.array_semantics();
     }
     static std::shared_ptr<const void> keepalive(const detail::AnnotatedWeakPtrView<T>& ptr) noexcept {
         return ptr.keepalive();

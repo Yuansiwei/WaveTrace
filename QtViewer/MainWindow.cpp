@@ -28,6 +28,7 @@
 #include <QLineEdit>
 #include <QClipboard>
 #include <QComboBox>
+#include <QCheckBox>
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QKeyEvent>
@@ -44,6 +45,8 @@
 #include <QProgressDialog>
 #include <QPointer>
 #include <QRegularExpression>
+#include <QScrollArea>
+#include <QSettings>
 #include <QShortcut>
 #include <QSizePolicy>
 #include <QSplitter>
@@ -147,6 +150,187 @@ quint64 viewerCacheBudgetBytes() {
     if (!ok || configuredMb == 0) return kViewerCacheBudgetBytes;
     const quint64 boundedMb = qMin<quint64>(configuredMb, 32ull * 1024ull);
     return boundedMb * 1024ull * 1024ull;
+}
+
+// Extract a literal that every match must contain, but only for a deliberately
+// small regex grammar whose implication is easy to prove. Unsupported syntax
+// returns no prefilter and therefore falls back to QRegularExpression alone.
+QString conservativeRegexRequiredLiteral(const QString& pattern) {
+    QString best;
+    QString run;
+    run.reserve(pattern.size());
+    auto finishRun = [&]() {
+        if (run.size() > best.size()) best = run;
+        run.clear();
+    };
+    const QString escapable =
+        QStringLiteral(".^$|()[]{}*+?\\");
+    const QString unsupported =
+        QStringLiteral("^$|()[]{}*+?");
+    auto consumeWildcardQuantifier = [&](int& index) {
+        const int next = index + 1;
+        if (next >= pattern.size()) return;
+        const QChar quantifier = pattern.at(next);
+        if (quantifier == QLatin1Char('*') ||
+            quantifier == QLatin1Char('+') ||
+            quantifier == QLatin1Char('?')) {
+            index = next;
+        } else if (quantifier == QLatin1Char('{')) {
+            const int close = pattern.indexOf(QLatin1Char('}'), next + 1);
+            if (close < 0) return;
+            index = close;
+        } else {
+            return;
+        }
+        // Lazy and possessive modifiers do not change which surrounding
+        // literals are required.
+        if (index + 1 < pattern.size() &&
+            (pattern.at(index + 1) == QLatin1Char('?') ||
+             pattern.at(index + 1) == QLatin1Char('+'))) {
+            ++index;
+        }
+    };
+
+    for (int i = 0; i < pattern.size(); ++i) {
+        const QChar ch = pattern.at(i);
+        if (ch == QLatin1Char('^') && i == 0) continue;
+        if (ch == QLatin1Char('$') && i == pattern.size() - 1) {
+            finishRun();
+            continue;
+        }
+        if (ch == QLatin1Char('\\')) {
+            if (++i >= pattern.size()) return QString();
+            const QChar escaped = pattern.at(i);
+            if (escapable.contains(escaped)) {
+                run += escaped;
+                continue;
+            }
+            if (QStringLiteral("dDhHsSvVwWNRX").contains(escaped)) {
+                finishRun();
+                consumeWildcardQuantifier(i);
+                continue;
+            }
+            if ((escaped == QLatin1Char('p') ||
+                 escaped == QLatin1Char('P')) &&
+                i + 1 < pattern.size() &&
+                pattern.at(i + 1) == QLatin1Char('{')) {
+                const int close =
+                    pattern.indexOf(QLatin1Char('}'), i + 2);
+                if (close < 0) return QString();
+                finishRun();
+                i = close;
+                consumeWildcardQuantifier(i);
+                continue;
+            }
+            return QString();
+        }
+        if (ch == QLatin1Char('[')) {
+            finishRun();
+            int contentStart = i + 1;
+            if (contentStart < pattern.size() &&
+                pattern.at(contentStart) == QLatin1Char('^')) {
+                ++contentStart;
+            }
+            bool escaped = false;
+            int close = -1;
+            for (int j = contentStart; j < pattern.size(); ++j) {
+                const QChar classChar = pattern.at(j);
+                if (escaped) {
+                    escaped = false;
+                    continue;
+                }
+                if (classChar == QLatin1Char('\\')) {
+                    escaped = true;
+                    continue;
+                }
+                // A leading ']' inside a character class is a literal.
+                if (classChar == QLatin1Char(']') &&
+                    j != contentStart) {
+                    close = j;
+                    break;
+                }
+            }
+            if (close < 0) return QString();
+            i = close;
+            consumeWildcardQuantifier(i);
+            continue;
+        }
+        if (ch == QLatin1Char('.')) {
+            finishRun();
+            consumeWildcardQuantifier(i);
+            continue;
+        }
+        if (unsupported.contains(ch)) return QString();
+        run += ch;
+    }
+    finishRun();
+    return best;
+}
+
+bool isAsciiText(const QString& text) {
+    for (const QChar ch : text) {
+        if (ch.unicode() > 0x7f) return false;
+    }
+    return true;
+}
+
+bool regexRequiredLiteralMayOccur(
+    const QString& subject, const QString& requiredLiteral,
+    bool requiredLiteralIsAscii, Qt::CaseSensitivity caseSensitivity) {
+    if (requiredLiteral.isEmpty()) return true;
+    if (caseSensitivity == Qt::CaseSensitive) {
+        return subject.contains(requiredLiteral, Qt::CaseSensitive);
+    }
+    // Unicode case folding includes non-ASCII characters equivalent to ASCII
+    // ones (for example the Kelvin sign). Let PCRE handle those subjects.
+    if (!requiredLiteralIsAscii) return true;
+
+    const int literalSize = requiredLiteral.size();
+    const int subjectSize = subject.size();
+    const ushort* const literalData = requiredLiteral.utf16();
+    const ushort* const subjectData = subject.utf16();
+    const ushort first = literalData[0] >= 'A' && literalData[0] <= 'Z'
+        ? ushort(literalData[0] + ('a' - 'A'))
+        : literalData[0];
+    bool hasNonAscii = false;
+    for (int i = 0; i < subjectSize; ++i) {
+        const ushort firstSubject = subjectData[i];
+        if (firstSubject > 0x7f) {
+            hasNonAscii = true;
+            continue;
+        }
+        const ushort foldedFirst =
+            firstSubject >= 'A' && firstSubject <= 'Z'
+                ? ushort(firstSubject + ('a' - 'A'))
+                : firstSubject;
+        if (foldedFirst != first || i + literalSize > subjectSize) {
+            continue;
+        }
+        bool matches = true;
+        for (int j = 1; j < literalSize; ++j) {
+            const ushort subjectChar = subjectData[i + j];
+            if (subjectChar > 0x7f) {
+                hasNonAscii = true;
+                matches = false;
+                break;
+            }
+            const ushort foldedSubject =
+                subjectChar >= 'A' && subjectChar <= 'Z'
+                    ? ushort(subjectChar + ('a' - 'A'))
+                    : subjectChar;
+            const ushort literalChar = literalData[j];
+            const ushort foldedLiteral =
+                literalChar >= 'A' && literalChar <= 'Z'
+                    ? ushort(literalChar + ('a' - 'A'))
+                    : literalChar;
+            if (foldedSubject != foldedLiteral) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return true;
+    }
+    return hasNonAscii;
 }
 
 QString compareSideSuffix(const QString& text) {
@@ -4470,6 +4654,7 @@ MainWindow::MainWindow(QWidget* parent)
 }
 
 MainWindow::~MainWindow() {
+    stopSignalConditionSearch();
     ++m_viewportLoadSerial;
     if (m_viewportLoadTimer) m_viewportLoadTimer->stop();
     if (m_viewportLoadThread.joinable()) m_viewportLoadThread.join();
@@ -4778,7 +4963,13 @@ void MainWindow::buildUi() {
 
     auto* findValueShortcut = new QShortcut(QKeySequence::Find, this);
     findValueShortcut->setContext(Qt::WindowShortcut);
-    connect(findValueShortcut, &QShortcut::activated, this, &MainWindow::openValueFindDialog);
+    connect(findValueShortcut, &QShortcut::activated, this, [this]() {
+        QWidget* focus = QApplication::focusWidget();
+        const bool treeHasFocus =
+            m_tree && focus && (focus == m_tree || m_tree->isAncestorOf(focus));
+        if (treeHasFocus) openSignalConditionSearchDialog();
+        else openValueFindDialog();
+    });
 
     auto* derivedSignalShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+E")), this);
     derivedSignalShortcut->setContext(Qt::WindowShortcut);
@@ -5590,6 +5781,7 @@ void MainWindow::loadDemoWave() {
 }
 
 void MainWindow::applyWave(WaveFile&& wave) {
+    stopSignalConditionSearch();
     stopTreeWarmup();
 
     const bool perf = viewerPerfLogEnabled();
@@ -5801,13 +5993,19 @@ bool MainWindow::runValueFindForBenchmark(const QString& targetText,
                                           int activeSignalCount,
                                           int* hitCount,
                                           quint64* resultChecksum,
-                                          qint64* elapsedMs) {
+                                          qint64* elapsedMs,
+                                          qint64 rangeStart,
+                                          qint64 rangeEnd) {
     activateFirstSignalsForBenchmark(activeSignalCount);
     if (!m_activeList || m_activeList->topLevelItemCount() <= 0) return false;
     m_activeList->selectAll();
     openValueFindDialog();
     if (!m_valueFindEdit) return false;
     m_valueFindEdit->setText(targetText);
+    if (rangeEnd > rangeStart && m_canvas && m_valueFindRangeCombo) {
+        m_canvas->commitViewportRange(rangeStart, rangeEnd);
+        m_valueFindRangeCombo->setCurrentIndex(1);
+    }
 
     QElapsedTimer timer;
     timer.start();
@@ -5821,7 +6019,6 @@ bool MainWindow::runValueFindForBenchmark(const QString& targetText,
     };
     for (const ValueFindHit& hit : m_valueFindHits) {
         mix(quint64(quint32(hit.signalIndex)));
-        mix(quint64(quint32(hit.sampleIndex)));
         mix(quint64(hit.time));
         mix(quint64(hit.duration));
     }
@@ -6282,6 +6479,1497 @@ void MainWindow::jumpSelectedTreeSignalToViewportEvent(bool firstEvent) {
     refreshActiveValueLabels();
 }
 
+void MainWindow::addSignalConditionValueRow(const QString& valueText,
+                                            const QString& ratioText) {
+    if (!m_signalConditionValueRowsLayout || !m_signalConditionSearchDialog) return;
+
+    SignalConditionValueRow row;
+    row.widget = new QWidget(m_signalConditionSearchDialog);
+    row.widget->setObjectName(QStringLiteral("signalConditionValueRow"));
+    auto* layout = new QHBoxLayout(row.widget);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(6);
+    row.valueEdit = new QLineEdit(row.widget);
+    row.valueEdit->setObjectName(QStringLiteral("signalConditionValue"));
+    row.valueEdit->setPlaceholderText(QStringLiteral("值，例如 0、0xA、-1"));
+    row.valueEdit->setText(valueText);
+    row.ratioEdit = new QLineEdit(row.widget);
+    row.ratioEdit->setObjectName(QStringLiteral("signalConditionRatio"));
+    row.ratioEdit->setFixedWidth(150);
+    row.ratioEdit->setPlaceholderText(QStringLiteral("最小时间占比(%)"));
+    row.ratioEdit->setText(ratioText);
+    row.ratioEdit->setToolTip(QStringLiteral("留空表示只要求该值存在；填写 0~100 时要求时间占比严格大于该比例。"));
+    row.removeButton = new QPushButton(QStringLiteral("删除"), row.widget);
+    row.removeButton->setObjectName(QStringLiteral("signalConditionRemoveValue"));
+    row.removeButton->setFixedWidth(58);
+    layout->addWidget(row.valueEdit, 1);
+    layout->addWidget(row.ratioEdit);
+    layout->addWidget(row.removeButton);
+    m_signalConditionValueRowsLayout->addWidget(row.widget);
+    m_signalConditionValueRows.push_back(row);
+
+    connect(row.removeButton, &QPushButton::clicked, this, [this, widget = row.widget]() {
+        removeSignalConditionValueRow(widget);
+    });
+}
+
+void MainWindow::removeSignalConditionValueRow(QWidget* rowWidget) {
+    if (!rowWidget) return;
+    for (int i = 0; i < m_signalConditionValueRows.size(); ++i) {
+        if (m_signalConditionValueRows.at(i).widget != rowWidget) continue;
+        const SignalConditionValueRow row = m_signalConditionValueRows.takeAt(i);
+        if (m_signalConditionValueRowsLayout) {
+            m_signalConditionValueRowsLayout->removeWidget(row.widget);
+        }
+        row.widget->deleteLater();
+        break;
+    }
+    if (m_signalConditionValueRows.isEmpty()) addSignalConditionValueRow();
+}
+
+void MainWindow::loadSignalConditionSearchSettings() {
+    if (!m_signalConditionSearchDialog) return;
+    QSettings settings(QStringLiteral("WaveTrace"), QStringLiteral("WaveViewer"));
+    settings.beginGroup(QStringLiteral("SignalConditionSearch"));
+    if (m_signalConditionScopeCheck) {
+        m_signalConditionScopeCheck->setChecked(
+            settings.value(QStringLiteral("selectedSubtree"), false).toBool());
+    }
+    if (m_signalConditionNameEdit) {
+        m_signalConditionNameEdit->setText(
+            settings.value(QStringLiteral("name")).toString());
+    }
+    if (m_signalConditionRegexCheck) {
+        m_signalConditionRegexCheck->setChecked(
+            settings.value(QStringLiteral("regex"), true).toBool());
+    }
+    if (m_signalConditionCaseCheck) {
+        m_signalConditionCaseCheck->setChecked(
+            settings.value(QStringLiteral("caseSensitive"), false).toBool());
+    }
+    if (m_signalConditionChangeMinEdit) {
+        m_signalConditionChangeMinEdit->setText(
+            settings.value(QStringLiteral("changeMin")).toString());
+    }
+    if (m_signalConditionChangeMaxEdit) {
+        m_signalConditionChangeMaxEdit->setText(
+            settings.value(QStringLiteral("changeMax")).toString());
+    }
+    const QStringList values = settings.value(QStringLiteral("values")).toStringList();
+    const QStringList ratios = settings.value(QStringLiteral("ratios")).toStringList();
+    settings.endGroup();
+
+    while (!m_signalConditionValueRows.isEmpty()) {
+        const SignalConditionValueRow row = m_signalConditionValueRows.takeLast();
+        if (m_signalConditionValueRowsLayout) {
+            m_signalConditionValueRowsLayout->removeWidget(row.widget);
+        }
+        delete row.widget;
+    }
+    const int rowCount = qMax(1, qMax(values.size(), ratios.size()));
+    for (int i = 0; i < rowCount; ++i) {
+        addSignalConditionValueRow(i < values.size() ? values.at(i) : QString(),
+                                   i < ratios.size() ? ratios.at(i) : QString());
+    }
+}
+
+void MainWindow::saveSignalConditionSearchSettings() const {
+    if (!m_signalConditionSearchDialog) return;
+    if (qEnvironmentVariableIntValue("WV_SIGNAL_SEARCH_BENCHMARK") != 0) return;
+    QSettings settings(QStringLiteral("WaveTrace"), QStringLiteral("WaveViewer"));
+    settings.beginGroup(QStringLiteral("SignalConditionSearch"));
+    settings.setValue(QStringLiteral("selectedSubtree"),
+                      m_signalConditionScopeCheck &&
+                      m_signalConditionScopeCheck->isChecked());
+    settings.setValue(QStringLiteral("name"),
+                      m_signalConditionNameEdit
+                          ? m_signalConditionNameEdit->text()
+                          : QString());
+    settings.setValue(QStringLiteral("regex"),
+                      !m_signalConditionRegexCheck ||
+                      m_signalConditionRegexCheck->isChecked());
+    settings.setValue(QStringLiteral("caseSensitive"),
+                      m_signalConditionCaseCheck &&
+                      m_signalConditionCaseCheck->isChecked());
+    settings.setValue(QStringLiteral("changeMin"),
+                      m_signalConditionChangeMinEdit
+                          ? m_signalConditionChangeMinEdit->text()
+                          : QString());
+    settings.setValue(QStringLiteral("changeMax"),
+                      m_signalConditionChangeMaxEdit
+                          ? m_signalConditionChangeMaxEdit->text()
+                          : QString());
+    QStringList values;
+    QStringList ratios;
+    values.reserve(m_signalConditionValueRows.size());
+    ratios.reserve(m_signalConditionValueRows.size());
+    for (const SignalConditionValueRow& row : m_signalConditionValueRows) {
+        values.push_back(row.valueEdit ? row.valueEdit->text() : QString());
+        ratios.push_back(row.ratioEdit ? row.ratioEdit->text() : QString());
+    }
+    settings.setValue(QStringLiteral("values"), values);
+    settings.setValue(QStringLiteral("ratios"), ratios);
+    settings.endGroup();
+    settings.sync();
+}
+
+void MainWindow::openSignalConditionSearchDialog() {
+    if (!m_signalConditionSearchDialog) {
+        m_signalConditionSearchDialog = new QDialog(this);
+        m_signalConditionSearchDialog->setObjectName(
+            QStringLiteral("signalConditionSearchDialog"));
+        m_signalConditionSearchDialog->setWindowTitle(QStringLiteral("条件查找信号"));
+        m_signalConditionSearchDialog->resize(760, 560);
+
+        auto* root = new QVBoxLayout(m_signalConditionSearchDialog);
+        root->setContentsMargins(12, 12, 12, 12);
+        root->setSpacing(9);
+
+        m_signalConditionScopeCheck = new QCheckBox(
+            QStringLiteral("仅在当前选中节点及其子节点中查找"),
+            m_signalConditionSearchDialog);
+        m_signalConditionScopeCheck->setObjectName(
+            QStringLiteral("signalConditionScope"));
+        m_signalConditionScopeCheck->setToolTip(
+            QStringLiteral("未勾选时查找整个待选信号树。"));
+        root->addWidget(m_signalConditionScopeCheck);
+
+        auto* nameRow = new QHBoxLayout();
+        nameRow->addWidget(new QLabel(QStringLiteral("名字"), m_signalConditionSearchDialog));
+        m_signalConditionNameEdit = new QLineEdit(m_signalConditionSearchDialog);
+        m_signalConditionNameEdit->setObjectName(
+            QStringLiteral("signalConditionName"));
+        m_signalConditionNameEdit->setPlaceholderText(
+            QStringLiteral("留空不限制；正则匹配完整层级路径"));
+        m_signalConditionRegexCheck = new QCheckBox(
+            QStringLiteral("正则"), m_signalConditionSearchDialog);
+        m_signalConditionRegexCheck->setObjectName(
+            QStringLiteral("signalConditionRegex"));
+        m_signalConditionCaseCheck = new QCheckBox(
+            QStringLiteral("区分大小写"), m_signalConditionSearchDialog);
+        m_signalConditionCaseCheck->setObjectName(
+            QStringLiteral("signalConditionCase"));
+        nameRow->addWidget(m_signalConditionNameEdit, 1);
+        nameRow->addWidget(m_signalConditionRegexCheck);
+        nameRow->addWidget(m_signalConditionCaseCheck);
+        root->addLayout(nameRow);
+
+        auto* changeRow = new QHBoxLayout();
+        changeRow->addWidget(new QLabel(QStringLiteral("变化次数"), m_signalConditionSearchDialog));
+        m_signalConditionChangeMinEdit = new QLineEdit(m_signalConditionSearchDialog);
+        m_signalConditionChangeMinEdit->setObjectName(
+            QStringLiteral("signalConditionChangeMin"));
+        m_signalConditionChangeMinEdit->setPlaceholderText(QStringLiteral("最小值（可空）"));
+        m_signalConditionChangeMaxEdit = new QLineEdit(m_signalConditionSearchDialog);
+        m_signalConditionChangeMaxEdit->setObjectName(
+            QStringLiteral("signalConditionChangeMax"));
+        m_signalConditionChangeMaxEdit->setPlaceholderText(QStringLiteral("最大值（可空）"));
+        changeRow->addWidget(m_signalConditionChangeMinEdit, 1);
+        changeRow->addWidget(new QLabel(QStringLiteral("~"), m_signalConditionSearchDialog));
+        changeRow->addWidget(m_signalConditionChangeMaxEdit, 1);
+        root->addLayout(changeRow);
+
+        auto* valuesTitleRow = new QHBoxLayout();
+        valuesTitleRow->addWidget(new QLabel(
+            QStringLiteral("值条件（多条之间为 AND）"),
+            m_signalConditionSearchDialog));
+        valuesTitleRow->addStretch(1);
+        auto* addValueButton = new QPushButton(
+            QStringLiteral("增加值条件"), m_signalConditionSearchDialog);
+        addValueButton->setObjectName(QStringLiteral("signalConditionAddValue"));
+        valuesTitleRow->addWidget(addValueButton);
+        root->addLayout(valuesTitleRow);
+
+        auto* valuesScroll = new QScrollArea(m_signalConditionSearchDialog);
+        valuesScroll->setWidgetResizable(true);
+        valuesScroll->setFrameShape(QFrame::NoFrame);
+        valuesScroll->setMinimumHeight(90);
+        valuesScroll->setMaximumHeight(230);
+        auto* valuesHost = new QWidget(valuesScroll);
+        m_signalConditionValueRowsLayout = new QVBoxLayout(valuesHost);
+        m_signalConditionValueRowsLayout->setContentsMargins(0, 0, 0, 0);
+        m_signalConditionValueRowsLayout->setSpacing(6);
+        valuesScroll->setWidget(valuesHost);
+        root->addWidget(valuesScroll);
+
+        auto* hint = new QLabel(
+            QStringLiteral("所有留空项均表示无要求。时间占比为空时只检查该值是否存在；"
+                           "填写比例时使用整个波形时间范围进行精确统计。结果保持父子树结构，最多显示前 5000 个匹配信号。"),
+            m_signalConditionSearchDialog);
+        hint->setWordWrap(true);
+        root->addWidget(hint);
+
+        root->addStretch(1);
+        m_signalConditionStatusLabel = new QLabel(
+            QStringLiteral("尚未搜索。"), m_signalConditionSearchDialog);
+        m_signalConditionStatusLabel->setObjectName(
+            QStringLiteral("signalConditionStatus"));
+        m_signalConditionStatusLabel->setWordWrap(true);
+        root->addWidget(m_signalConditionStatusLabel);
+
+        auto* buttons = new QHBoxLayout();
+        m_signalConditionSearchButton = new QPushButton(
+            QStringLiteral("查找"), m_signalConditionSearchDialog);
+        m_signalConditionSearchButton->setObjectName(
+            QStringLiteral("signalConditionSearch"));
+        m_signalConditionCancelButton = new QPushButton(
+            QStringLiteral("取消搜索"), m_signalConditionSearchDialog);
+        m_signalConditionCancelButton->setObjectName(
+            QStringLiteral("signalConditionCancel"));
+        m_signalConditionCancelButton->setEnabled(false);
+        auto* clearResultsButton = new QPushButton(
+            QStringLiteral("显示全部"), m_signalConditionSearchDialog);
+        auto* closeButton = new QPushButton(
+            QStringLiteral("关闭"), m_signalConditionSearchDialog);
+        buttons->addWidget(m_signalConditionSearchButton);
+        buttons->addWidget(m_signalConditionCancelButton);
+        buttons->addWidget(clearResultsButton);
+        buttons->addStretch(1);
+        buttons->addWidget(closeButton);
+        root->addLayout(buttons);
+
+        connect(addValueButton, &QPushButton::clicked, this, [this]() {
+            addSignalConditionValueRow();
+        });
+        connect(m_signalConditionSearchButton, &QPushButton::clicked,
+                this, &MainWindow::startSignalConditionSearch);
+        connect(m_signalConditionCancelButton, &QPushButton::clicked,
+                this, &MainWindow::cancelSignalConditionSearch);
+        connect(clearResultsButton, &QPushButton::clicked, this, [this]() {
+            SignalTreeModel* model = m_treeModel
+                ? signalTreeModelFrom(m_treeModel)
+                : nullptr;
+            if (model) model->clearSearch();
+            if (m_treeSearchEdit) {
+                const QSignalBlocker blocker(m_treeSearchEdit);
+                m_treeSearchEdit->clear();
+            }
+            if (m_signalConditionStatusLabel) {
+                m_signalConditionStatusLabel->setText(
+                    QStringLiteral("已恢复显示完整待选信号树。"));
+            }
+        });
+        connect(m_signalConditionNameEdit, &QLineEdit::returnPressed,
+                this, &MainWindow::startSignalConditionSearch);
+        connect(closeButton, &QPushButton::clicked, this, [this]() {
+            saveSignalConditionSearchSettings();
+            if (m_signalConditionSearchDialog) m_signalConditionSearchDialog->hide();
+        });
+        connect(m_signalConditionSearchDialog, &QDialog::finished,
+                this, [this](int) { saveSignalConditionSearchSettings(); });
+
+        loadSignalConditionSearchSettings();
+    }
+
+    m_signalConditionSearchDialog->show();
+    m_signalConditionSearchDialog->raise();
+    m_signalConditionSearchDialog->activateWindow();
+    if (m_signalConditionNameEdit) {
+        m_signalConditionNameEdit->setFocus();
+        m_signalConditionNameEdit->selectAll();
+    }
+}
+
+void MainWindow::cancelSignalConditionSearch() {
+    if (m_signalConditionSearchCancel) {
+        m_signalConditionSearchCancel->store(true, std::memory_order_release);
+    }
+    if (m_signalConditionStatusLabel) {
+        m_signalConditionStatusLabel->setText(
+            QStringLiteral("正在取消；当前解码批次结束后停止……"));
+    }
+}
+
+void MainWindow::stopSignalConditionSearch() {
+    ++m_signalConditionSearchGeneration;
+    if (m_signalConditionSearchCancel) {
+        m_signalConditionSearchCancel->store(true, std::memory_order_release);
+    }
+    if (m_signalConditionSearchThread.joinable()) {
+        m_signalConditionSearchThread.join();
+    }
+    m_signalConditionSearchCancel.reset();
+    if (m_signalConditionSearchButton) m_signalConditionSearchButton->setEnabled(true);
+    if (m_signalConditionCancelButton) m_signalConditionCancelButton->setEnabled(false);
+}
+
+void MainWindow::applySignalConditionSearchResults(
+        const QVector<int>& matchedNodeIds,
+        qint64 examinedSignals,
+        qint64 nameCandidates,
+        qint64 elapsedMs,
+        bool truncated,
+        const QString& error) {
+    if (m_signalConditionSearchThread.joinable() &&
+        m_signalConditionSearchThread.get_id() != std::this_thread::get_id()) {
+        m_signalConditionSearchThread.join();
+    }
+    m_signalConditionSearchCancel.reset();
+    if (m_signalConditionSearchButton) m_signalConditionSearchButton->setEnabled(true);
+    if (m_signalConditionCancelButton) m_signalConditionCancelButton->setEnabled(false);
+
+    if (!error.isEmpty()) {
+        if (m_signalConditionStatusLabel) {
+            m_signalConditionStatusLabel->setText(
+                QStringLiteral("查找失败：%1").arg(error));
+        }
+        statusBar()->showMessage(QStringLiteral("信号条件查找失败：%1").arg(error), 5000);
+        return;
+    }
+
+    SignalTreeModel* model = m_treeModel
+        ? signalTreeModelFrom(m_treeModel)
+        : nullptr;
+    if (model) {
+        if (m_treeSearchEdit) {
+            const QSignalBlocker blocker(m_treeSearchEdit);
+            m_treeSearchEdit->clear();
+        }
+        model->setSearchRoots(matchedNodeIds);
+
+        auto expandAncestorsTo = [this, model](int nodeId) {
+            if (!m_signalTreeModel) return;
+            QVector<int> chain;
+            int current = nodeId;
+            int guard = 0;
+            while (m_signalTreeModel->isValidNodeId(current) &&
+                   guard++ < m_signalTreeModel->nodeCount()) {
+                chain.push_back(current);
+                current = m_signalTreeModel->nodeParent(current);
+            }
+            for (int i = chain.size() - 1; i >= 1; --i) {
+                const QModelIndex index = model->indexForNode(chain.at(i));
+                if (index.isValid()) m_tree->expand(index);
+            }
+        };
+        const int expandLimit = qMin(matchedNodeIds.size(), 512);
+        for (int i = 0; i < expandLimit; ++i) {
+            expandAncestorsTo(matchedNodeIds.at(i));
+        }
+        if (!matchedNodeIds.isEmpty()) {
+            const QModelIndex first = model->indexForNode(matchedNodeIds.first());
+            if (first.isValid()) {
+                m_tree->scrollTo(first, QAbstractItemView::PositionAtTop);
+            }
+        }
+    }
+
+    QString summary = QStringLiteral(
+        "完成：检查 %1 个信号，名字预筛通过 %2 个，匹配 %3 个，用时 %4 ms。")
+        .arg(examinedSignals)
+        .arg(nameCandidates)
+        .arg(matchedNodeIds.size())
+        .arg(elapsedMs);
+    if (truncated) {
+        summary += QStringLiteral(" 已达到 5000 个结果上限，仅显示前 5000 个。");
+    }
+    if (m_signalConditionStatusLabel) {
+        m_signalConditionStatusLabel->setText(summary);
+    }
+    statusBar()->showMessage(summary, 5000);
+}
+
+void MainWindow::startSignalConditionSearch() {
+    if (!m_signalConditionSearchDialog || !m_signalConditionNameEdit) return;
+
+    struct SearchValueCondition {
+        ParsedValueFindTarget target;
+        bool requireRatio = false;
+        long double minimumPercent = 0.0L;
+    };
+
+    const bool selectedSubtree =
+        m_signalConditionScopeCheck && m_signalConditionScopeCheck->isChecked();
+    const QString nameText = m_signalConditionNameEdit->text().trimmed();
+    const bool regexMode =
+        m_signalConditionRegexCheck && m_signalConditionRegexCheck->isChecked();
+    const Qt::CaseSensitivity caseSensitivity =
+        (m_signalConditionCaseCheck && m_signalConditionCaseCheck->isChecked())
+            ? Qt::CaseSensitive
+            : Qt::CaseInsensitive;
+
+    QRegularExpression nameRegex;
+    QString regexRequiredLiteral;
+    bool regexRequiredLiteralIsAscii = false;
+    if (!nameText.isEmpty() && regexMode) {
+        QRegularExpression::PatternOptions options =
+            QRegularExpression::NoPatternOption;
+        if (caseSensitivity == Qt::CaseInsensitive) {
+            options |= QRegularExpression::CaseInsensitiveOption;
+        }
+        nameRegex = QRegularExpression(nameText, options);
+        if (!nameRegex.isValid()) {
+            m_signalConditionStatusLabel->setText(
+                QStringLiteral("名字正则无效：%1").arg(nameRegex.errorString()));
+            return;
+        }
+        regexRequiredLiteral =
+            conservativeRegexRequiredLiteral(nameRegex.pattern());
+        regexRequiredLiteralIsAscii =
+            isAsciiText(regexRequiredLiteral);
+    }
+
+    auto parseCountBound = [&](QLineEdit* edit, qint64& value,
+                               bool& present, const QString& label) {
+        const QString text = edit ? edit->text().trimmed() : QString();
+        present = !text.isEmpty();
+        if (!present) return true;
+        bool ok = false;
+        value = text.toLongLong(&ok, 10);
+        if (!ok || value < 0) {
+            m_signalConditionStatusLabel->setText(
+                QStringLiteral("%1必须是非负整数。").arg(label));
+            return false;
+        }
+        return true;
+    };
+
+    qint64 changeMin = 0;
+    qint64 changeMax = 0;
+    bool haveChangeMin = false;
+    bool haveChangeMax = false;
+    if (!parseCountBound(m_signalConditionChangeMinEdit, changeMin,
+                         haveChangeMin, QStringLiteral("变化次数最小值")) ||
+        !parseCountBound(m_signalConditionChangeMaxEdit, changeMax,
+                         haveChangeMax, QStringLiteral("变化次数最大值"))) {
+        return;
+    }
+    if (haveChangeMin && haveChangeMax && changeMin > changeMax) {
+        m_signalConditionStatusLabel->setText(
+            QStringLiteral("变化次数最小值不能大于最大值。"));
+        return;
+    }
+
+    QVector<SearchValueCondition> valueConditions;
+    valueConditions.reserve(m_signalConditionValueRows.size());
+    for (int rowIndex = 0; rowIndex < m_signalConditionValueRows.size(); ++rowIndex) {
+        const SignalConditionValueRow& row =
+            m_signalConditionValueRows.at(rowIndex);
+        const QString valueText =
+            row.valueEdit ? row.valueEdit->text().trimmed() : QString();
+        const QString ratioText =
+            row.ratioEdit ? row.ratioEdit->text().trimmed() : QString();
+        if (valueText.isEmpty() && ratioText.isEmpty()) continue;
+        if (valueText.isEmpty()) {
+            m_signalConditionStatusLabel->setText(
+                QStringLiteral("第 %1 条值条件填写了比例但没有填写值。")
+                    .arg(rowIndex + 1));
+            return;
+        }
+        SearchValueCondition condition;
+        if (!parseValueFindTargetText(valueText, condition.target)) {
+            m_signalConditionStatusLabel->setText(
+                QStringLiteral("第 %1 条值条件不是有效数值。")
+                    .arg(rowIndex + 1));
+            return;
+        }
+        if (!ratioText.isEmpty()) {
+            bool ok = false;
+            const double percent = ratioText.toDouble(&ok);
+            if (!ok || !std::isfinite(percent) || percent < 0.0 || percent > 100.0) {
+                m_signalConditionStatusLabel->setText(
+                    QStringLiteral("第 %1 条时间占比必须是 0~100。")
+                        .arg(rowIndex + 1));
+                return;
+            }
+            condition.requireRatio = true;
+            condition.minimumPercent = static_cast<long double>(percent);
+        }
+        valueConditions.push_back(condition);
+    }
+
+    QVector<int> selectedNodeIds;
+    QVector<int> fallbackScopedSignalIndexes;
+    if (selectedSubtree) {
+        QModelIndexList picked;
+        if (m_tree && m_tree->selectionModel()) {
+            picked = m_tree->selectionModel()->selectedRows(0);
+        }
+        if (picked.isEmpty() && m_tree && m_tree->currentIndex().isValid()) {
+            picked.push_back(m_tree->currentIndex());
+        }
+        QSet<int> seenNodes;
+        for (const QModelIndex& index : picked) {
+            const QVariant nodeValue = index.data(kTreeRoleNodeId);
+            if (!nodeValue.isValid()) continue;
+            const int nodeId = nodeValue.toInt();
+            if (nodeId < 0 || seenNodes.contains(nodeId)) continue;
+            seenNodes.insert(nodeId);
+            selectedNodeIds.push_back(nodeId);
+        }
+        if (selectedNodeIds.isEmpty()) {
+            m_signalConditionStatusLabel->setText(
+                QStringLiteral("请先在待选信号树中选择一个或多个节点。"));
+            return;
+        }
+        if (!m_wave.tree.valid) {
+            const QList<int> scoped = selectedTreeSignalIndexesForViewportJump();
+            fallbackScopedSignalIndexes = scoped.toVector();
+        }
+    }
+
+    QVector<int> fallbackNodeIdBySignalIndex;
+    if (!m_wave.tree.valid && m_signalTreeModel) {
+        fallbackNodeIdBySignalIndex.resize(m_wave.signalList.size());
+        for (int signalIndex = 0; signalIndex < m_wave.signalList.size();
+             ++signalIndex) {
+            fallbackNodeIdBySignalIndex[signalIndex] =
+                m_signalTreeModel->nodeIdForSignalIndex(signalIndex);
+        }
+    }
+
+    saveSignalConditionSearchSettings();
+    stopSignalConditionSearch();
+
+    const quint64 generation = ++m_signalConditionSearchGeneration;
+    const quint64 waveGeneration = m_waveFileGeneration;
+    std::shared_ptr<std::atomic_bool> cancel(new std::atomic_bool(false));
+    m_signalConditionSearchCancel = cancel;
+    if (m_signalConditionSearchButton) m_signalConditionSearchButton->setEnabled(false);
+    if (m_signalConditionCancelButton) m_signalConditionCancelButton->setEnabled(true);
+    if (m_signalConditionStatusLabel) {
+        m_signalConditionStatusLabel->setText(
+            QStringLiteral("正在后台预筛名字和范围……"));
+    }
+
+    const bool needStatistics =
+        haveChangeMin || haveChangeMax || !valueConditions.isEmpty();
+    const std::shared_ptr<WaveParser4Reader> reader = m_waveReader;
+    const std::shared_ptr<std::mutex> readerMutex = m_waveReaderMutex;
+    const bool canLoadOnDemand =
+        m_currentWaveSupportsOnDemand && bool(reader) && bool(readerMutex);
+
+    m_signalConditionSearchThread = std::thread(
+        [this, generation, waveGeneration, cancel, selectedSubtree,
+         selectedNodeIds, fallbackScopedSignalIndexes,
+         fallbackNodeIdBySignalIndex, nameText, regexMode, nameRegex,
+         regexRequiredLiteral, regexRequiredLiteralIsAscii, caseSensitivity,
+         haveChangeMin, haveChangeMax, changeMin, changeMax,
+         valueConditions, needStatistics, reader, readerMutex,
+         canLoadOnDemand]() mutable {
+        QElapsedTimer timer;
+        timer.start();
+        const WaveFile& wave = m_wave;
+        const qint64 waveStart = wave.meta.start;
+        const qint64 waveEnd = wave.meta.end;
+        const qint64 totalDuration = qMax<qint64>(0, waveEnd - waveStart);
+        constexpr int kResultLimit = 5000;
+        // Amortize footer/index lookup and file-handle setup while staying far
+        // below the 20M exact-sample safety budget for ordinary traces.
+        constexpr int kDecodeBatchSize = 1024;
+
+        QVector<int> matchedNodeIds;
+        matchedNodeIds.reserve(1024);
+        QVector<int> decodeBatch;
+        decodeBatch.reserve(kDecodeBatchSize);
+        qint64 examinedSignals = 0;
+        qint64 nameCandidates = 0;
+        bool truncated = false;
+        QString error;
+
+        auto nodeIdForSignal = [&](int signalIndex) {
+            if (wave.tree.valid &&
+                signalIndex >= 0 &&
+                signalIndex < wave.tree.signalIndexToNodeId.size()) {
+                return wave.tree.signalIndexToNodeId.at(signalIndex);
+            }
+            return signalIndex >= 0 &&
+                   signalIndex < fallbackNodeIdBySignalIndex.size()
+                ? fallbackNodeIdBySignalIndex.at(signalIndex)
+                : -1;
+        };
+
+        auto nameMatches = [&](int signalIndex,
+                               const QString* segmentOverride,
+                               const QString* fullPathOverride) {
+            if (nameText.isEmpty()) return true;
+            const QString segment = segmentOverride
+                ? *segmentOverride
+                : waveSignalSegmentName(wave, signalIndex);
+            if (regexMode) {
+                if (regexRequiredLiteralMayOccur(
+                        segment, regexRequiredLiteral,
+                        regexRequiredLiteralIsAscii, caseSensitivity) &&
+                    nameRegex.match(segment).hasMatch()) {
+                    return true;
+                }
+                const QString fullPath = fullPathOverride
+                    ? *fullPathOverride
+                    : waveSignalFullPath(wave, signalIndex);
+                return regexRequiredLiteralMayOccur(
+                           fullPath, regexRequiredLiteral,
+                           regexRequiredLiteralIsAscii, caseSensitivity) &&
+                       nameRegex.match(fullPath).hasMatch();
+            }
+            if (segment.contains(nameText, caseSensitivity)) return true;
+            const QString fullPath = fullPathOverride
+                ? *fullPathOverride
+                : waveSignalFullPath(wave, signalIndex);
+            return fullPath.contains(nameText, caseSensitivity);
+        };
+
+        auto proceduralClockChangeCount = [&](const WaveSignal& signal) -> qint64 {
+            if (!signal.proceduralClock || signal.clockTogglePeriodTicks == 0 ||
+                waveEnd <= waveStart || waveEnd <= 0) {
+                return 0;
+            }
+            const quint64 period = signal.clockTogglePeriodTicks;
+            const quint64 firstTime = quint64(qMax<qint64>(1, waveStart));
+            quint64 firstMultiple = firstTime / period;
+            if ((firstTime % period) != 0) ++firstMultiple;
+            if (firstMultiple == 0) firstMultiple = 1;
+            const quint64 lastTime = quint64(waveEnd - 1);
+            const quint64 lastMultiple = lastTime / period;
+            if (lastMultiple < firstMultiple) return 0;
+            const quint64 count = lastMultiple - firstMultiple + 1u;
+            return count > quint64((std::numeric_limits<qint64>::max)())
+                ? (std::numeric_limits<qint64>::max)()
+                : qint64(count);
+        };
+
+        auto clockTrueDurationFromZero = [](const WaveSignal& signal,
+                                            qint64 endTime) -> qint64 {
+            if (endTime <= 0 || signal.clockTogglePeriodTicks == 0) return 0;
+            const quint64 period = signal.clockTogglePeriodTicks;
+            const quint64 end = quint64(endTime);
+            const quint64 fullIntervals = end / period;
+            const quint64 remainder = end % period;
+            const quint64 trueFullIntervals = signal.clockInitialValue
+                ? (fullIntervals + 1u) / 2u
+                : fullIntervals / 2u;
+            quint64 duration = trueFullIntervals * period;
+            const bool remainderIsTrue =
+                ((fullIntervals & 1u) == 0u)
+                    ? signal.clockInitialValue
+                    : !signal.clockInitialValue;
+            if (remainderIsTrue) duration += remainder;
+            return duration > quint64((std::numeric_limits<qint64>::max)())
+                ? (std::numeric_limits<qint64>::max)()
+                : qint64(duration);
+        };
+
+        auto signalPassesStatistics = [&](const WaveSignal& signal) {
+            qint64 changeCount = 0;
+            if (signal.proceduralClock) {
+                changeCount = proceduralClockChangeCount(signal);
+            } else {
+                for (int i = 1; i < signal.samples.size(); ++i) {
+                    const WaveSample& current = signal.samples.at(i);
+                    if (current.time < waveStart) continue;
+                    if (current.time >= waveEnd) break;
+                    if (!waveSamplesEquivalent(current, signal.samples.at(i - 1))) {
+                        if (changeCount < (std::numeric_limits<qint64>::max)()) {
+                            ++changeCount;
+                        }
+                    }
+                }
+            }
+            if (haveChangeMin && changeCount < changeMin) return false;
+            if (haveChangeMax && changeCount > changeMax) return false;
+            if (valueConditions.isEmpty()) return true;
+            if (totalDuration <= 0) return false;
+
+            QVector<quint64> targetBits;
+            targetBits.reserve(valueConditions.size());
+            for (const SearchValueCondition& condition : valueConditions) {
+                quint64 bits = 0;
+                if (!valueFindTargetForSignal(condition.target,
+                                              signal.width, bits)) {
+                    return false;
+                }
+                targetBits.push_back(bits);
+            }
+
+            QVector<qint64> matchedDurations(valueConditions.size(), 0);
+            QVector<uchar> exists(valueConditions.size(), uchar(0));
+            if (signal.proceduralClock) {
+                const qint64 trueDuration =
+                    clockTrueDurationFromZero(signal, waveEnd) -
+                    clockTrueDurationFromZero(signal, qMax<qint64>(0, waveStart));
+                const qint64 falseDuration = totalDuration - trueDuration;
+                for (int conditionIndex = 0;
+                     conditionIndex < valueConditions.size(); ++conditionIndex) {
+                    const qint64 duration =
+                        (targetBits.at(conditionIndex) & 1u)
+                            ? trueDuration : falseDuration;
+                    matchedDurations[conditionIndex] = qMax<qint64>(0, duration);
+                    exists[conditionIndex] = duration > 0 ? 1 : 0;
+                }
+            } else {
+                const quint64 mask = waveBitMaskForWidth(signal.width);
+                for (int sampleIndex = 0;
+                     sampleIndex < signal.samples.size(); ++sampleIndex) {
+                    WaveSample sample = signal.samples.at(sampleIndex);
+                    hydrateWaveSampleRawFields(signal.kind, signal.width, sample);
+                    if (sample.isAbsent || sample.isZ) continue;
+                    const qint64 segmentStart =
+                        qMax(waveStart, sample.time);
+                    const qint64 nextTime =
+                        sampleIndex + 1 < signal.samples.size()
+                            ? signal.samples.at(sampleIndex + 1).time
+                            : waveEnd;
+                    const qint64 segmentEnd = qMin(waveEnd, nextTime);
+                    if (segmentEnd <= segmentStart) continue;
+                    const qint64 duration = segmentEnd - segmentStart;
+                    const quint64 bits = sample.rawBits & mask;
+                    for (int conditionIndex = 0;
+                         conditionIndex < valueConditions.size();
+                         ++conditionIndex) {
+                        if (bits != targetBits.at(conditionIndex)) continue;
+                        exists[conditionIndex] = 1;
+                        const qint64 old = matchedDurations.at(conditionIndex);
+                        matchedDurations[conditionIndex] =
+                            duration > (std::numeric_limits<qint64>::max)() - old
+                                ? (std::numeric_limits<qint64>::max)()
+                                : old + duration;
+                    }
+                }
+            }
+
+            for (int conditionIndex = 0;
+                 conditionIndex < valueConditions.size(); ++conditionIndex) {
+                const SearchValueCondition& condition =
+                    valueConditions.at(conditionIndex);
+                if (!exists.at(conditionIndex)) return false;
+                if (condition.requireRatio) {
+                    const long double lhs =
+                        static_cast<long double>(
+                            matchedDurations.at(conditionIndex)) * 100.0L;
+                    const long double rhs =
+                        condition.minimumPercent *
+                        static_cast<long double>(totalDuration);
+                    if (!(lhs > rhs)) return false;
+                }
+            }
+            return true;
+        };
+
+        auto appendMatchedSignal = [&](int signalIndex) {
+            const int nodeId = nodeIdForSignal(signalIndex);
+            if (nodeId < 0) return;
+            matchedNodeIds.push_back(nodeId);
+            if (matchedNodeIds.size() >= kResultLimit) {
+                truncated = true;
+            }
+        };
+
+        auto processDecodeBatch = [&]() -> bool {
+            if (decodeBatch.isEmpty()) return true;
+            if (cancel->load(std::memory_order_acquire)) return false;
+
+            if (!needStatistics) {
+                for (int signalIndex : decodeBatch) {
+                    appendMatchedSignal(signalIndex);
+                    if (truncated) break;
+                }
+                decodeBatch.clear();
+                return !truncated;
+            }
+
+            if (canLoadOnDemand) {
+                std::function<bool(int, int)> processOnDemandRange;
+                processOnDemandRange = [&](int begin, int end) {
+                    if (begin >= end) return true;
+                    if (cancel->load(std::memory_order_acquire) ||
+                        truncated) {
+                        return false;
+                    }
+
+                    QVector<int> signalIds;
+                    signalIds.reserve(end - begin);
+                    for (int i = begin; i < end; ++i) {
+                        const int signalIndex = decodeBatch.at(i);
+                        if (signalIndex < 0 ||
+                            signalIndex >= wave.signalList.size()) {
+                            continue;
+                        }
+                        const int signalId =
+                            wave.signalList.at(signalIndex).signalId;
+                        if (signalId > 0) signalIds.push_back(signalId);
+                    }
+
+                    WaveFile loadedWave;
+                    QString loadError;
+                    bool loadedOk = false;
+                    {
+                        std::lock_guard<std::mutex> lock(*readerMutex);
+                        loadedOk = reader->loadSignals(
+                            signalIds, loadedWave, loadError,
+                            kViewerOnDemandSampleBudget,
+                            waveStart, waveEnd);
+                    }
+                    if (!loadedOk) {
+                        const bool budgetExceeded =
+                            loadError.startsWith(QStringLiteral(
+                                "WVZ4 decoded sample limit exceeded"));
+                        if (budgetExceeded && end - begin > 1) {
+                            const int middle =
+                                begin + (end - begin) / 2;
+                            return processOnDemandRange(begin, middle) &&
+                                   processOnDemandRange(middle, end);
+                        }
+                        error = loadError;
+                        return false;
+                    }
+
+                    QHash<int, const WaveSignal*> loadedBySignalId;
+                    loadedBySignalId.reserve(
+                        loadedWave.signalList.size() * 2 + 1);
+                    for (const WaveSignal& signal : loadedWave.signalList) {
+                        loadedBySignalId.insert(signal.signalId, &signal);
+                    }
+                    for (int i = begin; i < end; ++i) {
+                        if (cancel->load(std::memory_order_acquire)) {
+                            return false;
+                        }
+                        const int signalIndex = decodeBatch.at(i);
+                        if (signalIndex < 0 ||
+                            signalIndex >= wave.signalList.size()) {
+                            continue;
+                        }
+                        const WaveSignal& directorySignal =
+                            wave.signalList.at(signalIndex);
+                        const WaveSignal* signal =
+                            loadedBySignalId.value(
+                                directorySignal.signalId, nullptr);
+                        if (!signal) continue;
+                        if (signalPassesStatistics(*signal)) {
+                            appendMatchedSignal(signalIndex);
+                            if (truncated) return false;
+                        }
+                    }
+                    return true;
+                };
+
+                const bool ok =
+                    processOnDemandRange(0, decodeBatch.size());
+                decodeBatch.clear();
+                return ok && !truncated;
+            }
+
+            for (int signalIndex : decodeBatch) {
+                if (cancel->load(std::memory_order_acquire)) return false;
+                if (signalIndex < 0 ||
+                    signalIndex >= wave.signalList.size()) {
+                    continue;
+                }
+                const WaveSignal& signal = wave.signalList.at(signalIndex);
+                if (signalPassesStatistics(signal)) {
+                    appendMatchedSignal(signalIndex);
+                    if (truncated) break;
+                }
+            }
+            decodeBatch.clear();
+            return !truncated;
+        };
+
+        auto considerSignal = [&](int signalIndex,
+                                  const QString* segmentOverride = nullptr,
+                                  const QString* fullPathOverride = nullptr) -> bool {
+            if (cancel->load(std::memory_order_acquire) || truncated) return false;
+            if (signalIndex < 0 || signalIndex >= wave.signalList.size()) return true;
+            ++examinedSignals;
+            if (!nameMatches(signalIndex, segmentOverride, fullPathOverride)) return true;
+            ++nameCandidates;
+            decodeBatch.push_back(signalIndex);
+            if (decodeBatch.size() >= kDecodeBatchSize) {
+                if (!processDecodeBatch()) return false;
+            }
+            if ((examinedSignals & 0x3ffff) == 0) {
+                const qint64 examinedSnapshot = examinedSignals;
+                const qint64 candidateSnapshot = nameCandidates;
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, generation, waveGeneration,
+                     examinedSnapshot, candidateSnapshot]() {
+                        if (generation != m_signalConditionSearchGeneration ||
+                            waveGeneration != m_waveFileGeneration ||
+                            !m_signalConditionStatusLabel) {
+                            return;
+                        }
+                        m_signalConditionStatusLabel->setText(
+                            QStringLiteral(
+                                "后台查找中：已检查 %1 个信号，名字预筛通过 %2 个……")
+                                .arg(examinedSnapshot)
+                                .arg(candidateSnapshot));
+                    },
+                    Qt::QueuedConnection);
+            }
+            return true;
+        };
+
+        auto traverseTreeSubtrees = [&](const QVector<int>& rootNodeIds,
+                                        bool includeAncestorPath) {
+            QBitArray visitedNodes(wave.tree.nodesById.size(), false);
+            QBitArray visitedSignals(wave.signalList.size(), false);
+            struct TreeWalkFrame {
+                int nodeId = 0;
+                int restorePathLength = 0;
+                bool exit = false;
+            };
+            QVector<TreeWalkFrame> pending;
+            pending.reserve(1024);
+            QVector<int> children;
+            QVector<QString> ancestorSegments;
+            QString path;
+            path.reserve(256);
+            const bool buildPaths = !nameText.isEmpty();
+
+            for (int rootNodeId : rootNodeIds) {
+                if (truncated || cancel->load(std::memory_order_acquire)) break;
+                if (rootNodeId <= 0 ||
+                    rootNodeId >= wave.tree.nodesById.size() ||
+                    visitedNodes.testBit(rootNodeId)) {
+                    continue;
+                }
+
+                path.clear();
+                if (buildPaths && includeAncestorPath) {
+                    ancestorSegments.clear();
+                    int parentId =
+                        wave.tree.nodesById.at(rootNodeId).parentId;
+                    int guard = 0;
+                    while (parentId > 0 &&
+                           parentId < wave.tree.nodesById.size() &&
+                           guard++ < wave.tree.nodesById.size()) {
+                        const WaveTreeNode& parent =
+                            wave.tree.nodesById.at(parentId);
+                        if (!parent.valid) break;
+                        const QString segment =
+                            waveTreeNameTokenText(wave.tree, parent.nameToken);
+                        if (!segment.isEmpty()) {
+                            ancestorSegments.push_back(segment);
+                        }
+                        parentId = parent.parentId;
+                    }
+                    for (int i = ancestorSegments.size() - 1; i >= 0; --i) {
+                        if (!path.isEmpty()) path += QLatin1Char('.');
+                        path += ancestorSegments.at(i);
+                    }
+                }
+
+                pending.clear();
+                pending.push_back(TreeWalkFrame{rootNodeId, path.size(), false});
+                while (!pending.isEmpty() && !truncated &&
+                       !cancel->load(std::memory_order_acquire)) {
+                    const TreeWalkFrame frame = pending.takeLast();
+                    if (frame.exit) {
+                        path.resize(frame.restorePathLength);
+                        continue;
+                    }
+
+                    const int nodeId = frame.nodeId;
+                    if (nodeId <= 0 ||
+                        nodeId >= wave.tree.nodesById.size() ||
+                        visitedNodes.testBit(nodeId)) {
+                        continue;
+                    }
+                    visitedNodes.setBit(nodeId);
+                    const WaveTreeNode& node = wave.tree.nodesById.at(nodeId);
+                    if (!node.valid) continue;
+
+                    const int restorePathLength = path.size();
+                    QString segment;
+                    if (buildPaths) {
+                        segment =
+                            waveTreeNameTokenText(wave.tree, node.nameToken);
+                        if (!segment.isEmpty()) {
+                            if (!path.isEmpty()) path += QLatin1Char('.');
+                            path += segment;
+                        }
+                    }
+                    if (node.signalIndex >= 0) {
+                        const int signalIndex = node.signalIndex;
+                        if (signalIndex >= 0 &&
+                            signalIndex < visitedSignals.size() &&
+                            !visitedSignals.testBit(signalIndex)) {
+                            visitedSignals.setBit(signalIndex);
+                            if (!considerSignal(
+                                    signalIndex,
+                                    buildPaths ? &segment : nullptr,
+                                    buildPaths ? &path : nullptr)) {
+                                break;
+                            }
+                        }
+                        path.resize(restorePathLength);
+                        continue;
+                    }
+
+                    pending.push_back(
+                        TreeWalkFrame{0, restorePathLength, true});
+                    children.clear();
+                    int childId = node.firstChild;
+                    int guard = 0;
+                    while (childId != 0 &&
+                           guard++ < wave.tree.nodesById.size()) {
+                        if (childId <= 0 ||
+                            childId >= wave.tree.nodesById.size()) {
+                            break;
+                        }
+                        children.push_back(childId);
+                        childId =
+                            wave.tree.nodesById.at(childId).nextSibling;
+                    }
+                    for (int i = children.size() - 1; i >= 0; --i) {
+                        pending.push_back(
+                            TreeWalkFrame{children.at(i), path.size(), false});
+                    }
+                }
+            }
+        };
+
+        bool nameDictionaryRejectedAll = false;
+        if (!selectedSubtree && regexMode &&
+            !regexRequiredLiteral.isEmpty() &&
+            !regexRequiredLiteral.contains(QLatin1Char('.')) &&
+            wave.tree.valid) {
+            bool mayOccurInNamedSegment = false;
+            for (int nameId = 1;
+                 nameId < wave.tree.namesById.size(); ++nameId) {
+                const QString segment =
+                    QString::fromUtf8(wave.tree.namesById.at(nameId));
+                if (regexRequiredLiteralMayOccur(
+                        segment, regexRequiredLiteral,
+                        regexRequiredLiteralIsAscii, caseSensitivity)) {
+                    mayOccurInNamedSegment = true;
+                    break;
+                }
+            }
+
+            // Array-index tokens render as "[digits]". Be conservative for
+            // literals made only of characters that such a token can contain.
+            bool mayOccurInArrayIndex = true;
+            for (const QChar ch : regexRequiredLiteral) {
+                if (!ch.isDigit() && ch != QLatin1Char('[') &&
+                    ch != QLatin1Char(']')) {
+                    mayOccurInArrayIndex = false;
+                    break;
+                }
+            }
+            if (!mayOccurInNamedSegment && !mayOccurInArrayIndex) {
+                nameDictionaryRejectedAll = true;
+                examinedSignals = wave.signalList.size();
+            }
+        }
+
+        bool usedParallelTreeNameSearch = false;
+        if (!nameDictionaryRejectedAll &&
+            !needStatistics && !selectedSubtree && wave.tree.valid &&
+            !wave.tree.rootNodeIds.isEmpty() &&
+            wave.signalList.size() >= 250000) {
+            struct ParallelTreeTask {
+                QVector<int> roots;
+            };
+            QVector<ParallelTreeTask> tasks;
+            tasks.push_back(ParallelTreeTask{wave.tree.rootNodeIds});
+
+            const int hardwareThreads =
+                int(std::thread::hardware_concurrency());
+            const int workerTarget = qBound(2, hardwareThreads, 4);
+            const int taskTarget = workerTarget * 4;
+            int splitGuard = 0;
+            while (tasks.size() < taskTarget &&
+                   splitGuard++ < wave.tree.nodesById.size()) {
+                bool split = false;
+                for (int taskIndex = 0; taskIndex < tasks.size(); ++taskIndex) {
+                    QVector<int> roots = tasks.at(taskIndex).roots;
+                    if (roots.size() > 1) {
+                        const int middle = roots.size() / 2;
+                        ParallelTreeTask left;
+                        ParallelTreeTask right;
+                        left.roots = roots.mid(0, middle);
+                        right.roots = roots.mid(middle);
+                        tasks[taskIndex] = std::move(left);
+                        tasks.insert(taskIndex + 1, std::move(right));
+                        split = true;
+                        break;
+                    }
+                    if (roots.isEmpty()) continue;
+
+                    const int rootNodeId = roots.first();
+                    if (rootNodeId <= 0 ||
+                        rootNodeId >= wave.tree.nodesById.size()) {
+                        continue;
+                    }
+                    const WaveTreeNode& rootNode =
+                        wave.tree.nodesById.at(rootNodeId);
+                    if (!rootNode.valid || rootNode.signalIndex >= 0 ||
+                        rootNode.firstChild == 0) {
+                        continue;
+                    }
+
+                    QVector<int> children;
+                    int childId = rootNode.firstChild;
+                    int guard = 0;
+                    while (childId != 0 &&
+                           guard++ < wave.tree.nodesById.size()) {
+                        if (childId <= 0 ||
+                            childId >= wave.tree.nodesById.size()) {
+                            break;
+                        }
+                        children.push_back(childId);
+                        childId =
+                            wave.tree.nodesById.at(childId).nextSibling;
+                    }
+                    if (children.isEmpty()) continue;
+                    if (children.size() == 1) {
+                        // Descend through a single-child module without making
+                        // another task. The worker reconstructs the omitted
+                        // ancestor prefix before matching the full path.
+                        tasks[taskIndex].roots = children;
+                        split = true;
+                        break;
+                    }
+
+                    const int middle = children.size() / 2;
+                    ParallelTreeTask left;
+                    ParallelTreeTask right;
+                    left.roots = children.mid(0, middle);
+                    right.roots = children.mid(middle);
+                    tasks[taskIndex] = std::move(left);
+                    tasks.insert(taskIndex + 1, std::move(right));
+                    split = true;
+                    break;
+                }
+                if (!split) break;
+            }
+
+            if (tasks.size() >= 2) {
+                usedParallelTreeNameSearch = true;
+                const int workerCount = qMin(workerTarget, tasks.size());
+                // Small/medium NAME tables often contain tokens reused by
+                // millions of NODE entries. Decode each UTF-8 token once and
+                // share the immutable QStrings across search workers.
+                constexpr int kPredecodeNameLimit = 128 * 1024;
+                QVector<QString> decodedTreeNames;
+                if (wave.tree.namesById.size() <= kPredecodeNameLimit) {
+                    decodedTreeNames.resize(wave.tree.namesById.size());
+                    for (int nameId = 1;
+                         nameId < wave.tree.namesById.size(); ++nameId) {
+                        decodedTreeNames[nameId] =
+                            QString::fromUtf8(wave.tree.namesById.at(nameId));
+                    }
+                }
+                std::atomic_int nextTask(0);
+                std::atomic<qint64> parallelExamined(0);
+                std::atomic<qint64> parallelCandidates(0);
+                std::atomic_bool cutoffReached(false);
+                std::mutex resultMutex;
+                QVector<QVector<int>> taskMatches(tasks.size());
+                QVector<uchar> taskComplete(tasks.size(), uchar(0));
+
+                auto updateCutoffLocked = [&]() {
+                    int accumulated = 0;
+                    for (int i = 0; i < taskMatches.size(); ++i) {
+                        accumulated += taskMatches.at(i).size();
+                        if (accumulated >= kResultLimit) {
+                            cutoffReached.store(true, std::memory_order_release);
+                            return;
+                        }
+                        if (!taskComplete.at(i)) return;
+                    }
+                };
+
+                auto worker = [&]() {
+                    const QRegularExpression workerRegex(
+                        nameRegex.pattern(), nameRegex.patternOptions());
+                    struct LocalNameEntry {
+                        quint32 token = 0;
+                        QString text;
+                    };
+                    constexpr int kLocalNameCacheSize = 2048;
+                    QVector<LocalNameEntry> localNameCache(
+                        kLocalNameCacheSize);
+                    auto resolveTreeName =
+                        [&](quint32 token, QString& temporary)
+                            -> const QString& {
+                        if (waveNameTokenIsArrayIndex(token)) {
+                            temporary = QStringLiteral("[%1]").arg(
+                                waveNameTokenValue(token));
+                            return temporary;
+                        }
+                        const quint32 nameId = waveNameTokenValue(token);
+                        if (nameId > 0 &&
+                            nameId < quint32(decodedTreeNames.size())) {
+                            return decodedTreeNames.at(int(nameId));
+                        }
+                        if (nameId > 0 &&
+                            nameId < quint32(wave.tree.namesById.size())) {
+                            LocalNameEntry& entry =
+                                localNameCache[int(nameId) &
+                                                   (kLocalNameCacheSize - 1)];
+                            if (entry.token != token) {
+                                entry.token = token;
+                                entry.text = QString::fromUtf8(
+                                    wave.tree.namesById.at(int(nameId)));
+                            }
+                            return entry.text;
+                        }
+                        temporary.clear();
+                        return temporary;
+                    };
+                    struct TreeWalkFrame {
+                        int nodeId = 0;
+                        int restorePathLength = 0;
+                        bool exit = false;
+                    };
+                    std::vector<TreeWalkFrame> pending;
+                    pending.reserve(1024);
+                    QVector<int> children;
+                    QVector<QString> ancestorSegments;
+                    QString path;
+                    path.reserve(256);
+                    qint64 localExamined = 0;
+                    qint64 localCandidates = 0;
+
+                    while (!cutoffReached.load(std::memory_order_acquire) &&
+                           !cancel->load(std::memory_order_acquire)) {
+                        const int taskIndex =
+                            nextTask.fetch_add(1, std::memory_order_relaxed);
+                        if (taskIndex >= tasks.size()) break;
+                        bool enoughMatchesInTask = false;
+
+                        for (int rootNodeId : tasks.at(taskIndex).roots) {
+                            if (cutoffReached.load(std::memory_order_acquire) ||
+                                cancel->load(std::memory_order_acquire) ||
+                                enoughMatchesInTask) {
+                                break;
+                            }
+                            if (rootNodeId <= 0 ||
+                                rootNodeId >= wave.tree.nodesById.size()) {
+                                continue;
+                            }
+
+                            path.clear();
+                            ancestorSegments.clear();
+                            int parentId =
+                                wave.tree.nodesById.at(rootNodeId).parentId;
+                            int guard = 0;
+                            while (parentId > 0 &&
+                                   parentId < wave.tree.nodesById.size() &&
+                                   guard++ < wave.tree.nodesById.size()) {
+                                const WaveTreeNode& parent =
+                                    wave.tree.nodesById.at(parentId);
+                                if (!parent.valid) break;
+                                QString parentTemporary;
+                                const QString& parentSegment =
+                                    resolveTreeName(
+                                        parent.nameToken, parentTemporary);
+                                if (!parentSegment.isEmpty()) {
+                                    ancestorSegments.push_back(parentSegment);
+                                }
+                                parentId = parent.parentId;
+                            }
+                            for (int i = ancestorSegments.size() - 1;
+                                 i >= 0; --i) {
+                                if (!path.isEmpty()) path += QLatin1Char('.');
+                                path += ancestorSegments.at(i);
+                            }
+
+                            pending.clear();
+                            pending.push_back(
+                                TreeWalkFrame{rootNodeId, path.size(), false});
+                            qint64 walkGuard = 0;
+                            while (!pending.empty() &&
+                                   !enoughMatchesInTask &&
+                                   walkGuard < wave.tree.nodesById.size()) {
+                                if ((walkGuard & 0xff) == 0 &&
+                                    (cutoffReached.load(
+                                         std::memory_order_acquire) ||
+                                     cancel->load(
+                                         std::memory_order_acquire))) {
+                                    break;
+                                }
+                                ++walkGuard;
+                                const TreeWalkFrame frame = pending.back();
+                                pending.pop_back();
+                                if (frame.exit) {
+                                    path.resize(frame.restorePathLength);
+                                    continue;
+                                }
+                                const int nodeId = frame.nodeId;
+                                if (nodeId <= 0 ||
+                                    nodeId >= wave.tree.nodesById.size()) {
+                                    continue;
+                                }
+                                const WaveTreeNode& node =
+                                    wave.tree.nodesById.at(nodeId);
+                                if (!node.valid) continue;
+
+                                const int restorePathLength = path.size();
+                                QString segmentTemporary;
+                                const QString& segment =
+                                    resolveTreeName(
+                                        node.nameToken, segmentTemporary);
+                                if (!segment.isEmpty()) {
+                                    if (!path.isEmpty()) {
+                                        path += QLatin1Char('.');
+                                    }
+                                    path += segment;
+                                }
+
+                                if (node.signalIndex >= 0) {
+                                    ++localExamined;
+                                    bool matches = false;
+                                    if (regexMode) {
+                                        matches =
+                                            (regexRequiredLiteralMayOccur(
+                                                 segment,
+                                                 regexRequiredLiteral,
+                                                 regexRequiredLiteralIsAscii,
+                                                 caseSensitivity) &&
+                                             workerRegex.match(segment)
+                                                 .hasMatch()) ||
+                                            (regexRequiredLiteralMayOccur(
+                                                 path,
+                                                 regexRequiredLiteral,
+                                                 regexRequiredLiteralIsAscii,
+                                                 caseSensitivity) &&
+                                             workerRegex.match(path)
+                                                 .hasMatch());
+                                    } else {
+                                        matches =
+                                            segment.contains(
+                                                nameText, caseSensitivity) ||
+                                            path.contains(
+                                                nameText, caseSensitivity);
+                                    }
+                                    if (matches) {
+                                        ++localCandidates;
+                                        std::lock_guard<std::mutex> lock(
+                                            resultMutex);
+                                        QVector<int>& matchesForTask =
+                                            taskMatches[taskIndex];
+                                        if (matchesForTask.size() <
+                                            kResultLimit) {
+                                            matchesForTask.push_back(nodeId);
+                                        }
+                                        if (matchesForTask.size() >=
+                                            kResultLimit) {
+                                            // The first 5000 matches within
+                                            // this ordered tree partition are
+                                            // sufficient regardless of what
+                                            // earlier partitions contribute.
+                                            enoughMatchesInTask = true;
+                                            taskComplete[taskIndex] = 1;
+                                        }
+                                        updateCutoffLocked();
+                                    }
+                                    path.resize(restorePathLength);
+                                    continue;
+                                }
+
+                                pending.push_back(
+                                    TreeWalkFrame{
+                                        0, restorePathLength, true});
+                                children.clear();
+                                int childId = node.firstChild;
+                                int childGuard = 0;
+                                while (childId != 0 &&
+                                       childGuard++ <
+                                           wave.tree.nodesById.size()) {
+                                    if (childId <= 0 ||
+                                        childId >=
+                                            wave.tree.nodesById.size()) {
+                                        break;
+                                    }
+                                    children.push_back(childId);
+                                    childId = wave.tree.nodesById
+                                                  .at(childId)
+                                                  .nextSibling;
+                                }
+                                for (int i = children.size() - 1;
+                                     i >= 0; --i) {
+                                    pending.push_back(
+                                        TreeWalkFrame{
+                                            children.at(i),
+                                            path.size(),
+                                            false});
+                                }
+                            }
+                        }
+
+                        {
+                            std::lock_guard<std::mutex> lock(resultMutex);
+                            taskComplete[taskIndex] = 1;
+                            updateCutoffLocked();
+                        }
+                    }
+                    parallelExamined.fetch_add(
+                        localExamined, std::memory_order_relaxed);
+                    parallelCandidates.fetch_add(
+                        localCandidates, std::memory_order_relaxed);
+                };
+
+                std::vector<std::thread> workers;
+                workers.reserve(size_t(workerCount));
+                for (int i = 0; i < workerCount; ++i) {
+                    workers.emplace_back(worker);
+                }
+                for (std::thread& thread : workers) thread.join();
+
+                examinedSignals =
+                    parallelExamined.load(std::memory_order_relaxed);
+                nameCandidates =
+                    parallelCandidates.load(std::memory_order_relaxed);
+                for (int taskIndex = 0;
+                     taskIndex < taskMatches.size() &&
+                     matchedNodeIds.size() < kResultLimit;
+                     ++taskIndex) {
+                    const QVector<int>& matches = taskMatches.at(taskIndex);
+                    const int remaining =
+                        kResultLimit - matchedNodeIds.size();
+                    matchedNodeIds += matches.mid(0, remaining);
+                }
+                truncated = matchedNodeIds.size() >= kResultLimit;
+            }
+        }
+
+        if (nameDictionaryRejectedAll) {
+            // The deduplicated NAME table proved the required literal absent.
+        } else if (usedParallelTreeNameSearch) {
+            // Results were gathered above in tree partition order.
+        } else if (selectedSubtree && wave.tree.valid) {
+            traverseTreeSubtrees(selectedNodeIds, true);
+        } else if (selectedSubtree) {
+            for (int signalIndex : fallbackScopedSignalIndexes) {
+                if (!considerSignal(signalIndex)) break;
+            }
+        } else if (wave.tree.valid && !wave.tree.rootNodeIds.isEmpty()) {
+            traverseTreeSubtrees(wave.tree.rootNodeIds, false);
+        } else {
+            for (int signalIndex = 0;
+                 signalIndex < wave.signalList.size(); ++signalIndex) {
+                if (!considerSignal(signalIndex)) break;
+            }
+        }
+
+        if (!truncated && error.isEmpty() &&
+            !cancel->load(std::memory_order_acquire)) {
+            processDecodeBatch();
+        }
+        if (cancel->load(std::memory_order_acquire) && error.isEmpty()) {
+            error = QStringLiteral("搜索已取消。");
+        }
+
+        const qint64 elapsedMs = timer.elapsed();
+        QMetaObject::invokeMethod(
+            this,
+            [this, generation, waveGeneration, matchedNodeIds,
+             examinedSignals, nameCandidates, elapsedMs,
+             truncated, error]() {
+                if (generation != m_signalConditionSearchGeneration ||
+                    waveGeneration != m_waveFileGeneration) {
+                    return;
+                }
+                applySignalConditionSearchResults(
+                    matchedNodeIds, examinedSignals, nameCandidates,
+                    elapsedMs, truncated, error);
+            },
+            Qt::QueuedConnection);
+    });
+}
+
 void MainWindow::openValueFindDialog() {
     if (!m_valueFindDialog) {
         m_valueFindDialog = new QDialog(this);
@@ -6422,9 +8110,79 @@ void MainWindow::runValueFind() {
         return;
     }
 
+    int widthSkippedSignals = 0;
+    bool streamingEligible = true;
+    bool allSearchSamplesAvailable = true;
+    QHash<int, quint64> targetBitsBySignalIndex;
+    QHash<int, int> signalIndexBySignalId;
+    QVector<WaveParser4Reader::SignalValueMatchRequest> streamingRequests;
+    targetBitsBySignalIndex.reserve(signalIndexes.size() * 2 + 1);
+    signalIndexBySignalId.reserve(signalIndexes.size() * 2 + 1);
+    streamingRequests.reserve(signalIndexes.size());
+    for (int signalIndex : signalIndexes) {
+        if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
+        const WaveSignal& signal = m_wave.signalList.at(signalIndex);
+        quint64 targetBits = 0;
+        if (!valueFindTargetForSignal(target, signal.width, targetBits)) {
+            ++widthSkippedSignals;
+            continue;
+        }
+        targetBitsBySignalIndex.insert(signalIndex, targetBits);
+        if (signal.signalId <= 0) {
+            streamingEligible = false;
+        } else {
+            WaveParser4Reader::SignalValueMatchRequest request;
+            request.signalId = signal.signalId;
+            request.targetBits = targetBits;
+            streamingRequests.push_back(request);
+            signalIndexBySignalId.insert(signal.signalId, signalIndex);
+        }
+        if (!signal.proceduralClock && !signal.samplesLoaded &&
+            !(selectedRange &&
+              waveSignalRawSamplesCoverRange(signal, searchStart, searchEnd))) {
+            allSearchSamplesAvailable = false;
+        }
+    }
+
+    const bool streamingDisabled =
+        qEnvironmentVariableIsSet("WV_VIEWER_DISABLE_STREAMING_VALUE_FIND") &&
+        qgetenv("WV_VIEWER_DISABLE_STREAMING_VALUE_FIND") != QByteArray("0");
+    const bool hasSearchableSignals = !targetBitsBySignalIndex.isEmpty();
+    const bool useStreamingValueFind =
+        hasSearchableSignals &&
+        streamingEligible && !streamingDisabled &&
+        !allSearchSamplesAvailable &&
+        m_currentWaveSupportsOnDemand &&
+        hasWvz4Suffix(m_currentWaveFilePath) &&
+        bool(m_waveReader);
+    QVector<WaveParser4Reader::SignalValueMatchSegment> streamedMatches;
+
     QElapsedTimer findStageTimer;
     if (viewerPerfLogEnabled()) findStageTimer.start();
-    if (selectedRange) {
+    if (useStreamingValueFind) {
+        QString error;
+        bool found = false;
+        if (m_blockCacheLoader) m_blockCacheLoader->pauseBackground();
+        {
+            std::lock_guard<std::mutex> readerLock(*m_waveReaderMutex);
+            found = m_waveReader->findSignalValueMatches(
+                streamingRequests, searchStart, searchEnd,
+                streamedMatches, error, kViewerOnDemandSampleBudget);
+        }
+        if (m_blockCacheLoader) m_blockCacheLoader->resumeBackground();
+        if (!found) {
+            QMessageBox::warning(
+                this, QStringLiteral("Find value"),
+                error.isEmpty()
+                    ? QStringLiteral("Unable to search the selected signal values.")
+                    : error);
+            return;
+        }
+    } else if (!hasSearchableSignals) {
+        // Width validation already proved that no selected signal can contain
+        // this positive target; avoid decoding data that cannot affect the
+        // empty result.
+    } else if (selectedRange) {
         if (!ensureSignalSamplesLoaded(signalIndexes, false, true, false, searchStart, searchEnd)) return;
     } else if (!ensureSignalSamplesLoaded(signalIndexes, false)) {
         return;
@@ -6443,105 +8201,127 @@ void MainWindow::runValueFind() {
     m_valueFindRangeEnd = searchEnd;
     m_valueFindCurrentHit = -1;
 
-    int widthSkippedSignals = 0;
     int matchedSignalCount = 0;
-    for (int signalIndex : signalIndexes) {
-        if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
-
-        const WaveSignal& sig = m_wave.signalList.at(signalIndex);
-        const int hitCountBeforeSignal = m_valueFindHits.size();
-        quint64 targetBits = 0;
-        if (!valueFindTargetForSignal(target, sig.width, targetBits)) {
-            ++widthSkippedSignals;
-            continue;
-        }
-
-        const quint64 mask = waveBitMaskForWidth(sig.width);
-        auto sampleMatches = [&](const WaveSample& sample) {
-            if (sample.isAbsent || sample.isZ) return false;
-            if (sample.rawFieldsReady) return (sample.rawBits & mask) == targetBits;
-
-            WaveSample hydrated = sample;
-            hydrateWaveSampleRawFields(sig.kind, sig.width, hydrated);
-            return !hydrated.isAbsent && !hydrated.isZ &&
-                   ((hydrated.rawBits & mask) == targetBits);
-        };
-
-        if (sig.proceduralClock) {
-            qint64 segmentStart = searchStart;
-            qint64 nextTransition =
-                waveProceduralClockNextTransition(sig, searchStart);
-            while (segmentStart < searchEnd) {
-                const qint64 segmentEnd =
-                    nextTransition > segmentStart
-                        ? qMin(searchEnd, nextTransition)
-                        : searchEnd;
-                const quint64 value =
-                    waveProceduralClockValueAtTime(sig, segmentStart) ? 1u : 0u;
-                if ((value & mask) == targetBits) {
-                    ValueFindHit hit;
-                    hit.signalIndex = signalIndex;
-                    hit.sampleIndex = -1;
-                    hit.time = segmentStart;
-                    hit.duration = clampedValueFindSegmentDuration(
-                        segmentStart, segmentEnd, searchStart, searchEnd);
-                    m_valueFindHits.push_back(hit);
-                }
-                if (segmentEnd >= searchEnd) break;
-                segmentStart = segmentEnd;
-                nextTransition =
-                    waveProceduralClockNextTransition(sig, segmentStart);
+    if (useStreamingValueFind) {
+        QSet<int> matchedSignalIndexes;
+        matchedSignalIndexes.reserve(signalIndexes.size() * 2 + 1);
+        for (const WaveParser4Reader::SignalValueMatchSegment& segment :
+             streamedMatches) {
+            const auto signalIt =
+                signalIndexBySignalId.constFind(segment.signalId);
+            if (signalIt == signalIndexBySignalId.constEnd() ||
+                segment.end <= segment.start) {
+                continue;
             }
-            if (m_valueFindHits.size() > hitCountBeforeSignal) {
-                ++matchedSignalCount;
-            }
-            continue;
-        }
-
-        const auto firstAfterStart = std::upper_bound(
-            sig.samples.constBegin(), sig.samples.constEnd(), searchStart,
-            [](qint64 time, const WaveSample& sample) { return time < sample.time; });
-        const int firstAfterStartIndex = int(firstAfterStart - sig.samples.constBegin());
-        const int stateAtStartIndex = firstAfterStartIndex - 1;
-        bool previousMatched = stateAtStartIndex >= 0 &&
-                               sampleMatches(sig.samples.at(stateAtStartIndex));
-        int activeHitIndex = -1;
-        if (previousMatched) {
             ValueFindHit hit;
-            hit.signalIndex = signalIndex;
-            hit.sampleIndex = stateAtStartIndex;
-            hit.time = searchStart;
-            activeHitIndex = m_valueFindHits.size();
+            hit.signalIndex = signalIt.value();
+            hit.sampleIndex = -1;
+            hit.time = segment.start;
+            hit.duration = clampedValueFindSegmentDuration(
+                segment.start, segment.end, searchStart, searchEnd);
+            if (hit.duration <= 0) continue;
             m_valueFindHits.push_back(hit);
+            matchedSignalIndexes.insert(hit.signalIndex);
         }
+        matchedSignalCount = matchedSignalIndexes.size();
+    } else {
+        for (int signalIndex : signalIndexes) {
+            if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
 
-        for (int sampleIndex = firstAfterStartIndex; sampleIndex < sig.samples.size(); ++sampleIndex) {
-            const WaveSample& sample = sig.samples.at(sampleIndex);
-            if (sample.time >= searchEnd) break;
-            const bool matched = sampleMatches(sample);
+            const auto targetIt =
+                targetBitsBySignalIndex.constFind(signalIndex);
+            if (targetIt == targetBitsBySignalIndex.constEnd()) continue;
+            const quint64 targetBits = targetIt.value();
+            const WaveSignal& sig = m_wave.signalList.at(signalIndex);
+            const int hitCountBeforeSignal = m_valueFindHits.size();
 
-            if (matched && !previousMatched) {
+            const quint64 mask = waveBitMaskForWidth(sig.width);
+            auto sampleMatches = [&](const WaveSample& sample) {
+                if (sample.isAbsent || sample.isZ) return false;
+                if (sample.rawFieldsReady) return (sample.rawBits & mask) == targetBits;
+
+                WaveSample hydrated = sample;
+                hydrateWaveSampleRawFields(sig.kind, sig.width, hydrated);
+                return !hydrated.isAbsent && !hydrated.isZ &&
+                       ((hydrated.rawBits & mask) == targetBits);
+            };
+
+            if (sig.proceduralClock) {
+                qint64 segmentStart = searchStart;
+                qint64 nextTransition =
+                    waveProceduralClockNextTransition(sig, searchStart);
+                while (segmentStart < searchEnd) {
+                    const qint64 segmentEnd =
+                        nextTransition > segmentStart
+                            ? qMin(searchEnd, nextTransition)
+                            : searchEnd;
+                    const quint64 value =
+                        waveProceduralClockValueAtTime(sig, segmentStart) ? 1u : 0u;
+                    if ((value & mask) == targetBits) {
+                        ValueFindHit hit;
+                        hit.signalIndex = signalIndex;
+                        hit.sampleIndex = -1;
+                        hit.time = segmentStart;
+                        hit.duration = clampedValueFindSegmentDuration(
+                            segmentStart, segmentEnd, searchStart, searchEnd);
+                        m_valueFindHits.push_back(hit);
+                    }
+                    if (segmentEnd >= searchEnd) break;
+                    segmentStart = segmentEnd;
+                    nextTransition =
+                        waveProceduralClockNextTransition(sig, segmentStart);
+                }
+                if (m_valueFindHits.size() > hitCountBeforeSignal) {
+                    ++matchedSignalCount;
+                }
+                continue;
+            }
+
+            const auto firstAfterStart = std::upper_bound(
+                sig.samples.constBegin(), sig.samples.constEnd(), searchStart,
+                [](qint64 time, const WaveSample& sample) { return time < sample.time; });
+            const int firstAfterStartIndex = int(firstAfterStart - sig.samples.constBegin());
+            const int stateAtStartIndex = firstAfterStartIndex - 1;
+            bool previousMatched = stateAtStartIndex >= 0 &&
+                                   sampleMatches(sig.samples.at(stateAtStartIndex));
+            int activeHitIndex = -1;
+            if (previousMatched) {
                 ValueFindHit hit;
                 hit.signalIndex = signalIndex;
-                hit.sampleIndex = sampleIndex;
-                hit.time = sample.time;
+                hit.sampleIndex = stateAtStartIndex;
+                hit.time = searchStart;
                 activeHitIndex = m_valueFindHits.size();
                 m_valueFindHits.push_back(hit);
-            } else if (!matched && previousMatched && activeHitIndex >= 0) {
-                m_valueFindHits[activeHitIndex].duration =
-                    clampedValueFindSegmentDuration(m_valueFindHits.at(activeHitIndex).time, sample.time,
-                                                    searchStart, searchEnd);
-                activeHitIndex = -1;
             }
-            previousMatched = matched;
-        }
 
-        if (previousMatched && activeHitIndex >= 0) {
-            m_valueFindHits[activeHitIndex].duration =
-                clampedValueFindSegmentDuration(m_valueFindHits.at(activeHitIndex).time, searchEnd,
-                                                searchStart, searchEnd);
+            for (int sampleIndex = firstAfterStartIndex; sampleIndex < sig.samples.size(); ++sampleIndex) {
+                const WaveSample& sample = sig.samples.at(sampleIndex);
+                if (sample.time >= searchEnd) break;
+                const bool matched = sampleMatches(sample);
+
+                if (matched && !previousMatched) {
+                    ValueFindHit hit;
+                    hit.signalIndex = signalIndex;
+                    hit.sampleIndex = sampleIndex;
+                    hit.time = sample.time;
+                    activeHitIndex = m_valueFindHits.size();
+                    m_valueFindHits.push_back(hit);
+                } else if (!matched && previousMatched && activeHitIndex >= 0) {
+                    m_valueFindHits[activeHitIndex].duration =
+                        clampedValueFindSegmentDuration(m_valueFindHits.at(activeHitIndex).time, sample.time,
+                                                        searchStart, searchEnd);
+                    activeHitIndex = -1;
+                }
+                previousMatched = matched;
+            }
+
+            if (previousMatched && activeHitIndex >= 0) {
+                m_valueFindHits[activeHitIndex].duration =
+                    clampedValueFindSegmentDuration(m_valueFindHits.at(activeHitIndex).time, searchEnd,
+                                                    searchStart, searchEnd);
+            }
+            if (m_valueFindHits.size() > hitCountBeforeSignal) ++matchedSignalCount;
         }
-        if (m_valueFindHits.size() > hitCountBeforeSignal) ++matchedSignalCount;
     }
     if (viewerPerfLogEnabled()) {
         viewerPerfLog("find.scan", findStageTimer.restart(),

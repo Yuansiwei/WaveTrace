@@ -19,6 +19,7 @@ int main() {
               << " end=" << cfg.wave_trace_end
               << " level_enabled=" << (cfg.wave_trace_level_enabled ? 1 : 0)
               << " level=" << cfg.wave_trace_level
+              << " array_first_only=" << (cfg.wave_trace_array_first_only ? 1 : 0)
               << " stats=" << (cfg.dirty_array_stats ? 1 : 0)
               << " marks=" << (cfg.dirty_array_marks ? 1 : 0)
               << " memory=" << (cfg.memory_usage ? 1 : 0)

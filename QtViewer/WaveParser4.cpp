@@ -4,6 +4,7 @@
 #include <QBitArray>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QSet>
 #include <QtGlobal>
 
@@ -27,6 +28,7 @@ using i64 = qint64;
 
 thread_local u64 gDecodedSampleLimit = 0;
 thread_local u64 gDecodedSampleCount = 0;
+thread_local const QVector<quint64>* gDecodedMatchTargets = nullptr;
 
 class DecodedSampleBudgetScope {
 public:
@@ -45,6 +47,21 @@ public:
 private:
     u64 oldLimit_ = 0;
     u64 oldCount_ = 0;
+};
+
+class DecodedMatchTargetScope {
+public:
+    explicit DecodedMatchTargetScope(const QVector<quint64>* targets)
+        : oldTargets_(gDecodedMatchTargets) {
+        gDecodedMatchTargets = targets;
+    }
+
+    ~DecodedMatchTargetScope() {
+        gDecodedMatchTargets = oldTargets_;
+    }
+
+private:
+    const QVector<quint64>* oldTargets_ = nullptr;
 };
 
 enum class Compression : u8 {
@@ -301,6 +318,33 @@ inline const QVector<int>* directIntListMapValue(const QVector<QVector<int>>& ma
     return &map[key];
 }
 
+struct StorageOutputIndexLookup {
+    const QVector<QVector<int>>* direct = nullptr;
+    const QHash<int, QVector<int>>* sparse = nullptr;
+
+    const QVector<int>* value(int storageId) const {
+        if (sparse) {
+            const auto it = sparse->constFind(storageId);
+            return it == sparse->constEnd() ? nullptr : &it.value();
+        }
+        return direct ? directIntListMapValue(*direct, storageId) : nullptr;
+    }
+};
+
+StorageOutputIndexLookup storageOutputIndexLookup(
+        const QVector<QVector<int>>& direct) {
+    StorageOutputIndexLookup lookup;
+    lookup.direct = &direct;
+    return lookup;
+}
+
+StorageOutputIndexLookup storageOutputIndexLookup(
+        const QHash<int, QVector<int>>& sparse) {
+    StorageOutputIndexLookup lookup;
+    lookup.sparse = &sparse;
+    return lookup;
+}
+
 bool applyProceduralClockDefinitions(const QVector<ClockRec>& clocks,
                                      const QVector<int>& outputIndexBySignalId,
                                      QVector<WaveSignal>& outputSignals,
@@ -331,6 +375,50 @@ bool applyProceduralClockDefinitions(const QVector<ClockRec>& clocks,
             return false;
         }
 
+        signal.proceduralClock = true;
+        signal.clockInitialValue = clock.initialValue;
+        signal.clockTogglePeriodTicks = clock.periodTicks;
+        signal.samplesLoaded = true;
+        signal.samples.clear();
+        signal.rawLoadedRanges.clear();
+        signal.changeTimes.clear();
+        signal.changeTimesReady = false;
+        signal.lodLevels.clear();
+    }
+    return true;
+}
+
+bool applyProceduralClockDefinitions(const QVector<ClockRec>& clocks,
+                                     const QHash<int, int>& outputIndexBySignalId,
+                                     QVector<WaveSignal>& outputSignals,
+                                     bool requireAllClockSignals,
+                                     QString& error) {
+    // Clock tables are normally tiny. Avoid rebuilding a global-size direct
+    // array for sparse high signal IDs; validate/apply clocks directly.
+    for (const ClockRec& clock : clocks) {
+        const auto found = outputIndexBySignalId.constFind(int(clock.signalId));
+        const int outputIndex =
+            found == outputIndexBySignalId.constEnd() ? -1 : found.value();
+        if (outputIndex < 0 || outputIndex >= outputSignals.size()) {
+            if (requireAllClockSignals) {
+                error = QStringLiteral("WVZ4 CLKD references missing visible signal_id %1")
+                            .arg(int(clock.signalId));
+                return false;
+            }
+            continue;
+        }
+        WaveSignal& signal = outputSignals[outputIndex];
+        if (signal.proceduralClock) {
+            error = QStringLiteral("WVZ4 CLKD contains duplicate signal_id %1")
+                        .arg(int(clock.signalId));
+            return false;
+        }
+        if (signal.kind != SignalKind::Bit || signal.width != 1 ||
+            clock.periodTicks == 0) {
+            error = QStringLiteral("WVZ4 CLKD signal_id %1 is not a valid 1-bit periodic clock")
+                        .arg(int(clock.signalId));
+            return false;
+        }
         signal.proceduralClock = true;
         signal.clockInitialValue = clock.initialValue;
         signal.clockTogglePeriodTicks = clock.periodTicks;
@@ -1937,6 +2025,12 @@ WaveSample makeDecodedSample(int outputIndex,
     sample.rawFieldsReady = true;
     const WaveSignal& sig = outputSignals.at(outputIndex);
     sample.rawBits = sliceRawBitsForSignal(readScalarBitsLE(valueBytes, byteCount), sig);
+    if (gDecodedMatchTargets &&
+        outputIndex >= 0 && outputIndex < gDecodedMatchTargets->size()) {
+        const quint64 targetBits =
+            gDecodedMatchTargets->at(outputIndex) & waveBitMaskForWidth(sig.width);
+        sample.rawBits = sample.rawBits == targetBits ? 1ull : 0ull;
+    }
     // WVZ4 stores fixed-width <=64-bit scalar values.  Do not materialize a
     // QString for every decoded sample; display code formats rawBits on demand.
     sample.value.clear();
@@ -1980,9 +2074,54 @@ bool appendDecodedSample(int outputIndex,
                          QVector<QVector<WaveSample>>& samplesByOutputIndex,
                          bool compactSamples,
                          QString& error) {
-    if (outputIndex < 0 || outputIndex >= outputSignals.size()) {
+    if (outputIndex < 0 || outputIndex >= outputSignals.size() ||
+        outputIndex >= samplesByOutputIndex.size()) {
         error = QStringLiteral("WVZ4 WDAT sample references invalid output signal index");
         return false;
+    }
+    if (gDecodedMatchTargets &&
+        outputIndex < gDecodedMatchTargets->size()) {
+        if (gDecodedSampleLimit != 0 &&
+            gDecodedSampleCount >= gDecodedSampleLimit) {
+            error = QStringLiteral("WVZ4 decoded sample limit exceeded (%1). Narrow the selected signals/time range or use LOD.")
+                .arg(gDecodedSampleLimit);
+            return false;
+        }
+
+        const WaveSignal& signal = outputSignals.at(outputIndex);
+        const quint64 rawBits =
+            sliceRawBitsForSignal(
+                readScalarBitsLE(valueBytes, byteCount), signal);
+        const quint64 targetBits =
+            gDecodedMatchTargets->at(outputIndex) &
+            waveBitMaskForWidth(signal.width);
+        const quint64 matched = rawBits == targetBits ? 1ull : 0ull;
+        QVector<WaveSample>& rows = samplesByOutputIndex[outputIndex];
+        if (!rows.isEmpty()) {
+            WaveSample& last = rows.last();
+            if (last.time == sampleTime) {
+                last.value.clear();
+                last.rawBits = matched;
+                last.isZ = false;
+                last.isAbsent = false;
+                last.rawFieldsReady = true;
+                ++gDecodedSampleCount;
+                return true;
+            }
+            if (compactSamples && !last.isAbsent && !last.isZ &&
+                last.rawFieldsReady && last.rawBits == matched) {
+                ++gDecodedSampleCount;
+                return true;
+            }
+        }
+
+        WaveSample sample;
+        sample.time = sampleTime;
+        sample.rawBits = matched;
+        sample.rawFieldsReady = true;
+        rows.push_back(std::move(sample));
+        ++gDecodedSampleCount;
+        return true;
     }
     WaveSample sample = makeDecodedSample(outputIndex, valueBytes, byteCount, sampleTime, outputSignals);
     return appendDecodedSampleObject(outputIndex, std::move(sample), outputSignals,
@@ -2052,7 +2191,11 @@ bool appendImplicitZeroSamplesForSelectedSignals(const QSet<int>& selectedIds,
         sample.time = initialTime;
         sample.isAbsent = false;
         sample.isZ = false;
-        sample.rawBits = 0ull;
+        sample.rawBits =
+            gDecodedMatchTargets && outputIndex < gDecodedMatchTargets->size()
+                ? ((gDecodedMatchTargets->at(outputIndex) &
+                    waveBitMaskForWidth(sig.width)) == 0ull ? 1ull : 0ull)
+                : 0ull;
         sample.rawFieldsReady = true;
         sample.value.clear();
         appendCompactedSample(samplesByOutputIndex[outputIndex], std::move(sample));
@@ -2523,7 +2666,7 @@ bool decodeRawWaveTile(const QByteArray& rawPayload,
                          u64 expectedSignalCount,
                          const QSet<int>& selectedIds,
                          bool allSelected,
-                         const QVector<QVector<int>>& outputIndexesByStorageId,
+                         const StorageOutputIndexLookup& outputIndexesByStorageId,
                          const QVector<int>& byteWidthBySignalId,
                          const QVector<WaveSignal>& outputSignals,
                          QVector<QVector<WaveSample>>& samplesByOutputIndex,
@@ -2750,7 +2893,7 @@ bool decodeRawWaveTile(const QByteArray& rawPayload,
                 error = QStringLiteral("WVZ4 WDAT sparse tile references unknown storage_id %1").arg(sid);
                 return false;
             }
-            const QVector<int>* outputIndexes = directIntListMapValue(outputIndexesByStorageId, sid);
+            const QVector<int>* outputIndexes = outputIndexesByStorageId.value(sid);
             if ((!outputIndexes || outputIndexes->isEmpty()) && !observer) continue;
             static const QVector<int> emptyOutputIndexes;
 
@@ -2789,7 +2932,7 @@ bool decodeRawWaveTile(const QByteArray& rawPayload,
             error = QStringLiteral("WVZ4 WDAT tile references unknown signal_id %1").arg(sid);
             return false;
         }
-        const QVector<int>* outputIndexes = directIntListMapValue(outputIndexesByStorageId, sid);
+        const QVector<int>* outputIndexes = outputIndexesByStorageId.value(sid);
         if ((!outputIndexes || outputIndexes->isEmpty()) && !observer) continue;
         static const QVector<int> emptyOutputIndexes;
 
@@ -2867,7 +3010,7 @@ bool decodeWdatSectionStreaming(QFile& file,
                                 const SectionHeader& section,
                                 const QSet<int>& selectedIds,
                                 bool allSelected,
-                                const QVector<QVector<int>>& outputIndexesByStorageId,
+                                const StorageOutputIndexLookup& outputIndexesByStorageId,
                                 const QVector<int>& byteWidthBySignalId,
                                 const QVector<WaveSignal>& outputSignals,
                                 QVector<QVector<WaveSample>>& samplesByOutputIndex,
@@ -3006,7 +3149,7 @@ bool decodeWdatSectionsFromFooterIndex(QFile& file,
                                         u64 signalsPerChunk,
                                         const QSet<int>& selectedIds,
                                         bool allSelected,
-                                        const QVector<QVector<int>>& outputIndexesByStorageId,
+                                        const StorageOutputIndexLookup& outputIndexesByStorageId,
                                         const QVector<int>& byteWidthBySignalId,
                                         const QVector<WaveSignal>& outputSignals,
                                         QVector<QVector<WaveSample>>& samplesByOutputIndex,
@@ -3181,7 +3324,7 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
                                                u64 signalsPerChunk,
                                                const QSet<int>& selectedIds,
                                                bool allSelected,
-                                               const QVector<QVector<int>>& outputIndexesByStorageId,
+                                               const StorageOutputIndexLookup& outputIndexesByStorageId,
                                                const QVector<int>& byteWidthBySignalId,
                                                const QVector<WaveSignal>& outputSignals,
                                                QVector<QVector<WaveSample>>& samplesByOutputIndex,
@@ -3271,8 +3414,11 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
 
     std::vector<std::thread> workers;
     workers.reserve(std::size_t(workerCount));
+    const QVector<quint64>* const decodedMatchTargets =
+        gDecodedMatchTargets;
     for (int workerIndex = 0; workerIndex < workerCount; ++workerIndex) {
         workers.emplace_back([&, workerIndex]() {
+            DecodedMatchTargetScope matchTargetScope(decodedMatchTargets);
             QFile file(filePath);
             if (!file.open(QIODevice::ReadOnly)) {
                 setError(QStringLiteral("Cannot open WVZ4 file: %1").arg(filePath));
@@ -3390,8 +3536,24 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
         for (ParallelWdatWorkerResult& result : workerResults) {
             if (outputIndex >= result.samplesByOutputIndex.size()) continue;
             QVector<WaveSample>& localSamples = result.samplesByOutputIndex[outputIndex];
-            for (WaveSample& sample : localSamples) {
-                appendCompactedSample(compacted, std::move(sample));
+            if (localSamples.isEmpty()) continue;
+
+            // Each worker already emits a time-ordered, compacted sequence for
+            // its contiguous block range. Only the seam between two workers
+            // can contain an equal-time replacement or an unchanged value.
+            // Rechecking every decoded sample here used to duplicate the
+            // hottest comparison from the decode loop.
+            int first = 0;
+            if (!compacted.isEmpty()) {
+                if (compacted.last().time == localSamples.first().time) {
+                    compacted.last() = std::move(localSamples.first());
+                    first = 1;
+                } else if (waveSamplesEquivalent(compacted.last(), localSamples.first())) {
+                    first = 1;
+                }
+            }
+            for (int i = first; i < localSamples.size(); ++i) {
+                compacted.push_back(std::move(localSamples[i]));
             }
         }
         samplesByOutputIndex[outputIndex] = std::move(compacted);
@@ -4425,10 +4587,11 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
     }
 
     QVector<WaveSignal> outputSignals;
-    QVector<int> outputIndexBySignalId;
-    QVector<QVector<int>> outputIndexesByStorageId;
+    QHash<int, int> outputIndexBySignalId;
+    QHash<int, QVector<int>> outputIndexesByStorageId;
     outputSignals.reserve(signalIds.size());
-    outputIndexBySignalId.reserve(signalIds.size());
+    outputIndexBySignalId.reserve(signalIds.size() * 2 + 1);
+    outputIndexesByStorageId.reserve(signalIds.size() * 2 + 1);
     for (int sid : signalIds) {
         if (sid <= 0 || sid > d->sigs.size() || emittedSignalIds.contains(sid)) continue;
         const SigRec& s = d->sigs.at(sid - 1);
@@ -4437,10 +4600,10 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
         emittedSignalIds.insert(sid);
         const int idx = outputSignals.size();
         outputSignals.push_back(makeWaveSignalFromRec(s, true));
-        directIntMapSet(outputIndexBySignalId, int(s.signalId), idx);
+        outputIndexBySignalId.insert(int(s.signalId), idx);
         if (!clockSignalIds.contains(sid)) {
             const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
-            directIntListMapAppend(outputIndexesByStorageId, storageId, idx);
+            outputIndexesByStorageId[storageId].push_back(idx);
         }
     }
     if (!applyProceduralClockDefinitions(d->clocks,
@@ -4472,7 +4635,7 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
                                                        d->signalsPerChunk,
                                                        selectedStorageIds,
                                                        false,
-                                                       outputIndexesByStorageId,
+                                                       storageOutputIndexLookup(outputIndexesByStorageId),
                                                        d->byteWidthByStorageId,
                                                        outputSignals,
                                                        samplesByOutputIndex,
@@ -4520,6 +4683,147 @@ bool WaveParser4Reader::loadSignalLod(const QVector<int>& signalIds,
                                       qint64 targetBucketCycles) const {
     return loadSignalLodImpl(signalIds, outWave, error, timeStart, timeEnd,
                              targetBucketCycles, false, -1);
+}
+
+bool WaveParser4Reader::findSignalValueMatches(
+        const QVector<SignalValueMatchRequest>& requests,
+        qint64 timeStart,
+        qint64 timeEnd,
+        QVector<SignalValueMatchSegment>& matches,
+        QString& error,
+        quint64 maxDecodedSamples) const {
+    matches.clear();
+    error.clear();
+    if (!d || !d->opened) {
+        error = QStringLiteral("WVZ4 reader is not open");
+        return false;
+    }
+    if (requests.isEmpty() || timeEnd <= timeStart) return true;
+
+    QVector<int> signalIds;
+    QVector<quint64> targetsByOutputIndex;
+    QHash<int, quint64> targetBySignalId;
+    QSet<int> emittedSignalIds;
+    signalIds.reserve(requests.size());
+    targetsByOutputIndex.reserve(requests.size());
+    targetBySignalId.reserve(requests.size() * 2 + 1);
+    emittedSignalIds.reserve(requests.size() * 2 + 1);
+    for (const SignalValueMatchRequest& request : requests) {
+        const int signalId = request.signalId;
+        if (signalId <= 0 || signalId > d->sigs.size() ||
+            emittedSignalIds.contains(signalId)) {
+            continue;
+        }
+        const SigRec& rec = d->sigs.at(signalId - 1);
+        if (rec.signalId != u32(signalId) || !isVisibleSignalRec(rec)) continue;
+        const quint64 targetBits =
+            request.targetBits & waveBitMaskForWidth(int(rec.bitWidth));
+        emittedSignalIds.insert(signalId);
+        signalIds.push_back(signalId);
+        targetsByOutputIndex.push_back(targetBits);
+        targetBySignalId.insert(signalId, targetBits);
+    }
+    if (signalIds.isEmpty()) return true;
+
+    WaveFile matchWave;
+    bool loaded = false;
+    if (d->residualLodTables) {
+        // Residual LOD tables can contain exact transitions not present in
+        // WDAT. Keep the established full decoder for those older layouts.
+        loaded = loadSignals(signalIds, matchWave, error, maxDecodedSamples,
+                             timeStart, timeEnd);
+    } else {
+        // The raw decoder normally compacts equal scalar values. For value
+        // search it can compact the much smaller boolean match state instead,
+        // preserving every entry/exit boundary without materializing unrelated
+        // values.
+        DecodedMatchTargetScope matchTargetScope(&targetsByOutputIndex);
+        loaded = loadSignals(signalIds, matchWave, error, maxDecodedSamples,
+                             timeStart, timeEnd);
+    }
+    if (!loaded) return false;
+
+    const bool matchEncoded = !d->residualLodTables;
+    for (const WaveSignal& signal : matchWave.signalList) {
+        const auto targetIt = targetBySignalId.constFind(signal.signalId);
+        if (targetIt == targetBySignalId.constEnd()) continue;
+        const quint64 targetBits = targetIt.value();
+        const quint64 mask = waveBitMaskForWidth(signal.width);
+
+        if (signal.proceduralClock) {
+            qint64 segmentStart = timeStart;
+            qint64 nextTransition =
+                waveProceduralClockNextTransition(signal, timeStart);
+            while (segmentStart < timeEnd) {
+                const qint64 segmentEnd =
+                    nextTransition > segmentStart
+                        ? qMin(timeEnd, nextTransition)
+                        : timeEnd;
+                const quint64 value =
+                    waveProceduralClockValueAtTime(signal, segmentStart) ? 1ull : 0ull;
+                if ((value & mask) == targetBits && segmentEnd > segmentStart) {
+                    SignalValueMatchSegment segment;
+                    segment.signalId = signal.signalId;
+                    segment.start = segmentStart;
+                    segment.end = segmentEnd;
+                    matches.push_back(segment);
+                }
+                if (segmentEnd >= timeEnd) break;
+                segmentStart = segmentEnd;
+                nextTransition =
+                    waveProceduralClockNextTransition(signal, segmentStart);
+            }
+            continue;
+        }
+
+        auto sampleMatches = [&](const WaveSample& sample) {
+            if (sample.isAbsent || sample.isZ) return false;
+            if (matchEncoded) return sample.rawFieldsReady && sample.rawBits != 0;
+            if (sample.rawFieldsReady) return (sample.rawBits & mask) == targetBits;
+            WaveSample hydrated = sample;
+            hydrateWaveSampleRawFields(signal.kind, signal.width, hydrated);
+            return !hydrated.isAbsent && !hydrated.isZ &&
+                   ((hydrated.rawBits & mask) == targetBits);
+        };
+
+        const auto firstAfterStart = std::upper_bound(
+            signal.samples.constBegin(), signal.samples.constEnd(), timeStart,
+            [](qint64 time, const WaveSample& sample) {
+                return time < sample.time;
+            });
+        const int firstAfterStartIndex =
+            int(firstAfterStart - signal.samples.constBegin());
+        const int stateAtStartIndex = firstAfterStartIndex - 1;
+        bool previousMatched =
+            stateAtStartIndex >= 0 &&
+            sampleMatches(signal.samples.at(stateAtStartIndex));
+        qint64 activeStart = previousMatched ? timeStart : 0;
+
+        for (int sampleIndex = firstAfterStartIndex;
+             sampleIndex < signal.samples.size(); ++sampleIndex) {
+            const WaveSample& sample = signal.samples.at(sampleIndex);
+            if (sample.time >= timeEnd) break;
+            const bool matched = sampleMatches(sample);
+            if (matched && !previousMatched) {
+                activeStart = sample.time;
+            } else if (!matched && previousMatched && sample.time > activeStart) {
+                SignalValueMatchSegment segment;
+                segment.signalId = signal.signalId;
+                segment.start = activeStart;
+                segment.end = sample.time;
+                matches.push_back(segment);
+            }
+            previousMatched = matched;
+        }
+        if (previousMatched && timeEnd > activeStart) {
+            SignalValueMatchSegment segment;
+            segment.signalId = signal.signalId;
+            segment.start = activeStart;
+            segment.end = timeEnd;
+            matches.push_back(segment);
+        }
+    }
+    return true;
 }
 
 bool WaveParser4Reader::findRawSignalEvent(const QVector<int>& signalIds,
@@ -4640,7 +4944,8 @@ bool WaveParser4Reader::findRawSignalEvent(const QVector<int>& signalIds,
                 }
                 if (!decodeWdatSectionStreaming(
                         file, section, selectedStorageIds, allSelectedStorage,
-                        noOutputIndexes, d->byteWidthByStorageId,
+                        storageOutputIndexLookup(noOutputIndexes),
+                        d->byteWidthByStorageId,
                         noOutputSignals, noOutputSamples,
                         std::numeric_limits<qint64>::min(),
                         std::numeric_limits<qint64>::max(),
@@ -5446,7 +5751,8 @@ bool WaveParser4::loadFromFile(const QString& filePath,
             }
 
             if (!decodeWdatSectionStreaming(file, sh, selectedStorageIds, allSelectedStorageIds,
-                                            outputIndexesByStorageId, byteWidthByStorageId,
+                                            storageOutputIndexLookup(outputIndexesByStorageId),
+                                            byteWidthByStorageId,
                                             outputSignals, samplesByOutputIndex,
                                             options.timeStart, options.timeEnd,
                                             minTime, maxTime, error, rawLeftAnchorPtr())) {
@@ -5531,7 +5837,8 @@ bool WaveParser4::loadFromFile(const QString& filePath,
         if (!decodeWdatSectionsFromFooterIndex(file, footerBlocks, footerBlockIndexesByChunk,
                                                headerSignalsPerChunk,
                                                selectedStorageIds, allSelectedStorageIds,
-                                               outputIndexesByStorageId, byteWidthByStorageId,
+                                               storageOutputIndexLookup(outputIndexesByStorageId),
+                                               byteWidthByStorageId,
                                                outputSignals, samplesByOutputIndex,
                                                options.timeStart, options.timeEnd,
                                                minTime, maxTime, rawLeftAnchorPtr(), error)) {

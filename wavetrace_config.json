@@ -4,5 +4,6 @@
   "WaveTraceStart": "",
   "WaveTraceEnd": "",
   "WaveTraceLevel": "",
+  "WaveTraceArrayFirstOnly": false,
   "wave_ptr_members": []
 }

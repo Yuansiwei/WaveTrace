@@ -4,9 +4,12 @@
 #include "WaveParser4.h"
 
 #include <QApplication>
+#include <QAbstractItemModel>
 #include <QByteArray>
+#include <QCheckBox>
 #include <QColor>
 #include <QCoreApplication>
+#include <QDialog>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
@@ -16,11 +19,15 @@
 #include <QIcon>
 #include <QImage>
 #include <QKeyEvent>
+#include <QLabel>
+#include <QLineEdit>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPen>
 #include <QPixmap>
+#include <QPushButton>
 #include <QRectF>
+#include <QRegularExpression>
 #include <QString>
 #include <QStringList>
 #include <QTextStream>
@@ -1824,6 +1831,10 @@ static int runValueFindUiBenchmark(QApplication& app, const QStringList& args) {
     if (args.size() < 4) return 2;
     const int activeSignals =
         args.size() >= 5 ? qMax(1, args.at(4).toInt()) : 64;
+    const qint64 rangeStart =
+        args.size() >= 7 ? args.at(5).toLongLong() : 0;
+    const qint64 rangeEnd =
+        args.size() >= 7 ? args.at(6).toLongLong() : 0;
 
     MainWindow window;
     window.resize(1600, 800);
@@ -1835,7 +1846,8 @@ static int runValueFindUiBenchmark(QApplication& app, const QStringList& args) {
     quint64 checksum = 0;
     qint64 elapsedMs = 0;
     if (!window.runValueFindForBenchmark(args.at(3), activeSignals,
-                                         &hitCount, &checksum, &elapsedMs)) {
+                                         &hitCount, &checksum, &elapsedMs,
+                                         rangeStart, rangeEnd)) {
         return 4;
     }
 
@@ -1844,9 +1856,177 @@ static int runValueFindUiBenchmark(QApplication& app, const QStringList& args) {
         << ",target," << args.at(3)
         << ",elapsed_ms," << elapsedMs
         << ",hits," << hitCount
-        << ",checksum," << QString::number(checksum, 16) << '\n';
+        << ",checksum," << QString::number(checksum, 16);
+    if (rangeEnd > rangeStart) {
+        out << ",range_start," << rangeStart
+            << ",range_end," << rangeEnd;
+    }
+    out << '\n';
     out.flush();
     return 0;
+}
+
+static int runSignalConditionSearchBenchmark(QApplication& app,
+                                             const QStringList& args) {
+    // file, name-or-dash, regex(0/1), change-min-or-dash,
+    // change-max-or-dash, optional scope-depth=N, then zero or more
+    // value/ratio pairs.
+    if (args.size() < 7) return 2;
+    int valuePairStart = 7;
+    int scopeDepth = -1;
+    if (args.size() > 7 &&
+        args.at(7).startsWith(QStringLiteral("scope-depth="))) {
+        bool depthOk = false;
+        scopeDepth = args.at(7).mid(12).toInt(&depthOk);
+        if (!depthOk || scopeDepth < 0) return 2;
+        valuePairStart = 8;
+    }
+    if (((args.size() - valuePairStart) & 1) != 0) return 2;
+    auto optionalText = [](const QString& value) {
+        return value == QStringLiteral("-") ? QString() : value;
+    };
+
+    qputenv("WV_SIGNAL_SEARCH_BENCHMARK", QByteArray("1"));
+    MainWindow window;
+    window.resize(1600, 800);
+    window.show();
+    if (!window.openWaveFilePath(args.at(2), false)) return 3;
+    processEventsFor(app, 100);
+
+    QTreeView* tree =
+        window.findChild<QTreeView*>(QStringLiteral("signalTree"));
+    if (!tree) return 4;
+    if (scopeDepth >= 0 && tree->model() && tree->selectionModel()) {
+        QModelIndex scopedIndex = tree->model()->index(0, 0);
+        for (int depth = 0;
+             scopedIndex.isValid() && depth < scopeDepth; ++depth) {
+            scopedIndex = tree->model()->index(0, 0, scopedIndex);
+        }
+        if (!scopedIndex.isValid()) return 4;
+        tree->selectionModel()->select(
+            scopedIndex,
+            QItemSelectionModel::ClearAndSelect |
+            QItemSelectionModel::Rows);
+        tree->setCurrentIndex(scopedIndex);
+    }
+    tree->setFocus(Qt::OtherFocusReason);
+    processEventsFor(app, 20);
+    QKeyEvent press(QEvent::KeyPress, Qt::Key_F, Qt::ControlModifier);
+    QKeyEvent release(QEvent::KeyRelease, Qt::Key_F, Qt::ControlModifier);
+    QApplication::sendEvent(tree, &press);
+    QApplication::sendEvent(tree, &release);
+    processEventsFor(app, 30);
+
+    QDialog* dialog =
+        window.findChild<QDialog*>(QStringLiteral("signalConditionSearchDialog"));
+    QLineEdit* nameEdit =
+        window.findChild<QLineEdit*>(QStringLiteral("signalConditionName"));
+    QCheckBox* scopeCheck =
+        window.findChild<QCheckBox*>(QStringLiteral("signalConditionScope"));
+    QCheckBox* regexCheck =
+        window.findChild<QCheckBox*>(QStringLiteral("signalConditionRegex"));
+    QCheckBox* caseCheck =
+        window.findChild<QCheckBox*>(QStringLiteral("signalConditionCase"));
+    QLineEdit* changeMin =
+        window.findChild<QLineEdit*>(QStringLiteral("signalConditionChangeMin"));
+    QLineEdit* changeMax =
+        window.findChild<QLineEdit*>(QStringLiteral("signalConditionChangeMax"));
+    QPushButton* addValue =
+        window.findChild<QPushButton*>(QStringLiteral("signalConditionAddValue"));
+    QPushButton* search =
+        window.findChild<QPushButton*>(QStringLiteral("signalConditionSearch"));
+    QPushButton* cancel =
+        window.findChild<QPushButton*>(QStringLiteral("signalConditionCancel"));
+    QLabel* status =
+        window.findChild<QLabel*>(QStringLiteral("signalConditionStatus"));
+    if (!dialog || !nameEdit || !scopeCheck || !regexCheck || !caseCheck ||
+        !changeMin || !changeMax || !addValue || !search || !cancel || !status) {
+        return 5;
+    }
+
+    nameEdit->setText(optionalText(args.at(3)));
+    scopeCheck->setChecked(scopeDepth >= 0);
+    regexCheck->setChecked(args.at(4).toInt() != 0);
+    caseCheck->setChecked(false);
+    changeMin->setText(optionalText(args.at(5)));
+    changeMax->setText(optionalText(args.at(6)));
+
+    const int requestedValueRows =
+        (args.size() - valuePairStart) / 2;
+    QList<QLineEdit*> valueEdits =
+        window.findChildren<QLineEdit*>(QStringLiteral("signalConditionValue"));
+    while (valueEdits.size() < qMax(1, requestedValueRows)) {
+        addValue->click();
+        valueEdits =
+            window.findChildren<QLineEdit*>(QStringLiteral("signalConditionValue"));
+    }
+    QList<QLineEdit*> ratioEdits =
+        window.findChildren<QLineEdit*>(QStringLiteral("signalConditionRatio"));
+    for (int i = 0; i < valueEdits.size(); ++i) {
+        valueEdits.at(i)->clear();
+        if (i < ratioEdits.size()) ratioEdits.at(i)->clear();
+    }
+    for (int i = 0; i < requestedValueRows; ++i) {
+        valueEdits.at(i)->setText(
+            optionalText(args.at(valuePairStart + i * 2)));
+        ratioEdits.at(i)->setText(
+            optionalText(args.at(valuePairStart + 1 + i * 2)));
+    }
+
+    QElapsedTimer wallTimer;
+    wallTimer.start();
+    search->click();
+    while (!search->isEnabled() && wallTimer.elapsed() < 120000) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+        QThread::msleep(1);
+    }
+    processEventsFor(app, 20);
+    if (!search->isEnabled()) {
+        cancel->click();
+        processEventsFor(app, 100);
+        return 6;
+    }
+
+    const QString statusText = status->text();
+    const QRegularExpression matchCountPattern(
+        QStringLiteral("匹配\\s+(\\d+)\\s+个"));
+    const QRegularExpressionMatch countMatch =
+        matchCountPattern.match(statusText);
+    const int matchedSignals =
+        countMatch.hasMatch() ? countMatch.captured(1).toInt() : -1;
+
+    const QAbstractItemModel* model = tree->model();
+    struct PendingIndex {
+        QModelIndex parent;
+        int depth = 0;
+    };
+    QVector<PendingIndex> pending;
+    pending.push_back(PendingIndex{QModelIndex(), 0});
+    qint64 visibleNodes = 0;
+    int maxDepth = 0;
+    while (!pending.isEmpty() && visibleNodes < 2000000) {
+        const PendingIndex current = pending.takeLast();
+        const int rows = model ? model->rowCount(current.parent) : 0;
+        for (int row = 0; row < rows; ++row) {
+            const QModelIndex child = model->index(row, 0, current.parent);
+            if (!child.isValid()) continue;
+            ++visibleNodes;
+            maxDepth = qMax(maxDepth, current.depth + 1);
+            if (model->hasChildren(child)) {
+                pending.push_back(PendingIndex{child, current.depth + 1});
+            }
+        }
+    }
+
+    QTextStream out(stdout);
+    out << "signal_condition_search,wall_ms," << wallTimer.elapsed()
+        << ",matched," << matchedSignals
+        << ",top_level_rows," << (model ? model->rowCount() : 0)
+        << ",visible_tree_nodes," << visibleNodes
+        << ",max_tree_depth," << maxDepth
+        << ",status," << csvField(statusText) << '\n';
+    out.flush();
+    return statusText.startsWith(QStringLiteral("完成：")) ? 0 : 7;
 }
 
 int main(int argc, char *argv[]) {
@@ -1889,6 +2069,10 @@ int main(int argc, char *argv[]) {
     }
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--value-find-ui-benchmark")) {
         return runValueFindUiBenchmark(a, args);
+    }
+    if (args.size() >= 2 &&
+        args.at(1) == QStringLiteral("--signal-condition-search-benchmark")) {
+        return runSignalConditionSearchBenchmark(a, args);
     }
 
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--value-find-benchmark")) {
