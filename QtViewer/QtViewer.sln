@@ -10,6 +10,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_wvz4_dirty_array_pars
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_wvz4_dirty_peek_dynamic_parser", "smoke_wvz4_dirty_peek_dynamic_parser.vcxproj", "{9A06519D-0A21-43AF-B26A-C28FA1222276}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "WavePerf", "WavePerf.vcxproj", "{47A4EF8C-D282-42A6-B29D-B7EB7BE4780E}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -32,6 +34,10 @@ Global
 		{9A06519D-0A21-43AF-B26A-C28FA1222276}.Debug|x64.Build.0 = Debug|x64
 		{9A06519D-0A21-43AF-B26A-C28FA1222276}.Release|x64.ActiveCfg = Release|x64
 		{9A06519D-0A21-43AF-B26A-C28FA1222276}.Release|x64.Build.0 = Release|x64
+		{47A4EF8C-D282-42A6-B29D-B7EB7BE4780E}.Debug|x64.ActiveCfg = Debug|x64
+		{47A4EF8C-D282-42A6-B29D-B7EB7BE4780E}.Debug|x64.Build.0 = Debug|x64
+		{47A4EF8C-D282-42A6-B29D-B7EB7BE4780E}.Release|x64.ActiveCfg = Release|x64
+		{47A4EF8C-D282-42A6-B29D-B7EB7BE4780E}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

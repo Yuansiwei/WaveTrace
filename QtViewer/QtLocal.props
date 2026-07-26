@@ -17,6 +17,9 @@
 
   <PropertyGroup>
     <!-- Consumed by QtMsBuild/Qt.props/qmake cache generation. -->
+    <!-- Dependencies are vendored under third_party; do not use machine-wide vcpkg integration. -->
+    <VcpkgEnabled>false</VcpkgEnabled>
+
     <QtInstallDir>$(QtLocalRoot)</QtInstallDir>
     <QtToolsPath>$(QtLocalBin)</QtToolsPath>
     <QtDllPath>$(QtLocalBin)</QtDllPath>

@@ -65,7 +65,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp14</LanguageStandard>
       <ExceptionHandling>Sync</ExceptionHandling>
-      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
       <AdditionalIncludeDirectories>$(MSBuildProjectDirectory);$(QtGeneratedDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;_WINDOWS;NOMINMAX;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/utf-8 /Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions>
@@ -76,7 +76,7 @@
       <EnableUAC>false</EnableUAC>
       <AdditionalDependencies>$(QtEntryPointLib);delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <DelayLoadDLLs>$(QtNetworkDll);%(DelayLoadDLLs)</DelayLoadDLLs>
-      <AdditionalOptions>/MANIFESTINPUT:&quot;$(MSBuildProjectDirectory)\app.manifest&quot; %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/MANIFESTINPUT:&quot;$(MSBuildProjectDirectory)\app.manifest&quot; /ignore:4099 %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
 
@@ -103,7 +103,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <AdditionalDependencies>$(QtEntryPointLib);delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <DelayLoadDLLs>$(QtNetworkDll);%(DelayLoadDLLs)</DelayLoadDLLs>
-      <AdditionalOptions>/MANIFESTINPUT:&quot;$(MSBuildProjectDirectory)\app.manifest&quot; %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/MANIFESTINPUT:&quot;$(MSBuildProjectDirectory)\app.manifest&quot; /ignore:4099 %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
 
@@ -119,8 +119,6 @@
     <ClCompile Include="$(QtGeneratedDir)moc_ActiveSignalListWidget.cpp" />
     <ClCompile Include="$(QtGeneratedDir)moc_MainWindow.cpp" />
     <ClCompile Include="$(QtGeneratedDir)moc_WaveCanvas.cpp" />
-    <ClCompile Include="$(QtGeneratedDir)qrc_QtSingalViewer.cpp" />
-    <ClCompile Include="$(QtGeneratedDir)qrc_resources.cpp" />
   </ItemGroup>
 
   <ItemGroup>
@@ -141,21 +139,16 @@
     <Image Include="app.ico" />
     <None Include="app.manifest" />
     <None Include="QtSingalViewer.ui" />
-    <None Include="QtSingalViewer.qrc" />
-    <None Include="resources.qrc" />
   </ItemGroup>
 
   <Target Name="GenerateQtSources" BeforeTargets="ClCompile">
     <Error Condition="!Exists('$(QtLocalBin)moc.exe')" Text="Qt moc.exe not found. Expected $(QtLocalBin)moc.exe" />
     <Error Condition="!Exists('$(QtLocalBin)uic.exe')" Text="Qt uic.exe not found. Expected $(QtLocalBin)uic.exe" />
-    <Error Condition="!Exists('$(QtLocalBin)rcc.exe')" Text="Qt rcc.exe not found. Expected $(QtLocalBin)rcc.exe" />
     <MakeDir Directories="$(QtGeneratedDir)" />
     <Exec Command="&quot;$(QtLocalBin)moc.exe&quot; $(QtMocDefines) $(QtMocIncludes) -o &quot;$(QtGeneratedDir)moc_ActiveSignalListWidget.cpp&quot; &quot;$(MSBuildProjectDirectory)\ActiveSignalListWidget.h&quot;" />
     <Exec Command="&quot;$(QtLocalBin)moc.exe&quot; $(QtMocDefines) $(QtMocIncludes) -o &quot;$(QtGeneratedDir)moc_MainWindow.cpp&quot; &quot;$(MSBuildProjectDirectory)\MainWindow.h&quot;" />
     <Exec Command="&quot;$(QtLocalBin)moc.exe&quot; $(QtMocDefines) $(QtMocIncludes) -o &quot;$(QtGeneratedDir)moc_WaveCanvas.cpp&quot; &quot;$(MSBuildProjectDirectory)\WaveCanvas.h&quot;" />
     <Exec Command="&quot;$(QtLocalBin)uic.exe&quot; &quot;$(MSBuildProjectDirectory)\QtSingalViewer.ui&quot; -o &quot;$(QtGeneratedDir)ui_QtSingalViewer.h&quot;" />
-    <Exec Command="&quot;$(QtLocalBin)rcc.exe&quot; -name QtSingalViewer &quot;$(MSBuildProjectDirectory)\QtSingalViewer.qrc&quot; -o &quot;$(QtGeneratedDir)qrc_QtSingalViewer.cpp&quot;" />
-    <Exec Command="&quot;$(QtLocalBin)rcc.exe&quot; -name resources &quot;$(MSBuildProjectDirectory)\resources.qrc&quot; -o &quot;$(QtGeneratedDir)qrc_resources.cpp&quot;" />
   </Target>
 
   <Target Name="DeployQtRuntime" AfterTargets="Build">

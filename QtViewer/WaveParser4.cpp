@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -3333,20 +3335,22 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
                                                qint64& minTime,
                                                qint64& maxTime,
                                                quint64 maxDecodedSamples,
-                                               QString& error) {
+                                               QString& error,
+                                               const WaveParser4Reader::LoadProgressCallback& progress) {
     if (selectedIds.isEmpty() || allSelected) {
+        if (progress) progress(0, 1);
         QFile file(filePath);
         if (!file.open(QIODevice::ReadOnly)) {
             error = QStringLiteral("Cannot open WVZ4 file: %1").arg(filePath);
             return false;
         }
-            return decodeWdatSectionsFromFooterIndex(file, footerBlocks, blockIndexesByChunk,
-                                                     signalsPerChunk,
-                                                     selectedIds, allSelected,
-                                                 outputIndexesByStorageId, byteWidthBySignalId,
-                                                 outputSignals, samplesByOutputIndex,
-                                                 windowStart, windowEnd, minTime, maxTime,
-                                                 nullptr, error);
+        const bool ok = decodeWdatSectionsFromFooterIndex(
+            file, footerBlocks, blockIndexesByChunk, signalsPerChunk,
+            selectedIds, allSelected, outputIndexesByStorageId, byteWidthBySignalId,
+            outputSignals, samplesByOutputIndex, windowStart, windowEnd, minTime,
+            maxTime, nullptr, error);
+        if (ok && progress) progress(1, 1);
+        return ok;
     }
 
     QVector<int> selectedBlockIndexes;
@@ -3356,7 +3360,12 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
                                                selectedBlockIndexes, error)) {
         return false;
     }
-    if (selectedBlockIndexes.isEmpty()) return true;
+    if (selectedBlockIndexes.isEmpty()) {
+        if (progress) progress(1, 1);
+        return true;
+    }
+    const quint64 totalBlocks = quint64(selectedBlockIndexes.size());
+    if (progress) progress(0, totalBlocks);
 
     const unsigned hw = std::thread::hardware_concurrency();
     const int detectedWorkers = int(hw == 0 ? 4 : hw);
@@ -3391,6 +3400,7 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
                 return false;
             }
         }
+        if (progress) progress(totalBlocks, totalBlocks);
         return true;
     }
 
@@ -3402,7 +3412,10 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
     }
 
     std::atomic<bool> failed(false);
+    std::atomic<quint64> completedBlocks(0);
     std::mutex errorMutex;
+    std::mutex progressMutex;
+    std::condition_variable progressCondition;
     QString firstError;
     auto setError = [&](const QString& message) {
         bool expected = false;
@@ -3410,6 +3423,7 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
             std::lock_guard<std::mutex> lock(errorMutex);
             firstError = message;
         }
+        progressCondition.notify_one();
     };
 
     std::vector<std::thread> workers;
@@ -3479,6 +3493,9 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
                     setError(localError);
                     return;
                 }
+                const quint64 completed =
+                    completedBlocks.fetch_add(1, std::memory_order_acq_rel) + 1;
+                if (completed == totalBlocks) progressCondition.notify_one();
             }
             for (int outputIndex = 0; outputIndex < outputSignals.size(); ++outputIndex) {
                 if (!emitLeftAnchorIfNeeded(outputIndex,
@@ -3494,6 +3511,25 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
         });
     }
 
+    quint64 lastReportedBlocks = 0;
+    if (progress) {
+        while (!failed.load(std::memory_order_acquire) &&
+               completedBlocks.load(std::memory_order_acquire) < totalBlocks) {
+            std::unique_lock<std::mutex> lock(progressMutex);
+            progressCondition.wait_for(
+                lock, std::chrono::milliseconds(50), [&]() {
+                    return failed.load(std::memory_order_acquire) ||
+                           completedBlocks.load(std::memory_order_acquire) == totalBlocks;
+                });
+            lock.unlock();
+            const quint64 completed =
+                completedBlocks.load(std::memory_order_acquire);
+            if (completed != lastReportedBlocks) {
+                progress(completed, totalBlocks);
+                lastReportedBlocks = completed;
+            }
+        }
+    }
     for (std::thread& worker : workers) {
         if (worker.joinable()) worker.join();
     }
@@ -3501,6 +3537,9 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
         std::lock_guard<std::mutex> lock(errorMutex);
         error = firstError.isEmpty() ? QStringLiteral("WVZ4 parallel WDAT decode failed") : firstError;
         return false;
+    }
+    if (progress && lastReportedBlocks != totalBlocks) {
+        progress(totalBlocks, totalBlocks);
     }
 
     quint64 decodedSamples = 0;
@@ -4561,7 +4600,8 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
                                     QString& error,
                                     quint64 maxDecodedSamples,
                                     qint64 timeStart,
-                                    qint64 timeEnd) const {
+                                    qint64 timeEnd,
+                                    const LoadProgressCallback& progress) const {
     error.clear();
     outWave = WaveFile();
     if (!d || !d->opened) {
@@ -4644,7 +4684,8 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
                                                        minTime,
                                                        maxTime,
                                                        maxDecodedSamples,
-                                                       error)) {
+                                                       error,
+                                                       progress)) {
             return false;
         }
     }

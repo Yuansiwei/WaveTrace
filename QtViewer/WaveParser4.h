@@ -4,6 +4,7 @@
 
 #include <QString>
 #include <QVector>
+#include <functional>
 #include <limits>
 #include <memory>
 
@@ -60,6 +61,9 @@ public:
 
 class WaveParser4Reader {
 public:
+    using LoadProgressCallback = std::function<void(quint64 completedBlocks,
+                                                    quint64 totalBlocks)>;
+
     struct SignalValueMatchRequest {
         int signalId = -1;
         quint64 targetBits = 0;
@@ -113,7 +117,8 @@ public:
                      QString& error,
                      quint64 maxDecodedSamples = 0,
                      qint64 timeStart = 0,
-                     qint64 timeEnd = std::numeric_limits<qint64>::max()) const;
+                     qint64 timeEnd = std::numeric_limits<qint64>::max(),
+                     const LoadProgressCallback& progress = LoadProgressCallback()) const;
     bool loadSignalLod(const QVector<int>& signalIds,
                        WaveFile& outWave,
                        QString& error,
