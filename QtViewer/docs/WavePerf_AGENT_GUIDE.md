@@ -122,7 +122,9 @@ WavePerf 只依赖 Viewer 的 WVZ4 v15 Reader。当前相关扩展是
 
 - `normal`：显式数组元素；
 - `flat`：`[size=N].[0]` 拍平代表元素；
-- `latency`：低发射、低带宽、可配对 L1 延迟。
+- `latency`：低发射、低带宽、可配对 L1 延迟；
+- `windowed`：文件首尾有空白、多个 QPPU 在不同时段发射，用于验证全局
+  首末发射窗口。
 
 ---
 
@@ -134,7 +136,9 @@ WVZ4 v15 directory
   -> 完整路径正式分类
   -> 选择性能信号
   -> 检查 signal_selection_complete
-  -> loadSignals(选择 ID, 时间范围)
+  -> loadSignals(全部 issue vld, 请求范围)
+  -> 在覆盖完整时求全局首末发射并按业务周期对齐
+  -> loadSignals(选择 ID, 实际分析范围)
   -> 每个信号按变化边界积分
   -> issue / scheduler / resource / bandwidth / thread 事实
   -> architecture 递归聚合
@@ -380,6 +384,23 @@ Group 指令槽。类型必须读取当前发射记录的 `instIssueType`。
 - CB
 - MMA
 
+当前配套模型的 `InstIssueType` 固定映射为：
+
+```text
+0 NotIssue
+1 Thread
+2 ThreadEbb
+3 Group
+4 GroupEbb
+5 CB
+6 QppuMMA
+7 QppuMMAEbb
+8 Count
+```
+
+旧版本使用过从 2 开始的另一套编号，不能在当前模型上复用。类型编号、类别
+映射、HTML 名称和 self-test 必须由同一张映射维护。
+
 原始 `mainType` 与 `instIssueType` 直方图保留在 JSON。当前没有完整 opcode 到
 助记符的解码，不得在报告中臆造具体 opcode。
 
@@ -476,7 +497,49 @@ Queue Ready && 本周期未发射该 SG
 ```
 
 只有队列读指针、队首 PC、类型、SG 状态和 issue attribution 都可用时才累计。
-PC 等待覆盖必须单独报告。
+不得从任意 queue entry、上一次 issue 或名字相似的 PC 猜测当前阻塞指令。
+队首索引必须由该 SG 的 queue read pointer 解析，再读取同一 entry 的
+`PC.pc_`、`preDecode.instIssueType` 和指令特征。
+
+CB 指令还应读取同一 entry/slot 的 `preDecode.cb_inst_client`。当前
+`CBCtrlInstClient` 映射为：
+
+```text
+0 IMGLDST       1 PSO          2 TEXTURE
+3 FP64          4 LDST         5 FCU
+6 TAC           7 UMMA         8 TotalNum
+9 MBAlloc      10 DTF         11 BWGBarrier
+12 NonCBInstrEbb
+```
+
+例如 AtomicAdd 类 CB memory 指令会由模型解码为 `CB / LDST`。客户端枚举只
+描述指令将去往哪个后端，不等于该后端资源已经不足。资源耗尽必须另有同周期
+credit、FIFO、inflight 或明确 stall 信号作为证据。
+
+可用于报告阻塞指令类型的 Predecode 字段必须同时满足：
+
+1. 配套模型源码明确显示字段如何赋值或消费；
+2. 实际 WVZ4 的 queue entry 与 issue slot 指令对象中存在该字段；
+3. 快速预筛选、正式分类和 Scheduler queue-entry 匹配均已接入；
+4. normal、flat、latency 三种布局和 Scheduler self-test 均覆盖。
+
+字段仅在波形中出现不代表语义已确认。`isFence` 已由模型维护者确认表示
+Fence 指令，现纳入统一特征表。所有已确认字段均由
+`instructionFeatureSpecs()` 统一维护，issue 特征与 queue-head 等待特征必须
+共用这张表，避免两套口径漂移。
+
+PC、粗类型和每个指令特征的覆盖必须分别报告。缺失特征是 Unknown，不是 false；
+只有特征覆盖完整时才能说“该阻塞指令没有某标记”。多个特征可同时为真，占比
+允许重叠。
+
+`scheduler.summary.pc_wait_instruction_flags` 按置位等待周期从高到低列出
+实际命中的特征；每个 QPPU 在同名字段中保存自己的分布。每项至少包含
+`source_field`、`group`、`active_wait_cycles`、`wait_share_percent`、
+`active_when_known_percent`、`coverage_percent` 和 `covered`。
+`wait_share_percent` 的分母是全部 `Queue Ready && 未发射` 等待周期，
+`active_when_known_percent` 的分母只包含该 flag 已知的等待周期。两者不能
+混用；多个 flag 可同时置位，因此所有 `wait_share_percent` 相加可以超过
+100%。
 
 ---
 
@@ -723,7 +786,9 @@ thread efficiency = execute lanes / valid lanes
 - mask bit 字节宽度已知；
 - 峰值口径存在。
 
-否则发布 unavailable/partial，并说明 reason。
+否则发布 unavailable/partial，并说明 reason。若 lane 布局不完整但已观测
+lane 的值覆盖完整，可以发布“已观测 lane 的 B/cycle”，状态必须为
+`partial`，且不得发布全接口利用率。
 
 ---
 
@@ -990,6 +1055,7 @@ $writer = 'tests\waveperf_layout_modes\build\waveperf_layout_modes_writer.exe'
 & $writer normal  build_vs\waveperf_normal.wvz4
 & $writer flat    build_vs\waveperf_flat.wvz4
 & $writer latency build_vs\waveperf_latency.wvz4
+& $writer windowed build_vs\waveperf_windowed.wvz4
 ```
 
 ### 25.4 生成报告
@@ -1005,6 +1071,9 @@ $perf = 'QtViewer\build\x64\Release\WavePerf.exe'
 
 & $perf build_vs\waveperf_latency.wvz4 `
   --out build_vs\waveperf_latency.perf --no-progress
+
+& $perf build_vs\waveperf_windowed.wvz4 `
+  --out build_vs\waveperf_windowed.perf --no-progress
 ```
 
 ### 25.5 截断对抗
@@ -1029,15 +1098,48 @@ summary.issue_activity_coverage_complete == false
 不存在 qppu_imbalance / memory_bandwidth / issue_underfill
 ```
 
-### 25.6 非零范围
+### 25.6 全局首末发射范围
 
 ```powershell
-& $perf build_vs\waveperf_normal.wvz4 `
-  --out build_vs\waveperf_normal_20_80.perf `
-  --start-cycle 20 --end-cycle 80 --no-progress
+& $perf build_vs\waveperf_windowed.wvz4 `
+  --out build_vs\waveperf_windowed.perf --no-progress
 ```
 
-应得到 `duration_cycles=60`，并保持完整覆盖。
+`windowed` 文件请求范围为 tick `[0,1000)`，实际发射分布在多个 QPPU 上。
+应得到：
+
+```text
+analysis.requested_start_tick == "0"
+analysis.requested_end_tick == "1000"
+analysis.first_issue_tick == "100"
+analysis.last_issue_tick_exclusive == "800"
+analysis.start_tick == "100"
+analysis.end_tick == "800"
+analysis.duration_cycles == 70
+analysis.range_basis == "global_issue_window"
+analysis.global_issue_window_coverage_complete == true
+```
+
+再验证显式外层裁剪：
+
+```powershell
+& $perf build_vs\waveperf_windowed.wvz4 `
+  --out build_vs\waveperf_windowed_0_60.perf `
+  --start-cycle 0 --end-cycle 60 --no-progress
+```
+
+应得到请求范围 tick `[0,600)`、实际范围 `[100,600)`。如果显式范围内完全
+没有发射，必须保留显式范围并设置
+`range_basis=requested_range_fallback`，不能生成空分析区间。
+
+自动收缩必须满足以下不变量：
+
+- 合并所有已选 QPPU 和所有 Main/Shadow 发射槽，不按单实例裁剪；
+- 首条发射所在业务周期完整保留；
+- 最后一条发射所在业务周期完整保留；
+- 显式 start/end 是不可越过的外层边界；
+- 发射槽覆盖不完整、信号选择截断或范围内没有发射时禁止自动收缩；
+- 诊断、分母、时间线、PC 热点、内存延迟和 HTML/JSON 必须共用实际范围。
 
 ---
 
@@ -1057,7 +1159,7 @@ summary.issue_activity_coverage_complete == false
 ### flat
 
 - 只观测代表 QPPU `[0]`；
-- 发射利用率约 120%；
+- 全局首末发射窗口为 80 个业务周期，发射利用率约 150%；
 - workload 为 throughput；
 - 资源压力可以是容量风险；
 - 事件总数：FIFO read/write 2/4，Cache hit/miss 2/1。
@@ -1065,11 +1167,21 @@ summary.issue_activity_coverage_complete == false
 ### latency
 
 - 只有一个 QPPU 实际参与；
-- 参与范围 issue utilization 约 1%；
-- 全局四 QPPU summary 约 0.25%；
+- 在最后一个业务周期额外保留一条发射，使请求/返回延迟证据位于全局首末
+  发射窗口内；
+- 参与范围 issue utilization 约 2%；
+- 全局四 QPPU summary 约 0.5%；
 - L1 延迟高置信且带宽不高；
 - workload 为 memory_latency；
 - 事件总数：FIFO read/write 8/16，Cache hit/miss 8/4。
+
+### windowed
+
+- 请求范围 tick `[0,1000)`；
+- QPPU 0 在 tick `[100,300)` 发射，QPPU 1 在 `[500,800)` 发射；
+- 实际分析范围为 `[100,800)`，共 70 个业务周期；
+- 文件首尾空白不进入利用率分母；
+- 显式外层裁剪与无发射回退均保持稳定。
 
 数值变化时先判断测试生成器是否有意修改，不要直接把断言改成新结果。
 
@@ -1085,6 +1197,7 @@ summary.issue_activity_coverage_complete == false
 - `analysis.decoded_samples`
 - `analysis.open_ms`
 - `analysis.selection_ms`
+- `analysis.issue_window_scan_ms`
 - `analysis.decode_ms`
 - `analysis.analysis_ms`
 - `coverage.signal_selection_complete`
@@ -1121,8 +1234,9 @@ summary.issue_activity_coverage_complete == false
 - [ ] Release Level4 构建通过。
 - [ ] Debug Level4 构建通过。
 - [ ] 两个配置的 `--self-test` 通过。
-- [ ] normal/flat/latency 均能生成报告。
-- [ ] 非零范围通过。
+- [ ] normal/flat/latency/windowed 均能生成报告。
+- [ ] windowed 全局首末发射范围通过。
+- [ ] 显式外层裁剪、无发射回退和覆盖不完整回退通过。
 - [ ] 40/80/120 截断对抗通过。
 - [ ] 事件总数符合预期。
 - [ ] JSON 可解析且无 U+FFFD。

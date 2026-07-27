@@ -1149,7 +1149,7 @@ struct SignalLogicTree {
     QVector<int> nodeIdBySignalIndex;
     const QVector<int>* waveNodeIdBySignalIndex = nullptr;
     const WaveTreeInfo* waveTree = nullptr;
-    const QVector<WaveSignal>* waveSignalDefs = nullptr;
+    const WaveSignalList* waveSignalDefs = nullptr;
     mutable WaveChildListCache waveChildLists;
 
     void clear() {
@@ -1354,16 +1354,17 @@ struct SignalLogicTree {
         return nodeId;
     }
 
-    void buildFromSignalDefs(const QVector<WaveSignal>& signalDefs) {
+    void buildFromSignalDefs(const WaveSignalList& signalDefs) {
         clear();
         nodeIdBySignalIndex.resize(signalDefs.size());
         std::fill(nodeIdBySignalIndex.begin(), nodeIdBySignalIndex.end(), -1);
 
-        names.reserve(qMax(1024, signalDefs.size() * 2));
-        signalPaths.reserve(signalDefs.size());
-        nodes.reserve(signalDefs.size() * 2);
+        const int signalCount = static_cast<int>(signalDefs.size());
+        names.reserve(qMax(1024, signalCount * 2));
+        signalPaths.reserve(signalCount);
+        nodes.reserve(signalCount * 2);
 
-        for (int signalIndex = 0; signalIndex < signalDefs.size(); ++signalIndex) {
+        for (int signalIndex = 0; signalIndex < signalCount; ++signalIndex) {
             const WaveSignal& sig = signalDefs.at(signalIndex);
             const QByteArray utf8 = sig.name.toUtf8();
             PathSegViewList segViews = splitPathToSmallVec(utf8);
@@ -1392,7 +1393,7 @@ struct SignalLogicTree {
         }
     }
 
-    void buildFromWaveTree(const WaveTreeInfo& tree, const QVector<WaveSignal>& signalDefs) {
+    void buildFromWaveTree(const WaveTreeInfo& tree, const WaveSignalList& signalDefs) {
         clear();
 
         if (!tree.valid || tree.nodesById.isEmpty()) {
@@ -2897,7 +2898,7 @@ bool buildComparedWaveFileWvz4Streaming(const QString& leftPath,
         }
     }
 
-    if (outWave.signalList.isEmpty()) {
+    if (outWave.signalList.empty()) {
         error = formatNoSignalDiffMessage(leftDirectory.meta, rightDirectory.meta);
         if (viewerPerfLogEnabled()) {
             comparePerfLog("compare.streaming.total", totalTimer.elapsed(),
@@ -5471,7 +5472,8 @@ QJsonValue MainWindow::handleAgentRpc(const QString& method,
         out.insert(QStringLiteral("file"), m_currentWaveFilePath);
         out.insert(QStringLiteral("title"), m_wave.meta.title);
         out.insert(QStringLiteral("timescale"), m_wave.meta.timescale);
-        out.insert(QStringLiteral("signal_count"), m_wave.signalList.size());
+        out.insert(QStringLiteral("signal_count"),
+                   QJsonValue(static_cast<double>(m_wave.signalList.size())));
         out.insert(QStringLiteral("range"), QJsonObject{{QStringLiteral("start"), agentTime(m_wave.meta.start)},
                                                          {QStringLiteral("end"), agentTime(m_wave.meta.end)}});
         if (m_canvas) {
@@ -5808,8 +5810,8 @@ void MainWindow::applyWave(WaveFile&& wave) {
         m_signalIndexBySignalId = std::move(m_wave.tree.signalIndexBySignalId);
     } else {
         m_signalIndexBySignalId.clear();
-        if (!m_wave.signalList.isEmpty()) {
-            const int maxSignalId = m_wave.signalList.constLast().signalId;
+        if (!m_wave.signalList.empty()) {
+            const int maxSignalId = m_wave.signalList.back().signalId;
             if (maxSignalId >= 0 && maxSignalId <= 100000000) {
                 m_signalIndexBySignalId.resize(maxSignalId + 1);
                 std::fill(m_signalIndexBySignalId.begin(), m_signalIndexBySignalId.end(), 0);
@@ -5979,7 +5981,7 @@ void MainWindow::activateFirstSignalsForBenchmark(int count) {
     if (!m_activeList) return;
     m_activeList->clear();
     QList<int> indexes;
-    const int limit = qMin(qMax(0, count), m_wave.signalList.size());
+    const int limit = qMin(qMax(0, count), static_cast<int>(m_wave.signalList.size()));
     indexes.reserve(limit);
     for (int i = 0; i < limit; ++i) indexes.push_back(i);
     addSignalIndexesToActive(indexes);
@@ -6383,7 +6385,7 @@ bool MainWindow::selectActiveSignalByIndex(int signalIndex) {
 }
 
 void MainWindow::jumpSelectedTreeSignalToViewportEvent(bool firstEvent) {
-    if (!m_canvas || m_wave.signalList.isEmpty()) return;
+    if (!m_canvas || m_wave.signalList.empty()) return;
     const QList<int> signalIndexes = selectedTreeSignalIndexesForViewportJump();
     if (signalIndexes.isEmpty()) return;
     if (!ensureSignalLodLoaded(signalIndexes)) return;
@@ -8653,7 +8655,7 @@ void MainWindow::applyWindowRangeInput() {
 }
 
 void MainWindow::openDerivedSignalDialog() {
-    if (m_wave.signalList.isEmpty()) {
+    if (m_wave.signalList.empty()) {
         QMessageBox::information(this,
             QStringLiteral("Create temporary signal"),
             QStringLiteral("Open a waveform before creating a temporary signal."));

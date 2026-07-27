@@ -267,6 +267,7 @@ int main(int argc, char** argv) {
     options.enable_wave_array_parallel_sampling = true;
     options.wave_array_parallel_threshold = 1u;
     options.enable_dirty_peek_groups = true;
+    options.enable_dynamic_dirty_groups = true;
     options.enable_dirty_peek_memory_block_precheck = true;
     options.enable_dirty_peek_memory_block_byte_map = true;
     options.dirty_peek_parallel_threshold = 1u;

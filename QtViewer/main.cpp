@@ -314,7 +314,7 @@ static int runValueFindBenchmark(const QStringList& args) {
     };
 
     QVector<SignalResult> results;
-    results.reserve(qMin(requestedSignals, wave.signalList.size()));
+    results.reserve(qMin(requestedSignals, static_cast<int>(wave.signalList.size())));
 
     qint64 totalSamples = 0;
     qint64 totalHits = 0;
@@ -580,7 +580,7 @@ static int runProceduralClockRenderRegression(QApplication& app) {
     clock.clockTogglePeriodTicks = 5;
     wave.signalList.push_back(clock);
 
-    const WaveSignal& signal = wave.signalList.constFirst();
+    const WaveSignal& signal = wave.signalList.front();
     const qint64 millionthEdge =
         qint64(signal.clockTogglePeriodTicks * 1'000'001ull);
     if (waveProceduralClockTransitionAtOrAfter(signal, millionthEdge) !=
@@ -617,8 +617,8 @@ static int runProceduralClockRenderRegression(QApplication& app) {
     }
     const qint64 renderMs = timer.elapsed();
 
-    if (!wave.signalList.constFirst().samples.isEmpty() ||
-        !wave.signalList.constFirst().lodLevels.isEmpty()) {
+    if (!wave.signalList.front().samples.isEmpty() ||
+        !wave.signalList.front().lodLevels.isEmpty()) {
         QTextStream(stderr) << "error: procedural clock rendering materialized samples\n";
         return 6;
     }
@@ -626,8 +626,8 @@ static int runProceduralClockRenderRegression(QApplication& app) {
     QTextStream out(stdout);
     out << "procedural_clock_render_ok"
         << " transitions=" << (wave.meta.end / qint64(signal.clockTogglePeriodTicks))
-        << " samples=" << wave.signalList.constFirst().samples.size()
-        << " lod_levels=" << wave.signalList.constFirst().lodLevels.size()
+        << " samples=" << wave.signalList.front().samples.size()
+        << " lod_levels=" << wave.signalList.front().lodLevels.size()
         << " renders=5"
         << " elapsed_ms=" << renderMs << "\n";
     return 0;

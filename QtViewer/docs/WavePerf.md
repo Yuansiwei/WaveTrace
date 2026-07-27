@@ -35,28 +35,56 @@ WavePerf.exe wave.wvz4 `
   --timeline-bins 200
 ```
 
-- `--start-cycle/--end-cycle` 使用业务周期，结束周期不包含在范围内。
+- `--start-cycle/--end-cycle` 使用业务周期，结束周期不包含在范围内；它们是
+  自动收缩前的外层裁剪边界。
 - `--ticks-per-cycle` 指定业务周期到 WVZ4 tick 的换算，默认 10。
 - `--timeline-bins` 控制时间线分桶数，默认 160，范围 1..1000。
 - `--no-progress` 关闭 WDAT 解码进度条。
 - `--max-samples/--max-signals` 是大文件保护上限。
+- `--dump-predecode-fields` 列出波形内实际存在的 Predecode 字段和示例路径，
+  用于核对版本差异；列出字段不等于分析器已经采用其语义。
 
 旧 `profile/Markdown/CSV/逐信号 JSON` 接口不再保留。
+
+## 默认分析范围
+
+WavePerf 默认只分析全局第一条实际发射的指令到最后一条实际发射的指令：
+
+1. 第一遍只解码所有已覆盖的 `issue_inst_[slot].vld`。
+2. 在 `--start-cycle/--end-cycle` 指定的外层范围内，寻找任意 QPPU、任意
+   Main/Shadow 槽第一次和最后一次有效发射。
+3. 起点向下对齐到第一条发射所在的业务周期，终点向上对齐到最后一条发射
+   所在业务周期的末尾。
+4. 第二遍只解码这个有效区间内的全部性能信号，所有利用率、等待时间、时间线
+   和热点统一使用该区间。
+
+因此仿真启动和结束阶段没有指令发射的空白周期不会稀释利用率。显式
+`--start-cycle/--end-cycle` 仍然有效，但只负责先裁掉不希望分析的外层区间。
+
+只有在发射槽选择完整时才会自动收缩。若范围内完全没有指令发射，或发射槽
+覆盖不完整，WavePerf 会保留请求范围并给出覆盖告警，不会猜测首末发射位置。
+`data.json` 的 `analysis` 中同时保留：
+
+- `requested_start_tick/requested_end_tick`：用户请求或文件给出的外层范围；
+- `start_tick/end_tick`：实际分析范围；
+- `range_basis`：`global_issue_window` 或 `requested_range_fallback`；
+- `first_issue_tick/last_issue_tick_exclusive`：实际观测到的首末发射边界。
 
 ## 分析流程
 
 1. 自动识别 QPPU、PPU、DPPU、Cluster、GPU、FIFO、Queue 和 L1/L2 信号。
-2. 对变化记录做区间积分，不把波形展开为逐周期数组。
-3. 建立每个 QPPU、每个 SG 的调度状态和时间线分桶。
-4. 由同一组事实生成发射、线程、缓冲、带宽和架构树指标。
-5. 先推断实际参与执行的 QPPU，再统一判定驻留、前端供给、调度依赖、
+2. 先只读取全局发射有效位，确定可靠的首末发射窗口。
+3. 对有效窗口内的变化记录做区间积分，不把波形展开为逐周期数组。
+4. 建立每个 QPPU、每个 SG 的调度状态和时间线分桶。
+5. 由同一组事实生成发射、线程、缓冲、带宽和架构树指标。
+6. 先推断实际参与执行的 QPPU，再统一判定驻留、前端供给、调度依赖、
    执行延迟、资源背压、访存延迟、带宽和持续吞吐。
 
 报告页面分为：
 
 - 总览：一级主瓶颈、逐 QPPU 二级归因、核心利用率和补充证据。
 - 发射 / Thread：指令类型、Main/Shadow、双发组合、每 SG Thread 有效率和
-  QPPU EU 指标。
+  QPPU EU 指标；同时显示源码已确认的 Predecode 指令特征。
 - 调度器：每个 QPPU/SG 的 Active、Queue Ready、Eligible 和阻塞原因。
 - 时间线：分阶段查看吞吐和调度状态。
 - 架构树：QPPU 到 GPU 的递归聚合利用率。
@@ -76,6 +104,22 @@ WavePerf.exe wave.wvz4 `
 `issue_inst_[0]` 和 `[1]` 是 Main/Shadow 发射顺序，不是固定的普通指令槽与
 Group 指令槽。指令功能类型按 `instIssueType` 归类为 Thread、Group、CB、
 MMA。
+
+当前模型的 `InstIssueType` 数值口径为：
+
+```text
+0 NotIssue
+1 Thread
+2 Thread EBB
+3 Group
+4 Group EBB
+5 CB
+6 QPPU MMA
+7 QPPU MMA EBB
+8 Count
+```
+
+该表不能沿用旧模型中从 2 开始的类型编号，否则会把 CB 等类型整体错判。
 
 ### SG 调度状态
 
@@ -115,9 +159,29 @@ Queue 或 Credit 压力若没有伴随发射下降，只标记为容量风险，
 Queue Head 等待 = Queue Ready 且本周期未发射该 SG
 ```
 
-每个等待周期记录已观测到的主要阻塞原因。若局部 Eligible 但仍未发射，则
+每个等待周期记录已观测到的主要阻塞原因，并从当前队列读指针定位真正的队首
+条目，报告该条目的 PC、`instIssueType` 和源码已确认的 Predecode 类型标记，
+例如 `isGlobalMem`、`isLDMB`、`isBarrier`。若局部 Eligible 但仍未发射，则
 保留为 `eligible`，表示瓶颈位于波形未覆盖的仲裁、操作数或执行资源，而不会
-猜测成某个具体原因。报告同时给出 PC 等待覆盖率。
+猜测成某个具体原因。
+
+对于 CB 指令，同时读取同一条 queue/issue 指令对象的
+`preDecode.cb_inst_client`，按当前模型的 `CBCtrlInstClient` 枚举显示目标
+客户端，例如 `4 = LDST`。这只能证明该指令需要哪个 CB 客户端；只有相应
+credit、FIFO 或 inflight 上限也被波形直接覆盖时，才能进一步断言该资源已经
+耗尽。
+
+PC、粗类型和每个 Predecode 类型标记分别计算覆盖率。字段不存在时报告部分
+覆盖，不把缺失字段当作 false。当前只采用已在配套模型源码中确认赋值/消费
+语义、且确实位于 queue/issue 指令对象上的字段。`isFence` 已由模型维护者
+确认表示 Fence 指令，因此与 `isBarrier` 等字段一样参与 issue 特征统计和
+Queue Head 阻塞指令类型展示；缺失时仍按 Unknown 处理，不当作 false。
+
+总览中的“阻塞指令 flag 分布”以全部 `Queue Ready && 未发射` 的 SG 等待
+周期为分母，统计队首指令各 Predecode flag 置位时覆盖了多少等待周期；逐
+QPPU 同样单独统计。报告同时给出全部等待占比、flag 已知区间内的置位占比和
+覆盖率。flag 不是互斥分类，一条指令可以同时具有多个标记，所以各类占比之和
+可以超过 100%；覆盖不足的区间不会按未置位处理。
 
 ### FIFO 与 Queue
 
@@ -153,6 +217,8 @@ Credit Top 50 同样只列出实际出现过耗尽周期的 Counter。名字中�
 
 带宽只统计已确认的握手和有效字节 mask。只有声明 lane 全部覆盖、mask 位宽
 可映射到字节、并且峰值口径已知时才输出利用率。
+拍平波形只覆盖部分 lane 时仍显示这些已观测 lane 的 B/cycle，但明确标为
+`partial`，不发布全接口利用率。
 
 - L1LSTX-L2 读：按返回 `vld + sector.vld + sector.mask` 统计有效字节。
 - L1LSTX-L2 写：按写数据 `vld + wmask` 统计有效字节。

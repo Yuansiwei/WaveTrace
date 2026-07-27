@@ -85,7 +85,7 @@ details{border-bottom:1px solid var(--line);padding:8px 0}summary{cursor:pointer
     const QByteArray suffix = R"HTML(;
 const $=id=>document.getElementById(id);
 const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const num=(v,d=1)=>Number.isFinite(Number(v))?Number(v).toLocaleString("zh-CN",{maximumFractionDigits:d}):"-";
+const num=(v,d=1)=>Number.isFinite(Number(v))?Number(v).toLocaleString("zh-CN",{maximumFractionDigits:Math.max(0,Math.min(20,Number.isFinite(Number(d))?Number(d):1))}):"-";
 const pct=v=>num(v,1)+"%";
 const bar=(v,kind="")=>`<div class="bar ${kind}"><i style="width:${Math.max(0,Math.min(100,Number(v)||0))}%"></i></div>`;
 const table=(headers,rows)=>`<div class="scroll"><table><thead><tr>${headers.map(x=>`<th>${x}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table></div>`;
@@ -101,7 +101,8 @@ document.querySelectorAll("#tabs button").forEach(button=>button.onclick=()=>{
  const issueCovered=selectionCovered&&(scoped?wp.issue_coverage_complete===true:sum.issue_activity_coverage_complete===true);
  const activityCovered=selectionCovered&&(scoped?wp.activity_coverage_complete===true:ss.activity_coverage_complete===true);
  const eligibilityCovered=selectionCovered&&(scoped?wp.eligibility_coverage_complete===true:ss.eligibility_coverage_complete===true);
-$("meta").textContent=`${file.path||""} · ${num(analysis.duration_cycles,2)} 业务周期 · ${num(file.signals,0)} 个信号`;
+ const rangeBasis=analysis.range_basis==="global_issue_window"?"全局首末发射窗口":"请求范围";
+$("meta").textContent=`${file.path||""} · 分析 tick [${analysis.start_tick??"-"}, ${analysis.end_tick??"-"}) · ${rangeBasis} · ${num(analysis.duration_cycles,2)} 业务周期 · ${num(file.signals,0)} 个信号`;
 const findings=DATA.findings||[];
 const primary=findings[0]||{};
 const primaryHtml=primary.title?`<p class="lead"><strong>${esc(primary.title)}</strong></p><p>${esc(primary.conclusion)}</p><p><b>依据：</b>${esc(primary.evidence)}</p><p class="next"><b>动作：</b>${esc(primary.next_step)}</p>`:`<p class="lead">${esc(DATA.conclusion||"没有可用结论")}</p>`;
@@ -109,8 +110,13 @@ const secondary=findings.slice(1);
 const secondaryHtml=secondary.map(f=>`<div class="finding ${esc(f.severity)}"><strong>${esc(f.title)}</strong><p><b>依据：</b>${esc(f.evidence)}</p><p class="next"><b>动作：</b>${esc(f.next_step)}</p></div>`).join("");
 const qppuConclusions=DATA.qppu_conclusions||[];
 const qppuConclusionByPath=new Map(qppuConclusions.map(q=>[String(q.path||""),q]));
+const schedulerQppuByPath=new Map((sched.qppus||[]).map(q=>[String(q.path||""),q]));
+const waitFlagRows=(ss.pc_wait_instruction_flags||[]).map((f,i)=>`<tr><td>${i+1}</td><td>${esc(f.source_field)}</td><td>${esc(f.group)}</td><td>${num(f.active_wait_cycles,2)}</td><td>${pct(f.wait_share_percent)}${bar(f.wait_share_percent,f.wait_share_percent>=50?"warn":"")}</td><td>${pct(f.active_when_known_percent)}</td><td>${pct(f.coverage_percent)} · ${f.covered?"完整":"部分"}</td></tr>`);
+const waitFlagEmpty=Number(ss.pc_wait_cycles||0)<=0?"分析区间没有 Queue Ready 且未发射的 SG 周期":(ss.pc_wait_feature_coverage_complete?"已覆盖的队首指令中没有置位的指令 flag":"指令 flag 覆盖不足，不能把未观测项当作 0");
+const waitFlagSection=`<div class="section"><h2>阻塞指令 flag 分布</h2><p class="muted">统计对象为 Queue Ready 且未发射时的队首指令；“全部等待占比”以全部此类 SG 等待周期为分母。多个 flag 可在同一条指令上同时置位，因此各类比例之和可以超过 100%。未知或缺失 flag 不按 0 计算；覆盖不足时，全部等待占比只是已确认的下限。</p>${table(["排名","指令 flag","分组","置位等待周期","全部等待占比","已知区间置位占比","flag 覆盖"],waitFlagRows.length?waitFlagRows:[`<tr><td colspan=7>${waitFlagEmpty}</td></tr>`])}</div>`;
+const qppuWaitFlagSummary=path=>{const q=schedulerQppuByPath.get(String(path||""))||{},flags=q.pc_wait_instruction_flags||[];if(flags.length)return flags.slice(0,4).map(f=>`${esc(f.source_field)} ${pct(f.wait_share_percent)}${f.covered?"":"（下限，覆盖 "+pct(f.coverage_percent)+"）"}`).join("<br>");if(Number(q.pc_wait_cycles||0)<=0)return "无队首等待";return q.pc_wait_feature_coverage_complete?"未见置位 flag":"flag 部分覆盖";};
  const stateName=s=>({bottleneck:"瓶颈",risk:"风险",healthy:"正常",uncovered:"未覆盖",inactive:"未参与"}[s]||s||"-");
- const qppuConclusionRows=qppuConclusions.map(q=>{const issue=q.issue_coverage_complete===true;return `<tr><td>QPPU ${num(q.qppu_index,0)}<br><span class="path">${esc(q.path)}</span></td><td><span class="pill ${esc(q.state)}">${esc(stateName(q.state))}</span></td><td>${esc(q.module)}</td><td><b>${esc(q.title)}</b></td><td>${esc(q.reason)}</td><td>${issue?num(q.issue_idle_cycles,2):"部分覆盖"}</td><td>${issue?pct(q.issue_active_percent):"部分覆盖"}</td><td>${issue?pct(q.issue_utilization_percent):"部分覆盖"}</td><td>${esc(q.confidence)}</td></tr>`});
+ const qppuConclusionRows=qppuConclusions.map(q=>{const issue=q.issue_coverage_complete===true;return `<tr><td>QPPU ${num(q.qppu_index,0)}<br><span class="path">${esc(q.path)}</span></td><td><span class="pill ${esc(q.state)}">${esc(stateName(q.state))}</span></td><td>${esc(q.module)}</td><td><b>${esc(q.title)}</b></td><td>${esc(q.reason)}</td><td>${qppuWaitFlagSummary(q.path)}</td><td>${issue?num(q.issue_idle_cycles,2):"部分覆盖"}</td><td>${issue?pct(q.issue_active_percent):"部分覆盖"}</td><td>${issue?pct(q.issue_utilization_percent):"部分覆盖"}</td><td>${esc(q.confidence)}</td></tr>`});
  const kpis=[
    ["发射利用率",issueCovered?pct(scoped?wp.issue_utilization_percent:sum.issue_utilization_percent):"部分覆盖"],
    ["IPC",issueCovered?num(sum.ipc_observed,3):"部分覆盖"],
@@ -121,17 +127,21 @@ const qppuConclusionByPath=new Map(qppuConclusions.map(q=>[String(q.path||""),q]
  ];
  const scopeNote=!selectionCovered?"性能信号选择达到上限；局部实例数据可查看，但全局 KPI 和瓶颈判型均按部分覆盖处理。":(wp.status==="static_snapshot"?"静态快照只保留边界状态，不计算动态参与范围。":`参与 ${num(wp.participating_qppus,0)} / 观测 ${num(wp.observed_qppus,0)} 个 QPPU；未参与实例不进入负载均衡分母。`);
  const workloadHtml=wp.title?`<div class="section"><h2>工作负载判型 <span class="pill">${esc(wp.confidence)}置信</span></h2><p class="lead"><strong>${esc(wp.scope_name)} · ${esc(wp.title)}</strong></p><p>${esc(wp.conclusion)}</p><p><b>证据：</b>${esc(wp.evidence)}</p><p class="muted">${esc(scopeNote)}</p></div>`:"";
- $("overview").innerHTML=`<div class="section"><h2>一级结论</h2>${primaryHtml}</div>${workloadHtml}<div class="kpis">${kpis.map(k=>`<div class="kpi"><span>${k[0]}</span><b>${k[1]}</b></div>`).join("")}</div>${qppuConclusionRows.length?`<div class="section"><h2>二级结论：逐 QPPU</h2>${table(["实例","状态","瓶颈模块","判断","原因","未发射周期","发射活跃","发射利用率","置信度"],qppuConclusionRows)}</div>`:""}${secondary.length?`<div class="section"><h2>全局补充证据</h2>${secondaryHtml}</div>`:""}<div class="section"><h2>覆盖</h2><p>信号选择 ${selectionCovered?"完整":"截断"} · QPPU ${num(sched.qppu_count,0)} · SG ${num(ss.fully_covered_shader_groups,0)}/${num(ss.shader_groups,0)} · 发生跳变信号 ${num(analysis.dynamic_signals,0)}</p>${sched.eligibility_definition?`<details><summary>Eligible 判据</summary><p class="muted">${esc(sched.eligibility_definition)}</p></details>`:""}</div>`;
+ $("overview").innerHTML=`<div class="section"><h2>一级结论</h2>${primaryHtml}</div>${workloadHtml}<div class="kpis">${kpis.map(k=>`<div class="kpi"><span>${k[0]}</span><b>${k[1]}</b></div>`).join("")}</div>${waitFlagSection}${qppuConclusionRows.length?`<div class="section"><h2>二级结论：逐 QPPU</h2>${table(["实例","状态","瓶颈模块","判断","原因","阻塞指令 flags","未发射周期","发射活跃","发射利用率","置信度"],qppuConclusionRows)}</div>`:""}${secondary.length?`<div class="section"><h2>全局补充证据</h2>${secondaryHtml}</div>`:""}<div class="section"><h2>覆盖</h2><p>信号选择 ${selectionCovered?"完整":"截断"} · QPPU ${num(sched.qppu_count,0)} · SG ${num(ss.fully_covered_shader_groups,0)}/${num(ss.shader_groups,0)} · 发生跳变信号 ${num(analysis.dynamic_signals,0)}</p>${sched.eligibility_definition?`<details><summary>Eligible 判据</summary><p class="muted">${esc(sched.eligibility_definition)}</p></details>`:""}</div>`;
+ const missingTargetPaths=[...new Set([...(DATA.coverage?.missing_signal_paths||[]),...(ss.missing_signal_paths||[])])];
+ const missingTargetsHtml=missingTargetPaths.length?`<details open><summary>Missing target signals (${missingTargetPaths.length})</summary><p class="muted">These paths were not found. A present signal with no events is measured as 0%, not listed here.</p><pre>${missingTargetPaths.map(esc).join("\n")}</pre></details>`:`<p class="muted">All required target signals found. Signals with no events are measured as 0%.</p>`;
+ $("overview").insertAdjacentHTML("beforeend",`<div class="section"><h2>Signal coverage details</h2>${missingTargetsHtml}</div>`);
 function flattenArchitecture(nodes,depth=0,out=[]){(nodes||[]).forEach(n=>{out.push({n,depth});flattenArchitecture(n.children,depth+1,out)});return out}
 const allArch=flattenArchitecture(DATA.architecture?.roots||[]);
 const className=k=>({thread:"Thread",group:"Group",cb:"CB",mma:"MMA"}[k]||k||"Unknown");
 const issueClassRows=(sum.issue_classes||[]).map(c=>`<tr><td>${esc(className(c.key))}</td><td>${num(c.issued_cycles,2)}</td><td>${c.covered?pct(c.qppu_cycle_rate_percent):"部分覆盖"}</td><td>${c.covered?pct(c.instruction_share_percent)+bar(c.instruction_share_percent):"部分覆盖"}</td><td>${c.covered?"完整":"部分"}</td></tr>`);
+const featureRows=(sum.instruction_features||[]).map(f=>`<tr><td>${esc(f.source_field)}</td><td>${esc(f.group)}</td><td>${num(f.issued_cycles,2)}</td><td>${f.covered?pct(f.instruction_share_percent)+bar(f.instruction_share_percent):"部分覆盖"}</td><td>${pct(f.classification_coverage_percent)}</td><td>${f.covered?"完整":"部分"}</td></tr>`);
  const issueSlotRows=(sum.issue_slots||[]).map(s=>`<tr><td>${num(s.index,0)}</td><td>${num(s.issued_cycles,2)}</td><td>${num(s.observed_cycles,2)}</td><td>${s.covered?pct(s.utilization_percent)+bar(s.utilization_percent):"部分覆盖"}</td><td>${s.covered?"是":"否"}</td></tr>`);
 const pairRows=(sum.dual_issue_pairs||[]).map(p=>`<tr><td>${esc(className(p.main_class))}</td><td>${esc(className(p.shadow_class))}</td><td>${num(p.cycles,2)}</td><td>${p.covered?pct(p.dual_issue_share_percent)+bar(p.dual_issue_share_percent):"部分覆盖"}</td></tr>`);
 const threadEntries=[...(DATA.sg_thread_efficiency?.entries||[])].sort((a,b)=>(Number(a.thread_efficiency_percent)||101)-(Number(b.thread_efficiency_percent)||101));
 const threadRows=threadEntries.map(t=>`<tr><td>QPPU ${num(t.qppu_index,0)}<br><span class="path">${esc(t.qppu_path)}</span></td><td>${num(t.sg_index,0)}</td><td>${esc(t.thread_instructions)}</td><td>${t.valid_thread_occupancy_percent==null?"未覆盖":pct(t.valid_thread_occupancy_percent)}</td><td>${t.active_thread_efficiency_percent==null?"未覆盖":pct(t.active_thread_efficiency_percent)}</td><td>${t.thread_efficiency_percent==null?"未覆盖":pct(t.thread_efficiency_percent)+bar(t.thread_efficiency_percent,t.thread_efficiency_percent<70?"warn":"")}</td></tr>`);
 const euRows=allArch.filter(x=>x.n.aggregate?.eu).map(({n})=>{const e=n.aggregate.eu||{},run=e.execution||{},input=e.instruction_input||{},phase=e.phase1_request||{};return `<tr><td>${esc(n.class)}</td><td class="path">${esc(n.path)}</td><td>${run.utilization_percent==null?"未覆盖":pct(run.utilization_percent)}</td><td>${esc(run.instructions_received??"-")}</td><td>${esc(run.instructions_executed??"-")}</td><td>${input.nonempty_rate_percent==null?"未覆盖":pct(input.nonempty_rate_percent)}</td><td>${input.full_rate_percent==null?"未覆盖":pct(input.full_rate_percent)}</td><td>${phase.pending_rate_percent==null?"未覆盖":pct(phase.pending_rate_percent)}</td></tr>`});
-$("issue").innerHTML=`<div class="section"><h2>发射类型</h2>${table(["类型","发射指令周期","QPPU 周期率","指令占比","覆盖"],issueClassRows)}</div><div class="section"><h2>Main / Shadow 位置</h2>${table(["位置","发射周期","观测周期","占用率","覆盖"],issueSlotRows)}</div><div class="section"><h2>双发组合</h2>${table(["Main 类型","Shadow 类型","周期","双发占比"],pairRows.length?pairRows:["<tr><td colspan=4>没有观测到已分类双发组合</td></tr>"])}</div><div class="section"><h2>每 SG Thread 有效率</h2>${table(["QPPU","SG","Thread 指令","Valid 占用","Active / Valid","Execute / Valid"],threadRows.length?threadRows:["<tr><td colspan=6>Thread mask 或 Thread 指令流未覆盖</td></tr>"])}</div><div class="section"><h2>QPPU EU</h2>${table(["模块","路径","执行利用率","接收","执行","输入非空率","输入满率","Phase1 Pending"],euRows.length?euRows:["<tr><td colspan=8>EU 输入/执行信号未覆盖</td></tr>"])}</div>`;
+$("issue").innerHTML=`<div class="section"><h2>发射类型</h2>${table(["类型","发射指令周期","QPPU 周期率","指令占比","覆盖"],issueClassRows)}</div><div class="section"><h2>Predecode 指令特征</h2><p class="muted">仅统计源码中已确认由解码或派发逻辑赋值、且位于实际 issue_inst 发射槽的字段。特征可重叠，占比之和不要求为 100%。</p>${table(["源码字段","分组","发射周期","指令占比","字段覆盖","覆盖"],featureRows.length?featureRows:["<tr><td colspan=6>未覆盖已确认的 Predecode 特征字段</td></tr>"])}</div><div class="section"><h2>Main / Shadow 位置</h2>${table(["位置","发射周期","观测周期","占用率","覆盖"],issueSlotRows)}</div><div class="section"><h2>双发组合</h2>${table(["Main 类型","Shadow 类型","周期","双发占比"],pairRows.length?pairRows:["<tr><td colspan=4>没有观测到已分类双发组合</td></tr>"])}</div><div class="section"><h2>每 SG Thread 有效率</h2>${table(["QPPU","SG","Thread 指令","Valid 占用","Active / Valid","Execute / Valid"],threadRows.length?threadRows:["<tr><td colspan=6>Thread mask 或 Thread 指令流未覆盖</td></tr>"])}</div><div class="section"><h2>QPPU EU</h2>${table(["模块","路径","执行利用率","接收","执行","输入非空率","输入满率","Phase1 Pending"],euRows.length?euRows:["<tr><td colspan=8>EU 输入/执行信号未覆盖</td></tr>"])}</div>`;
 const reasonRows=(ss.block_reasons||[]).map(r=>`<tr><td>${esc(r.name)}</td><td>${num(r.cycles,2)}</td><td>${eligibilityCovered?pct(r.queue_ready_percent)+bar(r.queue_ready_percent,r.queue_ready_percent>=30?"bad":r.queue_ready_percent>=10?"warn":""):"部分覆盖"}</td></tr>`);
  const qppuRows=(sched.qppus||[]).map(q=>{const d=qppuConclusionByPath.get(String(q.path||""))||{},issue=q.issue_coverage_complete===true,activity=q.activity_coverage_complete===true,eligibility=q.eligibility_coverage_complete===true,issueUtil=issue?pct(q.issue_utilization_percent)+bar(q.issue_utilization_percent,q.issue_utilization_percent<50?"warn":""):"部分覆盖";return `<tr><td>QPPU ${num(q.index,0)}</td><td>${esc(d.module||"未覆盖")}<br><span class="muted">${esc(d.title||"")}</span></td><td>${num(q.issued_instructions_estimate,2)}</td><td>${issueUtil}</td><td>${issue?pct(q.issue_active_percent):"部分覆盖"}</td><td>${issue?num(q.issue_idle_cycles,2):"部分覆盖"}</td><td>${activity?num(q.active_sg_cycles,2):"部分覆盖"}</td><td>${activity?num(q.queue_ready_sg_cycles,2):"部分覆盖"}</td><td>${eligibility?num(q.eligible_sg_cycles,2):"部分覆盖"}</td><td>${eligibility?pct(q.eligible_percent):"部分覆盖"}</td><td class="path">${esc(q.path)}</td></tr>`});
 const sgRows=[];(sched.qppus||[]).forEach(q=>(q.shader_groups||[]).forEach(s=>sgRows.push(`<tr><td>QPPU ${num(q.index,0)}<br><span class="path">${esc(q.path)}</span></td><td>${num(s.index,0)}</td><td>${s.activity_coverage_complete?num(s.active_cycles,2):"部分覆盖"}</td><td>${s.activity_coverage_complete?pct(s.queue_ready_percent):"部分覆盖"}</td><td>${s.eligibility_coverage_complete?pct(s.eligible_percent):"部分覆盖"}</td><td>${num(s.issued_cycles,2)}</td><td>${s.eligibility_coverage_complete?"完整":"部分"}</td></tr>`)));
@@ -160,16 +170,18 @@ const resourcePressure=DATA.resource_pressure||{};
 function fullResourceTop(title,section){section=section||{};const rows=(section.top||[]).map((r,i)=>`<tr><td>${i+1}</td><td class="path">${esc(r.path)}</td><td>${pct(r.full_rate_percent)}${bar(r.full_rate_percent,r.full_rate_percent>=30?"bad":"")}</td><td>${num(r.full_cycles,2)}</td><td>${num(r.observed_cycles,2)}</td><td>${num(r.average_occupancy,2)}</td><td>${num(r.average_capacity,2)}</td></tr>`),covered=Number(section.covered_resources)||0,incomplete=Number(section.incomplete_resources)||0,pressured=Number(section.pressured_resources)||0,message=covered===0?`未完整覆盖实际 ${title}`:`完整覆盖 ${covered} 个，未观测到满状态`;return `<div class="section"><h2>${title} 满率 Top 50 <span class="pill">${pressured} 命中 / ${covered} 完整 / ${incomplete} 不完整</span></h2>${table(["排名","实例路径","满率","满周期","覆盖周期","平均占用","平均容量"],rows.length?rows:[`<tr><td colspan=7>${message}</td></tr>`])}</div>`}
 function creditResourceTop(section){section=section||{};const rows=(section.top||[]).map((r,i)=>`<tr><td>${i+1}</td><td class="path">${esc(r.path)}</td><td>${pct(r.exhausted_rate_percent)}${bar(r.exhausted_rate_percent,r.exhausted_rate_percent>=30?"bad":"")}</td><td>${num(r.exhausted_cycles,2)}</td><td>${num(r.observed_cycles,2)}</td><td>${num(r.average_available,2)}</td><td>${esc(r.minimum_available)}</td><td>${esc(r.maximum_available)}</td></tr>`),covered=Number(section.covered_resources)||0,incomplete=Number(section.incomplete_resources)||0,pressured=Number(section.pressured_resources)||0,message=covered===0?"未完整覆盖已确认语义的 Credit Counter":`完整覆盖 ${covered} 个，未观测到 Credit 耗尽`;return `<div class="section"><h2>Credit 耗尽率 Top 50 <span class="pill">${pressured} 命中 / ${covered} 完整 / ${incomplete} 不完整</span></h2>${table(["排名","Counter 路径","耗尽率","耗尽周期","覆盖周期","平均可用","最小可用","最大可用"],rows.length?rows:[`<tr><td colspan=8>${message}</td></tr>`])}</div>`}
 $("resources").innerHTML=`${fullResourceTop("FIFO",resourcePressure.fifo)}${fullResourceTop("Queue",resourcePressure.queue)}${creditResourceTop(resourcePressure.credit)}<div class="section"><h2>模块聚合压力</h2>${table(["模块","路径","FIFO 满率","Queue 满率","Stall 周期","Pending 周期","Cache 命中率"],resourceRows.length?resourceRows:["<tr><td colspan=7>没有可判定的资源满率或背压证据</td></tr>"])}</div>`;
-function direction(label,d){d=d||{};return `<tr><td>${label}</td><td>${esc(d.status||"unavailable")}</td><td>${d.bytes_per_cycle==null?"-":num(d.bytes_per_cycle,3)}</td><td>${d.peak_bytes_per_cycle==null?"-":num(d.peak_bytes_per_cycle,3)}</td><td>${d.utilization_percent==null?"未覆盖":pct(d.utilization_percent)+bar(d.utilization_percent,d.utilization_percent>=80?"bad":"")}</td><td>${esc(d.basis||d.reason||"")}</td></tr>`}
+function direction(label,d){d=d||{};const detail=[d.basis,d.reason].filter(Boolean).join("；");return `<tr><td>${label}</td><td>${esc(d.status||"unavailable")}</td><td>${d.bytes_per_cycle==null?"-":num(d.bytes_per_cycle,3)}</td><td>${d.peak_bytes_per_cycle==null?"-":num(d.peak_bytes_per_cycle,3)}</td><td>${d.utilization_percent==null?"未覆盖":pct(d.utilization_percent)+bar(d.utilization_percent,d.utilization_percent>=80?"bad":"")}</td><td>${esc(detail)}</td></tr>`}
 const l1=DATA.memory_bandwidth?.l1||{},l2=DATA.memory_bandwidth?.l2||{};
 const lat=l1.latency||{},latencyRows=lat.available?[`<tr><td>${num(lat.request_count,0)}</td><td>${num(lat.matched_transactions,0)}</td><td>${num(lat.average_cycles,2)}</td><td>${num(lat.p50_cycles,2)}</td><td>${num(lat.p95_cycles,2)}</td><td>${num(lat.maximum_cycles,2)}</td><td>${num(lat.average_outstanding,2)}</td><td>${num(lat.maximum_outstanding,0)}</td><td>${lat.coverage_complete?"完整":"部分"}</td><td>${esc(lat.confidence)}</td></tr>`]:[`<tr><td colspan=10>${esc(lat.reason||"请求/返回握手未覆盖")}</td></tr>`];
 $("memory").innerHTML=`<div class="section"><h2>L1 / L2 有效带宽</h2>${table(["通路","状态","B/cycle","峰值 B/cycle","利用率","口径"],[direction("L1 读",l1.read),direction("L1 写",l1.write),direction("L2 读",l2.read),direction("L2 写",l2.write)])}<p class="muted">只有通道与 mask 覆盖足以建立峰值口径时才显示利用率，缺失数据不会按 0% 处理。</p></div><div class="section"><h2>DLS - L1 请求返回延迟</h2>${table(["请求","已配对","平均周期","P50","P95","最大","平均并发","最大并发","覆盖","置信度"],latencyRows)}<p class="muted">${esc(lat.basis||"")}</p></div>`;
- const issueType=v=>v==="unknown"||v==null?"未知":({2:"Thread",3:"Thread",4:"Group",5:"Group",6:"CB",7:"CB",8:"MMA",9:"MMA"}[Number(v)]||`类型 ${v}`);
-const hotRows=(sched.pc_hotspots||[]).map((h,i)=>`<tr><td>${i+1}</td><td>${esc(h.pc)}</td><td>${esc(issueType(h.issue_type))}</td><td>${num(h.issued_instructions_estimate,2)}</td><td>${pct(h.share_percent)}${bar(h.share_percent)}</td><td>${num(h.queue_wait_cycles,2)}</td><td class="path">${esc(h.qppu_path)}</td></tr>`);
-const waitRows=(sched.pc_wait_hotspots||[]).map((h,i)=>`<tr><td>${i+1}</td><td>${esc(h.pc)}</td><td>${esc(issueType(h.issue_type))}</td><td>${num(h.wait_cycles,2)}</td><td>${pct(h.share_percent)}${bar(h.share_percent,h.share_percent>=30?"warn":"")}</td><td>${esc(h.dominant_reason)}</td><td>${num(h.dominant_reason_cycles,2)}</td><td class="path">${esc(h.qppu_path)}</td></tr>`);
+ const issueType=v=>v==="unknown"||v==null?"未知":({0:"NotIssue",1:"Thread",2:"Thread EBB",3:"Group",4:"Group EBB",5:"CB",6:"QPPU MMA",7:"QPPU MMA EBB",8:"Count"}[Number(v)]||`类型 ${v}`);
+const issueTypeLabel=h=>h.issue_type_name&&h.issue_type_name!=="unknown"?h.issue_type_name:issueType(h.issue_type);
+const instructionFlags=h=>{const f=h.instruction_features||[];if(f.length)return f.map(x=>esc(x.source_field)).join("<br>");return h.feature_coverage_complete?"无置位 flag":"flag 覆盖不足"};
+const hotRows=(sched.pc_hotspots||[]).map((h,i)=>`<tr><td>${i+1}</td><td>${esc(h.pc)}</td><td>${num(h.sg_index,0)}</td><td>${esc(issueTypeLabel(h))}<br><span class="muted">${instructionFlags(h)}</span></td><td>${num(h.issued_instructions_estimate,2)}</td><td>${pct(h.share_percent)}${bar(h.share_percent)}</td><td>${num(h.queue_wait_cycles,2)}</td><td class="path">${esc(h.qppu_path)}</td></tr>`);
+const waitRows=(sched.pc_wait_hotspots||[]).map((h,i)=>`<tr><td>${i+1}</td><td>${esc(h.pc)}</td><td>${num(h.sg_index,0)}</td><td>${esc(issueTypeLabel(h))}<br><span class="muted">${instructionFlags(h)}</span></td><td>${num(h.wait_cycles,2)}</td><td>${pct(h.share_percent)}${bar(h.share_percent,h.share_percent>=30?"warn":"")}</td><td>${esc(h.dominant_reason)}</td><td>${num(h.dominant_reason_cycles,2)}</td><td class="path">${esc(h.qppu_path)}</td></tr>`);
 const issuePcCoverage=`发射 PC 覆盖 ${pct(ss.pc_issue_coverage_percent)}；PC 指令类型覆盖 ${pct(ss.pc_issue_type_coverage_percent)}`;
-const waitCoverage=Number(ss.pc_wait_cycles)>0?`Queue Head PC 覆盖 ${pct(ss.pc_wait_coverage_percent)}（${num(ss.pc_wait_covered_cycles,2)} / ${num(ss.pc_wait_cycles,2)} SG-cycle）`:"分析区间没有 Queue Ready 且未发射的 SG 周期";
-$("hotspots").innerHTML=`<div class="section"><h2>PC 发射热点</h2><p class="muted">${esc(issuePcCoverage)}</p>${table(["排名","PC","类型","估算指令数","发射占比","队首等待周期","QPPU"],hotRows.length?hotRows:["<tr><td colspan=7>波形没有覆盖发射 PC</td></tr>"])}</div><div class="section"><h2>Queue Head PC 等待热点</h2><p class="muted">${esc(waitCoverage)}</p>${table(["排名","PC","类型","等待周期","覆盖等待占比","主要状态","该状态周期","QPPU"],waitRows.length?waitRows:["<tr><td colspan=8>队列读指针或队首 PC 未覆盖，未进行猜测归因</td></tr>"])}</div>`;
+const waitCoverage=Number(ss.pc_wait_cycles)>0?`Queue Head PC 覆盖 ${pct(ss.pc_wait_coverage_percent)}（${num(ss.pc_wait_covered_cycles,2)} / ${num(ss.pc_wait_cycles,2)} SG-cycle）；指令特征覆盖 ${ss.pc_wait_feature_coverage_complete?"完整":"部分"}`:"分析区间没有 Queue Ready 且未发射的 SG 周期";
+$("hotspots").innerHTML=`<div class="section"><h2>PC 发射热点</h2><p class="muted">${esc(issuePcCoverage)}</p>${table(["排名","PC（原始指令地址）","SG","类型 / 指令 flags","估算指令数","发射占比","队首等待周期","QPPU"],hotRows.length?hotRows:["<tr><td colspan=8>波形没有覆盖发射 PC</td></tr>"])}</div><div class="section"><h2>Queue Head PC 等待热点</h2><p class="muted">${esc(waitCoverage)}</p>${table(["排名","PC（原始指令地址）","SG","类型 / 指令 flags","等待周期","覆盖等待占比","主要状态","该状态周期","QPPU"],waitRows.length?waitRows:["<tr><td colspan=9>队列读指针或队首 PC 未覆盖，未进行猜测归因</td></tr>"])}</div>`;
 </script>
 </body>
 </html>
@@ -213,6 +225,8 @@ bool writePerformanceBundle(const QString& outputDirectory,
 
 QString buildPerformanceConsoleSummary(const QJsonObject& model,
                                        const QString& outputDirectory) {
+    const QJsonObject analysis =
+        model.value(QStringLiteral("analysis")).toObject();
     const QJsonObject summary =
         model.value(QStringLiteral("summary")).toObject();
     const QJsonObject scheduler =
@@ -241,6 +255,16 @@ QString buildPerformanceConsoleSummary(const QJsonObject& model,
         schedulerStatus == QStringLiteral("partial");
     QString text;
     QTextStream out(&text);
+    out << QStringLiteral("分析范围：tick [")
+        << analysis.value(QStringLiteral("start_tick")).toString()
+        << QStringLiteral(", ")
+        << analysis.value(QStringLiteral("end_tick")).toString()
+        << QStringLiteral(")，")
+        << (analysis.value(QStringLiteral("range_basis")).toString() ==
+                    QStringLiteral("global_issue_window")
+                ? QStringLiteral("全局第一条指令发射到最后一条指令发射")
+                : QStringLiteral("保留请求范围"))
+        << '\n';
     out << QStringLiteral("结论：")
         << model.value(QStringLiteral("conclusion")).toString()
         << '\n';
@@ -324,6 +348,10 @@ bool performanceOutputSelfTest(QString& error) {
     QJsonObject analysis;
     analysis.insert(QStringLiteral("dynamic_signals"), 1);
     analysis.insert(QStringLiteral("duration_cycles"), 100.0);
+    analysis.insert(QStringLiteral("start_tick"), QStringLiteral("100"));
+    analysis.insert(QStringLiteral("end_tick"), QStringLiteral("1100"));
+    analysis.insert(QStringLiteral("range_basis"),
+                    QStringLiteral("global_issue_window"));
     model.insert(QStringLiteral("analysis"), analysis);
     QJsonObject summary;
     summary.insert(QStringLiteral("issue_utilization_percent"), 80.0);
@@ -332,6 +360,23 @@ bool performanceOutputSelfTest(QString& error) {
     schedulerSummary.insert(QStringLiteral("active_percent"), 90.0);
     schedulerSummary.insert(QStringLiteral("queue_ready_percent"), 90.0);
     schedulerSummary.insert(QStringLiteral("eligible_percent"), 20.0);
+    schedulerSummary.insert(QStringLiteral("pc_wait_cycles"), 100.0);
+    schedulerSummary.insert(
+        QStringLiteral("pc_wait_feature_coverage_complete"), true);
+    QJsonObject fenceWait;
+    fenceWait.insert(QStringLiteral("key"), QStringLiteral("fence"));
+    fenceWait.insert(QStringLiteral("source_field"),
+                     QStringLiteral("preDecode.isFence"));
+    fenceWait.insert(QStringLiteral("group"),
+                     QStringLiteral("instruction_kind"));
+    fenceWait.insert(QStringLiteral("active_wait_cycles"), 60.0);
+    fenceWait.insert(QStringLiteral("wait_share_percent"), 60.0);
+    fenceWait.insert(QStringLiteral("active_when_known_percent"), 60.0);
+    fenceWait.insert(QStringLiteral("coverage_percent"), 100.0);
+    fenceWait.insert(QStringLiteral("covered"), true);
+    schedulerSummary.insert(
+        QStringLiteral("pc_wait_instruction_flags"),
+        QJsonArray{fenceWait});
     QJsonObject scheduler;
     scheduler.insert(QStringLiteral("status"), QStringLiteral("measured"));
     scheduler.insert(QStringLiteral("summary"), schedulerSummary);
@@ -357,6 +402,12 @@ bool performanceOutputSelfTest(QString& error) {
     idleQppu.insert(QStringLiteral("shader_groups"),
                     QJsonArray{QJsonObject()});
     idleQppu.insert(QStringLiteral("block_reasons"), QJsonArray());
+    idleQppu.insert(QStringLiteral("pc_wait_cycles"), 100.0);
+    idleQppu.insert(
+        QStringLiteral("pc_wait_feature_coverage_complete"), true);
+    idleQppu.insert(
+        QStringLiteral("pc_wait_instruction_flags"),
+        QJsonArray{fenceWait});
     qppus.push_back(idleQppu);
     QJsonObject busyQppu;
     busyQppu.insert(QStringLiteral("index"), 1);
@@ -897,8 +948,24 @@ bool performanceOutputSelfTest(QString& error) {
 
     const QByteArray html = htmlDocument(model);
     if (!html.contains("WavePerf") || !html.contains("const DATA=") ||
-        !html.contains("\"scheduler\"")) {
+        !html.contains("\"scheduler\"") ||
+        !html.contains(
+            QStringLiteral("阻塞指令 flag 分布").toUtf8()) ||
+        !html.contains("preDecode.isFence") ||
+        !html.contains(
+            QStringLiteral("全局首末发射窗口").toUtf8())) {
         error = QStringLiteral("HTML report embedding mismatch");
+        return false;
+    }
+    const QString console =
+        buildPerformanceConsoleSummary(
+            model, QStringLiteral("waveperf-self-test"));
+    if (!console.contains(
+            QStringLiteral("tick [100, 1100)")) ||
+        !console.contains(
+            QStringLiteral(
+                "全局第一条指令发射到最后一条指令发射"))) {
+        error = QStringLiteral("console analysis range mismatch");
         return false;
     }
     return true;

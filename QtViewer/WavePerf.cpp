@@ -97,6 +97,12 @@ private:
     quint64 totalBlocks_ = 1;
 };
 
+void printProgressStage(bool enabled, const char* message) {
+    if (!enabled) return;
+    std::fprintf(stderr, "%s\n", message);
+    std::fflush(stderr);
+}
+
 struct Options {
     QString filePath;
     QString outputDirectory;
@@ -107,7 +113,53 @@ struct Options {
     int maxSignals = 2000000;
     int timelineBins = 160;
     bool showProgress = true;
+    bool dumpPredecodeFields = false;
 };
+
+struct PredecodeFieldCatalogEntry {
+    int signalCount = 0;
+    QSet<int> widths;
+    QString examplePath;
+};
+
+int dumpPredecodeFieldCatalog(const WaveFile& directory) {
+    QMap<QString, PredecodeFieldCatalogEntry> fields;
+    QStringList fencePaths;
+    for (int i = 0; i < directory.signalList.size(); ++i) {
+        const QString path = waveSignalFullPath(directory, i);
+        static const QString marker = QStringLiteral(".preDecode.");
+        const int markerIndex = path.indexOf(marker, 0, Qt::CaseInsensitive);
+        if (markerIndex < 0) continue;
+
+        const QString fieldPath = path.mid(markerIndex + marker.size());
+        if (fieldPath.compare(QStringLiteral("isFence"),
+                              Qt::CaseInsensitive) == 0) {
+            fencePaths.push_back(path);
+        }
+        PredecodeFieldCatalogEntry& entry = fields[fieldPath];
+        ++entry.signalCount;
+        entry.widths.insert(directory.signalList.at(i).width);
+        if (entry.examplePath.isEmpty()) entry.examplePath = path;
+    }
+
+    QTextStream out(stdout);
+    out << "preDecode field catalog: " << fields.size()
+        << " unique field path(s)\n";
+    for (auto it = fields.constBegin(); it != fields.constEnd(); ++it) {
+        QList<int> widths = it.value().widths.values();
+        std::sort(widths.begin(), widths.end());
+        QStringList widthText;
+        for (int width : widths) widthText.push_back(QString::number(width));
+        out << it.key()
+            << "\tcount=" << it.value().signalCount
+            << "\twidth=" << widthText.join(QLatin1Char(','))
+            << "\texample=" << it.value().examplePath << '\n';
+    }
+    out << "\nisFence full paths: " << fencePaths.size() << '\n';
+    for (const QString& path : fencePaths) out << path << '\n';
+    out.flush();
+    return 0;
+}
 
 struct SignalSelection {
     int directoryIndex = -1;
@@ -159,6 +211,7 @@ struct IssueSlot {
     const WaveSignal* issueType = nullptr;
     const WaveSignal* globalMem = nullptr;
     const WaveSignal* localMem = nullptr;
+    QHash<QString, const WaveSignal*> featureSignals;
 };
 
 struct IssueContextMetrics {
@@ -173,26 +226,21 @@ struct IssueContextMetrics {
     QMap<quint64, qint64> issueTypeTicks;
     QMap<QString, qint64> issueClassTicks;
     QMap<QString, qint64> dualIssuePairTicks;
+    QMap<QString, qint64> featureActiveIssueTicks;
+    QMap<QString, qint64> featureClassifiedIssueTicks;
+    QMap<QString, qint64> featureUnclassifiedIssueTicks;
+};
+
+struct IssueActivityWindow {
+    bool found = false;
+    qint64 firstActiveTick = 0;
+    qint64 lastActiveTickExclusive = 0;
+    qint64 alignedStartTick = 0;
+    qint64 alignedEndTick = 0;
 };
 
 QString issueClassKey(quint64 issueType) {
-    // InstIssueType ordering from the QPPU model revision paired with this profiler.
-    switch (issueType) {
-    case 2:
-    case 3:
-        return QStringLiteral("thread");
-    case 4:
-    case 5:
-        return QStringLiteral("group");
-    case 6:
-    case 7:
-        return QStringLiteral("cb");
-    case 8:
-    case 9:
-        return QStringLiteral("mma");
-    default:
-        return QStringLiteral("unknown_%1").arg(issueType);
-    }
+    return waveperf::instIssueClassKey(issueType);
 }
 
 QString orderedIssuePairKey(const QString& mainClass,
@@ -210,6 +258,8 @@ struct CoverageFamily {
     int declaredSize = 0;
     int tracedSize = 0;
     int incompleteArrays = 0;
+    int missingSignalCount = 0;
+    QStringList missingSignalPaths;
 };
 
 struct ThreadMaskSignals {
@@ -305,6 +355,69 @@ ValueState stateBefore(const WaveSignal& signal, qint64 time) {
     }
     if (lo <= 0) return ValueState();
     return stateFromSample(signal, signal.samples.at(lo - 1));
+}
+
+IssueActivityWindow findGlobalIssueActivityWindow(
+    const QVector<const WaveSignal*>& issueValidSignals,
+    qint64 outerStart,
+    qint64 outerEnd,
+    qint64 ticksPerCycle) {
+    IssueActivityWindow result;
+    if (outerEnd <= outerStart || ticksPerCycle <= 0) return result;
+
+    auto includeActiveInterval = [&](qint64 begin, qint64 end) {
+        begin = qMax(begin, outerStart);
+        end = qMin(end, outerEnd);
+        if (end <= begin) return;
+        if (!result.found) {
+            result.found = true;
+            result.firstActiveTick = begin;
+            result.lastActiveTickExclusive = end;
+            return;
+        }
+        result.firstActiveTick = qMin(result.firstActiveTick, begin);
+        result.lastActiveTickExclusive =
+            qMax(result.lastActiveTickExclusive, end);
+    };
+
+    for (const WaveSignal* signal : issueValidSignals) {
+        if (!signal) continue;
+        ValueState current = stateBefore(*signal, outerStart);
+        qint64 cursor = outerStart;
+        for (const WaveSample& sample : signal->samples) {
+            if (sample.time < outerStart) continue;
+            if (sample.time >= outerEnd) break;
+            if (current.known && current.value != 0) {
+                includeActiveInterval(cursor, sample.time);
+            }
+            current = stateFromSample(*signal, sample);
+            cursor = sample.time;
+        }
+        if (current.known && current.value != 0) {
+            includeActiveInterval(cursor, outerEnd);
+        }
+    }
+    if (!result.found) return result;
+
+    qint64 alignedStart =
+        (result.firstActiveTick / ticksPerCycle) * ticksPerCycle;
+    if (result.firstActiveTick < 0 &&
+        result.firstActiveTick % ticksPerCycle != 0) {
+        alignedStart -= ticksPerCycle;
+    }
+    qint64 alignedEnd = result.lastActiveTickExclusive;
+    qint64 remainder = alignedEnd % ticksPerCycle;
+    if (remainder < 0) remainder += ticksPerCycle;
+    if (remainder != 0) {
+        const qint64 increment = ticksPerCycle - remainder;
+        alignedEnd =
+            increment > outerEnd - alignedEnd
+                ? outerEnd
+                : alignedEnd + increment;
+    }
+    result.alignedStartTick = qMax(outerStart, alignedStart);
+    result.alignedEndTick = qMin(outerEnd, alignedEnd);
+    return result;
 }
 
 void includeNumericValue(SignalMetrics& metrics, const ValueState& state) {
@@ -446,7 +559,9 @@ IssueContextMetrics analyzeIssueContext(
 
     QSet<int> tracedSlots;
     QVector<const WaveSignal*> boundarySignals;
-    boundarySignals.reserve(contextSlots.size() * 5);
+    boundarySignals.reserve(
+        contextSlots.size() *
+        (5 + waveperf::instructionFeatureSpecs().size()));
     for (const IssueSlot* slot : contextSlots) {
         if (!slot || !slot->valid || slot->slotIndex < 0 ||
             slot->slotIndex >= declaredSlotCount) {
@@ -465,6 +580,12 @@ IssueContextMetrics analyzeIssueContext(
         if (slot->issueType) boundarySignals.push_back(slot->issueType);
         if (slot->globalMem) boundarySignals.push_back(slot->globalMem);
         if (slot->localMem) boundarySignals.push_back(slot->localMem);
+        for (const waveperf::InstructionFeatureSpec& spec :
+             waveperf::instructionFeatureSpecs()) {
+            const WaveSignal* feature =
+                slot->featureSignals.value(spec.key, nullptr);
+            if (feature) boundarySignals.push_back(feature);
+        }
     }
     const bool allSlotsTraced = tracedSlots.size() == declaredSlotCount;
     const QVector<qint64> boundaries =
@@ -480,6 +601,9 @@ IssueContextMetrics analyzeIssueContext(
         int localMemSlots = 0;
         int memoryClassifiedSlots = 0;
         int memoryUnclassifiedSlots = 0;
+        QMap<QString, int> featureActiveSlots;
+        QMap<QString, int> featureClassifiedSlots;
+        QMap<QString, int> featureUnclassifiedSlots;
         for (const IssueSlot* slot : contextSlots) {
             if (!slot || !slot->valid) {
                 allSlotsKnown = false;
@@ -533,6 +657,25 @@ IssueContextMetrics analyzeIssueContext(
             } else {
                 ++memoryUnclassifiedSlots;
             }
+            for (const waveperf::InstructionFeatureSpec& spec :
+                 waveperf::instructionFeatureSpecs()) {
+                const WaveSignal* feature =
+                    slot->featureSignals.value(spec.key, nullptr);
+                if (!feature) {
+                    ++featureUnclassifiedSlots[spec.key];
+                    continue;
+                }
+                const ValueState state =
+                    stateAtOrBefore(*feature, boundaries.at(i));
+                if (!state.known) {
+                    ++featureUnclassifiedSlots[spec.key];
+                    continue;
+                }
+                ++featureClassifiedSlots[spec.key];
+                if (state.value != 0) {
+                    ++featureActiveSlots[spec.key];
+                }
+            }
             activeClasses.push_back({slot->slotIndex, issueClass});
         }
 
@@ -552,6 +695,15 @@ IssueContextMetrics analyzeIssueContext(
             qint64(memoryClassifiedSlots) * ticks;
         result.memoryUnclassifiedIssueTicks +=
             qint64(memoryUnclassifiedSlots) * ticks;
+        for (const waveperf::InstructionFeatureSpec& spec :
+             waveperf::instructionFeatureSpecs()) {
+            result.featureActiveIssueTicks[spec.key] +=
+                qint64(featureActiveSlots.value(spec.key)) * ticks;
+            result.featureClassifiedIssueTicks[spec.key] +=
+                qint64(featureClassifiedSlots.value(spec.key)) * ticks;
+            result.featureUnclassifiedIssueTicks[spec.key] +=
+                qint64(featureUnclassifiedSlots.value(spec.key)) * ticks;
+        }
         for (const QPair<int, QString>& activeClass : activeClasses) {
             if (activeClass.second.isEmpty() ||
                 activeClass.second.startsWith(QStringLiteral("unknown_"))) {
@@ -1104,32 +1256,37 @@ bool fastPerformanceCandidate(const WaveFile& directory,
         nodeId = directory.tree.nodesById.at(nodeId).parentId;
     }
 
-    static const QSet<QByteArray> exactFields = {
-        QByteArrayLiteral("m_count"),
-        QByteArrayLiteral("m_numavail"),
-        QByteArrayLiteral("m_num_readable"),
-        QByteArrayLiteral("m_num_read"),
-        QByteArrayLiteral("m_num_written"),
-        QByteArrayLiteral("m_size"),
-        QByteArrayLiteral("m_ri"),
-        QByteArrayLiteral("m_read_index"),
-        QByteArrayLiteral("m_readindex"),
-        QByteArrayLiteral("m_head"),
-        QByteArrayLiteral("m_front"),
-        QByteArrayLiteral("pc_"),
-        QByteArrayLiteral("instissuetype"),
-        QByteArrayLiteral("maintype"),
-        QByteArrayLiteral("isglobalmem"),
-        QByteArrayLiteral("islocalmem"),
-        QByteArrayLiteral("sgid"),
-        QByteArrayLiteral("local_sgid"),
-        QByteArrayLiteral("local_sg_id"),
-        QByteArrayLiteral("mask"),
-        QByteArrayLiteral("smask"),
-        QByteArrayLiteral("wmask"),
-        QByteArrayLiteral("taken"),
-        QByteArrayLiteral("ready")
-    };
+    static const QSet<QByteArray> exactFields = [] {
+        QSet<QByteArray> fields = {
+            QByteArrayLiteral("m_count"),
+            QByteArrayLiteral("m_numavail"),
+            QByteArrayLiteral("m_num_readable"),
+            QByteArrayLiteral("m_num_read"),
+            QByteArrayLiteral("m_num_written"),
+            QByteArrayLiteral("m_size"),
+            QByteArrayLiteral("m_ri"),
+            QByteArrayLiteral("m_read_index"),
+            QByteArrayLiteral("m_readindex"),
+            QByteArrayLiteral("m_head"),
+            QByteArrayLiteral("m_front"),
+            QByteArrayLiteral("pc_"),
+            QByteArrayLiteral("instissuetype"),
+            QByteArrayLiteral("maintype"),
+            QByteArrayLiteral("sgid"),
+            QByteArrayLiteral("local_sgid"),
+            QByteArrayLiteral("local_sg_id"),
+            QByteArrayLiteral("mask"),
+            QByteArrayLiteral("smask"),
+            QByteArrayLiteral("wmask"),
+            QByteArrayLiteral("taken"),
+            QByteArrayLiteral("ready")
+        };
+        for (const waveperf::InstructionFeatureSpec& spec :
+             waveperf::instructionFeatureSpecs()) {
+            fields.insert(spec.fieldPath.toLatin1().toLower());
+        }
+        return fields;
+    }();
     if (exactFields.contains(field)) return true;
     if (field == QByteArrayLiteral("thread") ||
         field == QByteArrayLiteral("exethdunit")) {
@@ -1209,7 +1366,8 @@ QVector<SignalSelection> selectSignals(const WaveFile& directory,
     for (int i = 0; i < directory.signalList.size(); ++i) {
         const WaveSignal& signal = directory.signalList.at(i);
         if (!fastPerformanceCandidate(directory, i)) continue;
-        const QString path = waveSignalFullPath(directory, i);
+        const QString path = waveperf::canonicalArchitecturePath(
+            waveSignalFullPath(directory, i));
 
         QString key;
         QString category;
@@ -1244,7 +1402,8 @@ QVector<SignalSelection> selectSignals(const WaveFile& directory,
                 }
                 const waveperf::ClassifiedSignal remainingClassified =
                     waveperf::classifyArchitectureSignal(
-                        waveSignalFullPath(directory, j));
+                        waveperf::canonicalArchitecturePath(
+                            waveSignalFullPath(directory, j)));
                 if (!remainingClassified.key.isEmpty()) {
                     selectionTruncated = true;
                     warnings.push_back(
@@ -1296,17 +1455,42 @@ void collectQppuCoverage(const QVector<SignalSelection>& selections,
         collect(qppuExpression.match(path), qppuCoverage);
     }
 
-    for (CoverageFamily* family :
-         {&issueCoverage, &sgCoverage, &qppuCoverage}) {
-        for (auto it = family->arrays.constBegin();
-             it != family->arrays.constEnd(); ++it) {
-            family->declaredSize += it.value().declaredSize;
-            family->tracedSize += it.value().indexes.size();
+    auto finalize =
+        [](CoverageFamily& family, const QString& suffix) {
+        for (auto it = family.arrays.constBegin();
+             it != family.arrays.constEnd(); ++it) {
+            family.declaredSize += it.value().declaredSize;
+            family.tracedSize += it.value().indexes.size();
             if (it.value().indexes.size() < it.value().declaredSize) {
-                ++family->incompleteArrays;
+                ++family.incompleteArrays;
+            }
+            for (int index = 0; index < it.value().declaredSize; ++index) {
+                if (it.value().indexes.contains(index)) continue;
+                ++family.missingSignalCount;
+                if (family.missingSignalPaths.size() < 64) {
+                    family.missingSignalPaths.push_back(
+                        it.key() + QStringLiteral(".[%1]").arg(index) +
+                        suffix);
+                }
             }
         }
-    }
+    };
+    finalize(issueCoverage, QStringLiteral(".vld"));
+    finalize(sgCoverage, QStringLiteral(".valid"));
+    finalize(qppuCoverage,
+             QStringLiteral(".m_QPPUCtrl.issue_inst_.[0].vld"));
+}
+
+bool issueWindowCoverageIsComplete(
+    bool selectionTruncated,
+    const CoverageFamily& issueCoverage,
+    const CoverageFamily& qppuCoverage,
+    const QVector<int>& issueValidSignalIds) {
+    return !selectionTruncated &&
+           !issueValidSignalIds.isEmpty() &&
+           qppuCoverage.tracedSize > 0 &&
+           issueCoverage.incompleteArrays == 0 &&
+           issueCoverage.arrays.size() == qppuCoverage.tracedSize;
 }
 
 bool parseOptions(QCoreApplication& app, Options& options, bool& selfTest) {
@@ -1348,6 +1532,9 @@ bool parseOptions(QCoreApplication& app, Options& options, bool& selfTest) {
         QStringLiteral("关闭波形解析进度条")));
     parser.addOption(QCommandLineOption(
         QStringLiteral("self-test"), QStringLiteral("运行性能引擎自测")));
+    parser.addOption(QCommandLineOption(
+        QStringLiteral("dump-predecode-fields"),
+        QStringLiteral("List Predecode field paths without decoding samples")));
     parser.process(app);
 
     selfTest = parser.isSet(QStringLiteral("self-test"));
@@ -1382,6 +1569,8 @@ bool parseOptions(QCoreApplication& app, Options& options, bool& selfTest) {
         return false;
     }
     options.showProgress = !parser.isSet(QStringLiteral("no-progress"));
+    options.dumpPredecodeFields =
+        parser.isSet(QStringLiteral("dump-predecode-fields"));
     return true;
 }
 
@@ -1408,6 +1597,58 @@ int runSelfTest() {
         QTextStream(stderr) << "self_test_failed: boolean integration\n";
         return 10;
     }
+    auto makeBitSignal =
+        [](int signalId,
+           const QVector<QPair<qint64, quint64>>& values) {
+            WaveSignal result;
+            result.signalId = signalId;
+            result.kind = SignalKind::Bit;
+            result.width = 1;
+            for (const auto& value : values) {
+                WaveSample sample;
+                sample.time = value.first;
+                sample.rawBits = value.second;
+                sample.rawFieldsReady = true;
+                result.samples.push_back(sample);
+            }
+            return result;
+        };
+    WaveSignal issueWindowSlot0 = makeBitSignal(
+        101, {{0, 0}, {23, 1}, {24, 0}, {90, 1}, {91, 0}});
+    WaveSignal issueWindowSlot1 = makeBitSignal(
+        102, {{0, 0}, {50, 1}, {60, 0}});
+    const IssueActivityWindow issueWindow =
+        findGlobalIssueActivityWindow(
+            {&issueWindowSlot0, &issueWindowSlot1}, 0, 120, 10);
+    if (!issueWindow.found ||
+        issueWindow.firstActiveTick != 23 ||
+        issueWindow.lastActiveTickExclusive != 91 ||
+        issueWindow.alignedStartTick != 20 ||
+        issueWindow.alignedEndTick != 100) {
+        QTextStream(stderr)
+            << "self_test_failed: global issue window\n";
+        return 10;
+    }
+    const IssueActivityWindow clippedIssueWindow =
+        findGlobalIssueActivityWindow(
+            {&issueWindowSlot0}, 25, 95, 10);
+    if (!clippedIssueWindow.found ||
+        clippedIssueWindow.firstActiveTick != 90 ||
+        clippedIssueWindow.lastActiveTickExclusive != 91 ||
+        clippedIssueWindow.alignedStartTick != 90 ||
+        clippedIssueWindow.alignedEndTick != 95) {
+        QTextStream(stderr)
+            << "self_test_failed: clipped global issue window\n";
+        return 10;
+    }
+    WaveSignal noIssueWindow =
+        makeBitSignal(103, {{0, 0}});
+    if (findGlobalIssueActivityWindow(
+            {&noIssueWindow}, 0, 120, 10).found) {
+        QTextStream(stderr)
+            << "self_test_failed: empty global issue window\n";
+        return 10;
+    }
     WaveSignal knownIssueSlot = signal;
     knownIssueSlot.samples[0].rawBits = 1;
     WaveSignal lateIssueSlot = signal;
@@ -1425,6 +1666,16 @@ int runSelfTest() {
         analyzeIssueContext({&issueSlot0, &issueSlot1}, 2, 0, 40);
     const IssueContextMetrics missingIssue =
         analyzeIssueContext({&issueSlot0}, 2, 0, 40);
+    WaveSignal alwaysValid = signal;
+    for (WaveSample& sample : alwaysValid.samples) sample.rawBits = 1;
+    IssueSlot featureIssueSlot;
+    featureIssueSlot.slotIndex = 0;
+    featureIssueSlot.slotCount = 1;
+    featureIssueSlot.valid = &alwaysValid;
+    featureIssueSlot.featureSignals.insert(
+        QStringLiteral("barrier"), &signal);
+    const IssueContextMetrics featureIssue =
+        analyzeIssueContext({&featureIssueSlot}, 1, 0, 40);
     if (partialIssue.profile.issueActiveTicks != 20 ||
         partialIssue.profile.dualIssueTicks != 10 ||
         partialIssue.profile.idleTicks != 10 ||
@@ -1434,7 +1685,15 @@ int runSelfTest() {
         partialIssue.memoryClassifiedIssueTicks != 0 ||
         partialIssue.memoryUnclassifiedIssueTicks != 30 ||
         missingIssue.profile.issueActiveTicks != 0 ||
-        missingIssue.profile.idleTicks != 0) {
+        missingIssue.profile.idleTicks != 0 ||
+        featureIssue.featureActiveIssueTicks.value(
+            QStringLiteral("barrier")) != 20 ||
+        featureIssue.featureClassifiedIssueTicks.value(
+            QStringLiteral("barrier")) != 40 ||
+        featureIssue.featureUnclassifiedIssueTicks.value(
+            QStringLiteral("barrier")) != 0 ||
+        featureIssue.featureUnclassifiedIssueTicks.value(
+            QStringLiteral("branch")) != 40) {
         QTextStream(stderr)
             << "self_test_failed: issue unknown-interval coverage\n";
         return 23;
@@ -1536,14 +1795,14 @@ int runSelfTest() {
         return 26;
     }
 
-    if (issueClassKey(2) != QStringLiteral("thread") ||
-        issueClassKey(3) != QStringLiteral("thread") ||
+    if (issueClassKey(1) != QStringLiteral("thread") ||
+        issueClassKey(2) != QStringLiteral("thread") ||
+        issueClassKey(3) != QStringLiteral("group") ||
         issueClassKey(4) != QStringLiteral("group") ||
-        issueClassKey(5) != QStringLiteral("group") ||
-        issueClassKey(6) != QStringLiteral("cb") ||
-        issueClassKey(7) != QStringLiteral("cb") ||
-        issueClassKey(8) != QStringLiteral("mma") ||
-        issueClassKey(9) != QStringLiteral("mma") ||
+        issueClassKey(5) != QStringLiteral("cb") ||
+        issueClassKey(6) != QStringLiteral("mma") ||
+        issueClassKey(7) != QStringLiteral("mma") ||
+        issueClassKey(0) != QStringLiteral("not_issue") ||
         !issueClassKey(99).startsWith(QStringLiteral("unknown_"))) {
         QTextStream(stderr) << "self_test_failed: issue type classification\n";
         return 13;
@@ -1588,6 +1847,32 @@ int runSelfTest() {
         qppuCoverage.incompleteArrays != 2) {
         QTextStream(stderr)
             << "self_test_failed: per-instance array coverage\n";
+        return 19;
+    }
+    QVector<SignalSelection> missingWholeIssueArray =
+        coverageSelections;
+    missingWholeIssueArray.erase(
+        std::remove_if(
+            missingWholeIssueArray.begin(),
+            missingWholeIssueArray.end(),
+            [](const SignalSelection& item) {
+                return item.path.startsWith(
+                           QStringLiteral("gpu.m_ppu.[1]")) &&
+                       item.path.contains(
+                           QStringLiteral("issue_inst_"));
+            }),
+        missingWholeIssueArray.end());
+    CoverageFamily missingWholeIssueCoverage;
+    CoverageFamily missingWholeSgCoverage;
+    CoverageFamily missingWholeQppuCoverage;
+    collectQppuCoverage(
+        missingWholeIssueArray, missingWholeIssueCoverage,
+        missingWholeSgCoverage, missingWholeQppuCoverage);
+    if (issueWindowCoverageIsComplete(
+            false, missingWholeIssueCoverage,
+            missingWholeQppuCoverage, {1})) {
+        QTextStream(stderr)
+            << "self_test_failed: missing whole issue array coverage\n";
         return 19;
     }
 
@@ -1802,12 +2087,25 @@ int main(int argc, char* argv[]) {
     WaveParser4Reader reader;
     QElapsedTimer openTimer;
     openTimer.start();
+    printProgressStage(options.showProgress,
+                       "[1/6] Loading waveform directory...");
     if (!reader.open(options.filePath, error)) {
         QTextStream(stderr) << "error: " << error << '\n';
         return 3;
     }
     const qint64 openMs = openTimer.elapsed();
     const WaveFile& directory = reader.directoryWave();
+    if (options.showProgress) {
+        std::fprintf(stderr,
+                     "[1/6] Directory loaded: %llu signals in %lld ms\n",
+                     static_cast<unsigned long long>(
+                         directory.signalList.size()),
+                     static_cast<long long>(openMs));
+        std::fflush(stderr);
+    }
+    if (options.dumpPredecodeFields) {
+        return dumpPredecodeFieldCatalog(directory);
+    }
 
     qint64 startTick = directory.meta.start;
     qint64 endTick = directory.meta.end;
@@ -1827,20 +2125,15 @@ int main(int argc, char* argv[]) {
         QTextStream(stderr) << "error: empty analysis range\n";
         return 4;
     }
-    const qint64 durationTicks = endTick - startTick;
-    const double durationCycles = double(durationTicks) / double(options.ticksPerCycle);
-
+    const qint64 requestedStartTick = startTick;
+    const qint64 requestedEndTick = endTick;
     QStringList warnings;
-    if (startTick % options.ticksPerCycle != 0 ||
-        endTick % options.ticksPerCycle != 0) {
-        warnings.push_back(
-            QStringLiteral(
-                "分析区间未与业务周期边界对齐；按周期解释的事件计数可能包含取整。"));
-    }
     QHash<int, QString> pathBySignalId;
     bool selectionTruncated = false;
     QElapsedTimer selectTimer;
     selectTimer.start();
+    printProgressStage(options.showProgress,
+                       "[2/6] Selecting performance signals...");
     QVector<SignalSelection> selections =
         selectSignals(directory, options, warnings, pathBySignalId,
                       selectionTruncated);
@@ -1850,6 +2143,112 @@ int main(int argc, char* argv[]) {
             << "error: no supported GPU performance signals were found\n";
         return 5;
     }
+    if (options.showProgress) {
+        std::fprintf(stderr,
+                     "[2/6] Selected %d signals in %lld ms\n",
+                     selections.size(), static_cast<long long>(selectMs));
+        std::fflush(stderr);
+    }
+
+    CoverageFamily issueCoverage;
+    CoverageFamily sgCoverage;
+    CoverageFamily qppuCoverage;
+    collectQppuCoverage(selections, issueCoverage, sgCoverage, qppuCoverage);
+
+    static const QRegularExpression issueValidRegex(
+        QStringLiteral(
+            "^((.*)\\.issue_inst_(?:\\[size=(\\d+)\\])?"
+            "\\.\\[(\\d+)\\])\\.vld$"));
+    QVector<int> issueValidSignalIds;
+    for (const SignalSelection& selection : selections) {
+        if (issueValidRegex.match(selection.path).hasMatch()) {
+            issueValidSignalIds.push_back(selection.signalId);
+        }
+    }
+
+    bool issueActivityWindowFound = false;
+    bool issueActivityWindowApplied = false;
+    qint64 firstIssueTick = 0;
+    qint64 lastIssueTickExclusive = 0;
+    qint64 issueWindowScanMs = 0;
+    const bool issueWindowCoverageComplete =
+        issueWindowCoverageIsComplete(
+            selectionTruncated, issueCoverage, qppuCoverage,
+            issueValidSignalIds);
+    if (issueWindowCoverageComplete) {
+        printProgressStage(options.showProgress,
+                           "[3/6] Locating global issue window...");
+        QElapsedTimer issueWindowTimer;
+        issueWindowTimer.start();
+        WaveFile issueWindowWave;
+        if (!reader.loadSignals(issueValidSignalIds, issueWindowWave, error,
+                                options.maxDecodedSamples,
+                                requestedStartTick, requestedEndTick,
+                                WaveParser4Reader::LoadProgressCallback())) {
+            QTextStream(stderr)
+                << "error: failed to locate global issue window: "
+                << error << '\n';
+            return 6;
+        }
+        QVector<const WaveSignal*> issueValidSignals;
+        issueValidSignals.reserve(issueValidSignalIds.size());
+        for (const WaveSignal& signal : issueWindowWave.signalList) {
+            issueValidSignals.push_back(&signal);
+        }
+        const IssueActivityWindow issueWindow =
+            findGlobalIssueActivityWindow(
+                issueValidSignals, requestedStartTick,
+                requestedEndTick, options.ticksPerCycle);
+        issueWindowScanMs = issueWindowTimer.elapsed();
+        issueActivityWindowFound = issueWindow.found;
+        if (issueWindow.found) {
+            firstIssueTick = issueWindow.firstActiveTick;
+            lastIssueTickExclusive =
+                issueWindow.lastActiveTickExclusive;
+            startTick = issueWindow.alignedStartTick;
+            endTick = issueWindow.alignedEndTick;
+            issueActivityWindowApplied =
+                startTick != requestedStartTick ||
+                endTick != requestedEndTick;
+            if (options.showProgress) {
+                std::fprintf(
+                    stderr,
+                    "[3/6] Global issue window: [%lld, %lld) -> "
+                    "analysis [%lld, %lld) in %lld ms\n",
+                    static_cast<long long>(firstIssueTick),
+                    static_cast<long long>(lastIssueTickExclusive),
+                    static_cast<long long>(startTick),
+                    static_cast<long long>(endTick),
+                    static_cast<long long>(issueWindowScanMs));
+                std::fflush(stderr);
+            }
+        } else {
+            warnings.push_back(
+                QStringLiteral(
+                    "外层分析范围内未观测到实际指令发射；无法按全局首末发射"
+                    "收缩，保留原范围。"));
+        }
+    } else {
+        warnings.push_back(
+            QStringLiteral(
+                "发射槽选择覆盖不完整；为避免截断真实首末发射，未自动收缩"
+                "分析范围。"));
+    }
+
+    if (endTick <= startTick) {
+        QTextStream(stderr)
+            << "error: empty global issue analysis range\n";
+        return 4;
+    }
+    const qint64 durationTicks = endTick - startTick;
+    const double durationCycles =
+        double(durationTicks) / double(options.ticksPerCycle);
+    if (startTick % options.ticksPerCycle != 0 ||
+        endTick % options.ticksPerCycle != 0) {
+        warnings.push_back(
+            QStringLiteral(
+                "分析区间未与业务周期边界对齐；按周期解释的事件计数可能包含取整。"));
+    }
 
     QVector<int> signalIds;
     signalIds.reserve(selections.size());
@@ -1858,6 +2257,8 @@ int main(int argc, char* argv[]) {
     WaveFile loaded;
     QElapsedTimer decodeTimer;
     decodeTimer.start();
+    printProgressStage(options.showProgress,
+                       "[4/6] Decoding waveform blocks...");
     WaveParseProgressBar progressBar(options.showProgress);
     progressBar.start();
     WaveParser4Reader::LoadProgressCallback progressCallback;
@@ -1874,9 +2275,22 @@ int main(int argc, char* argv[]) {
     }
     progressBar.finish(true);
     const qint64 decodeMs = decodeTimer.elapsed();
+    if (options.showProgress) {
+        std::fprintf(stderr, "[4/6] Waveform decoded in %lld ms\n",
+                     static_cast<long long>(decodeMs));
+        std::fflush(stderr);
+    }
 
+    QElapsedTimer analysisTimer;
+    analysisTimer.start();
+    printProgressStage(options.showProgress,
+                       "[5/6] Analyzing performance...");
     QHash<int, const WaveSignal*> loadedById;
-    loadedById.reserve(loaded.signalList.size() * 2 + 1);
+    const std::size_t loadedReserve =
+        qMin<std::size_t>(
+            loaded.signalList.size() * 2u + 1u,
+            static_cast<std::size_t>((std::numeric_limits<int>::max)()));
+    loadedById.reserve(static_cast<int>(loadedReserve));
     for (const WaveSignal& signal : loaded.signalList) {
         loadedById.insert(signal.signalId, &signal);
     }
@@ -1921,10 +2335,25 @@ int main(int argc, char* argv[]) {
                     QStringLiteral("；"))));
     }
 
-    CoverageFamily issueCoverage;
-    CoverageFamily sgCoverage;
-    CoverageFamily qppuCoverage;
-    collectQppuCoverage(selections, issueCoverage, sgCoverage, qppuCoverage);
+    auto appendMissingSignalWarnings =
+        [&warnings](const CoverageFamily& family, const QString& familyName) {
+            const int shown = qMin(16, family.missingSignalPaths.size());
+            for (int i = 0; i < shown; ++i) {
+                warnings.push_back(
+                    QStringLiteral("Missing %1 target signal: %2")
+                        .arg(familyName, family.missingSignalPaths.at(i)));
+            }
+            if (family.missingSignalCount > shown) {
+                warnings.push_back(
+                    QStringLiteral(
+                        "Missing %1 target signals: %2 more path(s) omitted")
+                        .arg(familyName)
+                        .arg(family.missingSignalCount - shown));
+            }
+        };
+    appendMissingSignalWarnings(issueCoverage, QStringLiteral("issue-slot"));
+    appendMissingSignalWarnings(sgCoverage, QStringLiteral("SG-activity"));
+    appendMissingSignalWarnings(qppuCoverage, QStringLiteral("QPPU"));
 
     if (issueCoverage.incompleteArrays > 0) {
         warnings.push_back(
@@ -1951,8 +2380,6 @@ int main(int argc, char* argv[]) {
         warnings.push_back(QStringLiteral("所选范围内，匹配信号没有发生值变化"));
     }
 
-    static const QRegularExpression issueValidRegex(
-        QStringLiteral("^((.*)\\.issue_inst_(?:\\[size=(\\d+)\\])?\\.\\[(\\d+)\\])\\.vld$"));
     QHash<QString, const WaveSignal*> loadedByPath;
     for (const WaveSignal& signal : loaded.signalList) {
         loadedByPath.insert(pathBySignalId.value(signal.signalId), &signal);
@@ -1976,6 +2403,15 @@ int main(int argc, char* argv[]) {
             slot.rootPath + QStringLiteral(".preDecode.isGlobalMem"), nullptr);
         slot.localMem = loadedByPath.value(
             slot.rootPath + QStringLiteral(".preDecode.isLocalMem"), nullptr);
+        for (const waveperf::InstructionFeatureSpec& spec :
+             waveperf::instructionFeatureSpecs()) {
+            slot.featureSignals.insert(
+                spec.key,
+                loadedByPath.value(
+                    slot.rootPath + QStringLiteral(".preDecode.") +
+                        spec.fieldPath,
+                    nullptr));
+        }
         issueSlots.push_back(slot);
     }
     std::sort(issueSlots.begin(), issueSlots.end(),
@@ -1994,6 +2430,10 @@ int main(int argc, char* argv[]) {
     QMap<quint64, qint64> issueTypeTicks;
     QMap<QString, qint64> issueClassTicks;
     QMap<QString, qint64> dualIssuePairTicks;
+    QMap<QString, qint64> featureActiveIssueTicks;
+    QMap<QString, qint64> featureClassifiedIssueTicks;
+    QMap<QString, qint64> featureUnclassifiedIssueTicks;
+    QMap<QString, int> featureSlotsTraced;
     qint64 classifiedIssueTicks = 0;
     qint64 unclassifiedIssueTicks = 0;
     int issueTypeSlotsTraced = 0;
@@ -2006,6 +2446,12 @@ int main(int argc, char* argv[]) {
         issueSlotsByContext[slot.contextPath].push_back(&slot);
         if (slot.issueType) ++issueTypeSlotsTraced;
         if (slot.globalMem && slot.localMem) ++memoryTypeSlotsTraced;
+        for (const waveperf::InstructionFeatureSpec& spec :
+             waveperf::instructionFeatureSpecs()) {
+            if (slot.featureSignals.value(spec.key, nullptr)) {
+                ++featureSlotsTraced[spec.key];
+            }
+        }
         tracedSlotsByContext[slot.contextPath].insert(slot.slotIndex);
         slotCapacityByContext[slot.contextPath] =
             qMax(slotCapacityByContext.value(slot.contextPath),
@@ -2045,6 +2491,15 @@ int main(int argc, char* argv[]) {
         for (auto it = context.dualIssuePairTicks.constBegin();
              it != context.dualIssuePairTicks.constEnd(); ++it) {
             dualIssuePairTicks[it.key()] += it.value();
+        }
+        for (const waveperf::InstructionFeatureSpec& spec :
+             waveperf::instructionFeatureSpecs()) {
+            featureActiveIssueTicks[spec.key] +=
+                context.featureActiveIssueTicks.value(spec.key);
+            featureClassifiedIssueTicks[spec.key] +=
+                context.featureClassifiedIssueTicks.value(spec.key);
+            featureUnclassifiedIssueTicks[spec.key] +=
+                context.featureUnclassifiedIssueTicks.value(spec.key);
         }
         issueContextProfiles.push_back(context.profile);
     }
@@ -2394,14 +2849,36 @@ int main(int argc, char* argv[]) {
     fileObject.insert(QStringLiteral("bytes"), double(QFileInfo(options.filePath).size()));
     fileObject.insert(QStringLiteral("title"), directory.meta.title);
     fileObject.insert(QStringLiteral("timescale"), directory.meta.timescale);
-    fileObject.insert(QStringLiteral("signals"), directory.signalList.size());
+    fileObject.insert(QStringLiteral("signals"),
+                      QJsonValue(static_cast<double>(
+                          directory.signalList.size())));
     fileObject.insert(QStringLiteral("start_tick"), QString::number(directory.meta.start));
     fileObject.insert(QStringLiteral("end_tick"), QString::number(directory.meta.end));
     root.insert(QStringLiteral("file"), fileObject);
 
     QJsonObject analysis;
+    analysis.insert(QStringLiteral("requested_start_tick"),
+                    QString::number(requestedStartTick));
+    analysis.insert(QStringLiteral("requested_end_tick"),
+                    QString::number(requestedEndTick));
     analysis.insert(QStringLiteral("start_tick"), QString::number(startTick));
     analysis.insert(QStringLiteral("end_tick"), QString::number(endTick));
+    analysis.insert(QStringLiteral("range_basis"),
+                    issueActivityWindowFound
+                        ? QStringLiteral("global_issue_window")
+                        : QStringLiteral("requested_range_fallback"));
+    analysis.insert(QStringLiteral("global_issue_window_found"),
+                    issueActivityWindowFound);
+    analysis.insert(QStringLiteral("global_issue_window_applied"),
+                    issueActivityWindowApplied);
+    analysis.insert(QStringLiteral("global_issue_window_coverage_complete"),
+                    issueWindowCoverageComplete);
+    if (issueActivityWindowFound) {
+        analysis.insert(QStringLiteral("first_issue_tick"),
+                        QString::number(firstIssueTick));
+        analysis.insert(QStringLiteral("last_issue_tick_exclusive"),
+                        QString::number(lastIssueTickExclusive));
+    }
     analysis.insert(QStringLiteral("ticks_per_cycle"), QString::number(options.ticksPerCycle));
     analysis.insert(QStringLiteral("duration_cycles"), durationCycles);
     analysis.insert(QStringLiteral("matched_signals"), selections.size());
@@ -2411,11 +2888,26 @@ int main(int argc, char* argv[]) {
     analysis.insert(QStringLiteral("dynamic_signals"), dynamicSignals);
     analysis.insert(QStringLiteral("open_ms"), double(openMs));
     analysis.insert(QStringLiteral("selection_ms"), double(selectMs));
+    analysis.insert(QStringLiteral("issue_window_scan_ms"),
+                    double(issueWindowScanMs));
     analysis.insert(QStringLiteral("decode_ms"), double(decodeMs));
     analysis.insert(QStringLiteral("analysis_ms"), double(totalTimer.elapsed()));
     root.insert(QStringLiteral("analysis"), analysis);
 
     QJsonObject coverage;
+    QJsonArray missingSignalPaths;
+    for (const CoverageFamily* family :
+         {&issueCoverage, &sgCoverage, &qppuCoverage}) {
+        for (const QString& path : family->missingSignalPaths) {
+            missingSignalPaths.push_back(path);
+        }
+    }
+    coverage.insert(QStringLiteral("missing_signal_count"),
+                    issueCoverage.missingSignalCount +
+                        sgCoverage.missingSignalCount +
+                        qppuCoverage.missingSignalCount);
+    coverage.insert(QStringLiteral("missing_signal_paths"),
+                    missingSignalPaths);
     coverage.insert(QStringLiteral("issue_slots_declared"), issueCoverage.declaredSize);
     coverage.insert(QStringLiteral("signal_selection_complete"),
                     !selectionTruncated);
@@ -2554,6 +3046,66 @@ int main(int argc, char* argv[]) {
         issueClassSummary.push_back(issueClass);
     }
     summary.insert(QStringLiteral("issue_classes"), issueClassSummary);
+    QJsonArray instructionFeatureSummary;
+    QStringList incompleteFeatureFields;
+    for (const waveperf::InstructionFeatureSpec& spec :
+         waveperf::instructionFeatureSpecs()) {
+        const qint64 activeTicks =
+            featureActiveIssueTicks.value(spec.key);
+        const qint64 classifiedTicks =
+            featureClassifiedIssueTicks.value(spec.key);
+        const qint64 unclassifiedTicks =
+            featureUnclassifiedIssueTicks.value(spec.key);
+        const int tracedSignals =
+            featureSlotsTraced.value(spec.key);
+        const bool covered =
+            issueActivityCovered && !issueSlots.isEmpty() &&
+            tracedSignals == issueSlots.size() &&
+            unclassifiedTicks == 0 &&
+            classifiedTicks == issuedTicks;
+        if (!covered) incompleteFeatureFields.push_back(spec.fieldPath);
+
+        QJsonObject feature;
+        feature.insert(QStringLiteral("key"), spec.key);
+        feature.insert(QStringLiteral("source_field"),
+                       QStringLiteral("preDecode.") + spec.fieldPath);
+        feature.insert(QStringLiteral("group"), spec.group);
+        feature.insert(
+            QStringLiteral("issued_cycles"),
+            double(activeTicks) / double(options.ticksPerCycle));
+        feature.insert(
+            QStringLiteral("instruction_share_percent"),
+            issuedTicks > 0
+                ? 100.0 * double(activeTicks) / double(issuedTicks)
+                : 0.0);
+        feature.insert(
+            QStringLiteral("classification_coverage_percent"),
+            issuedTicks > 0
+                ? 100.0 * double(classifiedTicks) / double(issuedTicks)
+                : (covered ? 100.0 : 0.0));
+        feature.insert(
+            QStringLiteral("unclassified_issue_cycles"),
+            double(unclassifiedTicks) / double(options.ticksPerCycle));
+        feature.insert(QStringLiteral("signals_traced"), tracedSignals);
+        feature.insert(QStringLiteral("signals_expected"),
+                       issueSlots.size());
+        feature.insert(QStringLiteral("covered"), covered);
+        feature.insert(QStringLiteral("overlaps_other_features"), true);
+        instructionFeatureSummary.push_back(feature);
+    }
+    summary.insert(QStringLiteral("instruction_features"),
+                   instructionFeatureSummary);
+    summary.insert(
+        QStringLiteral("instruction_feature_coverage_complete"),
+        incompleteFeatureFields.isEmpty() &&
+        !waveperf::instructionFeatureSpecs().isEmpty());
+    if (!incompleteFeatureFields.isEmpty() && !issueSlots.isEmpty()) {
+        warnings.push_back(
+            QStringLiteral(
+                "Predecode feature coverage is partial for: %1")
+                .arg(incompleteFeatureFields.join(
+                    QStringLiteral(", "))));
+    }
     summary.insert(
         QStringLiteral("issue_type_classification_coverage_percent"),
         issuedTicks > 0
@@ -2667,6 +3219,20 @@ int main(int argc, char* argv[]) {
     };
     root.insert(QStringLiteral("issue_main_type_cycles"), histogramJson(mainTypeTicks));
     root.insert(QStringLiteral("issue_type_cycles"), histogramJson(issueTypeTicks));
+    const qint64 notIssueValidTicks = issueTypeTicks.value(1u, 0);
+    summary.insert(
+        QStringLiteral("not_issue_valid_cycles"),
+        double(notIssueValidTicks) / double(options.ticksPerCycle));
+    root.insert(QStringLiteral("summary"), summary);
+    if (notIssueValidTicks > 0) {
+        warnings.push_back(
+            QStringLiteral(
+                "检测到 %1 个业务周期同时满足 issue_inst.vld=1 且 "
+                "instIssueType=NotIssue(1)；该组合与发射槽语义矛盾，"
+                "对应 PC/类型会原样显示，但不能当作有效指令分类。")
+                .arg(double(notIssueValidTicks) /
+                     double(options.ticksPerCycle)));
+    }
     if (unclassifiedIssueTicks > 0) {
         warnings.push_back(
             QStringLiteral("存在 %1 个业务周期的有效发射无法映射到 "
@@ -2678,6 +3244,11 @@ int main(int argc, char* argv[]) {
     QJsonArray warningArray;
     for (const QString& warning : warnings) warningArray.push_back(warning);
     root.insert(QStringLiteral("warnings"), warningArray);
+    if (options.showProgress) {
+        std::fprintf(stderr, "[5/6] Analysis complete in %lld ms\n",
+                     static_cast<long long>(analysisTimer.elapsed()));
+        std::fflush(stderr);
+    }
 
     if (options.outputDirectory.isEmpty()) {
         const QFileInfo inputInfo(options.filePath);
@@ -2686,10 +3257,19 @@ int main(int argc, char* argv[]) {
                 .filePath(inputInfo.completeBaseName() +
                           QStringLiteral(".perf"));
     }
+    printProgressStage(options.showProgress,
+                       "[6/6] Writing performance report...");
     if (!waveperf::writePerformanceBundle(
             options.outputDirectory, root, error)) {
         QTextStream(stderr) << "error: " << error << '\n';
         return 7;
+    }
+    if (options.showProgress) {
+        const QByteArray outputPath =
+            QDir(options.outputDirectory).absolutePath().toLocal8Bit();
+        std::fprintf(stderr, "[6/6] Report written: %s\n",
+                     outputPath.constData());
+        std::fflush(stderr);
     }
 
     QTextStream out(stdout);

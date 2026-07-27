@@ -22,6 +22,27 @@ struct ClassifiedSignal {
     EventSemantics eventSemantics = EventSemantics::None;
 };
 
+// Predecode fields are admitted here only after both conditions are met:
+// 1. the model source shows how the field is assigned/consumed; and
+// 2. the field exists under the emitted issue/queue instruction object.
+// Keep this as the single source of truth for issue and queue-head analysis.
+struct InstructionFeatureSpec {
+    QString key;
+    QString fieldPath;
+    QString group;
+};
+
+const QVector<InstructionFeatureSpec>& instructionFeatureSpecs();
+
+// Numeric enum values are persisted in WVZ4. Keep their decoding centralized
+// and covered by self-tests so a model enum reorder cannot silently corrupt a
+// performance diagnosis.
+QString instIssueTypeName(quint64 value);
+QString instIssueClassKey(quint64 value);
+QString cbCtrlInstClientName(quint64 value);
+QString cbDataClientName(quint64 value);
+QString cbDataInstQueueClientName(quint64 value);
+
 struct CounterView {
     QString path;
     QString key;
@@ -58,6 +79,11 @@ struct ArchitectureProfile {
     quint64 representedInstances = 0;
     bool hasRepresentativeArrays = false;
 };
+
+// Runtime-reflected pointer/annotated arrays may encode an index in the
+// member segment ("items[0]"), while native arrays use a child segment
+// ("items.[0]").  WavePerf uses the latter as its canonical representation.
+QString canonicalArchitecturePath(const QString& path);
 
 ClassifiedSignal classifyArchitectureSignal(const QString& path);
 

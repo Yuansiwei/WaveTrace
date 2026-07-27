@@ -141,6 +141,7 @@ int main(int argc, char** argv) {
     opt.emit_track_decl_path = true;
     opt.enable_flat_leaf_fast_table = true;
     opt.enable_dirty_peek_groups = true;
+    opt.enable_dynamic_dirty_groups = true;
     opt.enable_dirty_peek_memory_block_precheck = true;
     opt.enable_dirty_peek_memory_block_byte_map = true;
     opt.dirty_peek_parallel_threshold = 1;

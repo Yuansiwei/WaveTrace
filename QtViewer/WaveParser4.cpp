@@ -349,7 +349,7 @@ StorageOutputIndexLookup storageOutputIndexLookup(
 
 bool applyProceduralClockDefinitions(const QVector<ClockRec>& clocks,
                                      const QVector<int>& outputIndexBySignalId,
-                                     QVector<WaveSignal>& outputSignals,
+                                     WaveSignalList& outputSignals,
                                      bool requireAllClockSignals,
                                      QString& error) {
     for (const ClockRec& clock : clocks) {
@@ -392,7 +392,7 @@ bool applyProceduralClockDefinitions(const QVector<ClockRec>& clocks,
 
 bool applyProceduralClockDefinitions(const QVector<ClockRec>& clocks,
                                      const QHash<int, int>& outputIndexBySignalId,
-                                     QVector<WaveSignal>& outputSignals,
+                                     WaveSignalList& outputSignals,
                                      bool requireAllClockSignals,
                                      QString& error) {
     // Clock tables are normally tiny. Avoid rebuilding a global-size direct
@@ -1153,7 +1153,7 @@ bool decodeSignalRecord(SpanReader& rr,
                         i64 blockEnd,
                         int byteWidth,
                         const QVector<int>& outputIndexes,
-                        const QVector<WaveSignal>& outputSignals,
+                        const WaveSignalList& outputSignals,
                         QVector<QVector<WaveSample>>& samplesByOutputIndex,
                         qint64 windowStart,
                         qint64 windowEnd,
@@ -1173,7 +1173,7 @@ bool decodeLodTransitionStreamPayload(const char* payload,
     }
 
     SpanReader rr(payload, payloadSize);
-    QVector<WaveSignal> fakeSignals;
+    WaveSignalList fakeSignals;
     fakeSignals.resize(1);
     fakeSignals[0].width = qMin(64, byteWidth * 8);
 
@@ -1769,7 +1769,7 @@ WaveSignal makeWaveSignalFromRec(const SigRec& s,
 
 bool finalizeCompactDirectorySignals(const QVector<SigRec>& sigs,
                                      WaveTreeInfo& tree,
-                                     QVector<WaveSignal>& outputSignals,
+                                     WaveSignalList& outputSignals,
                                      QVector<int>& byteWidthByStorageId,
                                      QVector<int>& boolStorageByStorageId,
                                      QString& error) {
@@ -2019,7 +2019,7 @@ WaveSample makeDecodedSample(int outputIndex,
                              const char* valueBytes,
                              int byteCount,
                              qint64 sampleTime,
-                             const QVector<WaveSignal>& outputSignals) {
+                             const WaveSignalList& outputSignals) {
     WaveSample sample;
     sample.time = sampleTime;
     sample.isAbsent = false;
@@ -2041,7 +2041,7 @@ WaveSample makeDecodedSample(int outputIndex,
 
 bool appendDecodedSampleObject(int outputIndex,
                                WaveSample&& sample,
-                               const QVector<WaveSignal>& outputSignals,
+                               const WaveSignalList& outputSignals,
                                QVector<QVector<WaveSample>>& samplesByOutputIndex,
                                bool compactSamples,
                                QString& error,
@@ -2072,7 +2072,7 @@ bool appendDecodedSample(int outputIndex,
                          const char* valueBytes,
                          int byteCount,
                          qint64 sampleTime,
-                         const QVector<WaveSignal>& outputSignals,
+                         const WaveSignalList& outputSignals,
                          QVector<QVector<WaveSample>>& samplesByOutputIndex,
                          bool compactSamples,
                          QString& error) {
@@ -2131,7 +2131,7 @@ bool appendDecodedSample(int outputIndex,
 }
 
 bool emitLeftAnchorIfNeeded(int outputIndex,
-                            const QVector<WaveSignal>& outputSignals,
+                            const WaveSignalList& outputSignals,
                             QVector<QVector<WaveSample>>& samplesByOutputIndex,
                             bool compactSamples,
                             RawLeftAnchorState* leftAnchors,
@@ -2159,7 +2159,7 @@ bool appendDecodedSampleToOutputs(const QVector<int>& outputIndexes,
                                   const char* valueBytes,
                                   int byteCount,
                                   qint64 sampleTime,
-                                  const QVector<WaveSignal>& outputSignals,
+                                  const WaveSignalList& outputSignals,
                                   QVector<QVector<WaveSample>>& samplesByOutputIndex,
                                   bool compactSamples,
                                   QString& error) {
@@ -2175,7 +2175,7 @@ bool appendDecodedSampleToOutputs(const QVector<int>& outputIndexes,
 bool appendImplicitZeroSamplesForSelectedSignals(const QSet<int>& selectedIds,
                                                 bool allSelected,
                                                 qint64 initialTime,
-                                                const QVector<WaveSignal>& outputSignals,
+                                                const WaveSignalList& outputSignals,
                                                 QVector<QVector<WaveSample>>& samplesByOutputIndex,
                                                 qint64& minTime,
                                                 qint64& maxTime,
@@ -2217,7 +2217,7 @@ bool appendDecodedRecordValue(const QVector<int>& outputIndexes,
                               qint64 sampleTime,
                               qint64 windowStart,
                               qint64 windowEnd,
-                              const QVector<WaveSignal>& outputSignals,
+                              const WaveSignalList& outputSignals,
                               QVector<QVector<WaveSample>>& samplesByOutputIndex,
                               bool compactSamples,
                               RawLeftAnchorState* leftAnchors,
@@ -2348,7 +2348,7 @@ bool appendDecodedRecordValue(const QVector<int>& outputIndexes,
                               qint64 sampleTime,
                               qint64 windowStart,
                               qint64 windowEnd,
-                              const QVector<WaveSignal>& outputSignals,
+                              const WaveSignalList& outputSignals,
                               QVector<QVector<WaveSample>>& samplesByOutputIndex,
                               bool compactSamples,
                               RawLeftAnchorState* leftAnchors,
@@ -2390,7 +2390,7 @@ bool decodeSignalRecord(SpanReader& rr,
                         i64 blockEnd,
                         int byteWidth,
                         const QVector<int>& outputIndexes,
-                        const QVector<WaveSignal>& outputSignals,
+                        const WaveSignalList& outputSignals,
                         QVector<QVector<WaveSample>>& samplesByOutputIndex,
                         qint64 windowStart,
                         qint64 windowEnd,
@@ -2670,7 +2670,7 @@ bool decodeRawWaveTile(const QByteArray& rawPayload,
                          bool allSelected,
                          const StorageOutputIndexLookup& outputIndexesByStorageId,
                          const QVector<int>& byteWidthBySignalId,
-                         const QVector<WaveSignal>& outputSignals,
+                         const WaveSignalList& outputSignals,
                          QVector<QVector<WaveSample>>& samplesByOutputIndex,
                          qint64 windowStart,
                          qint64 windowEnd,
@@ -3014,7 +3014,7 @@ bool decodeWdatSectionStreaming(QFile& file,
                                 bool allSelected,
                                 const StorageOutputIndexLookup& outputIndexesByStorageId,
                                 const QVector<int>& byteWidthBySignalId,
-                                const QVector<WaveSignal>& outputSignals,
+                                const WaveSignalList& outputSignals,
                                 QVector<QVector<WaveSample>>& samplesByOutputIndex,
                                 qint64 windowStart,
                                 qint64 windowEnd,
@@ -3153,7 +3153,7 @@ bool decodeWdatSectionsFromFooterIndex(QFile& file,
                                         bool allSelected,
                                         const StorageOutputIndexLookup& outputIndexesByStorageId,
                                         const QVector<int>& byteWidthBySignalId,
-                                        const QVector<WaveSignal>& outputSignals,
+                                        const WaveSignalList& outputSignals,
                                         QVector<QVector<WaveSample>>& samplesByOutputIndex,
                                         qint64 windowStart,
                                         qint64 windowEnd,
@@ -3328,7 +3328,7 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
                                                bool allSelected,
                                                const StorageOutputIndexLookup& outputIndexesByStorageId,
                                                const QVector<int>& byteWidthBySignalId,
-                                               const QVector<WaveSignal>& outputSignals,
+                                               const WaveSignalList& outputSignals,
                                                QVector<QVector<WaveSample>>& samplesByOutputIndex,
                                                qint64 windowStart,
                                                qint64 windowEnd,
@@ -3760,7 +3760,7 @@ void makeResidualLodLevelsCumulative(QVector<QVector<WaveLodLevel>>& lodLevelsBy
 void appendResidualLodToRawSamples(const QVector<QVector<WaveLodLevel>>& lodLevelsByStorageId,
                                    const QSet<int>& selectedSignalIds,
                                    bool allSelectedSignalIds,
-                                   const QVector<WaveSignal>& outputSignals,
+                                   const WaveSignalList& outputSignals,
                                    QVector<QVector<WaveSample>>& samplesByOutputIndex) {
     for (int outputIndex = 0; outputIndex < outputSignals.size() && outputIndex < samplesByOutputIndex.size(); ++outputIndex) {
         const WaveSignal& sig = outputSignals.at(outputIndex);
@@ -4626,7 +4626,7 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
         if (storageId > 0) selectedStorageIds.insert(storageId);
     }
 
-    QVector<WaveSignal> outputSignals;
+    WaveSignalList outputSignals;
     QHash<int, int> outputIndexBySignalId;
     QHash<int, QVector<int>> outputIndexesByStorageId;
     outputSignals.reserve(signalIds.size());
@@ -4953,7 +4953,7 @@ bool WaveParser4Reader::findRawSignalEvent(const QVector<int>& signalIds,
                 return false;
             }
             const QVector<QVector<int>> noOutputIndexes;
-            const QVector<WaveSignal> noOutputSignals;
+            const WaveSignalList noOutputSignals;
             QVector<QVector<WaveSample>> noOutputSamples;
             qint64 ignoredMinTime = std::numeric_limits<qint64>::max();
             qint64 ignoredMaxTime = 0;
@@ -5104,7 +5104,7 @@ bool WaveParser4Reader::loadSignalLodImpl(const QVector<int>& signalIds,
     selectedStorageIds.reserve(signalIds.size() * 2 + 1);
     emittedSignalIds.reserve(signalIds.size() * 2 + 1);
     const QSet<int> clockSignalIds = proceduralClockSignalIds(d->clocks);
-    QVector<WaveSignal> outputSignals;
+    WaveSignalList outputSignals;
     QVector<int> outputIndexBySignalId;
     outputSignals.reserve(signalIds.size());
     outputIndexBySignalId.reserve(signalIds.size());
@@ -5127,7 +5127,7 @@ bool WaveParser4Reader::loadSignalLodImpl(const QVector<int>& signalIds,
                                          error)) {
         return false;
     }
-    if (outputSignals.isEmpty() || selectedStorageIds.isEmpty()) {
+    if (outputSignals.empty() || selectedStorageIds.isEmpty()) {
         outWave.signalList = std::move(outputSignals);
         return true;
     }
@@ -5477,7 +5477,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
     QSet<int> selectedIds;
     QSet<int> selectedStorageIds;
     QSet<int> lodSelectedStorageIds;
-    QVector<WaveSignal> outputSignals;
+    WaveSignalList outputSignals;
     QVector<int> outputIndexBySignalId;
     QVector<QVector<int>> outputIndexesByStorageId;
     QVector<int> byteWidthByStorageId;

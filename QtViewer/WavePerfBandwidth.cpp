@@ -546,15 +546,27 @@ QJsonObject directionJson(const ByteAccumulator& data,
                   double(data.transferTicks) / double(ticksPerCycle));
     result.insert(QStringLiteral("known_cycles"),
                   double(data.knownTicks) / double(ticksPerCycle));
+    const bool valueCoverageComplete =
+        data.streams > 0 &&
+        static_cast<long double>(data.knownTicks) ==
+            static_cast<long double>(durationTicks) *
+                static_cast<long double>(data.streams);
+    const double bytesPerCycle =
+        durationCycles > 0.0 ? totalBytes / durationCycles : 0.0;
+    if (valueCoverageComplete) {
+        result.insert(QStringLiteral("bytes_per_cycle"), bytesPerCycle);
+    }
     if (!utilizationAvailable) {
         result.insert(
             QStringLiteral("reason"),
-            QStringLiteral("waveform value coverage is incomplete"));
+            valueCoverageComplete
+                ? QStringLiteral(
+                      "array layout coverage is incomplete; B/cycle is "
+                      "reported for observed lanes only")
+                : QStringLiteral(
+                      "waveform value coverage is incomplete"));
     }
     if (utilizationAvailable) {
-        const double bytesPerCycle =
-            durationCycles > 0.0 ? totalBytes / durationCycles : 0.0;
-        result.insert(QStringLiteral("bytes_per_cycle"), bytesPerCycle);
         if (peakBytesPerCycle > 0.0) {
             result.insert(QStringLiteral("utilization_percent"),
                           100.0 * bytesPerCycle / peakBytesPerCycle);
@@ -1258,7 +1270,11 @@ bool memoryBandwidthProfilerSelfTest(QString& error) {
         partialProfile.value(QStringLiteral("l2")).toObject();
     const QJsonObject partialCoverage =
         partialL2.value(QStringLiteral("coverage")).toObject();
-    if (partialL2.value(QStringLiteral("read")).toObject()
+    if (!partialL2.value(QStringLiteral("read")).toObject()
+             .contains(QStringLiteral("bytes_per_cycle")) ||
+        !partialL2.value(QStringLiteral("write")).toObject()
+             .contains(QStringLiteral("bytes_per_cycle")) ||
+        partialL2.value(QStringLiteral("read")).toObject()
             .contains(QStringLiteral("utilization_percent")) ||
         partialL2.value(QStringLiteral("write")).toObject()
             .contains(QStringLiteral("utilization_percent")) ||

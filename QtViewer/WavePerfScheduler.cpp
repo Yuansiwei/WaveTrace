@@ -1,4 +1,5 @@
 #include "WavePerfScheduler.h"
+#include "WavePerfArchitecture.h"
 
 #include <QJsonArray>
 #include <QMap>
@@ -61,12 +62,16 @@ struct SgSignals {
     const WaveSignal* barrier = nullptr;
     const WaveSignal* setMaxTemp = nullptr;
     const WaveSignal* inflightMemory = nullptr;
-    QVector<const WaveSignal*> dependencies;
+    QMap<int, const WaveSignal*> dependencies;
     const WaveSignal* queueHeadIndex = nullptr;
     QMap<int, const WaveSignal*> queueEntryPc;
     QMap<int, const WaveSignal*> queueEntryIssueType;
+    QMap<int, const WaveSignal*> queueEntryMainType;
+    QMap<int, const WaveSignal*> queueEntryCbSubtype;
+    QMap<int, const WaveSignal*> queueEntryCbClient;
     QMap<int, const WaveSignal*> queueEntryThreadSubtype;
     QMap<int, const WaveSignal*> queueEntryExeUnit;
+    QMap<int, QHash<QString, const WaveSignal*>> queueEntryFeatures;
 };
 
 struct IssueSignals {
@@ -75,6 +80,10 @@ struct IssueSignals {
     const WaveSignal* sgId = nullptr;
     const WaveSignal* pc = nullptr;
     const WaveSignal* issueType = nullptr;
+    const WaveSignal* mainType = nullptr;
+    const WaveSignal* cbSubtype = nullptr;
+    const WaveSignal* cbClient = nullptr;
+    QHash<QString, const WaveSignal*> features;
 };
 
 struct QppuSignals {
@@ -115,28 +124,41 @@ struct Bin {
 
 struct PcMetrics {
     QString qppuPath;
+    int shaderGroup = -1;
     quint64 pc = 0;
     quint64 issueType = 0;
     bool issueTypeKnown = false;
     qint64 issuedTicks = 0;
     qint64 waitTicks = 0;
+    QMap<QString, qint64> issueFeatureKnownTicks;
+    QMap<QString, qint64> issueFeatureActiveTicks;
     QMap<QString, qint64> waitReasonTicks;
+    QMap<QString, qint64> waitFeatureKnownTicks;
+    QMap<QString, qint64> waitFeatureActiveTicks;
+    QMap<quint64, qint64> issueMainTypeTicks;
+    QMap<quint64, qint64> issueCbSubtypeTicks;
+    QMap<quint64, qint64> issueCbClientTicks;
+    QMap<quint64, qint64> waitMainTypeTicks;
+    QMap<quint64, qint64> waitCbSubtypeTicks;
+    QMap<quint64, qint64> waitCbClientTicks;
 };
 
 bool queueHeadState(const SgSignals& sg,
                     qint64 time,
+                    int& entry,
                     quint64& pc,
                     quint64& issueType,
                     bool& issueTypeKnown) {
     const State index = stateAt(sg.queueHeadIndex, time);
     if (!index.known) return false;
+    entry = int(index.value);
     const WaveSignal* pcSignal =
-        sg.queueEntryPc.value(int(index.value), nullptr);
+        sg.queueEntryPc.value(entry, nullptr);
     const State pcState = stateAt(pcSignal, time);
     if (!pcState.known) return false;
     pc = pcState.value;
     const State typeState =
-        stateAt(sg.queueEntryIssueType.value(int(index.value), nullptr), time);
+        stateAt(sg.queueEntryIssueType.value(entry, nullptr), time);
     issueTypeKnown = typeState.known;
     issueType = typeState.value;
     return true;
@@ -192,11 +214,24 @@ void appendBoundarySignals(const SgSignals& sg,
     for (const WaveSignal* signal : sg.queueEntryIssueType) {
         result.push_back(signal);
     }
+    for (const WaveSignal* signal : sg.queueEntryMainType) {
+        result.push_back(signal);
+    }
+    for (const WaveSignal* signal : sg.queueEntryCbSubtype) {
+        result.push_back(signal);
+    }
+    for (const WaveSignal* signal : sg.queueEntryCbClient) {
+        result.push_back(signal);
+    }
     for (const WaveSignal* signal : sg.queueEntryThreadSubtype) {
         result.push_back(signal);
     }
     for (const WaveSignal* signal : sg.queueEntryExeUnit) {
         result.push_back(signal);
+    }
+    for (const QHash<QString, const WaveSignal*>& features :
+         sg.queueEntryFeatures) {
+        for (const WaveSignal* signal : features) result.push_back(signal);
     }
 }
 
@@ -317,7 +352,7 @@ QString localState(const SgSignals& sg,
         eligibilityCoverage = false;
         return QStringLiteral("unknown");
     }
-    if (issueType == 2) {
+    if (issueType == 1 || issueType == 2) {
         // FP32MinOrMax (subtype 0) can use either FP32 unit. Other Thread
         // instructions use the unit selected by predecode.
         if (threadSubtype.known && threadSubtype.value == 0) {
@@ -387,6 +422,86 @@ double percent(qint64 numerator, qint64 denominator) {
                            : 0.0;
 }
 
+bool waitInstructionFeatureCoverageComplete(
+    const QMap<QString, qint64>& knownTicksByFeature,
+    qint64 totalWaitTicks) {
+    if (totalWaitTicks <= 0) return false;
+    for (const InstructionFeatureSpec& spec :
+         instructionFeatureSpecs()) {
+        if (knownTicksByFeature.value(spec.key) != totalWaitTicks) {
+            return false;
+        }
+    }
+    return true;
+}
+
+QJsonArray waitInstructionFeatureStats(
+    const QMap<QString, qint64>& knownTicksByFeature,
+    const QMap<QString, qint64>& activeTicksByFeature,
+    qint64 totalWaitTicks,
+    qint64 ticksPerCycle,
+    bool activeOnly) {
+    struct Row {
+        const InstructionFeatureSpec* spec = nullptr;
+        qint64 knownTicks = 0;
+        qint64 activeTicks = 0;
+    };
+
+    QVector<Row> rows;
+    rows.reserve(instructionFeatureSpecs().size());
+    for (const InstructionFeatureSpec& spec :
+         instructionFeatureSpecs()) {
+        const qint64 activeTicks =
+            activeTicksByFeature.value(spec.key);
+        if (activeOnly && activeTicks <= 0) continue;
+        rows.push_back(
+            Row{&spec, knownTicksByFeature.value(spec.key),
+                activeTicks});
+    }
+    if (activeOnly) {
+        std::sort(rows.begin(), rows.end(),
+                  [](const Row& lhs, const Row& rhs) {
+                      if (lhs.activeTicks != rhs.activeTicks) {
+                          return lhs.activeTicks > rhs.activeTicks;
+                      }
+                      return lhs.spec->fieldPath <
+                             rhs.spec->fieldPath;
+                  });
+    }
+
+    QJsonArray result;
+    for (const Row& row : rows) {
+        QJsonObject feature;
+        feature.insert(QStringLiteral("key"), row.spec->key);
+        feature.insert(QStringLiteral("source_field"),
+                       QStringLiteral("preDecode.") +
+                           row.spec->fieldPath);
+        feature.insert(QStringLiteral("group"),
+                       row.spec->group);
+        feature.insert(
+            QStringLiteral("active_wait_cycles"),
+            cycles(row.activeTicks, ticksPerCycle));
+        feature.insert(
+            QStringLiteral("observed_cycles"),
+            cycles(row.knownTicks, ticksPerCycle));
+        feature.insert(
+            QStringLiteral("wait_share_percent"),
+            percent(row.activeTicks, totalWaitTicks));
+        feature.insert(
+            QStringLiteral("active_when_known_percent"),
+            percent(row.activeTicks, row.knownTicks));
+        feature.insert(
+            QStringLiteral("coverage_percent"),
+            percent(row.knownTicks, totalWaitTicks));
+        feature.insert(
+            QStringLiteral("covered"),
+            totalWaitTicks > 0 &&
+                row.knownTicks == totalWaitTicks);
+        result.push_back(feature);
+    }
+    return result;
+}
+
 QString reasonName(const QString& key) {
     if (key == QStringLiteral("barrier")) return QStringLiteral("Barrier 等待");
     if (key == QStringLiteral("flow_control")) return QStringLiteral("流控等待");
@@ -398,6 +513,41 @@ QString reasonName(const QString& key) {
     return key;
 }
 
+State dominantState(const QMap<quint64, qint64>& ticksByValue) {
+    State result;
+    qint64 bestTicks = 0;
+    for (auto it = ticksByValue.constBegin(); it != ticksByValue.constEnd();
+         ++it) {
+        if (it.value() > bestTicks) {
+            bestTicks = it.value();
+            result.known = true;
+            result.value = it.key();
+        }
+    }
+    return result;
+}
+
+void appendDecodedInstructionEnums(QJsonObject& object,
+                                   const QMap<quint64, qint64>& mainTypeTicks,
+                                   const QMap<quint64, qint64>& cbSubtypeTicks,
+                                   const QMap<quint64, qint64>& cbClientTicks) {
+    const State mainType = dominantState(mainTypeTicks);
+    const State cbSubtype = dominantState(cbSubtypeTicks);
+    const State cbClient = dominantState(cbClientTicks);
+    object.insert(QStringLiteral("main_type"),
+                  mainType.known ? QString::number(mainType.value)
+                                 : QStringLiteral("unknown"));
+    object.insert(QStringLiteral("cb_subtype"),
+                  cbSubtype.known ? QString::number(cbSubtype.value)
+                                  : QStringLiteral("unknown"));
+    object.insert(QStringLiteral("cb_inst_client"),
+                  cbClient.known ? QString::number(cbClient.value)
+                                 : QStringLiteral("unknown"));
+    object.insert(QStringLiteral("cb_inst_client_name"),
+                  cbClient.known ? cbCtrlInstClientName(cbClient.value)
+                                 : QStringLiteral("unknown"));
+}
+
 }  // namespace
 
 QJsonObject buildSchedulerProfile(
@@ -407,6 +557,13 @@ QJsonObject buildSchedulerProfile(
     qint64 ticksPerCycle,
     int timelineBinCount,
     QStringList& warnings) {
+    QHash<QString, const WaveSignal*> canonicalSignals;
+    canonicalSignals.reserve(signalsByPath.size());
+    for (auto it = signalsByPath.constBegin();
+         it != signalsByPath.constEnd(); ++it) {
+        canonicalSignals.insert(canonicalArchitecturePath(it.key()),
+                                it.value());
+    }
     QMap<QString, QppuSignals> qppus;
     static const QRegularExpression sgField(
         QStringLiteral("\\.(?:sg_table_|instr_queue_|stall_cnt_vector_|"
@@ -419,11 +576,29 @@ QJsonObject buildSchedulerProfile(
     static const QRegularExpression issueField(
         QStringLiteral("\\.issue_inst_(?:\\[size=(\\d+)\\])?\\.\\[(\\d+)\\]\\.vld$"));
     static const QRegularExpression queueEntryField(
-        QStringLiteral("\\.instr_queue_(?:\\[size=\\d+\\])?\\.\\[(\\d+)\\]"
+        [] {
+            QStringList fields = {
+                QStringLiteral("PC\\.pc_"),
+                QStringLiteral("preDecode\\.instIssueType"),
+                QStringLiteral("preDecode\\.instType\\.mainType"),
+                QStringLiteral("preDecode\\.instType\\.subType\\.cb"),
+                QStringLiteral("preDecode\\.cb_inst_client"),
+                QStringLiteral(
+                    "preDecode\\.instType\\.subType\\.thread"),
+                QStringLiteral("preDecode\\.exeThdUnit")
+            };
+            for (const InstructionFeatureSpec& spec :
+                 instructionFeatureSpecs()) {
+                fields.push_back(
+                    QStringLiteral("preDecode\\.") +
+                    QRegularExpression::escape(spec.fieldPath));
+            }
+            return QStringLiteral(
+                       "\\.instr_queue_(?:\\[size=\\d+\\])?\\.\\[(\\d+)\\]"
                        "\\.m_QData(?:\\[size=\\d+\\])?\\.\\[(\\d+)\\]"
-                       "\\.Data\\.(PC\\.pc_|preDecode\\.instIssueType|"
-                       "preDecode\\.instType\\.subType\\.thread|"
-                       "preDecode\\.exeThdUnit)$"),
+                       "\\.Data\\.(%1)$")
+                .arg(fields.join(QLatin1Char('|')));
+        }(),
         QRegularExpression::CaseInsensitiveOption);
     static const QRegularExpression queueHeadField(
         QStringLiteral("\\.instr_queue_(?:\\[size=\\d+\\])?\\.\\[(\\d+)\\]"
@@ -433,7 +608,8 @@ QJsonObject buildSchedulerProfile(
         QStringLiteral("\\.function_unit_pend_wait_vector_"
                        "(?:\\[size=\\d+\\])?\\.\\[(\\d+)\\]$"));
 
-    for (auto it = signalsByPath.constBegin(); it != signalsByPath.constEnd(); ++it) {
+    for (auto it = canonicalSignals.constBegin();
+         it != canonicalSignals.constEnd(); ++it) {
         const QString root = qppuRoot(it.key());
         if (root.isEmpty()) continue;
         QppuSignals& qppu = qppus[root];
@@ -457,12 +633,38 @@ QJsonObject buildSchedulerProfile(
                            Qt::CaseInsensitive) == 0) {
                 sgSignals.queueEntryIssueType.insert(entry, it.value());
             } else if (field.compare(
+                           QStringLiteral("preDecode.instType.mainType"),
+                           Qt::CaseInsensitive) == 0) {
+                sgSignals.queueEntryMainType.insert(entry, it.value());
+            } else if (field.compare(
+                           QStringLiteral("preDecode.instType.subType.cb"),
+                           Qt::CaseInsensitive) == 0) {
+                sgSignals.queueEntryCbSubtype.insert(entry, it.value());
+            } else if (field.compare(
+                           QStringLiteral("preDecode.cb_inst_client"),
+                           Qt::CaseInsensitive) == 0) {
+                sgSignals.queueEntryCbClient.insert(entry, it.value());
+            } else if (field.compare(
                            QStringLiteral(
                                "preDecode.instType.subType.thread"),
                            Qt::CaseInsensitive) == 0) {
                 sgSignals.queueEntryThreadSubtype.insert(entry, it.value());
-            } else {
+            } else if (field.compare(
+                           QStringLiteral("preDecode.exeThdUnit"),
+                           Qt::CaseInsensitive) == 0) {
                 sgSignals.queueEntryExeUnit.insert(entry, it.value());
+            } else {
+                for (const InstructionFeatureSpec& spec :
+                     instructionFeatureSpecs()) {
+                    if (field.compare(
+                            QStringLiteral("preDecode.") + spec.fieldPath,
+                            Qt::CaseInsensitive) != 0) {
+                        continue;
+                    }
+                    sgSignals.queueEntryFeatures[entry].insert(
+                        spec.key, it.value());
+                    break;
+                }
             }
             continue;
         }
@@ -489,16 +691,36 @@ QJsonObject buildSchedulerProfile(
             issue.valid = it.value();
             const QString issueRoot = it.key().left(it.key().size() - 4);
             issue.sgId =
-                signalsByPath.value(issueRoot + QStringLiteral(".sgId"), nullptr);
+                canonicalSignals.value(
+                    issueRoot + QStringLiteral(".sgId"), nullptr);
             if (!issue.sgId) {
                 issue.sgId =
-                    signalsByPath.value(
+                    canonicalSignals.value(
                         issueRoot + QStringLiteral(".local_sgid"), nullptr);
             }
             issue.pc =
-                signalsByPath.value(issueRoot + QStringLiteral(".PC.pc_"), nullptr);
-            issue.issueType = signalsByPath.value(
+                canonicalSignals.value(
+                    issueRoot + QStringLiteral(".PC.pc_"), nullptr);
+            issue.issueType = canonicalSignals.value(
                 issueRoot + QStringLiteral(".preDecode.instIssueType"), nullptr);
+            issue.mainType = canonicalSignals.value(
+                issueRoot + QStringLiteral(".preDecode.instType.mainType"),
+                nullptr);
+            issue.cbSubtype = canonicalSignals.value(
+                issueRoot + QStringLiteral(".preDecode.instType.subType.cb"),
+                nullptr);
+            issue.cbClient = canonicalSignals.value(
+                issueRoot + QStringLiteral(".preDecode.cb_inst_client"),
+                nullptr);
+            for (const InstructionFeatureSpec& spec :
+                 instructionFeatureSpecs()) {
+                issue.features.insert(
+                    spec.key,
+                    canonicalSignals.value(
+                        issueRoot + QStringLiteral(".preDecode.") +
+                            spec.fieldPath,
+                        nullptr));
+            }
             qppu.issueSlots.push_back(issue);
             continue;
         }
@@ -508,7 +730,8 @@ QJsonObject buildSchedulerProfile(
         if (dependencyMatch.hasMatch()) {
             const int sg = dependencyMatch.captured(1).toInt();
             qppu.shaderGroups[sg].index = sg;
-            qppu.shaderGroups[sg].dependencies.push_back(it.value());
+            qppu.shaderGroups[sg].dependencies.insert(
+                dependencyMatch.captured(2).toInt(), it.value());
             continue;
         }
 
@@ -601,15 +824,103 @@ QJsonObject buildSchedulerProfile(
     qint64 totalPcTypeKnownTicks = 0;
     qint64 totalQueueWaitTicks = 0;
     qint64 totalQueueHeadCoveredTicks = 0;
+    QMap<QString, qint64> totalQueueFeatureKnownTicks;
+    QMap<QString, qint64> totalQueueFeatureActiveTicks;
     QJsonArray qppuArray;
+    QSet<QString> allMissingSignalPaths;
 
     for (auto qppuIt = qppus.begin(); qppuIt != qppus.end(); ++qppuIt) {
         QppuSignals& qppu = qppuIt.value();
+        QSet<QString> qppuMissingSignalPaths;
+        const QString controlRoot =
+            qppu.path + QStringLiteral(".m_QPPUCtrl");
+        auto requireSignal =
+            [&qppuMissingSignalPaths](const WaveSignal* signal,
+                                     const QString& expectedPath) {
+                if (!signal) qppuMissingSignalPaths.insert(expectedPath);
+            };
+
+        QMap<int, const IssueSignals*> issueBySlot;
+        for (const IssueSignals& issue : qppu.issueSlots) {
+            issueBySlot.insert(issue.slot, &issue);
+        }
+        for (int slot = 0; slot < qppu.declaredIssueSlots; ++slot) {
+            const QString issueRoot =
+                controlRoot +
+                QStringLiteral(".issue_inst_.[%1]").arg(slot);
+            const IssueSignals* issue = issueBySlot.value(slot, nullptr);
+            if (!issue) {
+                qppuMissingSignalPaths.insert(
+                    issueRoot + QStringLiteral(".vld"));
+                continue;
+            }
+            requireSignal(issue->valid, issueRoot + QStringLiteral(".vld"));
+            requireSignal(
+                issue->sgId,
+                issueRoot + QStringLiteral(".{sgId|local_sgid}"));
+            requireSignal(issue->pc,
+                          issueRoot + QStringLiteral(".PC.pc_"));
+            requireSignal(
+                issue->issueType,
+                issueRoot +
+                    QStringLiteral(".preDecode.instIssueType"));
+        }
+
+        for (auto sgIt = qppu.shaderGroups.constBegin();
+             sgIt != qppu.shaderGroups.constEnd(); ++sgIt) {
+            const SgSignals& sg = sgIt.value();
+            const QString index = QString::number(sg.index);
+            requireSignal(
+                sg.valid,
+                controlRoot + QStringLiteral(".sg_table_.[%1].valid")
+                                  .arg(index));
+            requireSignal(
+                sg.queueCount,
+                controlRoot +
+                    QStringLiteral(
+                        ".instr_queue_.[%1].{m_count|m_numAvail|m_num_readable}")
+                        .arg(index));
+            requireSignal(
+                sg.stall,
+                controlRoot +
+                    QStringLiteral(".stall_cnt_vector_.[%1]").arg(index));
+            requireSignal(
+                sg.sleep,
+                controlRoot +
+                    QStringLiteral(".sleep_cnt_vector_.[%1]").arg(index));
+            requireSignal(
+                sg.flow,
+                controlRoot +
+                    QStringLiteral(".flow_ctrl_pend_wait_vector_.[%1]")
+                        .arg(index));
+            requireSignal(
+                sg.barrier,
+                controlRoot +
+                    QStringLiteral(".barrier_pend_wait_vector_.[%1]")
+                        .arg(index));
+            requireSignal(
+                sg.setMaxTemp,
+                controlRoot +
+                    QStringLiteral(".set_max_temp_pend_wait_vector_.[%1]")
+                        .arg(index));
+            for (int dependency = 0; dependency < 7; ++dependency) {
+                if (sg.dependencies.contains(dependency)) continue;
+                qppuMissingSignalPaths.insert(
+                    controlRoot +
+                    QStringLiteral(".check_dep_cnt_vector_.[%1].[%2]")
+                        .arg(index)
+                        .arg(dependency));
+            }
+        }
+
         QJsonArray sgArray;
         qint64 qppuActive = 0;
         qint64 qppuQueueReady = 0;
         qint64 qppuEligible = 0;
         qint64 qppuIssued = 0;
+        qint64 qppuQueueWaitTicks = 0;
+        QMap<QString, qint64> qppuQueueFeatureKnownTicks;
+        QMap<QString, qint64> qppuQueueFeatureActiveTicks;
         int qppuActivityCoveredSgs = 0;
         int qppuEligibilityCoveredSgs = 0;
         QMap<QString, qint64> qppuBlocks;
@@ -666,26 +977,79 @@ QJsonObject buildSchedulerProfile(
                 if (queueReady && !issued &&
                     state != QStringLiteral("unknown")) {
                     totalQueueWaitTicks += ticks;
+                    qppuQueueWaitTicks += ticks;
+                    int headEntry = -1;
                     quint64 headPc = 0;
                     quint64 headIssueType = 0;
                     bool headIssueTypeKnown = false;
-                    if (queueHeadState(sg, begin, headPc,
+                    if (queueHeadState(sg, begin, headEntry, headPc,
                                        headIssueType,
                                        headIssueTypeKnown)) {
                         totalQueueHeadCoveredTicks += ticks;
+                        QMap<QString, State> featureStates;
+                        const auto featureEntry =
+                            sg.queueEntryFeatures.constFind(headEntry);
+                        for (const InstructionFeatureSpec& spec :
+                             instructionFeatureSpecs()) {
+                            const State feature =
+                                stateAt(featureEntry ==
+                                                sg.queueEntryFeatures.constEnd()
+                                            ? nullptr
+                                            : featureEntry.value().value(
+                                                  spec.key, nullptr),
+                                        begin);
+                            featureStates.insert(spec.key, feature);
+                        }
                         const QString key =
                             qppu.path + QLatin1Char(':') +
+                            QString::number(sg.index) + QLatin1Char(':') +
                             QString::number(headPc) + QLatin1Char(':') +
                             (headIssueTypeKnown
                                  ? QString::number(headIssueType)
                                  : QStringLiteral("unknown"));
                         PcMetrics& wait = pcMetrics[key];
                         wait.qppuPath = qppu.path;
+                        wait.shaderGroup = sg.index;
                         wait.pc = headPc;
                         wait.issueType = headIssueType;
                         wait.issueTypeKnown = headIssueTypeKnown;
                         wait.waitTicks += ticks;
                         wait.waitReasonTicks[state] += ticks;
+                        const State mainType = stateAt(
+                            sg.queueEntryMainType.value(headEntry, nullptr),
+                            begin);
+                        const State cbSubtype = stateAt(
+                            sg.queueEntryCbSubtype.value(headEntry, nullptr),
+                            begin);
+                        const State cbClient = stateAt(
+                            sg.queueEntryCbClient.value(headEntry, nullptr),
+                            begin);
+                        if (mainType.known) {
+                            wait.waitMainTypeTicks[mainType.value] += ticks;
+                        }
+                        if (cbSubtype.known) {
+                            wait.waitCbSubtypeTicks[cbSubtype.value] += ticks;
+                        }
+                        if (cbClient.known) {
+                            wait.waitCbClientTicks[cbClient.value] += ticks;
+                        }
+                        for (const InstructionFeatureSpec& spec :
+                             instructionFeatureSpecs()) {
+                            const State feature =
+                                featureStates.value(spec.key);
+                            if (!feature.known) continue;
+                            wait.waitFeatureKnownTicks[spec.key] += ticks;
+                            totalQueueFeatureKnownTicks[spec.key] += ticks;
+                            qppuQueueFeatureKnownTicks[spec.key] += ticks;
+                            if (feature.value != 0) {
+                                wait.waitFeatureActiveTicks[spec.key] +=
+                                    ticks;
+                                totalQueueFeatureActiveTicks[spec.key] +=
+                                    ticks;
+                                qppuQueueFeatureActiveTicks[spec.key] +=
+                                    ticks;
+                            }
+                        }
                     }
                 }
                 allActivityIntervalsCovered =
@@ -796,6 +1160,12 @@ QJsonObject buildSchedulerProfile(
             issueBoundarySignals.push_back(issue.valid);
             issueBoundarySignals.push_back(issue.pc);
             issueBoundarySignals.push_back(issue.issueType);
+            for (const WaveSignal* feature : issue.features) {
+                issueBoundarySignals.push_back(feature);
+            }
+            issueBoundarySignals.push_back(issue.mainType);
+            issueBoundarySignals.push_back(issue.cbSubtype);
+            issueBoundarySignals.push_back(issue.cbClient);
         }
         const QVector<qint64> issueEdges =
             boundaries(issueBoundarySignals, startTick, endTick);
@@ -808,7 +1178,16 @@ QJsonObject buildSchedulerProfile(
             const qint64 ticks = issueEdges.at(i + 1) - begin;
             int activeSlots = 0;
             bool allSlotsKnown = issueLayoutCoverageComplete;
-            QVector<QPair<State, State>> activeInstructions;
+            struct ActiveInstruction {
+                State pc;
+                State type;
+                State sgId;
+                State mainType;
+                State cbSubtype;
+                State cbClient;
+                QMap<QString, State> features;
+            };
+            QVector<ActiveInstruction> activeInstructions;
             for (const IssueSignals& issue : qppu.issueSlots) {
                 bool validKnown = false;
                 const bool issueValid =
@@ -818,30 +1197,74 @@ QJsonObject buildSchedulerProfile(
                 ++activeSlots;
                 const State pc = stateAt(issue.pc, begin);
                 const State type = stateAt(issue.issueType, begin);
-                activeInstructions.push_back({pc, type});
+                ActiveInstruction instruction;
+                instruction.pc = pc;
+                instruction.type = type;
+                instruction.sgId = stateAt(issue.sgId, begin);
+                instruction.mainType = stateAt(issue.mainType, begin);
+                instruction.cbSubtype = stateAt(issue.cbSubtype, begin);
+                instruction.cbClient = stateAt(issue.cbClient, begin);
+                for (const InstructionFeatureSpec& spec :
+                     instructionFeatureSpecs()) {
+                    const State feature =
+                        stateAt(issue.features.value(spec.key, nullptr),
+                                begin);
+                    instruction.features.insert(spec.key, feature);
+                }
+                activeInstructions.push_back(instruction);
             }
             if (!allSlotsKnown) continue;
             qppuIssueObservedTicks += ticks;
             qppuIssueTicks += qint64(activeSlots) * ticks;
             if (activeSlots > 0) qppuIssueActiveTicks += ticks;
             if (activeSlots > 1) qppuDualIssueTicks += ticks;
-            for (const QPair<State, State>& instruction :
+            for (const ActiveInstruction& instruction :
                  activeInstructions) {
-                const State& pc = instruction.first;
-                const State& type = instruction.second;
+                const State& pc = instruction.pc;
+                const State& type = instruction.type;
                 if (!pc.known) continue;
                 const QString key =
-                    qppu.path + QLatin1Char(':') + QString::number(pc.value) +
+                    qppu.path + QLatin1Char(':') +
+                    (instruction.sgId.known
+                         ? QString::number(instruction.sgId.value)
+                         : QStringLiteral("unknown")) +
+                    QLatin1Char(':') + QString::number(pc.value) +
                     QLatin1Char(':') +
                     (type.known
                          ? QString::number(type.value)
                          : QStringLiteral("unknown"));
                 PcMetrics& hotspot = pcMetrics[key];
                 hotspot.qppuPath = qppu.path;
+                hotspot.shaderGroup =
+                    instruction.sgId.known
+                        ? int(instruction.sgId.value)
+                        : -1;
                 hotspot.pc = pc.value;
                 hotspot.issueType = type.value;
                 hotspot.issueTypeKnown = type.known;
                 hotspot.issuedTicks += ticks;
+                if (instruction.mainType.known) {
+                    hotspot.issueMainTypeTicks[instruction.mainType.value] +=
+                        ticks;
+                }
+                if (instruction.cbSubtype.known) {
+                    hotspot.issueCbSubtypeTicks[
+                        instruction.cbSubtype.value] += ticks;
+                }
+                if (instruction.cbClient.known) {
+                    hotspot.issueCbClientTicks[instruction.cbClient.value] +=
+                        ticks;
+                }
+                for (const InstructionFeatureSpec& spec :
+                     instructionFeatureSpecs()) {
+                    const State feature =
+                        instruction.features.value(spec.key);
+                    if (!feature.known) continue;
+                    hotspot.issueFeatureKnownTicks[spec.key] += ticks;
+                    if (feature.value != 0) {
+                        hotspot.issueFeatureActiveTicks[spec.key] += ticks;
+                    }
+                }
                 totalPcIssuedTicks += ticks;
                 if (type.known) totalPcTypeKnownTicks += ticks;
             }
@@ -898,6 +1321,37 @@ QJsonObject buildSchedulerProfile(
                           cycles(qppuDualIssueTicks, ticksPerCycle));
         qppuObject.insert(QStringLiteral("eligible_percent"),
                           percent(qppuEligible, qppuQueueReady));
+        qppuObject.insert(
+            QStringLiteral("pc_wait_cycles"),
+            cycles(qppuQueueWaitTicks, ticksPerCycle));
+        qppuObject.insert(
+            QStringLiteral("pc_wait_instruction_flags"),
+            waitInstructionFeatureStats(
+                qppuQueueFeatureKnownTicks,
+                qppuQueueFeatureActiveTicks,
+                qppuQueueWaitTicks, ticksPerCycle, true));
+        qppuObject.insert(
+            QStringLiteral("pc_wait_feature_coverage"),
+            waitInstructionFeatureStats(
+                qppuQueueFeatureKnownTicks,
+                qppuQueueFeatureActiveTicks,
+                qppuQueueWaitTicks, ticksPerCycle, false));
+        qppuObject.insert(
+            QStringLiteral("pc_wait_feature_coverage_complete"),
+            waitInstructionFeatureCoverageComplete(
+                qppuQueueFeatureKnownTicks,
+                qppuQueueWaitTicks));
+        QJsonArray qppuMissingArray;
+        QStringList sortedMissing = qppuMissingSignalPaths.values();
+        std::sort(sortedMissing.begin(), sortedMissing.end());
+        for (const QString& path : sortedMissing) {
+            qppuMissingArray.push_back(path);
+            allMissingSignalPaths.insert(path);
+        }
+        qppuObject.insert(QStringLiteral("missing_signal_count"),
+                          qppuMissingSignalPaths.size());
+        qppuObject.insert(QStringLiteral("missing_signal_paths"),
+                          qppuMissingArray);
         QJsonArray blockArray;
         for (auto it = qppuBlocks.constBegin(); it != qppuBlocks.constEnd(); ++it) {
             QJsonObject block;
@@ -951,12 +1405,36 @@ QJsonObject buildSchedulerProfile(
     summary.insert(QStringLiteral("pc_wait_coverage_percent"),
                    percent(totalQueueHeadCoveredTicks,
                            totalQueueWaitTicks));
+    summary.insert(QStringLiteral("pc_wait_feature_coverage"),
+                   waitInstructionFeatureStats(
+                       totalQueueFeatureKnownTicks,
+                       totalQueueFeatureActiveTicks,
+                       totalQueueWaitTicks, ticksPerCycle, false));
+    summary.insert(QStringLiteral("pc_wait_instruction_flags"),
+                   waitInstructionFeatureStats(
+                       totalQueueFeatureKnownTicks,
+                       totalQueueFeatureActiveTicks,
+                       totalQueueWaitTicks, ticksPerCycle, true));
+    summary.insert(QStringLiteral("pc_wait_feature_coverage_complete"),
+                   waitInstructionFeatureCoverageComplete(
+                       totalQueueFeatureKnownTicks,
+                       totalQueueWaitTicks));
     summary.insert(QStringLiteral("pc_issue_coverage_percent"),
                    percent(totalPcIssuedTicks,
                            totalIssueInstructionTicks));
     summary.insert(QStringLiteral("pc_issue_type_coverage_percent"),
                    percent(totalPcTypeKnownTicks,
                            totalIssueInstructionTicks));
+    QJsonArray missingSignalArray;
+    QStringList sortedMissing = allMissingSignalPaths.values();
+    std::sort(sortedMissing.begin(), sortedMissing.end());
+    for (const QString& path : sortedMissing) {
+        missingSignalArray.push_back(path);
+    }
+    summary.insert(QStringLiteral("missing_signal_count"),
+                   allMissingSignalPaths.size());
+    summary.insert(QStringLiteral("missing_signal_paths"),
+                   missingSignalArray);
     QJsonArray totalBlocks;
     QVector<QPair<QString, qint64>> sortedBlocks;
     for (auto it = totalBlockTicks.constBegin();
@@ -1035,18 +1513,72 @@ QJsonObject buildSchedulerProfile(
         if (hotspot.issuedTicks <= 0 || hotspotArray.size() >= 200) continue;
         QJsonObject object;
         object.insert(QStringLiteral("qppu_path"), hotspot.qppuPath);
+        object.insert(QStringLiteral("sg_index"), hotspot.shaderGroup);
         object.insert(QStringLiteral("pc"),
                       QStringLiteral("0x%1").arg(hotspot.pc, 0, 16));
         object.insert(QStringLiteral("issue_type"),
                       hotspot.issueTypeKnown
                           ? QString::number(hotspot.issueType)
                           : QStringLiteral("unknown"));
+        object.insert(QStringLiteral("issue_type_name"),
+                      hotspot.issueTypeKnown
+                          ? instIssueTypeName(hotspot.issueType)
+                          : QStringLiteral("unknown"));
+        appendDecodedInstructionEnums(
+            object, hotspot.issueMainTypeTicks, hotspot.issueCbSubtypeTicks,
+            hotspot.issueCbClientTicks);
         object.insert(QStringLiteral("issued_instructions_estimate"),
                       cycles(hotspot.issuedTicks, ticksPerCycle));
         object.insert(QStringLiteral("share_percent"),
                       percent(hotspot.issuedTicks, totalPcIssuedTicks));
         object.insert(QStringLiteral("queue_wait_cycles"),
                       cycles(hotspot.waitTicks, ticksPerCycle));
+        QJsonArray instructionFeatures;
+        bool featureCoverageComplete = hotspot.issuedTicks > 0;
+        for (const InstructionFeatureSpec& spec :
+             instructionFeatureSpecs()) {
+            const qint64 knownTicks =
+                hotspot.issueFeatureKnownTicks.value(spec.key);
+            const qint64 activeTicks =
+                hotspot.issueFeatureActiveTicks.value(spec.key);
+            featureCoverageComplete =
+                featureCoverageComplete &&
+                knownTicks == hotspot.issuedTicks;
+            if (activeTicks <= 0) continue;
+            QJsonObject feature;
+            feature.insert(QStringLiteral("key"), spec.key);
+            feature.insert(QStringLiteral("source_field"),
+                           QStringLiteral("preDecode.") +
+                               spec.fieldPath);
+            feature.insert(QStringLiteral("active_issue_cycles"),
+                           cycles(activeTicks, ticksPerCycle));
+            feature.insert(QStringLiteral("issue_share_percent"),
+                           percent(activeTicks, hotspot.issuedTicks));
+            feature.insert(QStringLiteral("coverage_percent"),
+                           percent(knownTicks, hotspot.issuedTicks));
+            instructionFeatures.push_back(feature);
+        }
+        const State issuedCbClient =
+            dominantState(hotspot.issueCbClientTicks);
+        if (hotspot.issueTypeKnown && hotspot.issueType == 5 &&
+            issuedCbClient.known) {
+            QJsonObject client;
+            client.insert(QStringLiteral("key"),
+                          QStringLiteral("cb_inst_client"));
+            client.insert(QStringLiteral("source_field"),
+                          QStringLiteral("CBCtrl: %1")
+                              .arg(cbCtrlInstClientName(
+                                  issuedCbClient.value)));
+            client.insert(QStringLiteral("active_issue_cycles"),
+                          cycles(hotspot.issuedTicks, ticksPerCycle));
+            client.insert(QStringLiteral("issue_share_percent"), 100.0);
+            client.insert(QStringLiteral("coverage_percent"), 100.0);
+            instructionFeatures.push_back(client);
+        }
+        object.insert(QStringLiteral("instruction_features"),
+                      instructionFeatures);
+        object.insert(QStringLiteral("feature_coverage_complete"),
+                      featureCoverageComplete);
         hotspotArray.push_back(object);
     }
     result.insert(QStringLiteral("pc_hotspots"), hotspotArray);
@@ -1075,12 +1607,20 @@ QJsonObject buildSchedulerProfile(
         }
         QJsonObject object;
         object.insert(QStringLiteral("qppu_path"), hotspot.qppuPath);
+        object.insert(QStringLiteral("sg_index"), hotspot.shaderGroup);
         object.insert(QStringLiteral("pc"),
                       QStringLiteral("0x%1").arg(hotspot.pc, 0, 16));
         object.insert(QStringLiteral("issue_type"),
                       hotspot.issueTypeKnown
                           ? QString::number(hotspot.issueType)
                           : QStringLiteral("unknown"));
+        object.insert(QStringLiteral("issue_type_name"),
+                      hotspot.issueTypeKnown
+                          ? instIssueTypeName(hotspot.issueType)
+                          : QStringLiteral("unknown"));
+        appendDecodedInstructionEnums(
+            object, hotspot.waitMainTypeTicks, hotspot.waitCbSubtypeTicks,
+            hotspot.waitCbClientTicks);
         object.insert(QStringLiteral("wait_cycles"),
                       cycles(hotspot.waitTicks, ticksPerCycle));
         object.insert(QStringLiteral("share_percent"),
@@ -1094,6 +1634,52 @@ QJsonObject buildSchedulerProfile(
                       reasonName(dominantReason));
         object.insert(QStringLiteral("dominant_reason_cycles"),
                       cycles(dominantTicks, ticksPerCycle));
+        QJsonArray instructionFeatures;
+        bool featureCoverageComplete = hotspot.waitTicks > 0;
+        for (const InstructionFeatureSpec& spec :
+             instructionFeatureSpecs()) {
+            const qint64 knownTicks =
+                hotspot.waitFeatureKnownTicks.value(spec.key);
+            const qint64 activeTicks =
+                hotspot.waitFeatureActiveTicks.value(spec.key);
+            featureCoverageComplete =
+                featureCoverageComplete &&
+                knownTicks == hotspot.waitTicks;
+            if (activeTicks <= 0) continue;
+            QJsonObject feature;
+            feature.insert(QStringLiteral("key"), spec.key);
+            feature.insert(QStringLiteral("source_field"),
+                           QStringLiteral("preDecode.") +
+                               spec.fieldPath);
+            feature.insert(QStringLiteral("active_wait_cycles"),
+                           cycles(activeTicks, ticksPerCycle));
+            feature.insert(QStringLiteral("wait_share_percent"),
+                           percent(activeTicks, hotspot.waitTicks));
+            feature.insert(QStringLiteral("coverage_percent"),
+                           percent(knownTicks, hotspot.waitTicks));
+            instructionFeatures.push_back(feature);
+        }
+        const State waitingCbClient =
+            dominantState(hotspot.waitCbClientTicks);
+        if (hotspot.issueTypeKnown && hotspot.issueType == 5 &&
+            waitingCbClient.known) {
+            QJsonObject client;
+            client.insert(QStringLiteral("key"),
+                          QStringLiteral("cb_inst_client"));
+            client.insert(QStringLiteral("source_field"),
+                          QStringLiteral("CBCtrl: %1")
+                              .arg(cbCtrlInstClientName(
+                                  waitingCbClient.value)));
+            client.insert(QStringLiteral("active_wait_cycles"),
+                          cycles(hotspot.waitTicks, ticksPerCycle));
+            client.insert(QStringLiteral("wait_share_percent"), 100.0);
+            client.insert(QStringLiteral("coverage_percent"), 100.0);
+            instructionFeatures.push_back(client);
+        }
+        object.insert(QStringLiteral("instruction_features"),
+                      instructionFeatures);
+        object.insert(QStringLiteral("feature_coverage_complete"),
+                      featureCoverageComplete);
         waitHotspotArray.push_back(object);
     }
     result.insert(QStringLiteral("pc_wait_hotspots"), waitHotspotArray);
@@ -1107,6 +1693,18 @@ QJsonObject buildSchedulerProfile(
                 "可证明清除已建模阻塞的周期。")
                 .arg(eligibilityCoveredSgs)
                 .arg(shaderGroupCount));
+    }
+    const int missingWarningLimit = qMin(32, sortedMissing.size());
+    for (int i = 0; i < missingWarningLimit; ++i) {
+        warnings.push_back(
+            QStringLiteral("Missing scheduler target signal: %1")
+                .arg(sortedMissing.at(i)));
+    }
+    if (sortedMissing.size() > missingWarningLimit) {
+        warnings.push_back(
+            QStringLiteral(
+                "Missing scheduler target signals: %1 more path(s) omitted")
+                .arg(sortedMissing.size() - missingWarningLimit));
     }
     return result;
 }
@@ -1131,7 +1729,7 @@ bool schedulerProfilerSelfTest(QString& error) {
         storage.push_back(signal);
         signalMap.insert(path, &storage.last());
     };
-    storage.reserve(32);
+    storage.reserve(96);
     const QString root =
         QStringLiteral("gpu.m_QPPUTOP[size=1].[0].m_QPPUCtrl.");
     add(root + QStringLiteral("sg_table_[size=16].[0].valid"),
@@ -1150,12 +1748,41 @@ bool schedulerProfilerSelfTest(QString& error) {
         4, {{0, 2}});
     add(root + QStringLiteral(
                    "instr_queue_[size=16].[0].m_QData[size=4].[0]."
+                   "Data.preDecode.instType.mainType"),
+        4, {{0, 1}});
+    add(root + QStringLiteral(
+                   "instr_queue_[size=16].[0].m_QData[size=4].[0]."
+                   "Data.preDecode.instType.subType.cb"),
+        4, {{0, 2}});
+    add(root + QStringLiteral(
+                   "instr_queue_[size=16].[0].m_QData[size=4].[0]."
+                   "Data.preDecode.cb_inst_client"),
+        4, {{0, 4}});
+    add(root + QStringLiteral(
+                   "instr_queue_[size=16].[0].m_QData[size=4].[0]."
                    "Data.preDecode.instType.subType.thread"),
         4, {{0, 1}});
     add(root + QStringLiteral(
                    "instr_queue_[size=16].[0].m_QData[size=4].[0]."
                    "Data.preDecode.exeThdUnit"),
         4, {{0, 0}});
+    for (const InstructionFeatureSpec& spec :
+         instructionFeatureSpecs()) {
+        QVector<QPair<qint64, quint64>> samples = {{0, 0}};
+        if (spec.key == QStringLiteral("fence")) {
+            samples = {{0, 1}};
+        } else if (spec.key == QStringLiteral("branch")) {
+            samples = {{0, 0}, {20, 1}};
+        } else if (spec.key == QStringLiteral("memory_barrier")) {
+            samples = {{0, 1}, {20, 0}};
+        }
+        add(root +
+                QStringLiteral(
+                    "instr_queue_[size=16].[0].m_QData[size=4].[0]."
+                    "Data.preDecode.") +
+                spec.fieldPath,
+            1, samples);
+    }
     add(root + QStringLiteral("stall_cnt_vector_[size=16].[0]"),
         4, {{0, 0}, {20, 1}, {30, 0}});
     add(root + QStringLiteral("sleep_cnt_vector_[size=16].[0]"),
@@ -1183,6 +1810,34 @@ bool schedulerProfilerSelfTest(QString& error) {
             QStringLiteral(
                 "issue_inst_[size=2].[0].preDecode.instIssueType"),
         4, {{0, 2}});
+    add(root +
+            QStringLiteral(
+                "issue_inst_[size=2].[0].preDecode.instType.mainType"),
+        4, {{0, 1}});
+    add(root +
+            QStringLiteral(
+                "issue_inst_[size=2].[0].preDecode.instType.subType.cb"),
+        4, {{0, 2}});
+    add(root +
+            QStringLiteral(
+                "issue_inst_[size=2].[0].preDecode.cb_inst_client"),
+        4, {{0, 4}});
+    for (const InstructionFeatureSpec& spec :
+         instructionFeatureSpecs()) {
+        QVector<QPair<qint64, quint64>> samples = {{0, 0}};
+        if (spec.key == QStringLiteral("fence")) {
+            samples = {{0, 1}, {5, 0}};
+        } else if (spec.key == QStringLiteral("branch")) {
+            samples = {{0, 0}, {5, 1}};
+        } else if (spec.key == QStringLiteral("memory_barrier")) {
+            samples = {{0, 1}};
+        }
+        add(root +
+                QStringLiteral(
+                    "issue_inst_[size=2].[0].preDecode.") +
+                spec.fieldPath,
+            1, samples);
+    }
     add(root + QStringLiteral("issue_inst_[size=2].[1].vld"),
         1, {{0, 0}});
     add(root +
@@ -1239,14 +1894,148 @@ bool schedulerProfilerSelfTest(QString& error) {
     }
     const QJsonArray waitHotspots =
         profile.value(QStringLiteral("pc_wait_hotspots")).toArray();
-    if (waitHotspots.isEmpty() ||
+    const QJsonArray issueHotspots =
+        profile.value(QStringLiteral("pc_hotspots")).toArray();
+    const QJsonArray waitInstructionFlags =
+        summary.value(
+                   QStringLiteral("pc_wait_instruction_flags")).toArray();
+    const QJsonArray qppuWaitInstructionFlags =
+        qppu.value(
+                QStringLiteral("pc_wait_instruction_flags")).toArray();
+    bool issuedFenceFound = false;
+    bool issuedBranchFound = false;
+    bool issuedMemoryBarrierFound = false;
+    int issuedFeatureCount = -1;
+    for (const QJsonValue& value : issueHotspots) {
+        const QJsonObject hotspot = value.toObject();
+        if (hotspot.value(QStringLiteral("pc")).toString() !=
+                QStringLiteral("0x100") ||
+            hotspot.value(QStringLiteral("sg_index")).toInt(-1) != 0 ||
+            !hotspot.value(
+                 QStringLiteral("feature_coverage_complete")).toBool()) {
+            continue;
+        }
+        issuedFeatureCount =
+            hotspot.value(
+                       QStringLiteral("instruction_features")).toArray().size();
+        for (const QJsonValue& featureValue :
+             hotspot.value(
+                        QStringLiteral("instruction_features")).toArray()) {
+            const QString field =
+                featureValue.toObject()
+                    .value(QStringLiteral("source_field")).toString();
+            issuedFenceFound =
+                issuedFenceFound ||
+                field == QStringLiteral("preDecode.isFence");
+            issuedBranchFound =
+                issuedBranchFound ||
+                field == QStringLiteral("preDecode.isBranch");
+            issuedMemoryBarrierFound =
+                issuedMemoryBarrierFound ||
+                field == QStringLiteral("preDecode.isMemBarrier");
+        }
+    }
+    if (issueHotspots.isEmpty() ||
+        issueHotspots.size() != 1 ||
+        issueHotspots.first().toObject()
+                .value(QStringLiteral("issue_type_name")).toString() !=
+            QStringLiteral("Thread EBB") ||
+        issueHotspots.first().toObject()
+                .value(QStringLiteral("cb_inst_client_name")).toString() !=
+            QStringLiteral("LDST") ||
+        !issuedFenceFound || !issuedBranchFound ||
+        !issuedMemoryBarrierFound ||
+        issuedFeatureCount != 3 ||
+        waitHotspots.isEmpty() ||
         waitHotspots.first().toObject()
                 .value(QStringLiteral("pc")).toString() !=
             QStringLiteral("0x100") ||
+        waitHotspots.first().toObject()
+                .value(QStringLiteral("cb_inst_client_name")).toString() !=
+            QStringLiteral("LDST") ||
         std::fabs(waitHotspots.first().toObject()
                           .value(QStringLiteral("wait_cycles")).toDouble() -
-                  3.0) > 1e-9) {
-        error = QStringLiteral("scheduler PC wait attribution mismatch");
+                  3.0) > 1e-9 ||
+        !summary.value(
+                    QStringLiteral(
+                        "pc_wait_feature_coverage_complete")).toBool() ||
+        !waitHotspots.first().toObject()
+             .value(QStringLiteral("feature_coverage_complete")).toBool() ||
+        waitHotspots.first().toObject()
+                .value(QStringLiteral("instruction_features")).toArray()
+                .size() != 3 ||
+        waitInstructionFlags.size() != 3 ||
+        qppuWaitInstructionFlags.size() != 3) {
+        error = QStringLiteral(
+            "scheduler PC wait attribution or flag OR aggregation mismatch");
+        return false;
+    }
+    const auto waitFlag =
+        [&waitInstructionFlags](int index) {
+            return waitInstructionFlags.at(index).toObject();
+        };
+    if (waitFlag(0).value(
+                        QStringLiteral("source_field")).toString() !=
+            QStringLiteral("preDecode.isFence") ||
+        waitFlag(1).value(
+                        QStringLiteral("source_field")).toString() !=
+            QStringLiteral("preDecode.isBranch") ||
+        waitFlag(2).value(
+                        QStringLiteral("source_field")).toString() !=
+            QStringLiteral("preDecode.isMemBarrier") ||
+        std::fabs(waitFlag(0).value(
+                                  QStringLiteral(
+                                      "active_wait_cycles")).toDouble() -
+                  3.0) > 1e-9 ||
+        std::fabs(waitFlag(1).value(
+                                  QStringLiteral(
+                                      "active_wait_cycles")).toDouble() -
+                  2.0) > 1e-9 ||
+        std::fabs(waitFlag(2).value(
+                                  QStringLiteral(
+                                      "active_wait_cycles")).toDouble() -
+                  1.0) > 1e-9 ||
+        std::fabs(waitFlag(0).value(
+                                  QStringLiteral(
+                                      "wait_share_percent")).toDouble() -
+                  100.0) > 1e-9 ||
+        std::fabs(waitFlag(1).value(
+                                  QStringLiteral(
+                                      "wait_share_percent")).toDouble() -
+                  (200.0 / 3.0)) > 1e-9 ||
+        std::fabs(waitFlag(2).value(
+                                  QStringLiteral(
+                                      "wait_share_percent")).toDouble() -
+                  (100.0 / 3.0)) > 1e-9 ||
+        !qppu.value(
+                 QStringLiteral(
+                     "pc_wait_feature_coverage_complete")).toBool()) {
+        error = QStringLiteral(
+            "scheduler blocking instruction flag distribution mismatch");
+        return false;
+    }
+
+    QHash<QString, const WaveSignal*> partialFeatureMap = signalMap;
+    partialFeatureMap.remove(
+        root +
+        QStringLiteral(
+            "instr_queue_[size=16].[0].m_QData[size=4].[0]."
+            "Data.preDecode.isBranch"));
+    QStringList partialFeatureWarnings;
+    const QJsonObject partialFeatures =
+        buildSchedulerProfile(partialFeatureMap, 0, 50, 10, 5,
+                              partialFeatureWarnings);
+    if (partialFeatures.value(QStringLiteral("summary")).toObject()
+            .value(QStringLiteral(
+                "pc_wait_feature_coverage_complete")).toBool() ||
+        partialFeatures.value(QStringLiteral("summary")).toObject()
+            .value(QStringLiteral(
+                "pc_wait_instruction_flags")).toArray().size() != 2 ||
+        partialFeatures.value(QStringLiteral("pc_wait_hotspots")).toArray()
+            .first().toObject()
+            .value(QStringLiteral("feature_coverage_complete")).toBool()) {
+        error = QStringLiteral(
+            "missing queue-head feature was accepted as covered");
         return false;
     }
 
@@ -1256,13 +2045,25 @@ bool schedulerProfilerSelfTest(QString& error) {
     const QJsonObject partial =
         buildSchedulerProfile(partialMap, 0, 50, 10, 5,
                               partialWarnings);
+    const QJsonArray partialMissing =
+        partial.value(QStringLiteral("summary")).toObject()
+            .value(QStringLiteral("missing_signal_paths")).toArray();
+    bool namedMissingIssueSlot = false;
+    for (const QJsonValue& value : partialMissing) {
+        if (value.toString().endsWith(
+                QStringLiteral(".issue_inst_.[1].vld"))) {
+            namedMissingIssueSlot = true;
+            break;
+        }
+    }
     if (partial.value(QStringLiteral("status")).toString() !=
             QStringLiteral("partial") ||
         partial.value(QStringLiteral("summary")).toObject()
                 .value(QStringLiteral("fully_covered_shader_groups"))
                 .toInt() != 0 ||
         partial.value(QStringLiteral("qppus")).toArray().first().toObject()
-                .value(QStringLiteral("issue_coverage_complete")).toBool()) {
+                .value(QStringLiteral("issue_coverage_complete")).toBool() ||
+        !namedMissingIssueSlot) {
         error = QStringLiteral("partial issue-slot coverage was misclassified");
         return false;
     }
@@ -1366,6 +2167,60 @@ bool schedulerProfilerSelfTest(QString& error) {
             QStringLiteral("unknown")) {
         error = QStringLiteral(
             "unknown issue type was merged with a numeric type");
+        return false;
+    }
+
+    QVector<WaveSignal> cbStorage = storage;
+    const QString queueIssueTypePath =
+        root +
+        QStringLiteral(
+            "instr_queue_[size=16].[0].m_QData[size=4].[0]."
+            "Data.preDecode.instIssueType");
+    const int queueIssueTypeId =
+        signalMap.value(queueIssueTypePath)->signalId;
+    cbStorage[queueIssueTypeId].samples[0].rawBits = 5;
+    cbStorage[issueTypeId].samples[0].rawBits = 5;
+    QHash<QString, const WaveSignal*> cbMap;
+    for (auto it = signalMap.constBegin(); it != signalMap.constEnd(); ++it) {
+        cbMap.insert(it.key(), &cbStorage.at(it.value()->signalId));
+    }
+    QStringList cbWarnings;
+    const QJsonObject cbProfile =
+        buildSchedulerProfile(cbMap, 0, 50, 10, 5, cbWarnings);
+    const QJsonObject cbIssueHotspot =
+        cbProfile.value(QStringLiteral("pc_hotspots")).toArray()
+            .first().toObject();
+    const QJsonObject cbWaitHotspot =
+        cbProfile.value(QStringLiteral("pc_wait_hotspots")).toArray()
+            .first().toObject();
+    const auto hasCbLdstFeature = [](const QJsonObject& hotspot) {
+        for (const QJsonValue& featureValue :
+             hotspot.value(
+                        QStringLiteral("instruction_features")).toArray()) {
+            if (featureValue.toObject()
+                    .value(QStringLiteral("source_field")).toString() ==
+                QStringLiteral("CBCtrl: LDST")) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (cbIssueHotspot.value(
+                           QStringLiteral("issue_type_name")).toString() !=
+            QStringLiteral("CB") ||
+        cbIssueHotspot.value(
+                           QStringLiteral("cb_inst_client_name")).toString() !=
+            QStringLiteral("LDST") ||
+        cbWaitHotspot.value(
+                          QStringLiteral("issue_type_name")).toString() !=
+            QStringLiteral("CB") ||
+        cbWaitHotspot.value(
+                          QStringLiteral("cb_inst_client_name")).toString() !=
+            QStringLiteral("LDST") ||
+        !hasCbLdstFeature(cbIssueHotspot) ||
+        !hasCbLdstFeature(cbWaitHotspot)) {
+        error = QStringLiteral(
+            "CB/LDST issue and queue-head decoding mismatch");
         return false;
     }
     return true;

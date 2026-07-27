@@ -67,6 +67,9 @@ int main(){
     }
     if (!saw_count_decl) {
         std::cerr << "missing peek.count declaration\n";
+        for (const auto& decl : sink.declarations) {
+            std::cerr << "declared path=" << decl.path << "\n";
+        }
         return 1;
     }
 
@@ -81,11 +84,94 @@ int main(){
         return 2;
     }
 
+    {
+        DynamicSmokeTarget flat_dynamic;
+        flat_dynamic.count = 3;
+        wave::InMemoryWaveSink dynamic_sink;
+        wave::BuildOptions dynamic_opt;
+        dynamic_opt.emit_track_decl_path = true;
+        dynamic_opt.enable_dirty_peek_groups = true;
+        // Runtime type recovery must remain independent from dirty grouping.
+        // This is intentionally the default false value.
+        dynamic_opt.enable_dynamic_dirty_groups = false;
+        wave::Tracer dynamic_tracer(dynamic_sink, dynamic_opt);
+        dynamic_tracer.add_root("dynamic_flat", &flat_dynamic);
+        dynamic_tracer.sample(0);
+
+        bool flat_track_is_not_dirty_grouped = false;
+        for (const auto& track : dynamic_tracer.tracks()) {
+            if (track.scalar_kind != wave::ScalarSampleKind::None &&
+                track.dirty_peek_group_id == wave::kInvalidIndex) {
+                flat_track_is_not_dirty_grouped = true;
+            }
+        }
+        if (!flat_track_is_not_dirty_grouped) {
+            std::cerr << "default dynamic target unexpectedly created dirty group\n";
+            return 3;
+        }
+
+        flat_dynamic.count = 9;
+        // The default-flat Dynamic hook is deliberately unbound. Calling it
+        // remains harmless; ordinary polling must still observe the update.
+        flat_dynamic.wave_dirty_hook()->mark_dirty();
+        dynamic_tracer.sample(1);
+        bool saw_flat_dynamic_update = false;
+        for (const auto& ev : dynamic_sink.events) {
+            if (ev.has_u64 && ev.u64_value == 9) {
+                saw_flat_dynamic_update = true;
+            }
+        }
+        if (!saw_flat_dynamic_update) {
+            std::cerr << "default-flat dynamic target missed updated value\n";
+            return 4;
+        }
+    }
+
+    {
+        DynamicSmokeTarget dirty_dynamic;
+        dirty_dynamic.count = 5;
+        wave::InMemoryWaveSink dynamic_sink;
+        wave::BuildOptions dynamic_opt;
+        dynamic_opt.emit_track_decl_path = true;
+        dynamic_opt.enable_dirty_peek_groups = true;
+        dynamic_opt.enable_dynamic_dirty_groups = true;
+        wave::Tracer dynamic_tracer(dynamic_sink, dynamic_opt);
+        dynamic_tracer.add_root("dynamic_dirty", &dirty_dynamic);
+        dynamic_tracer.attach_current_thread_for_dirty_peek();
+        dynamic_tracer.sample(0);
+
+        bool dirty_track_is_grouped = false;
+        for (const auto& track : dynamic_tracer.tracks()) {
+            if (track.scalar_kind != wave::ScalarSampleKind::None &&
+                track.dirty_peek_group_id != wave::kInvalidIndex) {
+                dirty_track_is_grouped = true;
+            }
+        }
+        if (!dirty_track_is_grouped) {
+            std::cerr << "explicit dirty Dynamic target did not create dirty group\n";
+            return 5;
+        }
+
+        dirty_dynamic.count = 11;
+        dirty_dynamic.wave_dirty_hook()->mark_dirty();
+        dynamic_tracer.sample(1);
+        bool saw_dirty_dynamic_update = false;
+        for (const auto& ev : dynamic_sink.events) {
+            if (ev.has_u64 && ev.u64_value == 11) {
+                saw_dirty_dynamic_update = true;
+            }
+        }
+        if (!saw_dirty_dynamic_update) {
+            std::cerr << "explicit dirty Dynamic target missed marked update\n";
+            return 6;
+        }
+    }
+
     PeekSmokeSource peek_hook_source;
     if (!peek_hook_source.wave_trace_peek_dirty_hook() ||
         peek_hook_source.wave_trace_peek_dirty_hook() != peek_hook_source.wave_dirty_hook()) {
         std::cerr << "missing peek dirty hook\n";
-        return 3;
+        return 7;
     }
 
     int peek_dirty_count = 0;
@@ -93,13 +179,13 @@ int main(){
     peek_hook_source.wave_dirty_hook()->mark_dirty();
     if (peek_dirty_count != 1) {
         std::cerr << "peek dirty hook did not fire\n";
-        return 4;
+        return 8;
     }
     PeekSmokeSource copied_peek_source = peek_hook_source;
     copied_peek_source.wave_dirty_hook()->mark_dirty();
     if (peek_dirty_count != 1) {
         std::cerr << "copied peek dirty hook kept binding\n";
-        return 5;
+        return 9;
     }
 
     DynamicSmokeTarget dynamic_target;
@@ -107,7 +193,7 @@ int main(){
     if (!dynamic_target.wave_trace_dirty_hook() ||
         dynamic_target.wave_trace_dirty_hook() != dynamic_target.wave_dirty_hook()) {
         std::cerr << "missing dynamic dirty hook\n";
-        return 6;
+        return 10;
     }
 
     int dirty_count = 0;
@@ -115,13 +201,13 @@ int main(){
     dynamic_target.wave_dirty_hook()->mark_dirty();
     if (dirty_count != 1) {
         std::cerr << "dynamic dirty hook did not fire\n";
-        return 7;
+        return 11;
     }
     DynamicSmokeTarget copied_target = dynamic_target;
     copied_target.wave_dirty_hook()->mark_dirty();
     if (dirty_count != 1) {
         std::cerr << "copied dynamic dirty hook kept binding\n";
-        return 8;
+        return 12;
     }
 
     return 0;

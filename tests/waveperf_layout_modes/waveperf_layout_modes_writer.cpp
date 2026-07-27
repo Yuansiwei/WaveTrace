@@ -8,6 +8,8 @@
 
 namespace {
 
+bool gAttachNumericIndexSegments = false;
+
 struct TempNode {
     std::string name;
     wvz4::NodeKind kind = wvz4::NodeKind::Object;
@@ -125,6 +127,19 @@ struct IssueSignals {
     std::uint32_t issueType[2] = {};
     std::uint32_t globalMem[2] = {};
     std::uint32_t localMem[2] = {};
+    std::uint32_t barrier[2] = {};
+    std::uint32_t branch[2] = {};
+    std::uint32_t exit[2] = {};
+    std::uint32_t flowControl[2] = {};
+    std::uint32_t fence[2] = {};
+    std::uint32_t groupLoad[2] = {};
+    std::uint32_t ldmb[2] = {};
+    std::uint32_t stmb[2] = {};
+    std::uint32_t movrel[2] = {};
+    std::uint32_t clause[2] = {};
+    std::uint32_t ebb[2] = {};
+    std::uint32_t needFastFcuCheck[2] = {};
+    std::uint32_t toFastFcu[2] = {};
     std::uint32_t sgId[2] = {};
     std::uint32_t pc[2] = {};
 };
@@ -144,6 +159,21 @@ struct SchedulerSignals {
     std::uint32_t queueHeadIssueType = 0;
     std::uint32_t queueHeadThreadSubtype = 0;
     std::uint32_t queueHeadExeUnit = 0;
+    std::uint32_t queueHeadBarrier = 0;
+    std::uint32_t queueHeadBranch = 0;
+    std::uint32_t queueHeadExit = 0;
+    std::uint32_t queueHeadFlowControl = 0;
+    std::uint32_t queueHeadFence = 0;
+    std::uint32_t queueHeadGroupLoad = 0;
+    std::uint32_t queueHeadGlobalMem = 0;
+    std::uint32_t queueHeadLocalMem = 0;
+    std::uint32_t queueHeadLdmb = 0;
+    std::uint32_t queueHeadStmb = 0;
+    std::uint32_t queueHeadMovrel = 0;
+    std::uint32_t queueHeadClause = 0;
+    std::uint32_t queueHeadEbb = 0;
+    std::uint32_t queueHeadNeedFastFcuCheck = 0;
+    std::uint32_t queueHeadToFastFcu = 0;
     std::uint32_t functionUnitPending[3] = {};
 };
 
@@ -179,8 +209,18 @@ std::vector<std::string> splitPath(const std::string& path) {
     std::size_t begin = 0;
     while (begin < path.size()) {
         const std::size_t end = path.find('.', begin);
-        result.push_back(path.substr(
-            begin, end == std::string::npos ? std::string::npos : end - begin));
+        const std::string segment = path.substr(
+            begin, end == std::string::npos ? std::string::npos : end - begin);
+        const bool numericIndex =
+            segment.size() >= 3u && segment.front() == '[' &&
+            segment.back() == ']' &&
+            segment.find_first_not_of("0123456789", 1u) ==
+                segment.size() - 1u;
+        if (gAttachNumericIndexSegments && numericIndex && !result.empty()) {
+            result.back() += segment;
+        } else {
+            result.push_back(segment);
+        }
         if (end == std::string::npos) break;
         begin = end + 1u;
     }
@@ -208,6 +248,25 @@ IssueSignals addIssueSignals(LayoutBuilder& builder,
         result.localMem[slot] = builder.addSignal(
             splitPath(root + ".preDecode.isLocalMem"),
             wvz4::ValueType::Bool, 1u, wvz4::Radix::Bin);
+        auto addFeature = [&](const char* field) {
+            return builder.addSignal(
+                splitPath(root + ".preDecode." + field),
+                wvz4::ValueType::Bool, 1u, wvz4::Radix::Bin);
+        };
+        result.barrier[slot] = addFeature("isBarrier");
+        result.branch[slot] = addFeature("isBranch");
+        result.exit[slot] = addFeature("isExit");
+        result.flowControl[slot] = addFeature("isFlowCtrl");
+        result.fence[slot] = addFeature("isFence");
+        result.groupLoad[slot] = addFeature("isGLoad");
+        result.ldmb[slot] = addFeature("isLDMB");
+        result.stmb[slot] = addFeature("isSTMB");
+        result.movrel[slot] = addFeature("isMOVREL");
+        result.clause[slot] = addFeature("clause");
+        result.ebb[slot] = addFeature("ebb");
+        result.needFastFcuCheck[slot] =
+            addFeature("needFastFcuCheck");
+        result.toFastFcu[slot] = addFeature("toFastFCU");
         result.sgId[slot] = builder.addSignal(
             splitPath(root + ".sgId"),
             wvz4::ValueType::U32, 4u, wvz4::Radix::Dec);
@@ -256,6 +315,36 @@ SchedulerSignals addSchedulerSignals(LayoutBuilder& builder,
         addU32(queueData + ".preDecode.instType.subType.thread", 4u);
     result.queueHeadExeUnit =
         addU32(queueData + ".preDecode.exeThdUnit", 4u);
+    result.queueHeadBarrier =
+        addBool(queueData + ".preDecode.isBarrier");
+    result.queueHeadBranch =
+        addBool(queueData + ".preDecode.isBranch");
+    result.queueHeadExit =
+        addBool(queueData + ".preDecode.isExit");
+    result.queueHeadFlowControl =
+        addBool(queueData + ".preDecode.isFlowCtrl");
+    result.queueHeadFence =
+        addBool(queueData + ".preDecode.isFence");
+    result.queueHeadGroupLoad =
+        addBool(queueData + ".preDecode.isGLoad");
+    result.queueHeadGlobalMem =
+        addBool(queueData + ".preDecode.isGlobalMem");
+    result.queueHeadLocalMem =
+        addBool(queueData + ".preDecode.isLocalMem");
+    result.queueHeadLdmb =
+        addBool(queueData + ".preDecode.isLDMB");
+    result.queueHeadStmb =
+        addBool(queueData + ".preDecode.isSTMB");
+    result.queueHeadMovrel =
+        addBool(queueData + ".preDecode.isMOVREL");
+    result.queueHeadClause =
+        addBool(queueData + ".preDecode.clause");
+    result.queueHeadEbb =
+        addBool(queueData + ".preDecode.ebb");
+    result.queueHeadNeedFastFcuCheck =
+        addBool(queueData + ".preDecode.needFastFcuCheck");
+    result.queueHeadToFastFcu =
+        addBool(queueData + ".preDecode.toFastFCU");
     result.stall =
         addU32(root + "stall_cnt_vector_" + vectorSuffix, 4u);
     result.sleep =
@@ -402,7 +491,8 @@ bool appendU32(wvz4::CycleSubmission& submission,
 
 bool writeFile(const std::string& output,
                bool flattened,
-               bool latencyCase) {
+               bool latencyCase,
+               bool windowedCase) {
     LayoutBuilder builder;
     std::vector<IssueSignals> qppus;
     std::vector<SchedulerSignals> schedulers;
@@ -509,8 +599,20 @@ bool writeFile(const std::string& output,
             };
             for (int slot = 0; slot < 2; ++slot) {
                 if (cycle == 0u) {
-                    if (!appendBool(submission, qppus[qppu].valid[slot],
-                                    ends[slot] > 0u) ||
+                    const bool isBarrier = qppu == 0u && slot == 1;
+                    const bool isBranch = qppu == 1u && slot == 0;
+                    const bool isExit = qppu == 1u && slot == 1;
+                    const bool isFlowControl = isBranch || isExit;
+                    const bool isFence = qppu == 0u && slot == 0;
+                    const bool isGroupLoad = slot == 1;
+                    const bool isLdmb =
+                        latencyCase && qppu == 0u && slot == 0;
+                    const bool isStmb = qppu == 2u && slot == 0;
+                    const bool isMovrel = qppu == 3u && slot == 0;
+                    const bool isEbb = slot == 1;
+                    if (!appendBool(
+                            submission, qppus[qppu].valid[slot],
+                            windowedCase ? false : ends[slot] > 0u) ||
                         !appendU32(submission, qppus[qppu].issueType[slot],
                                    slot == 0 ? 2u : 4u) ||
                         !appendBool(
@@ -519,12 +621,80 @@ bool writeFile(const std::string& output,
                         !appendBool(
                             submission, qppus[qppu].localMem[slot],
                             false) ||
+                        !appendBool(submission,
+                                    qppus[qppu].barrier[slot],
+                                    isBarrier) ||
+                        !appendBool(submission,
+                                    qppus[qppu].branch[slot],
+                                    isBranch) ||
+                        !appendBool(submission,
+                                    qppus[qppu].exit[slot],
+                                    isExit) ||
+                        !appendBool(submission,
+                                    qppus[qppu].flowControl[slot],
+                                    isFlowControl) ||
+                        !appendBool(submission,
+                                    qppus[qppu].fence[slot],
+                                    isFence) ||
+                        !appendBool(submission,
+                                    qppus[qppu].groupLoad[slot],
+                                    isGroupLoad) ||
+                        !appendBool(submission,
+                                    qppus[qppu].ldmb[slot],
+                                    isLdmb) ||
+                        !appendBool(submission,
+                                    qppus[qppu].stmb[slot],
+                                    isStmb) ||
+                        !appendBool(submission,
+                                    qppus[qppu].movrel[slot],
+                                    isMovrel) ||
+                        !appendBool(submission,
+                                    qppus[qppu].clause[slot],
+                                    slot == 0) ||
+                        !appendBool(submission,
+                                    qppus[qppu].ebb[slot],
+                                    isEbb) ||
+                        !appendBool(
+                            submission,
+                            qppus[qppu].needFastFcuCheck[slot],
+                            isBarrier || isFlowControl) ||
+                        !appendBool(submission,
+                                    qppus[qppu].toFastFcu[slot],
+                                    isFlowControl) ||
                         !appendU32(submission, qppus[qppu].sgId[slot], 0u) ||
                         !appendU32(
                             submission, qppus[qppu].pc[slot],
                             0x100u + static_cast<std::uint32_t>(qppu) *
                                          0x100u +
                                 static_cast<std::uint32_t>(slot) * 4u)) {
+                        return false;
+                    }
+                } else if (windowedCase) {
+                    const bool firstWindow =
+                        qppu == 0u && slot == 0;
+                    const bool secondWindow =
+                        qppu == 1u && slot == 0;
+                    if ((firstWindow && cycle == 10u) ||
+                        (secondWindow && cycle == 50u)) {
+                        if (!appendBool(
+                                submission, qppus[qppu].valid[slot],
+                                true)) {
+                            return false;
+                        }
+                    } else if ((firstWindow && cycle == 30u) ||
+                               (secondWindow && cycle == 80u)) {
+                        if (!appendBool(
+                                submission, qppus[qppu].valid[slot],
+                                false)) {
+                            return false;
+                        }
+                    }
+                } else if (latencyCase && qppu == 0u && slot == 0 &&
+                           cycle == 100u) {
+                    // Keep the latency regression's request/response interval
+                    // inside the global first-to-last issue analysis window.
+                    if (!appendBool(
+                            submission, qppus[qppu].valid[slot], true)) {
                         return false;
                     }
                 } else if (cycle == ends[slot] && ends[slot] < 100u) {
@@ -554,6 +724,43 @@ bool writeFile(const std::string& output,
                                 scheduler.queueHeadThreadSubtype, 1u) ||
                      !appendU32(submission,
                                 scheduler.queueHeadExeUnit, 0u) ||
+                     !appendBool(submission,
+                                 scheduler.queueHeadBarrier, false) ||
+                     !appendBool(submission,
+                                 scheduler.queueHeadBranch, qppu == 1u) ||
+                     !appendBool(submission,
+                                 scheduler.queueHeadExit, false) ||
+                     !appendBool(submission,
+                                 scheduler.queueHeadFlowControl,
+                                 qppu == 1u) ||
+                     !appendBool(submission,
+                                 scheduler.queueHeadFence,
+                                 qppu == 0u) ||
+                     !appendBool(submission,
+                                 scheduler.queueHeadGroupLoad, false) ||
+                     !appendBool(
+                         submission, scheduler.queueHeadGlobalMem,
+                         latencyCase && qppu == 0u) ||
+                     !appendBool(submission,
+                                 scheduler.queueHeadLocalMem, false) ||
+                     !appendBool(
+                         submission, scheduler.queueHeadLdmb,
+                         latencyCase && qppu == 0u) ||
+                     !appendBool(submission,
+                                 scheduler.queueHeadStmb, qppu == 2u) ||
+                     !appendBool(submission,
+                                 scheduler.queueHeadMovrel, qppu == 3u) ||
+                     !appendBool(submission,
+                                 scheduler.queueHeadClause, true) ||
+                     !appendBool(submission,
+                                 scheduler.queueHeadEbb, false) ||
+                     !appendBool(
+                         submission,
+                         scheduler.queueHeadNeedFastFcuCheck,
+                         qppu == 1u) ||
+                     !appendBool(submission,
+                                 scheduler.queueHeadToFastFcu,
+                                 qppu == 1u) ||
                      !appendU32(submission, scheduler.stall, 0u) ||
                     !appendU32(submission, scheduler.sleep, 0u) ||
                     !appendBool(submission, scheduler.flow, false) ||
@@ -678,17 +885,23 @@ bool writeFile(const std::string& output,
 int main(int argc, char** argv) {
     if (argc != 3) {
         std::cerr << "usage: waveperf_layout_modes_writer "
-                     "<normal|flat|latency> <output.wvz4>\n";
+                     "<normal|normal-attached|flat|latency|windowed> "
+                     "<output.wvz4>\n";
         return 2;
     }
     const std::string mode = argv[1];
-    if (mode != "normal" && mode != "flat" &&
-        mode != "latency") {
-        std::cerr << "mode must be normal, flat or latency\n";
+    if (mode != "normal" && mode != "normal-attached" &&
+        mode != "flat" &&
+        mode != "latency" && mode != "windowed") {
+        std::cerr
+            << "mode must be normal, normal-attached, flat, latency "
+               "or windowed\n";
         return 2;
     }
+    gAttachNumericIndexSegments = mode == "normal-attached";
     if (!writeFile(argv[2], mode == "flat",
-                   mode == "latency")) return 3;
+                   mode == "latency",
+                   mode == "windowed")) return 3;
     std::cout << "generated=" << argv[2] << " mode=" << mode
               << " business_cycles=100\n";
     return 0;

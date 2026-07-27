@@ -444,6 +444,15 @@ struct BuildOptions {
     // The default is disabled to preserve legacy pull-sampling behavior until
     // business threads call attach_current_thread_for_dirty_peek().
     bool enable_dirty_peek_groups = false;
+    // DynamicTraceTarget provides runtime type recovery. That must not
+    // implicitly turn every concrete instance into a dirty-peek group: an
+    // interface-pointer array can contain millions of independently addressed
+    // objects, and one group/range/block/hash entry per object more than doubles
+    // topology memory. Keep Dynamic leaves in the ordinary flat polling table
+    // by default. Callers that deliberately invoke DynamicTraceTargetFor<T>::
+    // wave_dirty_hook().mark_dirty() may opt back into the legacy event-driven
+    // behavior explicitly.
+    bool enable_dynamic_dirty_groups = false;
     bool enable_dirty_peek_parallel_sampling = true;
     std::size_t dirty_peek_parallel_threshold = 64;
 
@@ -3576,6 +3585,28 @@ private:
     std::uint32_t active_dirty_peek_open_block_id_ = kInvalidIndex;
     std::vector<TrackId> active_dirty_peek_storage_ids_;
     std::vector<std::size_t> active_dirty_peek_storage_id_marks_;
+    struct DirtyPeekOwnerTrackRange {
+        TrackId begin;
+        TrackId end;
+
+        DirtyPeekOwnerTrackRange() : begin(0), end(0) {}
+        DirtyPeekOwnerTrackRange(TrackId begin_value, TrackId end_value)
+            : begin(begin_value), end(end_value) {}
+    };
+    struct DirtyPeekCaptureSeen {
+        TrackId first_owner_begin;
+        TrackId first_owner_end;
+        std::vector<DirtyPeekOwnerTrackRange> additional_owner_ranges;
+        std::unordered_set<TrackId> aliases;
+
+        DirtyPeekCaptureSeen()
+            : first_owner_begin(0), first_owner_end(0) {}
+    };
+    // Unique owners dominate large captures. Keep their monotonically-created
+    // TrackIds as compact ranges, with the common first range inline; only
+    // aliases need a hash entry. This preserves nested-capture boundaries
+    // without an O(number-of-leaves) lookup or a per-small-capture allocation.
+    std::vector<DirtyPeekCaptureSeen> active_dirty_peek_capture_seen_;
 
 
     struct DirtyWaveValueGroupKey {
@@ -7034,12 +7065,84 @@ private:
     }
 
     bool dirty_peek_storage_seen_in_current_capture_(TrackId storage_id) const noexcept {
-        if (storage_id == 0 || active_dirty_peek_storage_id_marks_.empty()) return false;
-        const std::size_t begin = active_dirty_peek_storage_id_marks_.back();
-        for (std::size_t i = begin; i < active_dirty_peek_storage_ids_.size(); ++i) {
-            if (active_dirty_peek_storage_ids_[i] == storage_id) return true;
+        if (storage_id == 0 || active_dirty_peek_capture_seen_.empty()) return false;
+        const DirtyPeekCaptureSeen& seen = active_dirty_peek_capture_seen_.back();
+        if (seen.aliases.find(storage_id) != seen.aliases.end()) return true;
+        if (seen.first_owner_begin != 0 &&
+            storage_id >= seen.first_owner_begin &&
+            storage_id < seen.first_owner_end) return true;
+
+        const std::vector<DirtyPeekOwnerTrackRange>& ranges =
+            seen.additional_owner_ranges;
+        std::size_t lo = 0;
+        std::size_t hi = ranges.size();
+        while (lo < hi) {
+            const std::size_t mid = lo + (hi - lo) / 2u;
+            const DirtyPeekOwnerTrackRange& range = ranges[mid];
+            if (storage_id < range.begin) {
+                hi = mid;
+            } else if (storage_id >= range.end) {
+                lo = mid + 1u;
+            } else {
+                return true;
+            }
         }
         return false;
+    }
+
+    void mark_dirty_peek_storage_seen_in_current_capture_(TrackId storage_id,
+                                                           bool is_new_owner) {
+        if (storage_id == 0 || active_dirty_peek_capture_seen_.empty()) return;
+        DirtyPeekCaptureSeen& seen = active_dirty_peek_capture_seen_.back();
+        if (!is_new_owner) {
+            seen.aliases.insert(storage_id);
+            return;
+        }
+        if (seen.first_owner_begin == 0) {
+            seen.first_owner_begin = storage_id;
+            seen.first_owner_end = storage_id + 1u;
+            return;
+        }
+        if (seen.additional_owner_ranges.empty() &&
+            seen.first_owner_end == storage_id) {
+            seen.first_owner_end = storage_id + 1u;
+            return;
+        }
+        if (!seen.additional_owner_ranges.empty() &&
+            seen.additional_owner_ranges.back().end == storage_id) {
+            seen.additional_owner_ranges.back().end = storage_id + 1u;
+        } else {
+            seen.additional_owner_ranges.push_back(
+                DirtyPeekOwnerTrackRange(storage_id, storage_id + 1u));
+        }
+    }
+
+    void rebuild_active_dirty_peek_storage_seen_() {
+        const std::size_t depth = active_dirty_peek_storage_id_marks_.size();
+        if (active_dirty_peek_capture_seen_.size() != depth) {
+            throw std::logic_error(
+                "WaveTrace dirty-peek capture-seen stack is inconsistent");
+        }
+        for (std::size_t d = 0; d < depth; ++d) {
+            DirtyPeekCaptureSeen& capture = active_dirty_peek_capture_seen_[d];
+            capture.first_owner_begin = 0;
+            capture.first_owner_end = 0;
+            capture.additional_owner_ranges.clear();
+            capture.aliases.clear();
+            const std::size_t begin = active_dirty_peek_storage_id_marks_[d];
+            const std::size_t end =
+                d + 1u < depth
+                    ? active_dirty_peek_storage_id_marks_[d + 1u]
+                    : active_dirty_peek_storage_ids_.size();
+            if (begin > end || end > active_dirty_peek_storage_ids_.size()) {
+                throw std::logic_error(
+                    "WaveTrace dirty-peek capture storage suffix is inconsistent");
+            }
+            for (std::size_t i = begin; i < end; ++i) {
+                const TrackId storage_id = active_dirty_peek_storage_ids_[i];
+                if (storage_id != 0) capture.aliases.insert(storage_id);
+            }
+        }
     }
 
     bool dirty_peek_storage_cursor_range_for_(TrackId storage_id,
@@ -7080,6 +7183,7 @@ private:
         try {
             dirty_peek_leaves_.push_back(leaf);
             active_dirty_peek_storage_ids_.push_back(storage_id);
+            mark_dirty_peek_storage_seen_in_current_capture_(storage_id, false);
         } catch (...) {
             const TrackDesc* leaf_track = compact_dirty_leaf_track_(leaf.track_id);
             fail_dirty_peek_memory_cursor_("dirty_peek alias leaf allocation failed",
@@ -7115,7 +7219,10 @@ private:
         TrackDesc& track = tracks_[track_id];
         if (track.scalar_kind == ScalarSampleKind::None) return true;
         const TrackId storage_id = track.storage_id != 0 ? track.storage_id : track.id;
-        if (dirty_peek_storage_seen_in_current_capture_(storage_id)) return true;
+        // A newly-created owner has storage_id == track.id and cannot already
+        // exist in this capture. Only aliases need the duplicate check.
+        if (storage_id != track.id &&
+            dirty_peek_storage_seen_in_current_capture_(storage_id)) return true;
 
         DirtyPeekLeaf leaf;
         if (!fill_dirty_peek_leaf_from_track_(track, storage_id, leaf)) {
@@ -7258,6 +7365,8 @@ private:
             cursor_range.storage_ref_index = storage_ref_index;
             cursor_range.valid = true;
             active_dirty_peek_storage_ids_.push_back(storage_id);
+            mark_dirty_peek_storage_seen_in_current_capture_(
+                storage_id, storage_id == track.id);
         } catch (...) {
             fail_dirty_peek_memory_cursor_("dirty_peek memory storage ref allocation failed",
                                            active_dirty_peek_group_id_,
@@ -9333,6 +9442,7 @@ private:
         std::uint32_t active_dirty_peek_open_block_id;
         std::size_t active_dirty_peek_storage_ids_size;
         std::size_t active_dirty_peek_storage_id_marks_size;
+        std::size_t active_dirty_peek_capture_seen_size;
         std::size_t dirty_wave_value_groups_size;
         std::size_t dirty_wave_value_ranges_size;
         std::size_t dirty_wave_value_leaves_size;
@@ -9392,6 +9502,8 @@ private:
         cp.active_dirty_peek_open_block_id = active_dirty_peek_open_block_id_;
         cp.active_dirty_peek_storage_ids_size = active_dirty_peek_storage_ids_.size();
         cp.active_dirty_peek_storage_id_marks_size = active_dirty_peek_storage_id_marks_.size();
+        cp.active_dirty_peek_capture_seen_size =
+            active_dirty_peek_capture_seen_.size();
         cp.dirty_wave_value_groups_size = dirty_wave_value_groups_.size();
         cp.dirty_wave_value_ranges_size = dirty_wave_value_ranges_.size();
         cp.dirty_wave_value_leaves_size = dirty_wave_value_leaves_.size();
@@ -9754,6 +9866,9 @@ private:
         active_dirty_peek_open_block_id_ = cp.active_dirty_peek_open_block_id;
         active_dirty_peek_storage_ids_.resize(cp.active_dirty_peek_storage_ids_size);
         active_dirty_peek_storage_id_marks_.resize(cp.active_dirty_peek_storage_id_marks_size);
+        active_dirty_peek_capture_seen_.resize(
+            cp.active_dirty_peek_capture_seen_size);
+        rebuild_active_dirty_peek_storage_seen_();
         (void)dirty_peek_changed;
 
         const bool dirty_wave_value_changed =
@@ -9948,6 +10063,101 @@ private:
             accumulate_leaf_to_ancestors_for_dump_(parent_node, counts);
         }
         return counts;
+    }
+
+    std::vector<std::uint64_t> collect_dirty_wave_value_leaf_distribution_counts_() const {
+        std::vector<std::uint64_t> counts(nodes_.size(), 0);
+        for (std::size_t i = 0; i < dirty_wave_value_leaves_.size(); ++i) {
+            const DirtyWaveValueLeaf& leaf = dirty_wave_value_leaves_[i];
+            const NodeId parent_node = track_parent_node_for_dump_(leaf.track_id);
+            accumulate_leaf_to_ancestors_for_dump_(parent_node, counts);
+        }
+        return counts;
+    }
+
+    void dump_track_population_partition_(FILE* fp) const {
+        if (!fp) return;
+
+        std::uint64_t physical_flat_scalar = 0;
+        std::uint64_t physical_dirty_peek = 0;
+        std::uint64_t physical_dirty_wave_value = 0;
+        std::uint64_t physical_dirty_wave_array = 0;
+        std::uint64_t physical_custom = 0;
+        std::uint64_t logical_storage_alias = 0;
+        std::uint64_t logical_declaration_only = 0;
+        std::uint64_t inactive = 0;
+        std::uint64_t other = 0;
+
+        for (TrackId tid = 1; static_cast<std::size_t>(tid) < tracks_.size(); ++tid) {
+            const TrackDesc& track = tracks_[static_cast<std::size_t>(tid)];
+            if (track.id == 0) {
+                ++other;
+                continue;
+            }
+            if (static_cast<std::size_t>(tid) < track_runtime_.size() &&
+                !track_runtime_[static_cast<std::size_t>(tid)].alive) {
+                ++inactive;
+                continue;
+            }
+            if (track.declaration_only) {
+                ++logical_declaration_only;
+                continue;
+            }
+            if (track.storage_id == 0 || track.storage_id != track.id) {
+                ++logical_storage_alias;
+                continue;
+            }
+            if (track.scalar_kind == ScalarSampleKind::None) {
+                ++physical_custom;
+                continue;
+            }
+            if (is_dirty_peek_track_poll_suppressed(track)) {
+                ++physical_dirty_peek;
+            } else if (is_dirty_wave_value_track_poll_suppressed(track)) {
+                ++physical_dirty_wave_value;
+            } else if (is_dirty_wave_array_track_poll_suppressed(track)) {
+                ++physical_dirty_wave_array;
+            } else {
+                ++physical_flat_scalar;
+            }
+        }
+
+        const std::uint64_t partition_sum =
+            physical_flat_scalar +
+            physical_dirty_peek +
+            physical_dirty_wave_value +
+            physical_dirty_wave_array +
+            physical_custom +
+            logical_storage_alias +
+            logical_declaration_only +
+            inactive +
+            other;
+        const std::uint64_t track_total =
+            tracks_.size() > 0 ? static_cast<std::uint64_t>(tracks_.size() - 1u) : 0u;
+
+        std::fprintf(
+            fp,
+            "track_partition_total=%llu partition_sum=%llu "
+            "physical_flat_scalar=%llu physical_dirty_peek=%llu "
+            "physical_dirty_wave_value=%llu physical_dirty_wave_array=%llu "
+            "physical_custom=%llu logical_storage_alias=%llu "
+            "logical_declaration_only=%llu inactive=%llu other=%llu\n",
+            static_cast<unsigned long long>(track_total),
+            static_cast<unsigned long long>(partition_sum),
+            static_cast<unsigned long long>(physical_flat_scalar),
+            static_cast<unsigned long long>(physical_dirty_peek),
+            static_cast<unsigned long long>(physical_dirty_wave_value),
+            static_cast<unsigned long long>(physical_dirty_wave_array),
+            static_cast<unsigned long long>(physical_custom),
+            static_cast<unsigned long long>(logical_storage_alias),
+            static_cast<unsigned long long>(logical_declaration_only),
+            static_cast<unsigned long long>(inactive),
+            static_cast<unsigned long long>(other));
+        std::fprintf(
+            fp,
+            "track_partition_note=physical_* are sampling owners; logical_* are "
+            "signal declarations that reuse another physical storage stream; "
+            "memory blocks accelerate physical owners but do not replace logical tracks\n");
     }
 
     std::size_t dirty_wave_array_registered_bulk_range_count_() const noexcept {
@@ -10244,17 +10454,21 @@ private:
         const std::size_t dirty_wave_array_slice_range_count =
             dirty_wave_array_bulk_ranges_.size() - dirty_wave_array_bulk_range_count;
         std::fprintf(fp,
-                     "nodes=%u tracks=%u flat_poll_leaves=%u dirty_peek_groups=%u dirty_peek_ranges=%u dirty_peek_leaves=%u dirty_wave_array_ranges=%u dirty_wave_array_bulk_ranges=%u dirty_wave_array_slice_ranges=%u dirty_wave_array_leaves=%u\n",
+                     "nodes=%u tracks=%u flat_poll_leaves=%u dirty_peek_groups=%u dirty_peek_ranges=%u dirty_peek_leaves=%u dirty_wave_value_groups=%u dirty_wave_value_ranges=%u dirty_wave_value_leaves=%u dirty_wave_array_ranges=%u dirty_wave_array_bulk_ranges=%u dirty_wave_array_slice_ranges=%u dirty_wave_array_leaves=%u\n",
                      static_cast<unsigned>(nodes_.size() > 0 ? nodes_.size() - 1 : 0),
                      static_cast<unsigned>(tracks_.size() > 0 ? tracks_.size() - 1 : 0),
                      static_cast<unsigned>(flat_leaf_fast_table_.size()),
                      static_cast<unsigned>(dirty_peek_groups_.size()),
                      static_cast<unsigned>(dirty_peek_ranges_.size()),
                      static_cast<unsigned>(dirty_peek_leaves_.size()),
+                     static_cast<unsigned>(dirty_wave_value_groups_.size()),
+                     static_cast<unsigned>(dirty_wave_value_ranges_.size()),
+                     static_cast<unsigned>(dirty_wave_value_leaves_.size()),
                      static_cast<unsigned>(dirty_wave_array_bulk_ranges_.size()),
                      static_cast<unsigned>(dirty_wave_array_bulk_range_count),
                      static_cast<unsigned>(dirty_wave_array_slice_range_count),
                      static_cast<unsigned>(dirty_wave_array_leaves_.size()));
+        dump_track_population_partition_(fp);
         std::fprintf(fp,
                      "dirty_section=%s\n",
                      dirty_safe_only ? "dirty-safe active-report leaves only" : "all dirty-peek registered leaves");
@@ -10266,6 +10480,10 @@ private:
         dump_leaf_distribution_part_(fp,
                                      dirty_safe_only ? "DIRTY_PEEK_LEAVES_DIRTY_SAFE_ONLY" : "DIRTY_PEEK_LEAVES_ALL_GROUPS",
                                      collect_dirty_leaf_distribution_counts_(dirty_safe_only),
+                                     top_n);
+        dump_leaf_distribution_part_(fp,
+                                     "DIRTY_WAVE_VALUE_LEAVES",
+                                     collect_dirty_wave_value_leaf_distribution_counts_(),
                                      top_n);
         dump_leaf_distribution_part_(fp,
                                      "DIRTY_WAVE_ARRAY_LEAVES",
@@ -13003,6 +13221,7 @@ private:
                                            const void* type_tag,
                                            std::uint32_t byte_width,
                                            DynamicExpandFn fallback_expander,
+                                           bool capture_dirty_group,
                                            HookReader hook_reader) {
         if (!object_ptr || !type_tag) {
             if (options_.debug_log) {
@@ -13031,21 +13250,24 @@ private:
         }
 
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
-        const std::uint32_t group_id = get_or_create_dirty_peek_group(
-            object_ptr,
-            type_tag,
-            byte_width);
+        const std::uint32_t group_id =
+            capture_dirty_group
+                ? get_or_create_dirty_peek_group(object_ptr, type_tag, byte_width)
+                : kInvalidIndex;
 
         const std::uint32_t previous_group = active_dirty_peek_group_id_;
         const std::uint32_t previous_range = active_dirty_peek_range_id_;
         const std::uint32_t previous_capture_depth = active_dirty_peek_capture_depth_;
         const std::size_t previous_storage_seen_size = active_dirty_peek_storage_ids_.size();
         const std::size_t previous_storage_mark_size = active_dirty_peek_storage_id_marks_.size();
+        const std::size_t previous_capture_seen_size =
+            active_dirty_peek_capture_seen_.size();
         const std::uint32_t leaf_begin = static_cast<std::uint32_t>(dirty_peek_leaves_.size());
         DirtyPeekBlockCursor memory_begin;
         if (group_id != kInvalidIndex) {
             memory_begin = dirty_peek_current_block_cursor_();
             active_dirty_peek_storage_id_marks_.push_back(previous_storage_seen_size);
+            active_dirty_peek_capture_seen_.push_back(DirtyPeekCaptureSeen());
             ++active_dirty_peek_capture_depth_;
         }
         const std::uint32_t first_new_range = static_cast<std::uint32_t>(dirty_peek_ranges_.size());
@@ -13066,6 +13288,7 @@ private:
             }
             active_dirty_peek_storage_ids_.resize(previous_storage_seen_size);
             active_dirty_peek_storage_id_marks_.resize(previous_storage_mark_size);
+            active_dirty_peek_capture_seen_.resize(previous_capture_seen_size);
         }
         active_dirty_peek_group_id_ = previous_group;
         active_dirty_peek_range_id_ = previous_range;
@@ -13109,6 +13332,7 @@ private:
             target->wave_trace_target_type_tag(),
             target->wave_trace_target_byte_width(),
             target->wave_trace_dynamic_expander(),
+            options_.enable_dynamic_dirty_groups,
             [target]() -> WaveDirtyHook* {
                 return target->wave_trace_dirty_hook();
             });
@@ -13127,6 +13351,7 @@ private:
             source->wave_trace_peek_type_tag(),
             source->wave_trace_peek_byte_width(),
             source->wave_trace_peek_dynamic_expander(),
+            true,
             [source]() -> WaveDirtyHook* {
                 return source->wave_trace_peek_dirty_hook();
             });
@@ -13147,6 +13372,7 @@ private:
             source->wave_trace_peek_type_tag(),
             source->wave_trace_peek_byte_width(),
             &dynamic_expand_fallback_bridge<ValueT>,
+            true,
             [source]() -> WaveDirtyHook* {
                 return source->wave_trace_peek_dirty_hook();
             });
@@ -13207,11 +13433,14 @@ private:
         const std::uint32_t previous_capture_depth = active_dirty_peek_capture_depth_;
         const std::size_t previous_storage_seen_size = active_dirty_peek_storage_ids_.size();
         const std::size_t previous_storage_mark_size = active_dirty_peek_storage_id_marks_.size();
+        const std::size_t previous_capture_seen_size =
+            active_dirty_peek_capture_seen_.size();
         const std::uint32_t leaf_begin = static_cast<std::uint32_t>(dirty_peek_leaves_.size());
         DirtyPeekBlockCursor memory_begin;
         if (group_id != kInvalidIndex) {
             memory_begin = dirty_peek_current_block_cursor_();
             active_dirty_peek_storage_id_marks_.push_back(previous_storage_seen_size);
+            active_dirty_peek_capture_seen_.push_back(DirtyPeekCaptureSeen());
             ++active_dirty_peek_capture_depth_;
         }
         const std::uint32_t first_new_range = static_cast<std::uint32_t>(dirty_peek_ranges_.size());
@@ -13233,6 +13462,7 @@ private:
             }
             active_dirty_peek_storage_ids_.resize(previous_storage_seen_size);
             active_dirty_peek_storage_id_marks_.resize(previous_storage_mark_size);
+            active_dirty_peek_capture_seen_.resize(previous_capture_seen_size);
         }
         active_dirty_peek_group_id_ = previous_group;
         active_dirty_peek_range_id_ = previous_range;

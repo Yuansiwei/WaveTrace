@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
         return fail(error);
     }
     if (wave.signalList.size() != 1) return fail(QStringLiteral("expected one selected signal"));
-    const WaveSignal& signal = wave.signalList.first();
+    const WaveSignal& signal = wave.signalList.front();
     const qint64 expectedBuckets[] = {
         lod10Bucket,
         lod10Bucket * 10,

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <cmath>
 #include <limits>
+#include <vector>
 
 constexpr quint32 kWaveNameTokenArrayFlag = 0x80000000u;
 constexpr quint32 kWaveNameTokenValueMask = 0x7fffffffu;
@@ -134,6 +135,8 @@ struct WaveSignal {
     QVector<WaveLodLevel> lodLevels;
 };
 
+using WaveSignalList = std::vector<WaveSignal>;
+
 inline bool waveProceduralClockValueAtTime(const WaveSignal& sig, qint64 time) {
     if (!sig.proceduralClock || sig.clockTogglePeriodTicks == 0) {
         return sig.clockInitialValue;
@@ -248,7 +251,7 @@ struct WaveMeta {
 struct WaveFile {
     WaveMeta meta;
     WaveTreeInfo tree;
-    QVector<WaveSignal> signalList;
+    WaveSignalList signalList;
 };
 
 inline QString waveTreeNameTokenText(const WaveTreeInfo& tree, quint32 token) {

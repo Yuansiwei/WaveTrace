@@ -12,6 +12,154 @@
 #include <limits>
 
 namespace waveperf {
+
+const QVector<InstructionFeatureSpec>& instructionFeatureSpecs() {
+    static const QVector<InstructionFeatureSpec> specs = {
+        {QStringLiteral("movrel_src1_is_gr"),
+         QStringLiteral("MOVRELSrc1IsGR"),
+         QStringLiteral("movrel")},
+        {QStringLiteral("all_thread_exit"),
+         QStringLiteral("allThreadExit"),
+         QStringLiteral("runtime")},
+        {QStringLiteral("clause"), QStringLiteral("clause"),
+         QStringLiteral("bundle")},
+        {QStringLiteral("ebb"), QStringLiteral("ebb"),
+         QStringLiteral("bundle")},
+        {QStringLiteral("pc_24_bit"), QStringLiteral("is24BitPC"),
+         QStringLiteral("addressing")},
+        {QStringLiteral("barrier"), QStringLiteral("isBarrier"),
+         QStringLiteral("instruction_kind")},
+        {QStringLiteral("branch"), QStringLiteral("isBranch"),
+         QStringLiteral("instruction_kind")},
+        {QStringLiteral("exit"), QStringLiteral("isExit"),
+         QStringLiteral("instruction_kind")},
+        {QStringLiteral("flow_control"), QStringLiteral("isFlowCtrl"),
+         QStringLiteral("instruction_kind")},
+        {QStringLiteral("fence"), QStringLiteral("isFence"),
+         QStringLiteral("instruction_kind")},
+        {QStringLiteral("group_load"), QStringLiteral("isGLoad"),
+         QStringLiteral("instruction_kind")},
+        {QStringLiteral("global_memory"), QStringLiteral("isGlobalMem"),
+         QStringLiteral("memory")},
+        {QStringLiteral("ldmb"), QStringLiteral("isLDMB"),
+         QStringLiteral("memory")},
+        {QStringLiteral("ldg_stl"), QStringLiteral("isLdgStl"),
+         QStringLiteral("memory")},
+        {QStringLiteral("local_memory"), QStringLiteral("isLocalMem"),
+         QStringLiteral("memory")},
+        {QStringLiteral("mb_allocate"), QStringLiteral("isMBAllocate"),
+         QStringLiteral("memory")},
+        {QStringLiteral("mb_deallocate"),
+         QStringLiteral("isMBDeallocate"),
+         QStringLiteral("memory")},
+        {QStringLiteral("memory_barrier"),
+         QStringLiteral("isMemBarrier"),
+         QStringLiteral("memory")},
+        {QStringLiteral("pdt"), QStringLiteral("isPDT"),
+         QStringLiteral("instruction_kind")},
+        {QStringLiteral("stmb"), QStringLiteral("isSTMB"),
+         QStringLiteral("memory")},
+        {QStringLiteral("tac_umma"), QStringLiteral("isTacUmma"),
+         QStringLiteral("instruction_kind")},
+        {QStringLiteral("wait_dep_cnt"),
+         QStringLiteral("isWaitDepCnt"),
+         QStringLiteral("dependency")},
+        {QStringLiteral("relative_pc"), QStringLiteral("is_relative_pc"),
+         QStringLiteral("addressing")},
+        {QStringLiteral("movrel"), QStringLiteral("isMOVREL"),
+         QStringLiteral("instruction_kind")},
+        {QStringLiteral("needs_fast_fcu_check"),
+         QStringLiteral("needFastFcuCheck"),
+         QStringLiteral("dispatch")},
+        {QStringLiteral("no_uop"), QStringLiteral("noUop"),
+         QStringLiteral("instruction_kind")},
+        {QStringLiteral("read_dep_count_valid"),
+         QStringLiteral("rdChkDepCntVld"),
+         QStringLiteral("dependency")},
+        {QStringLiteral("to_fast_fcu"), QStringLiteral("toFastFCU"),
+         QStringLiteral("runtime")},
+        {QStringLiteral("write_dep_count_valid"),
+         QStringLiteral("wrChkDepCntVld"),
+         QStringLiteral("dependency")}
+    };
+    return specs;
+}
+
+QString instIssueTypeName(quint64 value) {
+    // InstIssueType in the active cmodel:
+    // -1 Invalid, 0 NotIssue, 1 Thread, 2 ThreadEbb, 3 Group,
+    // 4 GroupEbb, 5 CB, 6 QppuMMA, 7 QppuMMAEbb, 8 Count.
+    switch (value) {
+    case 0: return QStringLiteral("NotIssue");
+    case 1: return QStringLiteral("Thread");
+    case 2: return QStringLiteral("Thread EBB");
+    case 3: return QStringLiteral("Group");
+    case 4: return QStringLiteral("Group EBB");
+    case 5: return QStringLiteral("CB");
+    case 6: return QStringLiteral("QPPU MMA");
+    case 7: return QStringLiteral("QPPU MMA EBB");
+    case 8: return QStringLiteral("Count");
+    default: return QStringLiteral("Invalid/unknown(%1)").arg(value);
+    }
+}
+
+QString instIssueClassKey(quint64 value) {
+    switch (value) {
+    case 1:
+    case 2:
+        return QStringLiteral("thread");
+    case 3:
+    case 4:
+        return QStringLiteral("group");
+    case 5:
+        return QStringLiteral("cb");
+    case 6:
+    case 7:
+        return QStringLiteral("mma");
+    case 0:
+        return QStringLiteral("not_issue");
+    default:
+        return QStringLiteral("unknown_%1").arg(value);
+    }
+}
+
+QString cbCtrlInstClientName(quint64 value) {
+    // CBCtrlInstClient in vsiQPPUTypes.hpp.
+    static const char* const names[] = {
+        "IMGLDST", "PSO", "TEXTURE", "FP64", "LDST", "FCU", "TAC",
+        "UMMA", "TotalNum", "MBAlloc", "DTF", "BWGBarrier",
+        "NonCBInstrEbb"
+    };
+    return value < sizeof(names) / sizeof(names[0])
+               ? QString::fromLatin1(names[value])
+               : QStringLiteral("Invalid/unknown(%1)").arg(value);
+}
+
+QString cbDataClientName(quint64 value) {
+    // CBDataClient in vsiPPUTypes.hpp.
+    static const char* const names[] = {
+        "FlowControl", "CXR", "MemoryData", "MemoryAddress", "LoadData",
+        "Match", "Shuffle", "Vote", "Reduce", "Float64", "Movm",
+        "GCCache", "Barrier", "Csbg", "Umma", "Tac", "ClientCount"
+    };
+    return value < sizeof(names) / sizeof(names[0])
+               ? QString::fromLatin1(names[value])
+               : QStringLiteral("Invalid/unknown(%1)").arg(value);
+}
+
+QString cbDataInstQueueClientName(quint64 value) {
+    // CBDataInstQueueClient in vsiPPUTypes.hpp.
+    static const char* const names[] = {
+        "FlowControl", "MemoryData", "MemoryAddress", "Match",
+        "ShuffleMisc", "Reduce", "Float64", "Is1WgLdlstmb",
+        "Is2WgLdlstmb", "Is1WgTcInst", "Is2WgTcInst", "IsTac",
+        "InstQueueClientCount"
+    };
+    return value < sizeof(names) / sizeof(names[0])
+               ? QString::fromLatin1(names[value])
+               : QStringLiteral("Invalid/unknown(%1)").arg(value);
+}
+
 namespace {
 
 struct ScopeDescriptor {
@@ -1123,19 +1271,48 @@ bool recognizedArchitecturePath(const QString& path) {
 
 }  // namespace
 
-ClassifiedSignal classifyArchitectureSignal(const QString& path) {
-    ClassifiedSignal result;
-    if (!recognizedArchitecturePath(path)) return result;
+QString canonicalArchitecturePath(const QString& path) {
+    QString result;
+    result.reserve(path.size() + 16);
+    for (int i = 0; i < path.size();) {
+        if (path.at(i) != QLatin1Char('[')) {
+            result += path.at(i++);
+            continue;
+        }
 
-    if (isMemoryBandwidthSignal(path)) {
+        const int close = path.indexOf(QLatin1Char(']'), i + 1);
+        if (close < 0) {
+            result += path.mid(i);
+            break;
+        }
+        bool numericIndex = close > i + 1;
+        for (int j = i + 1; numericIndex && j < close; ++j) {
+            numericIndex = path.at(j).isDigit();
+        }
+        if (numericIndex && !result.isEmpty() &&
+            result.back() != QLatin1Char('.')) {
+            result += QLatin1Char('.');
+        }
+        result += path.mid(i, close - i + 1);
+        i = close + 1;
+    }
+    return result;
+}
+
+ClassifiedSignal classifyArchitectureSignal(const QString& path) {
+    const QString canonicalPath = canonicalArchitecturePath(path);
+    ClassifiedSignal result;
+    if (!recognizedArchitecturePath(canonicalPath)) return result;
+
+    if (isMemoryBandwidthSignal(canonicalPath)) {
         result.key = QStringLiteral("memory_bandwidth_helper");
         result.category = QStringLiteral("memory_bandwidth");
         result.helper = true;
         return result;
     }
 
-    const QString lowerPath = path.toLower();
-    const QString leaf = path.section(QLatin1Char('.'), -1);
+    const QString lowerPath = canonicalPath.toLower();
+    const QString leaf = canonicalPath.section(QLatin1Char('.'), -1);
     const QString lowerLeaf = leaf.toLower();
     const bool queueResource =
         lowerPath.contains(QStringLiteral("queue"));
@@ -1151,16 +1328,31 @@ ClassifiedSignal classifyArchitectureSignal(const QString& path) {
     static const QRegularExpression issueValid(
         QStringLiteral("\\.issue_inst_(?:\\[size=\\d+\\])?\\.\\[\\d+\\]\\.vld$"));
     static const QRegularExpression issueField(
-        QStringLiteral("\\.issue_inst_(?:\\[size=\\d+\\])?\\.\\[\\d+\\]\\."
-                       "(preDecode\\.instType\\.mainType|preDecode\\.instIssueType|"
-                       "preDecode\\.isGlobalMem|preDecode\\.isLocalMem|sgId|"
-                       "local_sgid|PC\\.pc_)$"));
-    if (issueValid.match(path).hasMatch()) {
+        [] {
+            QStringList fields = {
+                QStringLiteral("preDecode\\.instType\\.mainType"),
+                QStringLiteral("preDecode\\.instIssueType"),
+                QStringLiteral("sgId"),
+                QStringLiteral("local_sgid"),
+                QStringLiteral("PC\\.pc_")
+            };
+            for (const InstructionFeatureSpec& spec :
+                 instructionFeatureSpecs()) {
+                fields.push_back(
+                    QStringLiteral("preDecode\\.") +
+                    QRegularExpression::escape(spec.fieldPath));
+            }
+            return QStringLiteral(
+                       "\\.issue_inst_(?:\\[size=\\d+\\])?\\.\\[\\d+\\]"
+                       "\\.(%1)$")
+                .arg(fields.join(QLatin1Char('|')));
+        }());
+    if (issueValid.match(canonicalPath).hasMatch()) {
         result.key = QStringLiteral("issue_valid");
         result.category = QStringLiteral("issue");
         return result;
     }
-    if (issueField.match(path).hasMatch()) {
+    if (issueField.match(canonicalPath).hasMatch()) {
         result.key = QStringLiteral("issue_field");
         result.category = QStringLiteral("issue_field");
         result.helper = true;
@@ -1171,7 +1363,7 @@ ClassifiedSignal classifyArchitectureSignal(const QString& path) {
         QStringLiteral("\\.m_EU\\.shader_group_context_.*\\."
                        "thread_(valid|active|execute)_(indicator|mask)"
                        "(?:\\[size=\\d+\\])?(?:\\.\\[\\d+\\])?$"));
-    if (threadMaskField.match(path).hasMatch() ||
+    if (threadMaskField.match(canonicalPath).hasMatch() ||
         (lowerPath.contains(QStringLiteral(".m_qppueu.m_eustate.group_info.")) &&
          (lowerLeaf == QStringLiteral("sgid") ||
           lowerLeaf == QStringLiteral("local_sg_id")))) {
@@ -1181,12 +1373,25 @@ ClassifiedSignal classifyArchitectureSignal(const QString& path) {
         return result;
     }
 
+    bool queueInstructionFeature = false;
+    if (lowerPath.contains(QStringLiteral(".instr_queue_")) &&
+        lowerPath.contains(QStringLiteral(".m_qdata")) &&
+        lowerPath.contains(QStringLiteral(".predecode."))) {
+        for (const InstructionFeatureSpec& feature :
+             instructionFeatureSpecs()) {
+            if (lowerLeaf == feature.fieldPath.toLower()) {
+                queueInstructionFeature = true;
+                break;
+            }
+        }
+    }
     if (lowerPath.contains(QStringLiteral(".instr_queue_")) &&
         ((lowerPath.contains(QStringLiteral(".m_qdata")) &&
            (lowerLeaf == QStringLiteral("pc_") ||
             lowerLeaf == QStringLiteral("instissuetype") ||
             lowerLeaf == QStringLiteral("thread") ||
-            lowerLeaf == QStringLiteral("exethdunit"))) ||
+            lowerLeaf == QStringLiteral("exethdunit") ||
+            queueInstructionFeature)) ||
          lowerLeaf == QStringLiteral("m_ri") ||
          lowerLeaf == QStringLiteral("m_read_index") ||
          lowerLeaf == QStringLiteral("m_readindex") ||
@@ -1506,6 +1711,45 @@ ArchitectureProfile buildArchitectureProfile(const QVector<CounterView>& counter
 }
 
 bool architectureProfilerSelfTest(QString& error) {
+    if (instIssueTypeName(5) != QStringLiteral("CB") ||
+        instIssueClassKey(1) != QStringLiteral("thread") ||
+        instIssueClassKey(2) != QStringLiteral("thread") ||
+        instIssueClassKey(3) != QStringLiteral("group") ||
+        instIssueClassKey(4) != QStringLiteral("group") ||
+        instIssueClassKey(5) != QStringLiteral("cb") ||
+        instIssueClassKey(6) != QStringLiteral("mma") ||
+        instIssueClassKey(7) != QStringLiteral("mma") ||
+        cbCtrlInstClientName(4) != QStringLiteral("LDST") ||
+        cbDataClientName(12) != QStringLiteral("Barrier") ||
+        cbDataInstQueueClientName(7) != QStringLiteral("Is1WgLdlstmb")) {
+        error = QStringLiteral("persisted cmodel enum decoding regressed");
+        return false;
+    }
+    const QString attachedPointerArray =
+        QStringLiteral("gpu.m_clusters[0].m_dppu[0].m_ppu[0]."
+                       "m_QPPUTOP[3].m_QPPUCtrl.issue_inst_[1].vld");
+    const QString canonicalPointerArray =
+        QStringLiteral("gpu.m_clusters.[0].m_dppu.[0].m_ppu.[0]."
+                       "m_QPPUTOP.[3].m_QPPUCtrl.issue_inst_.[1].vld");
+    if (canonicalArchitecturePath(attachedPointerArray) !=
+            canonicalPointerArray ||
+        classifyArchitectureSignal(attachedPointerArray).key !=
+            QStringLiteral("issue_valid")) {
+        error = QStringLiteral(
+            "attached array-index path was not normalized/classified");
+        return false;
+    }
+    const QString flattenedArray =
+        QStringLiteral("gpu.m_QPPUTOP[size=4].[0].m_QPPUCtrl."
+                       "sg_table_[size=16].[0].valid");
+    if (canonicalArchitecturePath(flattenedArray) != flattenedArray ||
+        classifyArchitectureSignal(flattenedArray).key !=
+            QStringLiteral("shader_group_state")) {
+        error = QStringLiteral(
+            "flattened array-index path normalization regressed");
+        return false;
+    }
+
     CounterView flat;
     flat.path =
         QStringLiteral("gpu.m_clusters[size=2].[0].m_dppu[size=5].[0]."

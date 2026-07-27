@@ -677,6 +677,7 @@ static RunResult run_guarded_hook_parallel_case(bool enable_parallel, bool& hook
     opt.parallel_topology_min_work_items_per_element = 0;
     opt.parallel_topology_batch_elements = slot_count;
     opt.enable_dirty_peek_groups = true;
+    opt.enable_dynamic_dirty_groups = true;
     opt.dump_leaf_distribution_after_topology = false;
 
     RunResult out;

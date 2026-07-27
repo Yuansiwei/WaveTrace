@@ -376,7 +376,8 @@ QJsonArray buildQppuConclusions(const QJsonObject& model) {
             confidenceScore = 30;
             evidenceCycles =
                 issueActivityCovered ? issueIdle : 0.0;
-        } else if (sgCovered && activePercent < 50.0) {
+        } else if (sgCovered && activePercent < 50.0 &&
+                   !(eligibilityCovered && topBlockRate >= 10.0)) {
             state = QStringLiteral("bottleneck");
             severity = activePercent < 20.0
                            ? QStringLiteral("critical")
@@ -1969,6 +1970,27 @@ bool performanceDiagnosisSelfTest(QString& error) {
     unknownMemoryModel.remove(QStringLiteral("workload_profile"));
     const QJsonArray unknownMemoryConclusions =
         buildQppuConclusions(unknownMemoryModel);
+    QJsonObject directBlockModel = unknownMemoryModel;
+    QJsonObject directBlockQppu = unknownMemoryQppu;
+    directBlockQppu.insert(QStringLiteral("active_sg_cycles"), 10.0);
+    directBlockQppu.insert(QStringLiteral("queue_ready_sg_cycles"), 10.0);
+    directBlockQppu.insert(QStringLiteral("eligible_sg_cycles"), 4.0);
+    directBlockQppu.insert(QStringLiteral("eligible_percent"), 40.0);
+    QJsonObject directBlockScheduler = unknownMemoryScheduler;
+    directBlockScheduler.insert(
+        QStringLiteral("qppus"), QJsonArray{directBlockQppu});
+    directBlockModel.insert(
+        QStringLiteral("scheduler"), directBlockScheduler);
+    const QJsonArray directBlockConclusions =
+        buildQppuConclusions(directBlockModel);
+    if (directBlockConclusions.isEmpty() ||
+        directBlockConclusions.first().toObject()
+                .value(QStringLiteral("module_key")).toString() !=
+            QStringLiteral("qppu_ctrl")) {
+        error = QStringLiteral(
+            "direct scheduler blocker was hidden by low SG residency");
+        return false;
+    }
     const QJsonObject unknownMemoryWorkload =
         buildWorkloadProfile(
             unknownMemoryModel, unknownMemoryConclusions);
