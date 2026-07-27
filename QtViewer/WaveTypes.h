@@ -137,6 +137,14 @@ struct WaveSignal {
 
 using WaveSignalList = std::vector<WaveSignal>;
 
+inline int waveSignalCount(const WaveSignalList& signalList) noexcept {
+    if (signalList.size() >
+        static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        qFatal("Wave signal count exceeds the Qt container index limit");
+    }
+    return static_cast<int>(signalList.size());
+}
+
 inline bool waveProceduralClockValueAtTime(const WaveSignal& sig, qint64 time) {
     if (!sig.proceduralClock || sig.clockTogglePeriodTicks == 0) {
         return sig.clockInitialValue;

@@ -331,7 +331,8 @@ struct WaveBlockCacheLoader::Impl {
             signal.rawLoadedRanges.clear();
             signal.lodLevels.clear();
             signal.samplesLoaded = false;
-            outputIndex.insert(signalId, output.signalList.size());
+            outputIndex.insert(
+                signalId, waveSignalCount(output.signalList));
             output.signalList.push_back(std::move(signal));
         }
 

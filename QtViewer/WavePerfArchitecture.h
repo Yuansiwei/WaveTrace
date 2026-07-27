@@ -8,6 +8,8 @@
 
 namespace waveperf {
 
+constexpr quint64 kInstIssueTypeNotIssue = 0;
+
 enum class EventSemantics {
     None,
     PerCycleValue,

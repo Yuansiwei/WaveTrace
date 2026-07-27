@@ -1,6 +1,7 @@
 #include "WaveParser4.h"
 #include "WavePerfArchitecture.h"
 #include "WavePerfBandwidth.h"
+#include "WavePerfCBCtrl.h"
 #include "WavePerfDiagnosis.h"
 #include "WavePerfOutput.h"
 #include "WavePerfScheduler.h"
@@ -241,6 +242,12 @@ struct IssueActivityWindow {
 
 QString issueClassKey(quint64 issueType) {
     return waveperf::instIssueClassKey(issueType);
+}
+
+qint64 notIssueTicks(
+    const QMap<quint64, qint64>& issueTypeHistogram) {
+    return issueTypeHistogram.value(
+        waveperf::kInstIssueTypeNotIssue, 0);
 }
 
 QString orderedIssuePairKey(const QString& mainClass,
@@ -1287,6 +1294,18 @@ bool fastPerformanceCandidate(const WaveFile& directory,
         }
         return fields;
     }();
+    if (waveperf::isCBCtrlDetailLeafName(field)) {
+        int contextNode = nodeId;
+        for (int depth = 0; depth < 24 && contextNode > 0; ++depth) {
+            if (waveperf::isCBCtrlEndpointSegment(
+                    nodeName(contextNode))) {
+                return true;
+            }
+            if (contextNode >= directory.tree.nodesById.size()) break;
+            contextNode =
+                directory.tree.nodesById.at(contextNode).parentId;
+        }
+    }
     if (exactFields.contains(field)) return true;
     if (field == QByteArrayLiteral("thread") ||
         field == QByteArrayLiteral("exethdunit")) {
@@ -1380,6 +1399,12 @@ QVector<SignalSelection> selectSignals(const WaveFile& directory,
         category = classified.category;
         helper = classified.helper;
         eventSemantics = classified.eventSemantics;
+        if (key.isEmpty() &&
+            waveperf::isCBCtrlDetailSignalPath(path)) {
+            key = QStringLiteral("cb_ctrl_detail");
+            category = QStringLiteral("cb_ctrl");
+            helper = true;
+        }
         if (key.isEmpty() || selectedIds.contains(signal.signalId)) continue;
 
         SignalSelection selection;
@@ -1404,7 +1429,12 @@ QVector<SignalSelection> selectSignals(const WaveFile& directory,
                     waveperf::classifyArchitectureSignal(
                         waveperf::canonicalArchitecturePath(
                             waveSignalFullPath(directory, j)));
-                if (!remainingClassified.key.isEmpty()) {
+                const QString remainingPath =
+                    waveperf::canonicalArchitecturePath(
+                        waveSignalFullPath(directory, j));
+                if (!remainingClassified.key.isEmpty() ||
+                    waveperf::isCBCtrlDetailSignalPath(
+                        remainingPath)) {
                     selectionTruncated = true;
                     warnings.push_back(
                         QStringLiteral(
@@ -1807,6 +1837,15 @@ int runSelfTest() {
         QTextStream(stderr) << "self_test_failed: issue type classification\n";
         return 13;
     }
+    const QMap<quint64, qint64> issueTypeHistogram = {
+        {waveperf::kInstIssueTypeNotIssue, 30},
+        {1u, 10}
+    };
+    if (notIssueTicks(issueTypeHistogram) != 30) {
+        QTextStream(stderr)
+            << "self_test_failed: NotIssue histogram lookup\n";
+        return 27;
+    }
 
     QVector<SignalSelection> coverageSelections;
     auto addCoveragePath =
@@ -1886,6 +1925,12 @@ int runSelfTest() {
     if (!waveperf::memoryBandwidthProfilerSelfTest(bandwidthError)) {
         QTextStream(stderr) << "self_test_failed: " << bandwidthError << '\n';
         return 15;
+    }
+
+    QString cbCtrlError;
+    if (!waveperf::cbCtrlProfilerSelfTest(cbCtrlError)) {
+        QTextStream(stderr) << "self_test_failed: " << cbCtrlError << '\n';
+        return 28;
     }
 
     QVector<WaveSignal> threadSignals;
@@ -2841,9 +2886,13 @@ int main(int argc, char* argv[]) {
         waveperf::buildSchedulerProfile(
             loadedByPath, startTick, endTick, options.ticksPerCycle,
             options.timelineBins, warnings);
+    const QJsonObject cbCtrl =
+        waveperf::buildCBCtrlProfile(
+            loadedByPath, startTick, endTick,
+            options.ticksPerCycle, dynamicSignals > 0, warnings);
 
     QJsonObject root;
-    root.insert(QStringLiteral("schema_version"), 7);
+    root.insert(QStringLiteral("schema_version"), 8);
     QJsonObject fileObject;
     fileObject.insert(QStringLiteral("path"), QFileInfo(options.filePath).absoluteFilePath());
     fileObject.insert(QStringLiteral("bytes"), double(QFileInfo(options.filePath).size()));
@@ -3189,6 +3238,7 @@ int main(int argc, char* argv[]) {
                 sgThreadEfficiency);
     root.insert(QStringLiteral("memory_bandwidth"), memoryBandwidth);
     root.insert(QStringLiteral("scheduler"), scheduler);
+    root.insert(QStringLiteral("cb_ctrl"), cbCtrl);
     root.insert(QStringLiteral("resource_pressure"), resourcePressure);
 
     QJsonObject architectureObject;
@@ -3219,7 +3269,7 @@ int main(int argc, char* argv[]) {
     };
     root.insert(QStringLiteral("issue_main_type_cycles"), histogramJson(mainTypeTicks));
     root.insert(QStringLiteral("issue_type_cycles"), histogramJson(issueTypeTicks));
-    const qint64 notIssueValidTicks = issueTypeTicks.value(1u, 0);
+    const qint64 notIssueValidTicks = notIssueTicks(issueTypeTicks);
     summary.insert(
         QStringLiteral("not_issue_valid_cycles"),
         double(notIssueValidTicks) / double(options.ticksPerCycle));
@@ -3228,7 +3278,7 @@ int main(int argc, char* argv[]) {
         warnings.push_back(
             QStringLiteral(
                 "检测到 %1 个业务周期同时满足 issue_inst.vld=1 且 "
-                "instIssueType=NotIssue(1)；该组合与发射槽语义矛盾，"
+                "instIssueType=NotIssue(0)；该组合与发射槽语义矛盾，"
                 "对应 PC/类型会原样显示，但不能当作有效指令分类。")
                 .arg(double(notIssueValidTicks) /
                      double(options.ticksPerCycle)));

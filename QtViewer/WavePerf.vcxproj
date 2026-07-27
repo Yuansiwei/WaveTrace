@@ -30,7 +30,9 @@
   <ItemDefinitionGroup>
     <ClCompile>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
-      <WarningLevel>Level3</WarningLevel>
+      <WarningLevel>Level4</WarningLevel>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <TreatAngleIncludeAsExternal>true</TreatAngleIncludeAsExternal>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp14</LanguageStandard>
@@ -48,6 +50,7 @@
     <ClCompile Include="WavePerf.cpp" />
     <ClCompile Include="WavePerfArchitecture.cpp" />
     <ClCompile Include="WavePerfBandwidth.cpp" />
+    <ClCompile Include="WavePerfCBCtrl.cpp" />
     <ClCompile Include="WavePerfDiagnosis.cpp" />
     <ClCompile Include="WavePerfOutput.cpp" />
     <ClCompile Include="WavePerfScheduler.cpp" />
@@ -58,9 +61,13 @@
     <ClInclude Include="WaveTypes.h" />
     <ClInclude Include="WavePerfArchitecture.h" />
     <ClInclude Include="WavePerfBandwidth.h" />
+    <ClInclude Include="WavePerfCBCtrl.h" />
     <ClInclude Include="WavePerfDiagnosis.h" />
     <ClInclude Include="WavePerfOutput.h" />
     <ClInclude Include="WavePerfScheduler.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="WavePerfInstructionFeatures.def" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

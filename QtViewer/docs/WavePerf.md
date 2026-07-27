@@ -86,6 +86,8 @@ WavePerf 默认只分析全局第一条实际发射的指令到最后一条实�
 - 发射 / Thread：指令类型、Main/Shadow、双发组合、每 SG Thread 有效率和
   QPPU EU 指标；同时显示源码已确认的 Predecode 指令特征。
 - 调度器：每个 QPPU/SG 的 Active、Queue Ready、Eligible 和阻塞原因。
+- CBCtrl：请求、寄存器读 uop、EU 操作数返回、CBData 下发/写回和 Pending
+  清除六段链路；按 QPPU、客户端、SG 和 PC 展示服务率、延迟与公平性。
 - 时间线：分阶段查看吞吐和调度状态。
 - 架构树：QPPU 到 GPU 的递归聚合利用率。
 - 资源压力：实际 FIFO、Queue、Credit Counter 压力 Top 50，以及模块聚合的
@@ -182,6 +184,33 @@ Queue Head 阻塞指令类型展示；缺失时仍按 Unknown 处理，不当作
 QPPU 同样单独统计。报告同时给出全部等待占比、flag 已知区间内的置位占比和
 覆盖率。flag 不是互斥分类，一条指令可以同时具有多个标记，所以各类占比之和
 可以超过 100%；覆盖不足的区间不会按未置位处理。
+
+### CBCtrl 数据通路
+
+CBCtrl 页面按 FIFO 的真实读写事件复原以下链路：
+
+```text
+BE 请求 -> CBCtrl 读 uop -> EU 操作数返回
+        -> CBData 指令下发 -> CBData 写回
+        -> Pending 清除
+```
+
+- 请求到首条 uop：CBCtrl 读仲裁等待；
+- uop 到 EU 返回：操作数读取延迟；
+- 请求到首次写回：首写回延迟；
+- 请求到 Pending 清除：完整 Pending 生命周期；
+- 请求数与首 uop 数：请求服务率；
+- 各 QPPU 服务份额相对请求份额：公平性。
+
+FIFO `m_num_read/m_num_write` 是每周期事件数；连续两个周期都为 1 会计为两次
+事件，不能只数上升沿。读事件使用读指针移动前的队首 payload，写事件使用写入
+前的队尾位置和事件时刻 payload。只有 `bFirstUop` 覆盖完整时，服务率和公平性
+才能用于确定性归因。
+
+`CBData*Taken` 仅报告各目的端被选中的次数，不把它解释成 credit 余额。没有
+内部仲裁阻塞枚举时，长等待只能归因到 CBCtrl 仲裁区间，不能虚构更细的具体
+阻塞原因。`signal_selection_complete=false` 时仍可显示局部观测，但不会发布
+全局 CBCtrl 瓶颈或逐 QPPU 确定性 CBCtrl 归因。
 
 ### FIFO 与 Queue
 

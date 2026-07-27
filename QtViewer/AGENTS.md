@@ -6,6 +6,8 @@
 
 - `docs/WavePerf_AGENT_GUIDE.md`：实现、指标、覆盖、诊断和回归的维护规范。
 - `docs/WavePerf.md`：面向使用者的命令行和指标说明。
+- `docs/WavePerf_CHANGES_20260727.md`：CBCtrl、NotIssue、指令特征单一数据源及
+  本轮回归结果的交接记录。
 
 维护 WavePerf 时必须遵守以下硬约束：
 

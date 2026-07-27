@@ -1207,6 +1207,8 @@ bool parseFooterSection(const QByteArray& payload,
                         QVector<QVector<WaveLodLevel>>& lodLevelsByStorageId,
                         QVector<LodChunkIndexRec>& lodChunkIndex,
                         QString& error) {
+    Q_UNUSED(byteWidthByStorageId);
+    Q_UNUSED(boolStorageByStorageId);
     SpanReader r(payload);
     u64 count = 0;
     if (!r.readVarUInt(count)) {
@@ -1844,7 +1846,7 @@ bool finalizeCompactDirectorySignals(const QVector<SigRec>& sigs,
             return false;
         }
 
-        const int outputIndex = outputSignals.size();
+        const int outputIndex = waveSignalCount(outputSignals);
         outputSignals.push_back(makeWaveSignalFromRec(s, false));
         tree.signalIndexToNodeId.push_back(int(s.nodeId));
         tree.signalIndexBySignalId[signalId] = outputIndex + 1;
@@ -3384,7 +3386,7 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
             return false;
         }
         RawLeftAnchorState leftAnchors;
-        leftAnchors.reset(outputSignals.size());
+        leftAnchors.reset(waveSignalCount(outputSignals));
         if (!decodeWdatSectionsFromFooterIndex(file, footerBlocks, blockIndexesByChunk,
                                                signalsPerChunk,
                                                selectedIds, allSelected,
@@ -3394,7 +3396,8 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
                                                &leftAnchors, error)) {
             return false;
         }
-        for (int outputIndex = 0; outputIndex < outputSignals.size(); ++outputIndex) {
+        for (int outputIndex = 0;
+             outputIndex < waveSignalCount(outputSignals); ++outputIndex) {
             if (!emitLeftAnchorIfNeeded(outputIndex, outputSignals, samplesByOutputIndex,
                                         true, &leftAnchors, error)) {
                 return false;
@@ -3407,8 +3410,8 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
     std::vector<ParallelWdatWorkerResult> workerResults;
     workerResults.resize(std::size_t(workerCount));
     for (ParallelWdatWorkerResult& result : workerResults) {
-        result.samplesByOutputIndex.resize(outputSignals.size());
-        result.leftAnchors.reset(outputSignals.size());
+        result.samplesByOutputIndex.resize(waveSignalCount(outputSignals));
+        result.leftAnchors.reset(waveSignalCount(outputSignals));
     }
 
     std::atomic<bool> failed(false);
@@ -4638,7 +4641,7 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
         if (s.signalId != u32(sid)) continue;
         if (!isVisibleSignalRec(s)) continue;
         emittedSignalIds.insert(sid);
-        const int idx = outputSignals.size();
+        const int idx = waveSignalCount(outputSignals);
         outputSignals.push_back(makeWaveSignalFromRec(s, true));
         outputIndexBySignalId.insert(int(s.signalId), idx);
         if (!clockSignalIds.contains(sid)) {
@@ -4655,7 +4658,7 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
     }
 
     QVector<QVector<WaveSample>> samplesByOutputIndex;
-    samplesByOutputIndex.resize(outputSignals.size());
+    samplesByOutputIndex.resize(waveSignalCount(outputSignals));
     qint64 minTime = std::numeric_limits<qint64>::max();
     qint64 maxTime = 0;
 
@@ -5117,7 +5120,8 @@ bool WaveParser4Reader::loadSignalLodImpl(const QVector<int>& signalIds,
             const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
             if (storageId > 0) selectedStorageIds.insert(storageId);
         }
-        directIntMapSet(outputIndexBySignalId, sid, outputSignals.size());
+        directIntMapSet(
+            outputIndexBySignalId, sid, waveSignalCount(outputSignals));
         outputSignals.push_back(makeWaveSignalFromRec(s, false));
     }
     if (!applyProceduralClockDefinitions(d->clocks,
@@ -5506,7 +5510,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
     auto rawLeftAnchorPtr = [&]() -> RawLeftAnchorState* {
         if (!windowedRawLoad()) return nullptr;
         if (!rawLeftAnchorsInitialized) {
-            rawLeftAnchors.reset(outputSignals.size());
+            rawLeftAnchors.reset(waveSignalCount(outputSignals));
             rawLeftAnchorsInitialized = true;
         }
         return &rawLeftAnchors;
@@ -5667,7 +5671,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
                     error = QStringLiteral("WVZ4 SIGT references missing node_id %1").arg(int(s.nodeId));
                     return false;
                 }
-                const int idx = outputSignals.size();
+                const int idx = waveSignalCount(outputSignals);
                 const bool rawSelected = options.loadRawSamples &&
                     (allSelectedSignalIds || selectedIds.contains(int(s.signalId)));
                 outputSignals.push_back(makeWaveSignal(s, rawSelected));
@@ -5685,7 +5689,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
                 const SigRec& s = sigs.at(i);
                 if (!isVisibleSignal(s)) continue;
                 if (!allSelectedSignalIds && !selectedIds.contains(int(s.signalId))) continue;
-                const int idx = outputSignals.size();
+                const int idx = waveSignalCount(outputSignals);
                 outputSignals.push_back(makeWaveSignal(s, options.loadRawSamples));
                 directIntMapSet(outputIndexBySignalId, int(s.signalId), idx);
                 if (options.loadRawSamples &&
@@ -5704,7 +5708,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
             return false;
         }
 
-        samplesByOutputIndex.resize(outputSignals.size());
+        samplesByOutputIndex.resize(waveSignalCount(outputSignals));
 
         if (options.loadRawSamples) {
             qint64 implicitZeroTime = 0;
@@ -5728,7 +5732,8 @@ bool WaveParser4::loadFromFile(const QString& filePath,
 
         if (options.includeAllSignalDefinitions) {
             if (!buildWaveTreeInfo(nodesById, namesById, sigs, outputIndexBySignalId,
-                                   outputSignals.size(), outWave.tree, error)) {
+                                   waveSignalCount(outputSignals),
+                                   outWave.tree, error)) {
                 return false;
             }
         }

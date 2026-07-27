@@ -1356,10 +1356,10 @@ struct SignalLogicTree {
 
     void buildFromSignalDefs(const WaveSignalList& signalDefs) {
         clear();
-        nodeIdBySignalIndex.resize(signalDefs.size());
+        nodeIdBySignalIndex.resize(waveSignalCount(signalDefs));
         std::fill(nodeIdBySignalIndex.begin(), nodeIdBySignalIndex.end(), -1);
 
-        const int signalCount = static_cast<int>(signalDefs.size());
+        const int signalCount = waveSignalCount(signalDefs);
         names.reserve(qMax(1024, signalCount * 2));
         signalPaths.reserve(signalCount);
         nodes.reserve(signalCount * 2);
@@ -2539,7 +2539,7 @@ void buildDigestMatchedCompareJobs(const WaveFile& leftWave,
     const WaveFile& probeWave = indexRightWave ? leftWave : rightWave;
 
     QHash<ComparePathDigest, int> indexedSignalByDigest;
-    indexedSignalByDigest.reserve(indexedWave.signalList.size());
+    indexedSignalByDigest.reserve(waveSignalCount(indexedWave.signalList));
     forEachCompareSignalPathDigest(
         indexedWave,
         [&](int signalIndex, const ComparePathDigest& digest) {
@@ -2666,14 +2666,16 @@ bool buildComparedWaveFileWvz4Streaming(const QString& leftPath,
     const WaveFile& leftDirectory = leftReader.directoryWave();
     const WaveFile& rightDirectory = rightReader.directoryWave();
     if (viewerPerfLogEnabled()) {
-        comparePerfLog("compare.streaming.directory_load", stageTimer.restart(),
-                       0, 0, leftDirectory.signalList.size(), rightDirectory.signalList.size(), 0);
+        comparePerfLog(
+            "compare.streaming.directory_load", stageTimer.restart(), 0, 0,
+            waveSignalCount(leftDirectory.signalList),
+            waveSignalCount(rightDirectory.signalList), 0);
     }
 
     const bool signalPathsIndexAligned =
         waveDirectorySignalPathsIndexAligned(leftDirectory, rightDirectory);
     const int alignedJobCount = signalPathsIndexAligned
-        ? leftDirectory.signalList.size()
+        ? waveSignalCount(leftDirectory.signalList)
         : 0;
     if (viewerPerfLogEnabled()) {
         comparePerfLog("compare.streaming.layout_match", stageTimer.restart(),
@@ -2699,8 +2701,8 @@ bool buildComparedWaveFileWvz4Streaming(const QString& leftPath,
                            rawCompareTimer.elapsed(),
                            0,
                            alignedJobCount,
-                           leftDirectory.signalList.size(),
-                           rightDirectory.signalList.size(),
+                           waveSignalCount(leftDirectory.signalList),
+                           waveSignalCount(rightDirectory.signalList),
                            int(rawCompare));
         }
         if (rawCompare == WaveParser4Reader::RawBlockCompareResult::Equal &&
@@ -2709,7 +2711,8 @@ bool buildComparedWaveFileWvz4Streaming(const QString& leftPath,
             if (viewerPerfLogEnabled()) {
                 comparePerfLog("compare.streaming.total", totalTimer.elapsed(),
                                0, alignedJobCount,
-                               leftDirectory.signalList.size(), rightDirectory.signalList.size(), 0);
+                               waveSignalCount(leftDirectory.signalList),
+                               waveSignalCount(rightDirectory.signalList), 0);
             }
             return false;
         }
@@ -2724,12 +2727,12 @@ bool buildComparedWaveFileWvz4Streaming(const QString& leftPath,
     if (!signalPathsIndexAligned) {
         if (leftDirectory.tree.valid && rightDirectory.tree.valid) {
             buildTreeMatchedCompareJobs(leftDirectory, rightDirectory, jobs);
-            leftUniquePathCount = leftDirectory.signalList.size();
-            rightUniquePathCount = rightDirectory.signalList.size();
+            leftUniquePathCount = waveSignalCount(leftDirectory.signalList);
+            rightUniquePathCount = waveSignalCount(rightDirectory.signalList);
         } else {
             buildDigestMatchedCompareJobs(leftDirectory, rightDirectory, jobs);
-            leftUniquePathCount = leftDirectory.signalList.size();
-            rightUniquePathCount = rightDirectory.signalList.size();
+            leftUniquePathCount = waveSignalCount(leftDirectory.signalList);
+            rightUniquePathCount = waveSignalCount(rightDirectory.signalList);
         }
     }
 
@@ -2760,7 +2763,8 @@ bool buildComparedWaveFileWvz4Streaming(const QString& leftPath,
         if (viewerPerfLogEnabled()) {
             comparePerfLog("compare.streaming.total", totalTimer.elapsed(),
                            0, jobCount,
-                           leftDirectory.signalList.size(), rightDirectory.signalList.size(), 0);
+                           waveSignalCount(leftDirectory.signalList),
+                           waveSignalCount(rightDirectory.signalList), 0);
         }
         return false;
     }
@@ -2902,15 +2906,19 @@ bool buildComparedWaveFileWvz4Streaming(const QString& leftPath,
         error = formatNoSignalDiffMessage(leftDirectory.meta, rightDirectory.meta);
         if (viewerPerfLogEnabled()) {
             comparePerfLog("compare.streaming.total", totalTimer.elapsed(),
-                           0, jobCount, leftDirectory.signalList.size(), rightDirectory.signalList.size(), 0);
+                           0, jobCount,
+                           waveSignalCount(leftDirectory.signalList),
+                           waveSignalCount(rightDirectory.signalList), 0);
         }
         return false;
     }
 
     if (viewerPerfLogEnabled()) {
         comparePerfLog("compare.streaming.total", totalTimer.elapsed(),
-                       0, jobCount, leftDirectory.signalList.size(), rightDirectory.signalList.size(),
-                       outWave.signalList.size() / 2);
+                       0, jobCount,
+                       waveSignalCount(leftDirectory.signalList),
+                       waveSignalCount(rightDirectory.signalList),
+                       waveSignalCount(outWave.signalList) / 2);
     }
     return true;
 }
@@ -5803,7 +5811,8 @@ void MainWindow::applyWave(WaveFile&& wave) {
     updateValueFindNavigationState();
     if (perf) {
         viewerPerfLog("apply.move_assign", stepTimer.restart(),
-                      m_wave.signalList.size(), m_wave.tree.nodesById.size());
+                      waveSignalCount(m_wave.signalList),
+                      m_wave.tree.nodesById.size());
     }
 
     if (!m_wave.tree.signalIndexBySignalId.isEmpty()) {
@@ -5832,26 +5841,31 @@ void MainWindow::applyWave(WaveFile&& wave) {
     }
     if (perf) {
         viewerPerfLog("apply.signal_index", stepTimer.restart(),
-                      m_wave.signalList.size(), m_wave.tree.nodesById.size());
+                      waveSignalCount(m_wave.signalList),
+                      m_wave.tree.nodesById.size());
     }
 
     updateMetaLabel();
     if (perf) {
         viewerPerfLog("apply.meta", stepTimer.restart(),
-                      m_wave.signalList.size(), m_wave.tree.nodesById.size());
+                      waveSignalCount(m_wave.signalList),
+                      m_wave.tree.nodesById.size());
     }
 
     rebuildTree();
     if (perf) {
         viewerPerfLog("apply.rebuild_tree", stepTimer.restart(),
-                      m_wave.signalList.size(), m_wave.tree.nodesById.size());
+                      waveSignalCount(m_wave.signalList),
+                      m_wave.tree.nodesById.size());
     }
 
     m_activeList->clear();
     m_canvas->setWave(&m_wave);
     if (perf) {
         viewerPerfLog("apply.canvas_bind", stepTimer.restart(),
-                      m_wave.signalList.size(), m_wave.tree.nodesById.size(), m_activeList->topLevelItemCount());
+                      waveSignalCount(m_wave.signalList),
+                      m_wave.tree.nodesById.size(),
+                      m_activeList->topLevelItemCount());
     }
 
     QList<int> initialSignalIndexes;
@@ -5869,16 +5883,22 @@ void MainWindow::applyWave(WaveFile&& wave) {
     addSignalIndexesToActive(initialSignalIndexes);
     if (perf) {
         viewerPerfLog("apply.first_active", stepTimer.restart(),
-                      m_wave.signalList.size(), m_wave.tree.nodesById.size(), m_activeList->topLevelItemCount());
+                      waveSignalCount(m_wave.signalList),
+                      m_wave.tree.nodesById.size(),
+                      m_activeList->topLevelItemCount());
     }
 
     rebuildVisibleSignals();
     refreshActiveValueLabels();
     if (perf) {
         viewerPerfLog("apply.final_refresh", stepTimer.restart(),
-                      m_wave.signalList.size(), m_wave.tree.nodesById.size(), m_activeList->topLevelItemCount());
+                      waveSignalCount(m_wave.signalList),
+                      m_wave.tree.nodesById.size(),
+                      m_activeList->topLevelItemCount());
         viewerPerfLog("apply.total", totalTimer.elapsed(),
-                      m_wave.signalList.size(), m_wave.tree.nodesById.size(), m_activeList->topLevelItemCount());
+                      waveSignalCount(m_wave.signalList),
+                      m_wave.tree.nodesById.size(),
+                      m_activeList->topLevelItemCount());
     }
     scheduleTreeWarmup();
 }
@@ -5940,7 +5960,8 @@ bool MainWindow::openWaveFilePath(const QString& path, bool showError) {
     if (ok) wave = reader->takeDirectoryWave();
     if (perf) {
         viewerPerfLog("open.load", stepTimer.restart(),
-                      wave.signalList.size(), wave.tree.nodesById.size());
+                      waveSignalCount(wave.signalList),
+                      wave.tree.nodesById.size());
     }
     if (!ok) {
         if (!showError) return false;
@@ -5970,9 +5991,11 @@ bool MainWindow::openWaveFilePath(const QString& path, bool showError) {
     m_blockCacheLoader->start(m_waveReader, m_waveReaderMutex, m_wave, viewerCacheBudgetBytes());
     if (perf) {
         viewerPerfLog("open.apply", stepTimer.restart(),
-                      m_wave.signalList.size(), m_wave.tree.nodesById.size());
+                      waveSignalCount(m_wave.signalList),
+                      m_wave.tree.nodesById.size());
         viewerPerfLog("open.total", totalTimer.elapsed(),
-                      m_wave.signalList.size(), m_wave.tree.nodesById.size());
+                      waveSignalCount(m_wave.signalList),
+                      m_wave.tree.nodesById.size());
     }
     return true;
 }
@@ -5981,7 +6004,8 @@ void MainWindow::activateFirstSignalsForBenchmark(int count) {
     if (!m_activeList) return;
     m_activeList->clear();
     QList<int> indexes;
-    const int limit = qMin(qMax(0, count), static_cast<int>(m_wave.signalList.size()));
+    const int limit =
+        qMin(qMax(0, count), waveSignalCount(m_wave.signalList));
     indexes.reserve(limit);
     for (int i = 0; i < limit; ++i) indexes.push_back(i);
     addSignalIndexesToActive(indexes);
@@ -6251,7 +6275,8 @@ bool MainWindow::compareWaveFilePaths(const QString& leftPath,
         return false;
     }
 
-    const int comparedSignalCount = comparedWave.signalList.size();
+    const int comparedSignalCount =
+        waveSignalCount(comparedWave.signalList);
     m_currentWaveFilePath.clear();
     m_currentWaveSupportsOnDemand = false;
     if (m_blockCacheLoader) m_blockCacheLoader->stop();
@@ -6330,7 +6355,7 @@ QList<int> MainWindow::selectedTreeSignalIndexesForViewportJump() const {
         picked.push_back(m_tree->currentIndex());
     }
 
-    QBitArray seen(m_wave.signalList.size(), false);
+    QBitArray seen(waveSignalCount(m_wave.signalList), false);
     QVector<int> pendingNodes;
     pendingNodes.reserve(256);
     auto appendSignal = [&](int signalIndex) {
@@ -7012,7 +7037,8 @@ void MainWindow::startSignalConditionSearch() {
 
     QVector<int> fallbackNodeIdBySignalIndex;
     if (!m_wave.tree.valid && m_signalTreeModel) {
-        fallbackNodeIdBySignalIndex.resize(m_wave.signalList.size());
+        fallbackNodeIdBySignalIndex.resize(
+            waveSignalCount(m_wave.signalList));
         for (int signalIndex = 0; signalIndex < m_wave.signalList.size();
              ++signalIndex) {
             fallbackNodeIdBySignalIndex[signalIndex] =
@@ -7316,7 +7342,7 @@ void MainWindow::startSignalConditionSearch() {
 
                     QHash<int, const WaveSignal*> loadedBySignalId;
                     loadedBySignalId.reserve(
-                        loadedWave.signalList.size() * 2 + 1);
+                        waveSignalCount(loadedWave.signalList) * 2 + 1);
                     for (const WaveSignal& signal : loadedWave.signalList) {
                         loadedBySignalId.insert(signal.signalId, &signal);
                     }
@@ -7403,7 +7429,8 @@ void MainWindow::startSignalConditionSearch() {
         auto traverseTreeSubtrees = [&](const QVector<int>& rootNodeIds,
                                         bool includeAncestorPath) {
             QBitArray visitedNodes(wave.tree.nodesById.size(), false);
-            QBitArray visitedSignals(wave.signalList.size(), false);
+            QBitArray visitedSignals(
+                waveSignalCount(wave.signalList), false);
             struct TreeWalkFrame {
                 int nodeId = 0;
                 int restorePathLength = 0;
@@ -8814,7 +8841,7 @@ bool MainWindow::createDerivedSignal(const QString& name, const QString& express
         }
     };
 
-    leafByName.reserve(m_wave.signalList.size());
+    leafByName.reserve(waveSignalCount(m_wave.signalList));
     for (int i = 0; i < m_wave.signalList.size(); ++i) {
         const QString rawName = waveSignalSegmentName(m_wave, i);
         addLeaf(rawName, i);
@@ -8823,7 +8850,7 @@ bool MainWindow::createDerivedSignal(const QString& name, const QString& express
     auto ensureFullPathIndex = [&]() {
         if (fullPathIndexReady) return;
         fullPathIndexReady = true;
-        fullPathByName.reserve(m_wave.signalList.size());
+        fullPathByName.reserve(waveSignalCount(m_wave.signalList));
         for (int i = 0; i < m_wave.signalList.size(); ++i) {
             const QString key = stripDisplayRangeSuffix(signalDisplayName(i));
             if (key.isEmpty()) continue;
@@ -9075,7 +9102,7 @@ bool MainWindow::createDerivedSignal(const QString& name, const QString& express
                       derived.samples.size());
     }
 
-    const int newSignalIndex = m_wave.signalList.size();
+    const int newSignalIndex = waveSignalCount(m_wave.signalList);
     m_wave.signalList.push_back(std::move(derived));
     if (m_signalIndexBySignalId.size() <= maxSignalId + 1) {
         m_signalIndexBySignalId.resize(maxSignalId + 2);
@@ -9224,7 +9251,8 @@ void MainWindow::scheduleTreeWarmup() {
                                                          std::move(result->nameStrings));
                     if (viewerPerfLogEnabled()) {
                         viewerPerfLog("tree.warmup", result->elapsedMs,
-                                      m_wave.signalList.size(), m_wave.tree.nodesById.size());
+                                      waveSignalCount(m_wave.signalList),
+                                      m_wave.tree.nodesById.size());
                     }
                 },
                 Qt::QueuedConnection);
@@ -9435,7 +9463,8 @@ bool MainWindow::ensureSignalLodLoaded(const QList<int>& signalIndexes) {
     }
     if (viewerPerfLogEnabled()) {
         viewerPerfLog("lod.load", lodTimer.elapsed(),
-                      loadedWave.signalList.size(), loadedWave.tree.nodesById.size(),
+                      waveSignalCount(loadedWave.signalList),
+                      loadedWave.tree.nodesById.size(),
                       signalIdsToLoad.size());
     }
 

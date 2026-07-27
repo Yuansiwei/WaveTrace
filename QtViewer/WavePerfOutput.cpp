@@ -65,6 +65,7 @@ details{border-bottom:1px solid var(--line);padding:8px 0}summary{cursor:pointer
 <button data-view="overview" class="active">总览</button>
 <button data-view="issue">发射 / Thread</button>
 <button data-view="scheduler">调度器</button>
+<button data-view="cbctrl">CBCtrl</button>
 <button data-view="timeline">时间线</button>
 <button data-view="architecture">架构树</button>
 <button data-view="resources">资源压力</button>
@@ -75,6 +76,7 @@ details{border-bottom:1px solid var(--line);padding:8px 0}summary{cursor:pointer
 <section id="overview" class="view active"></section>
 <section id="issue" class="view"></section>
 <section id="scheduler" class="view"></section>
+<section id="cbctrl" class="view"></section>
 <section id="timeline" class="view"></section>
 <section id="architecture" class="view"></section>
 <section id="resources" class="view"></section>
@@ -94,7 +96,7 @@ document.querySelectorAll("#tabs button").forEach(button=>button.onclick=()=>{
   button.classList.add("active");$(button.dataset.view).classList.add("active");
   if(button.dataset.view==="timeline")drawTimeline();
 });
- const file=DATA.file||{},analysis=DATA.analysis||{},sum=DATA.summary||{},sched=DATA.scheduler||{},ss=sched.summary||{},wp=DATA.workload_profile||{};
+ const file=DATA.file||{},analysis=DATA.analysis||{},sum=DATA.summary||{},sched=DATA.scheduler||{},ss=sched.summary||{},wp=DATA.workload_profile||{},cb=DATA.cb_ctrl||{},cbs=cb.summary||{};
  const schedCovered=sched.status==="measured"||sched.status==="partial";
  const scoped=["measured","partial"].includes(wp.status)&&Number(wp.participating_qppus)>0;
  const selectionCovered=wp.selection_coverage_complete!==false;
@@ -147,6 +149,32 @@ const reasonRows=(ss.block_reasons||[]).map(r=>`<tr><td>${esc(r.name)}</td><td>$
 const sgRows=[];(sched.qppus||[]).forEach(q=>(q.shader_groups||[]).forEach(s=>sgRows.push(`<tr><td>QPPU ${num(q.index,0)}<br><span class="path">${esc(q.path)}</span></td><td>${num(s.index,0)}</td><td>${s.activity_coverage_complete?num(s.active_cycles,2):"部分覆盖"}</td><td>${s.activity_coverage_complete?pct(s.queue_ready_percent):"部分覆盖"}</td><td>${s.eligibility_coverage_complete?pct(s.eligible_percent):"部分覆盖"}</td><td>${num(s.issued_cycles,2)}</td><td>${s.eligibility_coverage_complete?"完整":"部分"}</td></tr>`)));
 $("scheduler").innerHTML=`<div class="section"><h2>调度器总览</h2>${table(["阻塞原因","SG-cycle","Queue Ready 占比"],reasonRows.length?reasonRows:["<tr><td colspan=3>没有观测到已分类阻塞</td></tr>"])}</div><div class="section"><h2>每个 QPPU</h2>${table(["实例","二级结论","发射指令","发射利用率","发射活跃","未发射周期","Active SG-cycle","Queue Ready SG-cycle","Eligible SG-cycle","Eligible 率","路径"],qppuRows)}</div><div class="section"><h2>每个 SG</h2>${table(["QPPU","SG","Active 周期","Queue Ready","Eligible","发射周期","覆盖"],sgRows)}</div>`;
 )HTML";
+    const QByteArray suffixCb = R"HTML(
+const cbStatusName=s=>({measured:"完整测量",partial:"部分覆盖",static_snapshot:"静态快照",no_activity:"无 CBCtrl 活动",not_covered:"未覆盖",invalid_range:"区间无效"}[s]||s||"未覆盖");
+const cbBottleneck=cb.bottleneck||{};
+const cbBottleneckHtml=cbBottleneck.stage&&cbBottleneck.stage!=="none"?`<p class="lead"><strong>${esc(cbBottleneck.stage_name||cbBottleneck.stage)}</strong></p><p>${esc(cbBottleneck.reason)}</p><p><b>依据：</b>${esc(cbBottleneck.evidence)}</p><p class="muted">${cbBottleneck.direct_evidence?"直接状态证据":"阶段相关性证据"} · ${esc(cbBottleneck.confidence||"low")} 置信</p>`:`<p class="lead"><strong>未形成明确 CBCtrl 瓶颈</strong></p><p>${esc(cbBottleneck.reason||cb.reason||"当前波形没有足够的 CBCtrl 动态证据。")}</p>`;
+const cbKpis=[
+ ["指令请求",num(cbs.request_events,0)],
+ ["首 uop 服务率",Number(cbs.request_events)>0?pct(cbs.request_service_ratio_percent):"-"],
+ ["仲裁等待 P95",cbs.arbitration_wait_p95_cycles==null?"未配对":num(cbs.arbitration_wait_p95_cycles,2)+" cycle"],
+ ["EU 读返回 P95",cbs.eu_read_latency_p95_cycles==null?"未配对":num(cbs.eu_read_latency_p95_cycles,2)+" cycle"],
+ ["Pending 生命周期 P95",cbs.pending_lifetime_p95_cycles==null?"未配对":num(cbs.pending_lifetime_p95_cycles,2)+" cycle"],
+ ["写回事件",num(cbs.writeback_events,0)]
+];
+const cbStageRows=(cb.stages||[]).map(s=>`<tr><td>${esc(s.name)}</td><td>${num(s.channels,0)}</td><td>${num(s.events,0)}</td><td>${s.events_per_channel_cycle==null?"未覆盖":num(s.events_per_channel_cycle,3)}</td><td>${s.nonempty_rate_percent==null?"未覆盖":pct(s.nonempty_rate_percent)}</td><td>${s.full_rate_percent==null?"未覆盖":pct(s.full_rate_percent)+bar(s.full_rate_percent,s.full_rate_percent>=30?"bad":s.full_rate_percent>=10?"warn":"")}</td><td>${s.observed_channel_cycles==null?"未覆盖":num(s.observed_channel_cycles,2)}</td></tr>`);
+const cbQppuRows=(cb.qppus||[]).map(q=>`<tr><td>QPPU ${num(q.qppu_index,0)}<br><span class="path">${esc(q.path)}</span></td><td>${num(q.requests,0)}</td><td>${num(q.first_uop_instructions,0)}</td><td>${pct(q.service_ratio_percent)}</td><td>${q.fairness_ratio==null?"样本不足":num(q.fairness_ratio,2)}</td><td>${q.arbitration_average_cycles==null?"未配对":num(q.arbitration_average_cycles,2)}</td><td>${q.pending_average_cycles==null?"未配对":num(q.pending_average_cycles,2)}</td><td>${num(q.operand_returns,0)}</td><td>${num(q.writebacks,0)}</td></tr>`);
+const cbClientRows=(cb.clients||[]).map(c=>`<tr><td>${num(c.index,0)}</td><td>${esc(c.name)}</td><td>${num(c.read_uops,0)}</td><td>${num(c.operand_returns,0)}</td><td>${c.read_latency_average_cycles==null?"未配对":num(c.read_latency_average_cycles,2)}</td><td>${c.read_latency_maximum_cycles==null?"未配对":num(c.read_latency_maximum_cycles,2)}</td></tr>`);
+const cbClear=cb.pending_clear_detail||{};
+const cbReadDepRows=(cbClear.read_counter_indexes||[]).map(r=>`<tr><td>读 ChkDep</td><td>${num(r.index,0)}</td><td>${num(r.events,0)}</td></tr>`);
+const cbWriteDepRows=(cbClear.write_counter_indexes||[]).map(r=>`<tr><td>写 ChkDep</td><td>${num(r.index,0)}</td><td>${num(r.events,0)}</td></tr>`);
+const cbPcRows=(cb.pc_hotspots||[]).map((p,i)=>`<tr><td>${i+1}</td><td>${esc(p.pc)}</td><td>QPPU ${num(p.qppu_index,0)} / SG ${num(p.sg_index,0)}</td><td>${num(p.requests,0)}</td><td>${p.arbitration_average_cycles==null?"未配对":num(p.arbitration_average_cycles,2)}</td><td>${p.arbitration_maximum_cycles==null?"未配对":num(p.arbitration_maximum_cycles,2)}</td><td>${p.pending_average_cycles==null?"未配对":num(p.pending_average_cycles,2)}</td><td>${p.pending_maximum_cycles==null?"未配对":num(p.pending_maximum_cycles,2)}</td><td class="path">${esc(p.ppu_path)}</td></tr>`);
+const cbResources=cb.resource_taken||{};
+const cbInstQueueRows=(cbResources.instruction_queues||[]).map(r=>`<tr><td>${num(r.index,0)}</td><td>${esc(r.name)}</td><td>${num(r.taken_events,0)}</td></tr>`);
+const cbRamRows=(cbResources.ram_clients||[]).map(r=>`<tr><td>${num(r.index,0)}</td><td>${esc(r.name)}</td><td>${num(r.taken_events,0)}</td></tr>`);
+const cbCoverage=cb.coverage||{};
+const cbCoverageText=`身份覆盖 ${Number(cbCoverage.identity_events)>0?pct(cbCoverage.identity_coverage_percent):"无事件"} · first_uop flag 覆盖 ${Number(cbs.read_uops)>0?pct(cbCoverage.first_uop_flag_coverage_percent):"无 uop"} · 端口 ${num(cbCoverage.event_channels,0)}/${num(cbCoverage.endpoint_channels,0)} · 边界回退 ${num(cbCoverage.pointer_boundary_fallbacks,0)}+${num(cbCoverage.payload_boundary_fallbacks,0)}`;
+$("cbctrl").innerHTML=`<div class="section"><h2>CBCtrl 总判断 <span class="pill">${esc(cbStatusName(cb.status))}</span></h2>${cbBottleneckHtml}</div><div class="kpis">${cbKpis.map(k=>`<div class="kpi"><span>${k[0]}</span><b>${k[1]}</b></div>`).join("")}</div><div class="section"><h2>阶段吞吐与满率</h2>${table(["阶段","通道","事件","事件 / channel-cycle","非空率","满率","观测 channel-cycle"],cbStageRows.length?cbStageRows:["<tr><td colspan=7>未覆盖 CBCtrl 阶段端口</td></tr>"])}</div><div class="section"><h2>每个 QPPU：服务与公平性</h2><p class="muted">公平性 = 首 uop 份额 / 请求份额；该 QPPU 至少观测到 10 个请求时才发布。低于 1 表示获得的服务份额低于需求份额。</p>${table(["实例","请求","首 uop","服务率","公平性","平均仲裁等待","平均 Pending","EU 返回","写回"],cbQppuRows.length?cbQppuRows:["<tr><td colspan=9>身份字段未覆盖或没有 CBCtrl 请求</td></tr>"])}</div><div class="section"><h2>读客户端</h2>${table(["枚举","客户端","读 uop","EU 返回","平均返回延迟","最大返回延迟"],cbClientRows.length?cbClientRows:["<tr><td colspan=6>client/返回身份未覆盖</td></tr>"])}</div><div class="section"><h2>Pending 清除</h2><p>读依赖 ${num(cbClear.read_dependency_events,0)} · 写依赖 ${num(cbClear.write_dependency_events,0)} · 类型字段未知 ${num(cbClear.kind_unknown_events,0)}</p><p class="muted">${esc(cbClear.interpretation||"")}</p>${table(["类型","Counter index","清除事件"],[...cbReadDepRows,...cbWriteDepRows].length?[...cbReadDepRows,...cbWriteDepRows]:["<tr><td colspan=3>没有可归因的 ChkDep counter</td></tr>"])}</div><div class="section"><h2>慢 PC Top 50</h2>${table(["排名","PC","QPPU / SG","请求","平均仲裁","最大仲裁","平均 Pending","最大 Pending","PPU"],cbPcRows.length?cbPcRows:["<tr><td colspan=9>PC 身份或阶段配对未覆盖</td></tr>"])}</div><div class="section"><h2>CBData 资源 taken</h2><p class="muted">${esc(cbResources.interpretation||"taken 只表示资源活动，不等同于 Credit 耗尽。")}</p><h3>Instruction Queue</h3>${table(["枚举","队列","taken 事件"],cbInstQueueRows.length?cbInstQueueRows:["<tr><td colspan=3>没有观测到 taken</td></tr>"])}<h3>RAM Client</h3>${table(["枚举","客户端","taken 事件"],cbRamRows.length?cbRamRows:["<tr><td colspan=3>没有观测到 taken</td></tr>"])}<p>GR RAM taken ${num(cbResources.gr_ram_taken_events,0)} · mFIFO taken ${num(cbResources.mfifo_taken_events,0)} · L1 Credit token ${num(cbResources.l1_credit_tokens,0)}</p></div><div class="section"><h2>覆盖与边界</h2><p>${esc(cbCoverageText)}</p><p class="muted">${esc(cb.causality_boundary||"")}</p>${(cb.warnings||[]).map(w=>`<p class="finding warning">${esc(w)}</p>`).join("")}</div>`;
+)HTML";
     const QByteArray suffix2 = R"HTML(
 let timelineDrawn=false;
 function drawTimeline(){
@@ -186,7 +214,7 @@ $("hotspots").innerHTML=`<div class="section"><h2>PC 发射热点</h2><p class="
 </body>
 </html>
 )HTML";
-    return prefix + json + suffix + suffix2;
+    return prefix + json + suffix + suffixCb + suffix2;
 }
 
 }  // namespace
@@ -951,6 +979,8 @@ bool performanceOutputSelfTest(QString& error) {
         !html.contains("\"scheduler\"") ||
         !html.contains(
             QStringLiteral("阻塞指令 flag 分布").toUtf8()) ||
+        !html.contains(
+            QStringLiteral("CBCtrl 总判断").toUtf8()) ||
         !html.contains("preDecode.isFence") ||
         !html.contains(
             QStringLiteral("全局首末发射窗口").toUtf8())) {

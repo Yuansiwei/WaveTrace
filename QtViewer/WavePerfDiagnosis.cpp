@@ -2,6 +2,7 @@
 
 #include <QHash>
 #include <QJsonValue>
+#include <QRegularExpression>
 
 #include <algorithm>
 #include <limits>
@@ -218,6 +219,14 @@ bool dependencyBlock(const QJsonObject& block) {
 }  // namespace
 
 QJsonArray buildQppuConclusions(const QJsonObject& model) {
+    auto logicalInstancePath =
+        [](QString path) {
+            path.remove(
+                QRegularExpression(
+                    QStringLiteral("\\[size=\\d+\\]"),
+                    QRegularExpression::CaseInsensitiveOption));
+            return path;
+        };
     const QJsonObject analysis =
         model.value(QStringLiteral("analysis")).toObject();
     const double durationCycles =
@@ -233,6 +242,34 @@ QJsonArray buildQppuConclusions(const QJsonObject& model) {
 
     const QJsonObject resourcePressure =
         model.value(QStringLiteral("resource_pressure")).toObject();
+    const bool selectionCoverageComplete =
+        model.value(QStringLiteral("coverage")).toObject()
+            .value(
+                QStringLiteral("signal_selection_complete")).toBool(true);
+    QHash<QString, QJsonObject> cbQppuByPath;
+    const QJsonObject cbCtrl =
+        model.value(QStringLiteral("cb_ctrl")).toObject();
+    const bool cbFirstUopCovered =
+        cbCtrl.value(QStringLiteral("coverage")).toObject()
+                .value(
+                    QStringLiteral(
+                        "first_uop_flag_coverage_percent")).toDouble() >=
+            99.999;
+    if (selectionCoverageComplete &&
+        (cbCtrl.value(QStringLiteral("status")).toString() ==
+             QStringLiteral("measured") ||
+         cbCtrl.value(QStringLiteral("status")).toString() ==
+             QStringLiteral("partial"))) {
+        for (const QJsonValue& value :
+             cbCtrl.value(QStringLiteral("qppus")).toArray()) {
+            const QJsonObject qppu = value.toObject();
+            cbQppuByPath.insert(
+                logicalInstancePath(
+                    qppu.value(
+                        QStringLiteral("path")).toString()),
+                qppu);
+        }
+    }
     QJsonArray result;
     const QJsonArray qppus =
         scheduler.value(QStringLiteral("qppus")).toArray();
@@ -302,6 +339,45 @@ QJsonArray buildQppuConclusions(const QJsonObject& model) {
                 QStringLiteral("queue_ready_percent")).toDouble();
         const PressureEvidence pressure =
             pressureForScope(resourcePressure, path);
+        const QJsonObject cbQppu =
+            cbQppuByPath.value(logicalInstancePath(path));
+        const double cbRequests =
+            cbQppu.value(QStringLiteral("requests")).toDouble();
+        const double cbService =
+            cbQppu.value(
+                QStringLiteral("service_ratio_percent")).toDouble();
+        const double cbArbitrationAverage =
+            cbQppu.value(
+                QStringLiteral(
+                    "arbitration_average_cycles")).toDouble();
+        const double cbArbitrationMaximum =
+            cbQppu.value(
+                QStringLiteral(
+                    "arbitration_maximum_cycles")).toDouble();
+        const double cbPendingAverage =
+            cbQppu.value(
+                QStringLiteral("pending_average_cycles")).toDouble();
+        const double cbPendingMaximum =
+            cbQppu.value(
+                QStringLiteral("pending_maximum_cycles")).toDouble();
+        const double cbFairness =
+            cbQppu.value(
+                QStringLiteral("fairness_ratio")).toDouble(1.0);
+        const bool cbServiceLimited =
+            cbFirstUopCovered && cbRequests >= 10.0 &&
+            cbService < 90.0;
+        const bool cbArbitrationSlow =
+            cbQppu.value(
+                QStringLiteral("arbitration_matched")).toDouble() >=
+                10.0 &&
+            (cbArbitrationAverage >= 4.0 ||
+             cbArbitrationMaximum >= 16.0);
+        const bool cbPendingSlow =
+            cbQppu.value(
+                QStringLiteral("pending_matched")).toDouble() >=
+                10.0 &&
+            (cbPendingAverage >= 16.0 ||
+             cbPendingMaximum >= 64.0);
         const double issuedInstructions =
             qppu.contains(QStringLiteral("issued_instructions_estimate"))
                 ? qppu.value(
@@ -516,6 +592,53 @@ QJsonArray buildQppuConclusions(const QJsonObject& model) {
                     QStringLiteral("在时间线上核对资源压力与未发射区间是否重合。");
                 confidenceScore = 68;
                 evidencePath = pressure.path;
+            } else if (cbServiceLimited || cbArbitrationSlow) {
+                module = {QStringLiteral("cb_ctrl"),
+                          QStringLiteral("CBCtrl")};
+                title = QStringLiteral("CBCtrl 请求服务不足");
+                reason =
+                    cbArbitrationSlow
+                        ? QStringLiteral(
+                              "该 QPPU 的请求已进入 CBCtrl，但到首个寄存器读 "
+                              "uop 的等待偏长。")
+                        : QStringLiteral(
+                              "该 QPPU 的 CBCtrl 首 uop 服务量持续落后于请求量。");
+                evidence =
+                    QStringLiteral(
+                        "发射活跃 %1%，未发射 %2 周期；CBCtrl 请求 %3，"
+                        "服务率 %4%，平均/最大仲裁等待 %5/%6 周期。")
+                        .arg(issueActive, 0, 'f', 1)
+                        .arg(issueIdle, 0, 'f', 1)
+                        .arg(cbRequests, 0, 'f', 0)
+                        .arg(cbService, 0, 'f', 1)
+                        .arg(cbArbitrationAverage, 0, 'f', 1)
+                        .arg(cbArbitrationMaximum, 0, 'f', 1);
+                nextStep =
+                    QStringLiteral(
+                        "在 CBCtrl 专页按客户端和 PC 下钻；内部 eligible/"
+                        "资源模拟器未出波形时不继续猜具体仲裁原因。");
+                confidenceScore =
+                    cbArbitrationSlow ? 82 : 72;
+            } else if (cbPendingSlow) {
+                module = {QStringLiteral("cb_ctrl"),
+                          QStringLiteral("CBCtrl/CBData")};
+                title = QStringLiteral("CBCtrl Pending 完成链偏慢");
+                reason =
+                    QStringLiteral(
+                        "请求已被 CBCtrl 接收，但清除 Pending 的生命周期较长，"
+                        "限制位于 CBCtrl/CBData 完成链。");
+                evidence =
+                    QStringLiteral(
+                        "发射活跃 %1%，未发射 %2 周期；Pending 平均/最大 "
+                        "%3/%4 周期。")
+                        .arg(issueActive, 0, 'f', 1)
+                        .arg(issueIdle, 0, 'f', 1)
+                        .arg(cbPendingAverage, 0, 'f', 1)
+                        .arg(cbPendingMaximum, 0, 'f', 1);
+                nextStep =
+                    QStringLiteral(
+                        "按 Pending 清除 counter、客户端和慢 PC 检查完成链。");
+                confidenceScore = 76;
             } else if (eligibilityCovered && eligiblePercent >= 50.0) {
                 module = {QStringLiteral("backend_unknown"),
                           QStringLiteral("BE/仲裁")};
@@ -592,6 +715,30 @@ QJsonArray buildQppuConclusions(const QJsonObject& model) {
             confidenceScore = 78;
             evidenceCycles = pressure.cycles;
             evidencePath = pressure.path;
+        } else if (cbRequests >= 10.0 &&
+                   (cbServiceLimited ||
+                    (cbFirstUopCovered && cbFairness < 0.50))) {
+            state = QStringLiteral("risk");
+            severity = QStringLiteral("warning");
+            module = {QStringLiteral("cb_ctrl"),
+                      QStringLiteral("CBCtrl")};
+            title = QStringLiteral("CBCtrl QPPU 服务不均");
+            reason =
+                QStringLiteral(
+                    "该 QPPU 的 CBCtrl 服务份额低于请求份额，但当前总体"
+                    "发射活跃度尚未明显下降。");
+            evidence =
+                QStringLiteral(
+                    "发射活跃 %1%，CBCtrl 请求 %2，服务率 %3%，"
+                    "grant/demand 份额比 %4。")
+                    .arg(issueActive, 0, 'f', 1)
+                    .arg(cbRequests, 0, 'f', 0)
+                    .arg(cbService, 0, 'f', 1)
+                    .arg(cbFairness, 0, 'f', 2);
+            nextStep =
+                QStringLiteral(
+                    "作为公平性风险监控，并与请求高峰时间段对齐复核。");
+            confidenceScore = 72;
         }
 
         QJsonObject object;
@@ -1772,6 +1919,49 @@ QJsonArray buildPerformanceFindings(const QJsonObject& model) {
             qMin(999, int(highestCreditPressure))));
     }
 
+    const QJsonObject cbCtrl =
+        model.value(QStringLiteral("cb_ctrl")).toObject();
+    const QString cbCtrlStatus =
+        cbCtrl.value(QStringLiteral("status")).toString();
+    const QJsonObject cbBottleneck =
+        cbCtrl.value(QStringLiteral("bottleneck")).toObject();
+    const QString cbStage =
+        cbBottleneck.value(QStringLiteral("stage")).toString();
+    if (selectionCoverageComplete &&
+        (cbCtrlStatus == QStringLiteral("measured") ||
+         cbCtrlStatus == QStringLiteral("partial")) &&
+        !cbStage.isEmpty() && cbStage != QStringLiteral("none")) {
+        const QString confidence =
+            cbBottleneck.value(
+                QStringLiteral("confidence")).toString();
+        const bool direct =
+            cbBottleneck.value(
+                QStringLiteral("direct_evidence")).toBool();
+        findings.push_back(finding(
+            cbBottleneck.value(
+                QStringLiteral("severity")).toString(
+                    QStringLiteral("warning")),
+            QStringLiteral("cb_ctrl_bottleneck"),
+            QStringLiteral("CBCtrl 阶段瓶颈：%1")
+                .arg(cbBottleneck.value(
+                    QStringLiteral("stage_name")).toString(
+                        cbStage)),
+            cbBottleneck.value(
+                QStringLiteral("reason")).toString(),
+            cbBottleneck.value(
+                QStringLiteral("evidence")).toString(),
+            direct
+                ? QStringLiteral(
+                      "按 CBCtrl 专页的 QPPU、客户端和 PC 排名定位持续满载来源。")
+                : QStringLiteral(
+                      "先在 CBCtrl 专页核对阶段延迟和 QPPU 公平性；"
+                      "内部仲裁原因未暴露时不做更细的确定性归因。"),
+            direct ? 850
+                   : (confidence == QStringLiteral("medium")
+                          ? 500
+                          : 250)));
+    }
+
     const QJsonObject bandwidth =
         model.value(QStringLiteral("memory_bandwidth")).toObject();
     double highestBandwidth = 0.0;
@@ -1910,6 +2100,150 @@ bool performanceDiagnosisSelfTest(QString& error) {
     if (!foundCoverageFinding) {
         error = QStringLiteral(
             "partial issue coverage did not produce a coverage finding");
+        return false;
+    }
+
+    QJsonObject cbModel = model;
+    QJsonObject cbBottleneck;
+    cbBottleneck.insert(QStringLiteral("stage"),
+                        QStringLiteral("request_ingress"));
+    cbBottleneck.insert(QStringLiteral("stage_name"),
+                        QStringLiteral("请求入口"));
+    cbBottleneck.insert(QStringLiteral("severity"),
+                        QStringLiteral("critical"));
+    cbBottleneck.insert(QStringLiteral("confidence"),
+                        QStringLiteral("high"));
+    cbBottleneck.insert(QStringLiteral("direct_evidence"), true);
+    cbBottleneck.insert(
+        QStringLiteral("reason"),
+        QStringLiteral("CBCtrl 请求入口持续满载。"));
+    cbBottleneck.insert(
+        QStringLiteral("evidence"),
+        QStringLiteral("入口满率 60%，请求服务率 50%。"));
+    QJsonObject cbProfile;
+    cbProfile.insert(QStringLiteral("status"),
+                     QStringLiteral("measured"));
+    cbProfile.insert(QStringLiteral("bottleneck"),
+                     cbBottleneck);
+    cbModel.insert(QStringLiteral("cb_ctrl"), cbProfile);
+    bool foundCbFinding = false;
+    for (const QJsonValue& value :
+         buildPerformanceFindings(cbModel)) {
+        if (value.toObject()
+                .value(QStringLiteral("key")).toString() ==
+            QStringLiteral("cb_ctrl_bottleneck")) {
+            foundCbFinding = true;
+            break;
+        }
+    }
+    if (!foundCbFinding) {
+        error = QStringLiteral(
+            "CBCtrl bottleneck did not reach global findings");
+        return false;
+    }
+    QJsonObject truncatedCbModel = cbModel;
+    QJsonObject truncatedCbWorkload =
+        truncatedCbModel.value(
+            QStringLiteral("workload_profile")).toObject();
+    truncatedCbWorkload.insert(
+        QStringLiteral("selection_coverage_complete"), false);
+    truncatedCbWorkload.insert(
+        QStringLiteral("regime"), QStringLiteral("partial_selection"));
+    truncatedCbModel.insert(
+        QStringLiteral("workload_profile"), truncatedCbWorkload);
+    for (const QJsonValue& value :
+         buildPerformanceFindings(truncatedCbModel)) {
+        if (value.toObject()
+                .value(QStringLiteral("key")).toString() ==
+            QStringLiteral("cb_ctrl_bottleneck")) {
+            error = QStringLiteral(
+                "truncated selection promoted a CBCtrl bottleneck");
+            return false;
+        }
+    }
+
+    QJsonObject cbQppuModel = model;
+    QJsonObject cbSchedulerQppu = qppu;
+    cbSchedulerQppu.insert(
+        QStringLiteral("issue_coverage_complete"), true);
+    cbSchedulerQppu.insert(
+        QStringLiteral("issue_observed_cycles"), 100.0);
+    cbSchedulerQppu.insert(
+        QStringLiteral("issue_utilization_percent"), 20.0);
+    cbSchedulerQppu.insert(
+        QStringLiteral("issue_active_percent"), 20.0);
+    cbSchedulerQppu.insert(
+        QStringLiteral("issue_idle_cycles"), 80.0);
+    cbSchedulerQppu.insert(
+        QStringLiteral("active_sg_cycles"), 100.0);
+    cbSchedulerQppu.insert(
+        QStringLiteral("queue_ready_sg_cycles"), 100.0);
+    cbSchedulerQppu.insert(
+        QStringLiteral("eligible_sg_cycles"), 100.0);
+    cbSchedulerQppu.insert(
+        QStringLiteral("eligible_percent"), 100.0);
+    QJsonObject cbScheduler = scheduler;
+    cbScheduler.insert(QStringLiteral("status"),
+                       QStringLiteral("measured"));
+    cbScheduler.insert(
+        QStringLiteral("qppus"),
+        QJsonArray{cbSchedulerQppu});
+    cbQppuModel.insert(QStringLiteral("scheduler"),
+                       cbScheduler);
+    QJsonObject cbQppuEntry;
+    QString cbLogicalPath =
+        cbSchedulerQppu.value(
+            QStringLiteral("path")).toString();
+    cbLogicalPath.replace(
+        QStringLiteral(".m_QPPUTOP."),
+        QStringLiteral(".m_QPPUTOP[size=4]."));
+    cbQppuEntry.insert(
+        QStringLiteral("path"),
+        cbLogicalPath);
+    cbQppuEntry.insert(QStringLiteral("requests"), 100.0);
+    cbQppuEntry.insert(
+        QStringLiteral("service_ratio_percent"), 50.0);
+    cbQppuEntry.insert(
+        QStringLiteral("arbitration_matched"), 100.0);
+    cbQppuEntry.insert(
+        QStringLiteral("arbitration_average_cycles"), 8.0);
+    cbQppuEntry.insert(
+        QStringLiteral("arbitration_maximum_cycles"), 20.0);
+    QJsonObject cbQppuCoverage;
+    cbQppuCoverage.insert(
+        QStringLiteral("first_uop_flag_coverage_percent"),
+        100.0);
+    QJsonObject cbQppuProfile = cbProfile;
+    cbQppuProfile.insert(QStringLiteral("coverage"),
+                         cbQppuCoverage);
+    cbQppuProfile.insert(QStringLiteral("qppus"),
+                         QJsonArray{cbQppuEntry});
+    cbQppuModel.insert(QStringLiteral("cb_ctrl"),
+                       cbQppuProfile);
+    const QJsonArray cbQppuConclusions =
+        buildQppuConclusions(cbQppuModel);
+    if (cbQppuConclusions.size() != 1 ||
+        cbQppuConclusions.first().toObject()
+                .value(QStringLiteral("module_key")).toString() !=
+            QStringLiteral("cb_ctrl")) {
+        error = QStringLiteral(
+            "CBCtrl per-QPPU evidence did not refine BE attribution");
+        return false;
+    }
+    QJsonObject truncatedCbQppuModel = cbQppuModel;
+    QJsonObject truncatedCbCoverage;
+    truncatedCbCoverage.insert(
+        QStringLiteral("signal_selection_complete"), false);
+    truncatedCbQppuModel.insert(
+        QStringLiteral("coverage"), truncatedCbCoverage);
+    const QJsonArray truncatedCbQppuConclusions =
+        buildQppuConclusions(truncatedCbQppuModel);
+    if (truncatedCbQppuConclusions.size() != 1 ||
+        truncatedCbQppuConclusions.first().toObject()
+                .value(QStringLiteral("module_key")).toString() ==
+            QStringLiteral("cb_ctrl")) {
+        error = QStringLiteral(
+            "truncated selection refined per-QPPU CBCtrl attribution");
         return false;
     }
 
@@ -2311,7 +2645,8 @@ bool performanceDiagnosisSelfTest(QString& error) {
             key == QStringLiteral("scheduler_coverage") ||
             key == QStringLiteral("scheduler_block") ||
             key == QStringLiteral("issue_underfill") ||
-            key == QStringLiteral("qppu_imbalance")) {
+            key == QStringLiteral("qppu_imbalance") ||
+            key == QStringLiteral("cb_ctrl_bottleneck")) {
             error = QStringLiteral(
                 "truncated signal selection produced a false finding");
             return false;

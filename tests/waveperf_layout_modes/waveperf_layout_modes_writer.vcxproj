@@ -46,5 +46,8 @@
   <ItemGroup>
     <ClCompile Include="waveperf_layout_modes_writer.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="..\..\QtViewer\WavePerfInstructionFeatures.def" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

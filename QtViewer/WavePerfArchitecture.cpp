@@ -15,72 +15,10 @@ namespace waveperf {
 
 const QVector<InstructionFeatureSpec>& instructionFeatureSpecs() {
     static const QVector<InstructionFeatureSpec> specs = {
-        {QStringLiteral("movrel_src1_is_gr"),
-         QStringLiteral("MOVRELSrc1IsGR"),
-         QStringLiteral("movrel")},
-        {QStringLiteral("all_thread_exit"),
-         QStringLiteral("allThreadExit"),
-         QStringLiteral("runtime")},
-        {QStringLiteral("clause"), QStringLiteral("clause"),
-         QStringLiteral("bundle")},
-        {QStringLiteral("ebb"), QStringLiteral("ebb"),
-         QStringLiteral("bundle")},
-        {QStringLiteral("pc_24_bit"), QStringLiteral("is24BitPC"),
-         QStringLiteral("addressing")},
-        {QStringLiteral("barrier"), QStringLiteral("isBarrier"),
-         QStringLiteral("instruction_kind")},
-        {QStringLiteral("branch"), QStringLiteral("isBranch"),
-         QStringLiteral("instruction_kind")},
-        {QStringLiteral("exit"), QStringLiteral("isExit"),
-         QStringLiteral("instruction_kind")},
-        {QStringLiteral("flow_control"), QStringLiteral("isFlowCtrl"),
-         QStringLiteral("instruction_kind")},
-        {QStringLiteral("fence"), QStringLiteral("isFence"),
-         QStringLiteral("instruction_kind")},
-        {QStringLiteral("group_load"), QStringLiteral("isGLoad"),
-         QStringLiteral("instruction_kind")},
-        {QStringLiteral("global_memory"), QStringLiteral("isGlobalMem"),
-         QStringLiteral("memory")},
-        {QStringLiteral("ldmb"), QStringLiteral("isLDMB"),
-         QStringLiteral("memory")},
-        {QStringLiteral("ldg_stl"), QStringLiteral("isLdgStl"),
-         QStringLiteral("memory")},
-        {QStringLiteral("local_memory"), QStringLiteral("isLocalMem"),
-         QStringLiteral("memory")},
-        {QStringLiteral("mb_allocate"), QStringLiteral("isMBAllocate"),
-         QStringLiteral("memory")},
-        {QStringLiteral("mb_deallocate"),
-         QStringLiteral("isMBDeallocate"),
-         QStringLiteral("memory")},
-        {QStringLiteral("memory_barrier"),
-         QStringLiteral("isMemBarrier"),
-         QStringLiteral("memory")},
-        {QStringLiteral("pdt"), QStringLiteral("isPDT"),
-         QStringLiteral("instruction_kind")},
-        {QStringLiteral("stmb"), QStringLiteral("isSTMB"),
-         QStringLiteral("memory")},
-        {QStringLiteral("tac_umma"), QStringLiteral("isTacUmma"),
-         QStringLiteral("instruction_kind")},
-        {QStringLiteral("wait_dep_cnt"),
-         QStringLiteral("isWaitDepCnt"),
-         QStringLiteral("dependency")},
-        {QStringLiteral("relative_pc"), QStringLiteral("is_relative_pc"),
-         QStringLiteral("addressing")},
-        {QStringLiteral("movrel"), QStringLiteral("isMOVREL"),
-         QStringLiteral("instruction_kind")},
-        {QStringLiteral("needs_fast_fcu_check"),
-         QStringLiteral("needFastFcuCheck"),
-         QStringLiteral("dispatch")},
-        {QStringLiteral("no_uop"), QStringLiteral("noUop"),
-         QStringLiteral("instruction_kind")},
-        {QStringLiteral("read_dep_count_valid"),
-         QStringLiteral("rdChkDepCntVld"),
-         QStringLiteral("dependency")},
-        {QStringLiteral("to_fast_fcu"), QStringLiteral("toFastFCU"),
-         QStringLiteral("runtime")},
-        {QStringLiteral("write_dep_count_valid"),
-         QStringLiteral("wrChkDepCntVld"),
-         QStringLiteral("dependency")}
+#define WAVEPERF_INSTRUCTION_FEATURE(key, field, group) \
+        {QStringLiteral(key), QStringLiteral(field), QStringLiteral(group)},
+#include "WavePerfInstructionFeatures.def"
+#undef WAVEPERF_INSTRUCTION_FEATURE
     };
     return specs;
 }
@@ -1711,7 +1649,11 @@ ArchitectureProfile buildArchitectureProfile(const QVector<CounterView>& counter
 }
 
 bool architectureProfilerSelfTest(QString& error) {
-    if (instIssueTypeName(5) != QStringLiteral("CB") ||
+    if (instIssueTypeName(kInstIssueTypeNotIssue) !=
+            QStringLiteral("NotIssue") ||
+        instIssueClassKey(kInstIssueTypeNotIssue) !=
+            QStringLiteral("not_issue") ||
+        instIssueTypeName(5) != QStringLiteral("CB") ||
         instIssueClassKey(1) != QStringLiteral("thread") ||
         instIssueClassKey(2) != QStringLiteral("thread") ||
         instIssueClassKey(3) != QStringLiteral("group") ||

@@ -89,6 +89,17 @@ QPPU/SG 调度器：
 - outstanding、P50/P95、覆盖和置信度；
 - 带宽与延迟自测。
 
+### `WavePerfCBCtrl.cpp/.h`
+
+CBCtrl/CBData 数据通路：
+
+- 识别 CBCtrl、PPUSData 和 CBData 的真实 FIFO 端点并消除层级镜像；
+- 依据读写事件前后的指针语义提取 payload；
+- 关联请求、首 uop、EU 返回、CBData 下发/写回和 Pending 清除；
+- 按 QPPU、客户端、SG 与 PC 聚合服务率、延迟、公平性和 ChkDep 清除；
+- 发布各阶段覆盖、匹配率和保守瓶颈结论；
+- 连续事件、payload 边界和截断降级自测。
+
 ### `WavePerfDiagnosis.cpp/.h`
 
 结论层：
@@ -140,7 +151,7 @@ WVZ4 v15 directory
   -> 在覆盖完整时求全局首末发射并按业务周期对齐
   -> loadSignals(选择 ID, 实际分析范围)
   -> 每个信号按变化边界积分
-  -> issue / scheduler / resource / bandwidth / thread 事实
+  -> issue / scheduler / CBCtrl / resource / bandwidth / thread 事实
   -> architecture 递归聚合
   -> QPPU 二级结论
   -> 参与范围 workload_profile
@@ -845,13 +856,14 @@ Store 通过 store smask 排除。store mask 缺失时覆盖不完整。
 
 ## 20. JSON 模型
 
-当前 `schema_version` 为 7。主要顶层字段：
+当前 `schema_version` 为 8。主要顶层字段：
 
 - `file`
 - `analysis`
 - `coverage`
 - `summary`
 - `scheduler`
+- `cb_ctrl`
 - `sg_thread_efficiency`
 - `memory_bandwidth`
 - `resource_pressure`
@@ -873,6 +885,7 @@ summary.issue_type_signals_covered
 summary.memory_issue_signals_covered
 scheduler.summary.activity_coverage_complete
 scheduler.summary.eligibility_coverage_complete
+cb_ctrl.coverage.first_uop_flag_coverage_percent
 workload_profile.selection_coverage_complete
 workload_profile.issue_coverage_complete
 workload_profile.activity_coverage_complete
@@ -1008,6 +1021,8 @@ JSON、HTML、自测和本文。
 - Cache/FIFO 事件配对；
 - Scheduler 状态与 PC；
 - L1/L2 字节和延迟；
+- CBCtrl 连续 FIFO 事件、payload 边界、请求/uop/返回/Pending 关联；
+- CBCtrl 全局 finding、逐 QPPU 归因及 signal selection 截断门禁；
 - QPPU 局部模块诊断；
 - 单 QPPU microbenchmark 范围；
 - 稳定活动信号；
@@ -1095,7 +1110,7 @@ workload_profile.regime == partial_selection
 findings[0].key == performance_coverage
 summary.issue_activity_coverage_complete == false
 不存在 critical finding
-不存在 qppu_imbalance / memory_bandwidth / issue_underfill
+不存在 qppu_imbalance / memory_bandwidth / issue_underfill / cb_ctrl_bottleneck
 ```
 
 ### 25.6 全局首末发射范围
