@@ -12135,16 +12135,108 @@ private:
     }
 
     bool topology_fragment_batch_has_no_alias_(
-        const std::vector<std::unique_ptr<ParallelTopologyFragment> >& fragments) const {
+        const std::vector<std::unique_ptr<ParallelTopologyFragment> >& fragments,
+        const ParallelObjectRangeState* ranged_objects = NULL) const {
         std::unordered_set<ObjectKey, ObjectKeyHash> objects;
         std::unordered_set<BitfieldStorageKey, BitfieldStorageKeyHash> bitfields;
         std::unordered_set<DirtyWaveValueGroupKey, DirtyWaveValueGroupKeyHash> wave_values;
         std::unordered_set<WaveArrayBulkMarkKey, WaveArrayBulkMarkKeyHash> array_bulk;
         std::unordered_set<DirtyWaveArraySliceKey, DirtyWaveArraySliceKeyHash> array_slices;
+
+        // Validated range slots have a unique address/type-derived id for every
+        // element. Only residual objects still need cross-fragment hashing.
+        std::vector<unsigned char> ranged_slots;
+        if (ranged_objects && ranged_objects->active) {
+            ranged_slots.resize(ranged_objects->objects_per_element, 0u);
+            for (std::size_t ci = 0;
+                 ci < ranged_objects->candidates.size();
+                 ++ci) {
+                const std::size_t slot =
+                    ranged_objects->candidates[ci].object_slot;
+                if (slot >= ranged_slots.size()) return false;
+                ranged_slots[slot] = 1u;
+            }
+        }
+
+        std::size_t object_count = 0;
+        std::size_t bitfield_count = 0;
+        std::size_t wave_value_count = 0;
+        std::size_t array_bulk_count = 0;
+        std::size_t array_slice_count = 0;
         for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
-            const Tracer& fragment = *fragments[fi]->tracer;
-            for (std::size_t i = 0; i < fragment.object_created_keys_.size(); ++i) {
-                if (!objects.insert(fragment.object_created_keys_[i]).second) return false;
+            const ParallelTopologyFragment& result = *fragments[fi];
+            const Tracer& fragment = *result.tracer;
+            std::size_t fragment_object_count =
+                fragment.object_created_keys_.size();
+            if (!ranged_slots.empty()) {
+                const std::size_t ranged_count = checked_mul_for_reserve_(
+                    result.end_index - result.begin_index,
+                    ranged_objects->candidates.size());
+                if (ranged_count > fragment_object_count) return false;
+                fragment_object_count -= ranged_count;
+            }
+            object_count =
+                checked_add_for_reserve_(object_count, fragment_object_count);
+            bitfield_count = checked_add_for_reserve_(
+                bitfield_count,
+                fragment.bitfield_storage_created_keys_.size());
+            wave_value_count = checked_add_for_reserve_(
+                wave_value_count, fragment.dirty_wave_value_groups_.size());
+            array_bulk_count = checked_add_for_reserve_(
+                array_bulk_count,
+                fragment.dirty_wave_array_bulk_ranges_.size());
+            array_slice_count = checked_add_for_reserve_(
+                array_slice_count,
+                fragment.dirty_wave_array_bulk_ranges_.size());
+        }
+        objects.reserve(object_count);
+        bitfields.reserve(bitfield_count);
+        wave_values.reserve(wave_value_count);
+        array_bulk.reserve(array_bulk_count);
+        array_slices.reserve(array_slice_count);
+
+        for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+            const ParallelTopologyFragment& result = *fragments[fi];
+            const Tracer& fragment = *result.tracer;
+            if (ranged_slots.empty()) {
+                for (std::size_t i = 0;
+                     i < fragment.object_created_keys_.size();
+                     ++i) {
+                    if (!objects.insert(fragment.object_created_keys_[i]).second) {
+                        return false;
+                    }
+                }
+            } else {
+                const std::size_t element_count =
+                    result.end_index - result.begin_index;
+                if (result.element_object_offsets.size() !=
+                    element_count + 1u) {
+                    return false;
+                }
+                for (std::size_t element = 0;
+                     element < element_count;
+                     ++element) {
+                    const std::size_t object_begin =
+                        result.element_object_offsets[element];
+                    const std::size_t object_end =
+                        result.element_object_offsets[element + 1u];
+                    if (object_end < object_begin ||
+                        object_end - object_begin != ranged_slots.size() ||
+                        object_end > fragment.objects_.size()) {
+                        return false;
+                    }
+                    for (std::size_t object_index = object_begin;
+                         object_index < object_end;
+                         ++object_index) {
+                        const std::size_t slot =
+                            object_index - object_begin;
+                        if (ranged_slots[slot] != 0u) continue;
+                        if (!objects.insert(
+                                fragment.objects_[object_index].key).second) {
+                            return false;
+                        }
+                    }
+                }
             }
             for (std::size_t i = 0; i < fragment.bitfield_storage_created_keys_.size(); ++i) {
                 if (!bitfields.insert(fragment.bitfield_storage_created_keys_[i]).second) return false;
@@ -12569,15 +12661,23 @@ private:
                 (!had_dirty_peek_blocks || dirty_peek_memory_blocks_complete_) &&
                 fragment.dirty_peek_memory_blocks_complete_;
         }
-        const std::size_t required_cursor_ranges = result.track_base +
-            fragment.dirty_peek_storage_cursor_ranges_.size();
-        if (dirty_peek_storage_cursor_ranges_.size() < required_cursor_ranges) {
-            dirty_peek_storage_cursor_ranges_.resize(required_cursor_ranges);
-        }
-        for (std::size_t local_id = 1; local_id < fragment.dirty_peek_storage_cursor_ranges_.size(); ++local_id) {
-            if (fragment.dirty_peek_storage_cursor_ranges_[local_id].valid) {
-                dirty_peek_storage_cursor_ranges_[result.track_base + local_id] =
-                    fragment.dirty_peek_storage_cursor_ranges_[local_id];
+        if (!fragment.dirty_peek_storage_cursor_ranges_.empty()) {
+            const std::size_t required_cursor_ranges = result.track_base +
+                fragment.dirty_peek_storage_cursor_ranges_.size();
+            if (dirty_peek_storage_cursor_ranges_.size() <
+                required_cursor_ranges) {
+                dirty_peek_storage_cursor_ranges_.resize(
+                    required_cursor_ranges);
+            }
+            for (std::size_t local_id = 1;
+                 local_id <
+                     fragment.dirty_peek_storage_cursor_ranges_.size();
+                 ++local_id) {
+                if (fragment.dirty_peek_storage_cursor_ranges_[local_id].valid) {
+                    dirty_peek_storage_cursor_ranges_[
+                        result.track_base + local_id] =
+                        fragment.dirty_peek_storage_cursor_ranges_[local_id];
+                }
             }
         }
         append_fragment_vector_(dirty_peek_groups_, fragment.dirty_peek_groups_);
@@ -12833,18 +12933,77 @@ private:
         reserve_parallel_batch_vector_(dirty_wave_array_memory_shadow_bytes_, add_dirty_wave_array_shadow);
     }
 
-    void append_remapped_topology_fragment_(ParallelTopologyFragment& result, NodeId parent_id) {
+    void append_remapped_topology_fragment_(
+        ParallelTopologyFragment& result,
+        NodeId parent_id,
+        const ParallelObjectRangeState* ranged_objects = NULL) {
         Tracer& fragment = *result.tracer;
         const std::size_t object_begin = objects_.size();
         append_fragment_vector_without_sentinel_(objects_, fragment.objects_);
-        for (std::size_t i = object_begin; i < objects_.size(); ++i) {
-            ObjectId ranged_id = 0;
-            if (find_object_array_range_id_(objects_[i].key, ranged_id) &&
-                ranged_id == objects_[i].id) {
-                continue;
+
+        // Range objects are already represented by object_array_ranges_; keep
+        // only residual objects in the general lookup and created-key tables.
+        std::vector<unsigned char> ranged_slots;
+        if (ranged_objects && ranged_objects->active) {
+            ranged_slots.resize(ranged_objects->objects_per_element, 0u);
+            for (std::size_t ci = 0;
+                 ci < ranged_objects->candidates.size();
+                 ++ci) {
+                const std::size_t slot =
+                    ranged_objects->candidates[ci].object_slot;
+                if (slot >= ranged_slots.size()) {
+                    throw std::logic_error(
+                        "WaveTrace parallel ranged object slot is invalid during append");
+                }
+                ranged_slots[slot] = 1u;
             }
-            object_id_by_key_.insert(std::make_pair(objects_[i].key, objects_[i].id));
-            object_created_keys_.push_back(objects_[i].key);
+        }
+
+        if (ranged_slots.empty()) {
+            for (std::size_t i = object_begin; i < objects_.size(); ++i) {
+                ObjectId ranged_id = 0;
+                if (find_object_array_range_id_(objects_[i].key, ranged_id) &&
+                    ranged_id == objects_[i].id) {
+                    continue;
+                }
+                object_id_by_key_.insert(
+                    std::make_pair(objects_[i].key, objects_[i].id));
+                object_created_keys_.push_back(objects_[i].key);
+            }
+        } else {
+            const std::size_t element_count =
+                result.end_index - result.begin_index;
+            if (result.element_object_offsets.size() !=
+                element_count + 1u) {
+                throw std::logic_error(
+                    "WaveTrace parallel object offsets changed during append");
+            }
+            for (std::size_t element = 0;
+                 element < element_count;
+                 ++element) {
+                const std::size_t local_begin =
+                    result.element_object_offsets[element];
+                const std::size_t local_end =
+                    result.element_object_offsets[element + 1u];
+                if (local_end < local_begin ||
+                    local_end - local_begin != ranged_slots.size() ||
+                    local_end > fragment.objects_.size()) {
+                    throw std::logic_error(
+                        "WaveTrace parallel ranged object layout changed during append");
+                }
+                for (std::size_t local_index = local_begin;
+                     local_index < local_end;
+                     ++local_index) {
+                    const std::size_t slot = local_index - local_begin;
+                    if (ranged_slots[slot] != 0u) continue;
+                    const std::size_t merged_index =
+                        object_begin + local_index - 1u;
+                    ObjectEntry& object = objects_[merged_index];
+                    object_id_by_key_.insert(
+                        std::make_pair(object.key, object.id));
+                    object_created_keys_.push_back(object.key);
+                }
+            }
         }
         append_fragment_vector_without_sentinel_(nodes_, fragment.nodes_);
         if (parent_id != 0) {
@@ -13020,8 +13179,10 @@ private:
             values.size(), checked_mul_for_reserve_(expected_add, headroom_multiplier)));
     }
 
-    void reserve_repeated_topology_from_first_(const RepeatedTopologyCapacitySnapshot& before,
-                                               std::size_t remaining_elements) {
+    void reserve_repeated_topology_from_first_(
+        const RepeatedTopologyCapacitySnapshot& before,
+        std::size_t remaining_elements,
+        std::size_t ranged_objects_per_element) {
         if (!options_.enable_wave_ptr_array_batch_reserve || remaining_elements == 0) return;
 
         reserve_repeated_vector_delta_(nodes_, before.nodes, remaining_elements);
@@ -13030,7 +13191,24 @@ private:
         reserve_repeated_vector_delta_(scalar_getter_storage_, before.scalar_getter_storage, remaining_elements);
         reserve_repeated_vector_delta_(bitfield_storage_created_keys_, before.bitfield_storage_created_keys, remaining_elements);
         reserve_repeated_vector_delta_(objects_, before.objects, remaining_elements);
-        reserve_repeated_vector_delta_(object_created_keys_, before.object_created_keys, remaining_elements);
+        const std::size_t created_keys_per_element =
+            object_created_keys_.size() > before.object_created_keys
+                ? object_created_keys_.size() -
+                      before.object_created_keys
+                : 0u;
+        const std::size_t residual_created_keys_per_element =
+            created_keys_per_element > ranged_objects_per_element
+                ? created_keys_per_element -
+                      ranged_objects_per_element
+                : 0u;
+        if (residual_created_keys_per_element != 0u) {
+            object_created_keys_.reserve(
+                checked_append_reserve_target_(
+                    object_created_keys_.size(),
+                    checked_mul_for_reserve_(
+                        remaining_elements,
+                        residual_created_keys_per_element)));
+        }
         reserve_repeated_vector_delta_(lazy_value_watches_, before.lazy_value_watches, remaining_elements);
         reserve_repeated_vector_delta_(all_track_ids_, before.all_track_ids, remaining_elements);
         reserve_repeated_vector_delta_(parallel_track_ids_, before.parallel_track_ids, remaining_elements);
@@ -13047,7 +13225,24 @@ private:
         // Match the old proven lookup load: object keys were one-per-reserved
         // object, while storage and dirty hot maps kept two buckets of demand
         // per observed element.
-        reserve_repeated_hash_delta_(object_id_by_key_, before.object_id_by_key, remaining_elements, 1u);
+        const std::size_t object_keys_per_element =
+            object_id_by_key_.size() > before.object_id_by_key
+                ? object_id_by_key_.size() -
+                      before.object_id_by_key
+                : 0u;
+        const std::size_t residual_object_keys_per_element =
+            object_keys_per_element > ranged_objects_per_element
+                ? object_keys_per_element -
+                      ranged_objects_per_element
+                : 0u;
+        if (residual_object_keys_per_element != 0u) {
+            object_id_by_key_.reserve(
+                checked_append_reserve_target_(
+                    object_id_by_key_.size(),
+                    checked_mul_for_reserve_(
+                        remaining_elements,
+                        residual_object_keys_per_element)));
+        }
         reserve_repeated_hash_delta_(bitfield_storage_by_key_, before.bitfield_storage_by_key, remaining_elements, 2u);
         reserve_repeated_hash_delta_(dirty_wave_value_group_by_key_, before.dirty_wave_value_group_by_key, remaining_elements, 2u);
         reserve_repeated_hash_delta_(dirty_wave_array_slice_by_key_, before.dirty_wave_array_slice_by_key, remaining_elements, 2u);
@@ -13268,7 +13463,7 @@ private:
             rollback_topology_to(cp);
             return 0;
         }
-        WaveDirtyHook* const dirty_hook =
+        WaveDirtyHook* dirty_hook =
             capture_dirty_group ? hook_reader() : static_cast<WaveDirtyHook*>(NULL);
         if (runtime_object->canonical_runtime_subtree_id != 0) {
             const NodeDesc* canonical =
@@ -13282,7 +13477,9 @@ private:
                     reference->reference_target_id =
                         compact_topology_id_(canonical->id, "reference target node id");
                 }
-                if (capture_dirty_group) {
+                if (capture_dirty_group ||
+                    runtime_object->dirty_peek_group_id != kInvalidIndex) {
+                    if (!dirty_hook) dirty_hook = hook_reader();
                     const std::uint32_t alias_group_id =
                         get_or_create_dirty_peek_group(
                             runtime_object, dirty_hook, object_ptr, type_tag, byte_width);
@@ -15933,6 +16130,49 @@ private:
         return true;
     }
 
+    void right_size_parallel_object_lookup_(
+        const ParallelObjectRangeState& state,
+        std::size_t remaining_elements) {
+        if (!state.active ||
+            options_.root_expand_reserve_objects != 0u ||
+            state.candidates.size() > state.objects_per_element) {
+            return;
+        }
+        const std::size_t residual_per_element =
+            state.objects_per_element - state.candidates.size();
+        const std::size_t expected_residual = checked_mul_for_reserve_(
+            remaining_elements, residual_per_element);
+        const std::size_t expected_keys = checked_add_for_reserve_(
+            object_id_by_key_.size(), expected_residual);
+        const double current_capacity =
+            static_cast<double>(object_id_by_key_.bucket_count()) *
+            static_cast<double>(object_id_by_key_.max_load_factor());
+        // MSVC's unordered_map::rehash does not reliably shrink this table, so
+        // rebuild after fixed ranges make the first-element reserve excessive.
+        if (static_cast<double>(expected_keys) * 2.0 <
+            current_capacity) {
+            std::unordered_map<ObjectKey, ObjectId, ObjectKeyHash> compact;
+            compact.max_load_factor(object_id_by_key_.max_load_factor());
+            compact.reserve(expected_keys);
+            compact.insert(
+                object_id_by_key_.begin(), object_id_by_key_.end());
+            object_id_by_key_.swap(compact);
+        }
+
+        const std::size_t expected_created_keys =
+            checked_add_for_reserve_(
+                object_created_keys_.size(), expected_residual);
+        if (expected_created_keys <
+                object_created_keys_.capacity() / 2u) {
+            std::vector<ObjectKey> compact;
+            compact.reserve(expected_created_keys);
+            compact.assign(
+                object_created_keys_.begin(),
+                object_created_keys_.end());
+            object_created_keys_.swap(compact);
+        }
+    }
+
     template <typename CleanPointee>
     std::size_t register_parallel_fragment_object_ranges_(
         Tracer& fragment,
@@ -16145,6 +16385,8 @@ private:
         ParallelObjectRangeState object_range_state;
         initialize_parallel_object_range_state_(
             object_range_state, target, objects_per_element);
+        right_size_parallel_object_lookup_(
+            object_range_state, end - begin);
 
         for (std::size_t batch_begin = begin; batch_begin < end; ) {
             const std::size_t remaining = end - batch_begin;
@@ -16222,7 +16464,11 @@ private:
             if (!batch_uses_object_ranges) {
                 object_range_state.active = false;
             }
-            if (!topology_fragment_batch_has_no_alias_(fragments)) {
+            if (!topology_fragment_batch_has_no_alias_(
+                    fragments,
+                    batch_uses_object_ranges
+                        ? &object_range_state
+                        : static_cast<const ParallelObjectRangeState*>(NULL))) {
                 throw std::logic_error(
                     std::string("WaveTrace parallel topology alias conflict for batch [") +
                     detail::to_string_unsigned(batch_begin) + "," +
@@ -16320,7 +16566,12 @@ private:
                     batch_begin + batch_count);
             }
             for (std::size_t t = 0; t < fragments.size(); ++t) {
-                append_remapped_topology_fragment_(*fragments[t], node_id);
+                append_remapped_topology_fragment_(
+                    *fragments[t],
+                    node_id,
+                    batch_uses_object_ranges
+                        ? &object_range_state
+                        : static_cast<const ParallelObjectRangeState*>(NULL));
                 parallel_topology_expanded_elements_ += fragments[t]->end_index - fragments[t]->begin_index;
             }
             finalize_parallel_dirty_metadata_merge_(
@@ -16417,17 +16668,12 @@ private:
                 node_id, target, 0u, declared_count);
             return true;
         }
-#if !defined(WAVE_RUNTIME_BENCH_LEGACY_WAVE_PTR_ARRAY_RESERVE)
-        if (declared_count > 1u) {
-            reserve_repeated_topology_from_first_(capacity_before, declared_count - 1u);
-        }
-#endif
-
         const std::size_t first_element_nodes = nodes_.size() - first_nodes_before;
         const std::size_t first_element_tracks = tracks_.size() - first_tracks_before;
         const std::size_t first_element_objects = objects_.size() - first_objects_before;
 
         std::size_t object_range_index = static_cast<std::size_t>(-1);
+        std::size_t ranged_objects_per_element = 0u;
         const reflect::TopologyTypeEstimate generated_estimate =
             reflect::topology_type_estimate<CleanPointee>::get();
         if (generated_estimate.fixed_extent && !generated_estimate.dynamic_extent &&
@@ -16442,12 +16688,22 @@ private:
                 const std::size_t range_index = register_object_array_range_(
                     object.key.address, object.key.type_tag, sizeof(CleanPointee), declared_count,
                     object.id, first_element_objects);
+                ++ranged_objects_per_element;
                 if (object.key.address == detail::pointer_address(target) &&
                     object.key.type_tag == pointee_type_tag) {
                     object_range_index = range_index;
                 }
             }
         }
+
+#if !defined(WAVE_RUNTIME_BENCH_LEGACY_WAVE_PTR_ARRAY_RESERVE)
+        if (declared_count > 1u) {
+            reserve_repeated_topology_from_first_(
+                capacity_before,
+                declared_count - 1u,
+                ranged_objects_per_element);
+        }
+#endif
 
         if (try_clone_fixed_repeated_topology_<CleanPointee>(
                 node_id, target, declared_count, first_cp,
@@ -16561,7 +16817,8 @@ private:
 #if !defined(WAVE_RUNTIME_BENCH_LEGACY_WAVE_PTR_ARRAY_RESERVE)
             } else if (i == 0 && traced_count > 1 &&
                        (reflect::is_reflected<CleanPointee>::value || dynamic_ops.reflected)) {
-                reserve_repeated_topology_from_first_(capacity_before, traced_count - 1u);
+                reserve_repeated_topology_from_first_(
+                    capacity_before, traced_count - 1u, 0u);
 #endif
             }
         }

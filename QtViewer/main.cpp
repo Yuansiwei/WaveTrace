@@ -2029,6 +2029,66 @@ static int runSignalConditionSearchBenchmark(QApplication& app,
     return statusText.startsWith(QStringLiteral("完成：")) ? 0 : 7;
 }
 
+static int runTreeReferenceSearchBenchmark(QApplication& app,
+                                           const QStringList& args) {
+    if (args.size() < 4) return 2;
+    const int settleMs =
+        args.size() >= 5 ? qBound(50, args.at(4).toInt(), 60000) : 1500;
+
+    MainWindow window;
+    window.resize(1600, 800);
+    window.show();
+    if (!window.openWaveFilePath(args.at(2), false)) return 3;
+
+    QTreeView* tree =
+        window.findChild<QTreeView*>(QStringLiteral("signalTree"));
+    QLineEdit* search =
+        window.findChild<QLineEdit*>(QStringLiteral("signalTreeSearch"));
+    if (!tree || !search || !tree->model()) return 4;
+
+    search->setText(args.at(3));
+    QMetaObject::invokeMethod(search, "returnPressed", Qt::DirectConnection);
+    processEventsFor(app, settleMs);
+
+    const QAbstractItemModel* model = tree->model();
+    struct PendingIndex {
+        QModelIndex parent;
+        int depth = 0;
+    };
+    QVector<PendingIndex> pending;
+    pending.push_back(PendingIndex{QModelIndex(), 0});
+    qint64 visibleNodes = 0;
+    int maxDepth = 0;
+    const qint64 traversalLimit = 100000;
+    while (!pending.isEmpty() && visibleNodes < traversalLimit) {
+        const PendingIndex current = pending.takeLast();
+        const int rows = model->rowCount(current.parent);
+        for (int row = 0; row < rows && visibleNodes < traversalLimit; ++row) {
+            const QModelIndex child = model->index(row, 0, current.parent);
+            if (!child.isValid()) continue;
+            ++visibleNodes;
+            maxDepth = qMax(maxDepth, current.depth + 1);
+            if (model->hasChildren(child)) {
+                pending.push_back(PendingIndex{child, current.depth + 1});
+            }
+        }
+    }
+
+    QTextStream out(stdout);
+    out << "tree_reference_search,query," << csvField(args.at(3))
+        << ",settle_ms," << settleMs
+        << ",visible_nodes," << visibleNodes
+        << ",max_depth," << maxDepth
+        << ",query_retained,"
+        << (search->text() == args.at(3) ? 1 : 0)
+        << '\n';
+    out.flush();
+    return visibleNodes > 0 && visibleNodes < traversalLimit &&
+                   search->text() == args.at(3)
+        ? 0
+        : 5;
+}
+
 int main(int argc, char *argv[]) {
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
     QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
@@ -2073,6 +2133,10 @@ int main(int argc, char *argv[]) {
     if (args.size() >= 2 &&
         args.at(1) == QStringLiteral("--signal-condition-search-benchmark")) {
         return runSignalConditionSearchBenchmark(a, args);
+    }
+    if (args.size() >= 2 &&
+        args.at(1) == QStringLiteral("--tree-reference-search-benchmark")) {
+        return runTreeReferenceSearchBenchmark(a, args);
     }
 
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--value-find-benchmark")) {

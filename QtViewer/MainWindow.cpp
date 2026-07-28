@@ -2999,6 +2999,7 @@ public:
         beginResetModel();
         m_tree = tree;
         m_searchMode = false;
+        m_searchNodeIds.clear();
         clearSearchStorage();
         rebuildRowCache();
         endResetModel();
@@ -3007,44 +3008,9 @@ public:
     void setSearchRoots(const QVector<int>& nodeIds) {
         beginResetModel();
         m_searchMode = true;
+        m_searchNodeIds = nodeIds;
         clearSearchStorage();
-
-        if (m_tree) {
-            const int n = m_tree->nodeCount();
-            m_searchVisible.resize(n);
-            std::fill(m_searchVisible.begin(), m_searchVisible.end(), uchar(0));
-
-            // Search mode must still display the original tree structure.  Mark
-            // every matched node plus all of its ancestors as visible, then build
-            // filtered child lists that preserve WVZ4 NODE order.
-            for (int nodeId : nodeIds) {
-                if (!isValidNode(nodeId)) continue;
-                markNodeAndAncestorsVisible(nodeId);
-
-                // If the matched item is a module/container node, expose its
-                // filtered subtree as well.  Searching a module name should let
-                // the user expand that module and see/select its members, not
-                // leave a dead branch with no children.
-                if (m_tree->nodeSignalIndex(nodeId) < 0) {
-                    markSubtreeVisible(nodeId);
-                }
-            }
-
-            m_searchRowByNodeId.resize(n);
-            std::fill(m_searchRowByNodeId.begin(), m_searchRowByNodeId.end(), -1);
-
-            for (int row = 0; row < m_tree->roots.size(); ++row) {
-                const int rootNodeId = m_tree->roots[row];
-                if (!isSearchVisibleNode(rootNodeId)) continue;
-                const int visibleRow = m_searchRootRows.size();
-                m_searchRootRows.push_back(rootNodeId);
-                if (rootNodeId >= 0 && rootNodeId < m_searchRowByNodeId.size()) {
-                    m_searchRowByNodeId[rootNodeId] = visibleRow;
-                }
-                buildSearchChildren(rootNodeId);
-            }
-        }
-
+        rebuildSearchStorage();
         endResetModel();
     }
 
@@ -3052,6 +3018,7 @@ public:
         if (!m_searchMode) return;
         beginResetModel();
         m_searchMode = false;
+        m_searchNodeIds.clear();
         clearSearchStorage();
         endResetModel();
     }
@@ -3235,7 +3202,7 @@ public:
             const bool ok = applyWaveSubtreeReferencePatch(tree, patch, error);
             m_tree->invalidateWaveChildList(patch.mountNodeId);
             clearSearchStorage();
-            m_searchMode = false;
+            rebuildSearchStorage();
             endResetModel();
             return ok;
         }
@@ -3253,9 +3220,67 @@ public:
         return ok;
     }
 
+    bool installReferencePatches(
+        WaveTreeInfo& tree,
+        const QVector<WaveSubtreeReferencePatch>& patches,
+        QString& error) {
+        if (!m_searchMode) {
+            for (const WaveSubtreeReferencePatch& patch : patches) {
+                if (!installReferencePatch(tree, patch, error)) return false;
+            }
+            return true;
+        }
+
+        beginResetModel();
+        bool ok = true;
+        for (const WaveSubtreeReferencePatch& patch : patches) {
+            if (!m_tree || !m_tree->isValidNodeId(patch.mountNodeId)) {
+                error = QStringLiteral(
+                    "Reference mount is no longer present in the tree");
+                ok = false;
+                break;
+            }
+            if (!m_tree->isPendingReference(patch.mountNodeId)) continue;
+
+            int encodedChild = patch.mountNode.firstChild;
+            int guard = 0;
+            while (encodedChild < 0 &&
+                   guard++ <= patch.appendedNodes.size()) {
+                const int localIndex = -encodedChild - 1;
+                if (localIndex < 0 ||
+                    localIndex >= patch.appendedNodes.size()) {
+                    error = QStringLiteral(
+                        "Reference patch contains an invalid child id");
+                    ok = false;
+                    break;
+                }
+                encodedChild =
+                    patch.appendedNodes.at(localIndex).nextSibling;
+            }
+            if (!ok) break;
+            if (encodedChild != 0) {
+                error = QStringLiteral(
+                    "Reference patch contains a non-local child id");
+                ok = false;
+                break;
+            }
+
+            if (!applyWaveSubtreeReferencePatch(tree, patch, error)) {
+                ok = false;
+                break;
+            }
+            m_tree->invalidateWaveChildList(patch.mountNodeId);
+        }
+        clearSearchStorage();
+        rebuildSearchStorage();
+        endResetModel();
+        return ok;
+    }
+
 private:
     SignalLogicTree* m_tree = nullptr;
     bool m_searchMode = false;
+    QVector<int> m_searchNodeIds;
     SmallVec32<int, 32> m_searchRootRows;
     std::unordered_map<int, std::unique_ptr<SmallVec32<int, 32>>> m_searchChildren;
     QVector<int> m_searchRowByNodeId;
@@ -3301,6 +3326,38 @@ private:
         m_searchRowByNodeId.clear();
         m_searchVisible.clear();
         m_searchSubtreeComplete.clear();
+    }
+
+    void rebuildSearchStorage() {
+        if (!m_tree) return;
+
+        const int n = m_tree->nodeCount();
+        m_searchVisible.resize(n);
+        std::fill(m_searchVisible.begin(), m_searchVisible.end(), uchar(0));
+
+        // Search mode still displays the original tree structure. Mark every
+        // matched node plus its ancestors, and expose matched module subtrees.
+        for (int nodeId : m_searchNodeIds) {
+            if (!isValidNode(nodeId)) continue;
+            markNodeAndAncestorsVisible(nodeId);
+            if (m_tree->nodeSignalIndex(nodeId) < 0) {
+                markSubtreeVisible(nodeId);
+            }
+        }
+
+        m_searchRowByNodeId.resize(n);
+        std::fill(m_searchRowByNodeId.begin(), m_searchRowByNodeId.end(), -1);
+
+        for (int row = 0; row < m_tree->roots.size(); ++row) {
+            const int rootNodeId = m_tree->roots[row];
+            if (!isSearchVisibleNode(rootNodeId)) continue;
+            const int visibleRow = m_searchRootRows.size();
+            m_searchRootRows.push_back(rootNodeId);
+            if (rootNodeId >= 0 && rootNodeId < m_searchRowByNodeId.size()) {
+                m_searchRowByNodeId[rootNodeId] = visibleRow;
+            }
+            buildSearchChildren(rootNodeId);
+        }
     }
 
     void markNodeAndAncestorsVisible(int nodeId) {
@@ -4854,6 +4911,7 @@ void MainWindow::buildUi() {
     leftLayout->addWidget(leftTitle);
 
     m_treeSearchEdit = new QLineEdit(leftPane);
+    m_treeSearchEdit->setObjectName(QStringLiteral("signalTreeSearch"));
     m_treeSearchEdit->setPlaceholderText(QString::fromUtf8("搜索层级名 / 信号名"));
     m_treeSearchEdit->setMinimumWidth(0);
     auto* treeSearchRow = new QHBoxLayout();
@@ -9397,19 +9455,17 @@ void MainWindow::scheduleTreeWarmup() {
                             SignalTreeModel* model =
                                 signalTreeModelFrom(m_treeModel);
                             QString patchError;
-                            for (const WaveSubtreeReferencePatch& patch :
-                                 posted->patches) {
-                                if (!model ||
-                                    !model->installReferencePatch(
-                                        m_wave.tree, patch, patchError)) {
-                                    if (!patchError.isEmpty()) {
-                                        statusBar()->showMessage(
-                                            QStringLiteral(
-                                                "Tree reference load failed: %1")
-                                                .arg(patchError),
-                                            5000);
-                                    }
-                                    break;
+                            if (!model ||
+                                !model->installReferencePatches(
+                                    m_wave.tree,
+                                    posted->patches,
+                                    patchError)) {
+                                if (!patchError.isEmpty()) {
+                                    statusBar()->showMessage(
+                                        QStringLiteral(
+                                            "Tree reference load failed: %1")
+                                            .arg(patchError),
+                                        5000);
                                 }
                             }
                             if (m_tree) m_tree->viewport()->update();
@@ -9537,6 +9593,13 @@ void MainWindow::scheduleTreeWarmup() {
                     m_signalTreeModel->installWaveWarmup(
                         std::move(result->childLists),
                         std::move(result->nameStrings));
+                    const QString treeSearchQuery =
+                        m_treeSearchEdit
+                            ? m_treeSearchEdit->text().trimmed()
+                            : QString();
+                    if (!treeSearchQuery.isEmpty()) {
+                        showTreeSearchResults(treeSearchQuery);
+                    }
                     if (viewerPerfLogEnabled()) {
                         viewerPerfLog(
                             "tree.warmup", result->elapsedMs,

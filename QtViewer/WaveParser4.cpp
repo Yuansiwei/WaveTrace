@@ -668,6 +668,7 @@ bool parseNodeReferenceSection(const QByteArray& payload,
 
 bool parseCompactNodeReferenceSection(const QByteArray& payload,
                                       QVector<NodeRec>& nodesById,
+                                      u32 formatVersion,
                                       QString& error) {
     SpanReader r(payload);
     u64 count = 0;
@@ -689,13 +690,14 @@ bool parseCompactNodeReferenceSection(const QByteArray& payload,
             error = QStringLiteral("WVZ4 NODI: malformed compact node record");
             return false;
         }
+        if (!isValidNodeKind(kind) ||
+            (kind == kNodeKindReference && formatVersion < 16)) {
+            error = QStringLiteral("WVZ4 NODI: invalid NodeKind for node_id %1").arg(id64);
+            return false;
+        }
         u64 referenceBack = 0;
         if (kind == kNodeKindReference && !r.readVarUInt(referenceBack)) {
             error = QStringLiteral("WVZ4 NODI: malformed subtree reference");
-            return false;
-        }
-        if (!isValidNodeKind(kind)) {
-            error = QStringLiteral("WVZ4 NODI: invalid NodeKind for node_id %1").arg(id64);
             return false;
         }
         const bool isArrayIndex = (nameRef & 1u) != 0;
@@ -761,6 +763,7 @@ bool parseCompactNodeReferenceSection(const QByteArray& payload,
 
 bool parseCompactNodeTreeSection(const QByteArray& payload,
                                  WaveTreeInfo& tree,
+                                 u32 formatVersion,
                                  QString& error) {
     SpanReader r(payload);
     u64 count = 0;
@@ -793,13 +796,14 @@ bool parseCompactNodeTreeSection(const QByteArray& payload,
             error = QStringLiteral("WVZ4 NODI: malformed compact node record");
             return false;
         }
+        if (!isValidNodeKind(kind) ||
+            (kind == kNodeKindReference && formatVersion < 16)) {
+            error = QStringLiteral("WVZ4 NODI: invalid NodeKind for node_id %1").arg(id64);
+            return false;
+        }
         u64 referenceBack = 0;
         if (kind == kNodeKindReference && !r.readVarUInt(referenceBack)) {
             error = QStringLiteral("WVZ4 NODI: malformed subtree reference");
-            return false;
-        }
-        if (!isValidNodeKind(kind)) {
-            error = QStringLiteral("WVZ4 NODI: invalid NodeKind for node_id %1").arg(id64);
             return false;
         }
         if (parentBack >= id64 ||
@@ -4701,7 +4705,10 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
                 error = QStringLiteral("WVZ4 contains duplicate NODI layout sections");
                 return false;
             }
-            if (!parseCompactNodeTreeSection(payload, next->directoryWave.tree, error)) return false;
+            if (!parseCompactNodeTreeSection(
+                    payload, next->directoryWave.tree, version, error)) {
+                return false;
+            }
             haveNodeLayout = true;
         } else if (sh.tag == "NIZ2") {
             const QByteArray raw = decodeCompressedLayoutPayload(payload, "NIZ2", error);
@@ -4710,7 +4717,10 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
                 error = QStringLiteral("WVZ4 contains duplicate NODI layout sections");
                 return false;
             }
-            if (!parseCompactNodeTreeSection(raw, next->directoryWave.tree, error)) return false;
+            if (!parseCompactNodeTreeSection(
+                    raw, next->directoryWave.tree, version, error)) {
+                return false;
+            }
             haveNodeLayout = true;
         } else if (sh.tag == "SIGD") {
             if (haveSignalLayout) {
@@ -5666,12 +5676,12 @@ bool WaveParser4::loadFromFile(const QString& filePath,
     Q_UNUSED(blockSpan);
 
     // On-demand WVZ4 sample load only needs SIGT plus WDAT. NAME/NAMZ and the
-    // v15 NREF/NODI node layouts are skipped instead of reparsed on every click,
+    // v15-v16 NREF/NODI node layouts are skipped instead of reparsed on every click,
     // which made selecting a signal appear stuck on large metadata-heavy files.
     const bool sampleOnlyLoad = !options.includeAllSignalDefinitions && !options.signalIds.isEmpty();
 
     if (!isSupportedFormatVersion(version)) {
-        error = QStringLiteral("不支持的 WVZ4 版本：%1（此 Viewer 仅支持 v15）").arg(version);
+        error = QStringLiteral("不支持的 WVZ4 版本：%1（此 Viewer 支持 v15-v16）").arg(version);
         return false;
     }
     if (headerSize < 64 || headerSize > u32(file.size())) {
@@ -6054,11 +6064,17 @@ bool WaveParser4::loadFromFile(const QString& filePath,
             if (!error.isEmpty()) return false;
             if (!parseNodeReferenceSection(raw, nodesById, error)) return false;
         } else if (sh.tag == "NODI") {
-            if (!parseCompactNodeReferenceSection(payload, nodesById, error)) return false;
+            if (!parseCompactNodeReferenceSection(
+                    payload, nodesById, version, error)) {
+                return false;
+            }
         } else if (sh.tag == "NIZ2") {
             const QByteArray raw = decodeCompressedLayoutPayload(payload, "NIZ2", error);
             if (!error.isEmpty()) return false;
-            if (!parseCompactNodeReferenceSection(raw, nodesById, error)) return false;
+            if (!parseCompactNodeReferenceSection(
+                    raw, nodesById, version, error)) {
+                return false;
+            }
         } else if (sh.tag == "SIGT") {
             if (!parseSignalSection(payload, sigs, error)) return false;
         } else if (sh.tag == "SIGZ") {

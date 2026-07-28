@@ -179,7 +179,13 @@ Repeated `peek()` pointers are grouped by:
 peek address + reflected/type tag + byte width -> dirty group id
 ```
 
-Different waveform paths that point to the same `peek()` address still generate their own leaves/signals. They only share the same dirty group id. When any alias writes the underlying object, the dirty hook marks the whole group dirty; sampling then updates all leaves belonging to that group.
+WVZ4 v16 stores repeated runtime-erased `DynamicTraceTarget` or
+`PeekTraceSource` objects as one canonical subtree plus reference nodes.
+Those reference paths reuse the canonical signals and dirty group. Every alias
+hook is bound to that group so a write through any exposed interface schedules
+the shared physical storage. Other value-source forms that are not runtime
+subtree references can still own separate logical leaves while sharing a dirty
+group.
 
 ### Runtime structure
 

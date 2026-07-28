@@ -306,12 +306,12 @@ flat:   FIFO read/write 2/4, Cache hit/miss 2/1
 
 ## 7. 已知边界
 
-1. 当前只支持 WVZ4 v15。
+1. 当前只支持 WVZ4 v15-v16。
 2. CBCtrl 内部 arbiter 的 eligible/block reason 未出现在现有波形，不能报告
    更细的确定性仲裁原因。
 3. 阶段延迟按指令身份和 FIFO 顺序关联，不等价于 transaction ID 精确配对。
 4. 实际可用的完整 CBCtrl 大树波形是静态快照；动态事件算法主要由内存自测
-   验证。拿到动态 CBCtrl v15 波形后，应优先补一份可提交的小夹具。
+   验证。拿到动态 CBCtrl v15/v16 波形后，应优先补一份可提交的小夹具。
 5. `CBData*Taken` 不是 credit 余额；真正 credit 满率仍要求“可用 credit=0”。
 6. CBCtrl 阶段阈值是首版保守经验值。调整阈值必须同时更新本文、自测和
    normal/flat/latency/windowed/截断回归。

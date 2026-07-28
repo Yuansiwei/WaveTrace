@@ -1,6 +1,6 @@
 # WavePerf 波形性能分析器
 
-WavePerf 使用 Viewer 的 WVZ4 v15 解析器，只加载 GPU 性能分析需要的信号。
+WavePerf 使用 Viewer 的 WVZ4 v15-v16 解析器，只加载 GPU 性能分析需要的信号。
 同一份区间积分结果同时驱动诊断、HTML 页面和 JSON，不按报表重复扫描波形。
 
 维护实现、增加指标或修改诊断规则前，请先阅读

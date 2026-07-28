@@ -212,6 +212,34 @@ int main(int argc, char** argv) {
     }
 
     {
+        Payload mixedPayload = {11u, true};
+        Root mixedRoot(&mixedPayload, &mixedPayload);
+        wave::BuildOptions mixedOptions = options;
+        mixedOptions.enable_dirty_peek_groups = false;
+
+        wave::InMemoryWaveSink sink;
+        wave::Tracer tracer(sink, mixedOptions);
+        tracer.add_root("mixed", &mixedRoot);
+        tracer.prepare_topology(0);
+        tracer.sample(0);
+
+        if (mixedRoot.peekFirst.hook.tracer != &tracer ||
+            mixedRoot.peekFirst.hook.group_id != mixedRoot.first.hook.group_id) {
+            std::cerr << "polling Peek alias did not join the canonical Dynamic dirty group\n";
+            return 1;
+        }
+
+        const std::size_t initialEventCount = sink.events.size();
+        mixedPayload.count = 12u;
+        mixedRoot.peekFirst.hook.mark_dirty();
+        tracer.sample(1);
+        if (sink.events.size() != initialEventCount + 1u) {
+            std::cerr << "mixed Dynamic/Peek alias lost a dirty value change\n";
+            return 1;
+        }
+    }
+
+    {
         Payload badPayload = {1u, true};
         Payload badPeekPayload = {2u, false};
         Root badRoot(&badPayload, &badPeekPayload);
@@ -266,6 +294,41 @@ int main(int argc, char** argv) {
                       << " rejected=" << (aliasRejected ? 1 : 0)
                       << " hook_bound=" << (sharedHook.tracer == &tracer ? 1 : 0)
                       << "\n";
+            return 1;
+        }
+    }
+
+    {
+        std::vector<Payload> crossFragmentPayloads(64u);
+        std::vector<ParallelAliasSlot> slots(64u);
+        for (std::size_t i = 0; i < slots.size(); ++i) {
+            std::size_t payloadIndex = i;
+            if (i >= 8u && i <= 14u) payloadIndex = i - 7u;
+            slots[i].target.payload = &crossFragmentPayloads[payloadIndex];
+            slots[i].target.sharedHook = NULL;
+        }
+        ParallelAliasRoot aliasRoot(&slots[0], slots.size());
+        wave::BuildOptions parallelOptions = options;
+        parallelOptions.emit_track_decl_path = false;
+        parallelOptions.enable_parallel_topology_expansion = true;
+        parallelOptions.topology_expansion_threads = 8u;
+        parallelOptions.parallel_topology_min_elements = 2u;
+        parallelOptions.parallel_topology_min_work_items_per_element = 0u;
+        parallelOptions.parallel_topology_batch_elements = slots.size();
+
+        wave::InMemoryWaveSink sink;
+        wave::Tracer tracer(sink, parallelOptions);
+        tracer.add_root("crossFragmentAlias", &aliasRoot);
+        bool aliasRejected = false;
+        try {
+            tracer.prepare_topology(0);
+        } catch (const std::logic_error& error) {
+            aliasRejected =
+                std::string(error.what()).find("alias conflict") !=
+                std::string::npos;
+        }
+        if (!aliasRejected) {
+            std::cerr << "cross-fragment residual object alias was not rejected\n";
             return 1;
         }
     }
