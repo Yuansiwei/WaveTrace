@@ -51,6 +51,7 @@ wave::BuildOptions opt;
 opt.enable_flat_leaf_fast_table = true;
 opt.enable_flat_memory_block_precheck = true;
 opt.enable_dirty_peek_groups = true;
+opt.enable_dynamic_dirty_groups = true; // default: Dynamic targets report dirty
 opt.enable_wave_value_dirty = true;
 opt.enable_wave_value_address_hash = true;
 opt.enable_wave_array_dirty = true;

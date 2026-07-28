@@ -400,6 +400,33 @@ public:
         commit_node_declaration(*st, node_id, parent_id, 0u, kind, true, array_index);
     }
 
+    void on_subtree_reference_declared(wave::NodeId node_id,
+                                       wave::NodeId target_node_id) override {
+        if (writer_opened_) {
+            set_error("WVZ4 recorder received subtree reference after writer open");
+            return;
+        }
+        if (node_id == 0 || target_node_id == 0 ||
+            node_id > static_cast<wave::NodeId>((std::numeric_limits<wvz4::u32>::max)()) ||
+            target_node_id > static_cast<wave::NodeId>((std::numeric_limits<wvz4::u32>::max)()) ||
+            target_node_id >= node_id) {
+            set_error("WVZ4 recorder received invalid subtree reference");
+            return;
+        }
+        ensure_node_capacity(node_id);
+        if (target_node_id >= node_states_.size() ||
+            !node_states_[static_cast<std::size_t>(target_node_id)].declared) {
+            set_error("WVZ4 recorder subtree reference target is not declared");
+            return;
+        }
+        NodeState& st = node_states_[static_cast<std::size_t>(node_id)];
+        if (!st.declared || st.kind != wvz4::NodeKind::Reference) {
+            set_error("WVZ4 recorder subtree reference mount is not a Reference node");
+            return;
+        }
+        st.reference_target_id = static_cast<wvz4::u32>(target_node_id);
+    }
+
     void on_track_declared(const wave::TrackDecl& decl) override {
         on_track_declared_fast(
             decl.track_id,
@@ -513,6 +540,7 @@ private:
         wvz4::u32 first_child = 0;
         wvz4::u32 last_child = 0;
         wvz4::u32 next_sibling = 0;
+        wvz4::u32 reference_target_id = 0;
     };
 
     struct TrackState {
@@ -919,6 +947,7 @@ private:
         case wave::NodeKind::PointerLink: return wvz4::NodeKind::Field;
         case wave::NodeKind::ValueSource: return wvz4::NodeKind::Object;
         case wave::NodeKind::Aggregate: return wvz4::NodeKind::Object;
+        case wave::NodeKind::Reference: return wvz4::NodeKind::Reference;
         case wave::NodeKind::Unsupported: return wvz4::NodeKind::Object;
         default: return wvz4::NodeKind::Object;
         }
@@ -1226,6 +1255,7 @@ private:
             rec.kind = ns.kind;
             rec.first_child = use_cached_child_links ? ns.first_child : first_child[nid];
             rec.next_sibling = use_cached_child_links ? ns.next_sibling : next_sibling[nid];
+            rec.reference_target_id = ns.reference_target_id;
             layout.nodes.push_back(rec);
         }
         if (cfg_.emit_default_clk) {

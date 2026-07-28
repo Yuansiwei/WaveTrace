@@ -3020,8 +3020,7 @@ void WaveCanvas::leaveEvent(QEvent* event) {
 }
 
 void WaveCanvas::wheelEvent(QWheelEvent* event) {
-    m_cursorTime = xToTime(wheelEventXCompat(event));
-    Q_EMIT cursorMoved(m_cursorTime);
-    zoomAt(m_cursorTime, event->angleDelta().y() > 0 ? 0.85 : 1.15, true);
+    const qint64 zoomCenter = xToTime(wheelEventXCompat(event));
+    zoomAt(zoomCenter, event->angleDelta().y() > 0 ? 0.85 : 1.15, true);
     event->accept();
 }

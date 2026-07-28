@@ -93,10 +93,10 @@ enum class Radix : u8 {
     Auto  = 255
 };
 
-static const u32 kSupportedFormatVersion = 15;
+static const u32 kCurrentFormatVersion = 16;
 
 bool isSupportedFormatVersion(u32 version) {
-    return version == kSupportedFormatVersion;
+    return version == 15 || version == kCurrentFormatVersion;
 }
 static const u8 kSignalFlagStorageOnly = 1u << 0;
 
@@ -137,6 +137,7 @@ struct NodeRec {
     u8 kind = 0;
     u32 firstChild = 0;
     u32 nextSibling = 0;
+    u32 referenceTarget = 0;
     bool valid = false;
 };
 
@@ -267,10 +268,11 @@ bool isValidRadix(Radix r) {
 }
 
 bool isValidNodeKind(u8 kind) {
-    return kind >= 1 && kind <= 6;
+    return kind >= 1 && kind <= 7;
 }
 
 static const u8 kNodeKindSignalLeaf = 6;
+static const u8 kNodeKindReference = 7;
 
 bool validBlockTimeRange(i64 start, i64 end) {
     return start >= 0 && end > start;
@@ -687,6 +689,15 @@ bool parseCompactNodeReferenceSection(const QByteArray& payload,
             error = QStringLiteral("WVZ4 NODI: malformed compact node record");
             return false;
         }
+        u64 referenceBack = 0;
+        if (kind == kNodeKindReference && !r.readVarUInt(referenceBack)) {
+            error = QStringLiteral("WVZ4 NODI: malformed subtree reference");
+            return false;
+        }
+        if (!isValidNodeKind(kind)) {
+            error = QStringLiteral("WVZ4 NODI: invalid NodeKind for node_id %1").arg(id64);
+            return false;
+        }
         const bool isArrayIndex = (nameRef & 1u) != 0;
         const u64 encodedValue = nameRef >> 1u;
         i64 nameId = 0;
@@ -719,7 +730,9 @@ bool parseCompactNodeReferenceSection(const QByteArray& payload,
         }
         if (parentBack >= id64 ||
             (firstForward != 0 && firstForward > count - id64) ||
-            (nextForward != 0 && nextForward > count - id64)) {
+            (nextForward != 0 && nextForward > count - id64) ||
+            (kind == kNodeKindReference &&
+             (referenceBack == 0 || referenceBack >= id64 || firstForward != 0))) {
             error = QStringLiteral("WVZ4 NODI: topology delta out of range for node_id %1").arg(id64);
             return false;
         }
@@ -734,6 +747,8 @@ bool parseCompactNodeReferenceSection(const QByteArray& payload,
         n.kind = kind;
         n.firstChild = firstForward == 0 ? 0u : u32(id64 + firstForward);
         n.nextSibling = nextForward == 0 ? 0u : u32(id64 + nextForward);
+        n.referenceTarget =
+            kind == kNodeKindReference ? u32(id64 - referenceBack) : 0u;
         n.valid = true;
         nodesById[int(id64)] = n;
     }
@@ -778,13 +793,20 @@ bool parseCompactNodeTreeSection(const QByteArray& payload,
             error = QStringLiteral("WVZ4 NODI: malformed compact node record");
             return false;
         }
+        u64 referenceBack = 0;
+        if (kind == kNodeKindReference && !r.readVarUInt(referenceBack)) {
+            error = QStringLiteral("WVZ4 NODI: malformed subtree reference");
+            return false;
+        }
         if (!isValidNodeKind(kind)) {
             error = QStringLiteral("WVZ4 NODI: invalid NodeKind for node_id %1").arg(id64);
             return false;
         }
         if (parentBack >= id64 ||
             (firstForward != 0 && firstForward > count - id64) ||
-            (nextForward != 0 && nextForward > count - id64)) {
+            (nextForward != 0 && nextForward > count - id64) ||
+            (kind == kNodeKindReference &&
+             (referenceBack == 0 || referenceBack >= id64 || firstForward != 0))) {
             error = QStringLiteral("WVZ4 NODI: topology delta out of range for node_id %1").arg(id64);
             return false;
         }
@@ -843,6 +865,8 @@ bool parseCompactNodeTreeSection(const QByteArray& payload,
         dst.parentId = parent;
         dst.firstChild = firstChild;
         dst.nextSibling = nextSibling;
+        dst.referenceTargetId =
+            kind == kNodeKindReference ? int(id64 - referenceBack) : 0;
         dst.rowInParent = parent == 0 ? tree.rootNodeIds.size() : expectedRow;
         dst.nameToken = nameToken;
         dst.kind = kind;
@@ -1592,6 +1616,19 @@ bool validateNodeAndSignalLayout(const QVector<NodeRec>& nodesById,
             error = QStringLiteral("WVZ4 NODE node_id %1 references invalid next_sibling %2").arg(nodeId).arg(int(n.nextSibling));
             return false;
         }
+        if (n.kind == kNodeKindReference) {
+            if (n.referenceTarget == 0 ||
+                n.referenceTarget >= u32(nodeId) ||
+                n.referenceTarget >= u32(nodesById.size()) ||
+                !nodesById.at(int(n.referenceTarget)).valid ||
+                n.firstChild != 0) {
+                error = QStringLiteral("WVZ4 NODE node_id %1 has invalid subtree reference").arg(nodeId);
+                return false;
+            }
+        } else if (n.referenceTarget != 0) {
+            error = QStringLiteral("WVZ4 NODE node_id %1 unexpectedly has a subtree reference").arg(nodeId);
+            return false;
+        }
     }
 
     if (rootCount == 0) {
@@ -1697,6 +1734,7 @@ bool buildWaveTreeInfo(const QVector<NodeRec>& nodesById,
         dst.parentId = int(src.parent);
         dst.firstChild = int(src.firstChild);
         dst.nextSibling = int(src.nextSibling);
+        dst.referenceTargetId = int(src.referenceTarget);
         dst.nameToken = src.nameToken;
         dst.kind = src.kind;
         dst.valid = true;
@@ -1740,6 +1778,175 @@ bool buildWaveTreeInfo(const QVector<NodeRec>& nodesById,
         }
     }
 
+    return true;
+}
+
+bool buildSubtreeReferencePatch(const WaveTreeInfo& sourceTree,
+                                int mountNodeId,
+                                WaveSubtreeReferencePatch& patch,
+                                QString& error,
+                                const std::atomic_bool* cancel) {
+    patch = WaveSubtreeReferencePatch();
+    error.clear();
+    if (!sourceTree.valid || mountNodeId <= 0 ||
+        mountNodeId >= sourceTree.nodesById.size()) {
+        error = QStringLiteral("WVZ4 subtree reference mount is invalid");
+        return false;
+    }
+
+    const QVector<WaveTreeNode>& sourceNodes = sourceTree.nodesById;
+    const WaveTreeNode& sourceMount = sourceNodes.at(mountNodeId);
+    if (!sourceMount.valid || sourceMount.kind != kNodeKindReference) {
+        error = QStringLiteral("WVZ4 node_id %1 is not a subtree reference")
+                    .arg(mountNodeId);
+        return false;
+    }
+
+    patch.mountNodeId = mountNodeId;
+    patch.mountNode = sourceMount;
+    patch.mountNode.firstChild = 0;
+    patch.mountNode.nextSibling = sourceMount.nextSibling;
+    QVector<uchar> activeTargets(sourceNodes.size(), 0);
+    quint64 visitedNodes = 0;
+
+    auto cancelled = [&]() {
+        return cancel && ((visitedNodes++ & 0xfffu) == 0u) &&
+               cancel->load(std::memory_order_acquire);
+    };
+    auto localNodeId = [](int index) { return -index - 1; };
+    auto localNodeIndex = [](int nodeId) { return -nodeId - 1; };
+    auto patchNode = [&](int nodeId) -> WaveTreeNode& {
+        if (nodeId == mountNodeId) return patch.mountNode;
+        return patch.appendedNodes[localNodeIndex(nodeId)];
+    };
+
+    std::function<bool(int, int, int&)> cloneNode;
+    std::function<bool(int, int)> mountReference;
+    std::function<bool(int, int)> appendChildren;
+
+    appendChildren = [&](int sourceParentId, int destinationParentId) -> bool {
+        int firstClone = 0;
+        int previousClone = 0;
+        int row = 0;
+        int guard = 0;
+        for (int child = sourceNodes.at(sourceParentId).firstChild;
+             child != 0;
+             child = sourceNodes.at(child).nextSibling) {
+            if (cancelled()) {
+                error = QStringLiteral("WVZ4 subtree reference expansion cancelled");
+                return false;
+            }
+            if (++guard > sourceNodes.size()) {
+                error = QStringLiteral("WVZ4 subtree reference sibling cycle");
+                return false;
+            }
+            int cloned = 0;
+            if (!cloneNode(child, destinationParentId, cloned)) return false;
+            patchNode(cloned).rowInParent = row++;
+            if (firstClone == 0) firstClone = cloned;
+            if (previousClone != 0) patchNode(previousClone).nextSibling = cloned;
+            previousClone = cloned;
+        }
+        patchNode(destinationParentId).firstChild = firstClone;
+        return true;
+    };
+
+    mountReference = [&](int mountId, int targetId) -> bool {
+        if (targetId <= 0 || targetId >= sourceNodes.size() ||
+            !sourceNodes.at(targetId).valid) {
+            error = QStringLiteral("WVZ4 subtree reference points to missing node_id %1")
+                        .arg(targetId);
+            return false;
+        }
+        if (activeTargets.at(targetId)) {
+            error = QStringLiteral("WVZ4 subtree reference cycle at node_id %1")
+                        .arg(targetId);
+            return false;
+        }
+        activeTargets[targetId] = 1;
+        const WaveTreeNode& target = sourceNodes.at(targetId);
+        patchNode(mountId).signalIndex = target.signalIndex;
+        patchNode(mountId).signalId = target.signalId;
+        const bool ok = appendChildren(targetId, mountId);
+        activeTargets[targetId] = 0;
+        return ok;
+    };
+
+    cloneNode = [&](int sourceId, int parentId, int& clonedId) -> bool {
+        if (sourceId <= 0 || sourceId >= sourceNodes.size() ||
+            !sourceNodes.at(sourceId).valid ||
+            patch.appendedNodes.size() == std::numeric_limits<int>::max()) {
+            error = QStringLiteral("WVZ4 subtree reference expansion is invalid or too large");
+            return false;
+        }
+        WaveTreeNode clone = sourceNodes.at(sourceId);
+        clone.parentId = parentId;
+        clone.firstChild = 0;
+        clone.nextSibling = 0;
+        clone.rowInParent = -1;
+        const int localIndex = patch.appendedNodes.size();
+        patch.appendedNodes.push_back(clone);
+        clonedId = localNodeId(localIndex);
+        if (clone.kind == kNodeKindReference) {
+            return mountReference(clonedId, clone.referenceTargetId);
+        }
+        return appendChildren(sourceId, clonedId);
+    };
+
+    return mountReference(mountNodeId, sourceMount.referenceTargetId);
+}
+
+int remapPatchNodeId(int nodeId, int appendBase) {
+    return nodeId < 0 ? appendBase + (-nodeId - 1) : nodeId;
+}
+
+bool applySubtreeReferencePatch(WaveTreeInfo& tree,
+                                const WaveSubtreeReferencePatch& patch,
+                                QString& error) {
+    error.clear();
+    if (!tree.valid || patch.mountNodeId <= 0 ||
+        patch.mountNodeId >= tree.nodesById.size() ||
+        !tree.nodesById.at(patch.mountNodeId).valid) {
+        error = QStringLiteral("WVZ4 subtree reference patch mount is invalid");
+        return false;
+    }
+    if (tree.nodesById.at(patch.mountNodeId).firstChild != 0) return true;
+    if (tree.nodesById.size() >
+        std::numeric_limits<int>::max() - patch.appendedNodes.size()) {
+        error = QStringLiteral("WVZ4 subtree reference expansion is too large");
+        return false;
+    }
+
+    const int appendBase = tree.nodesById.size();
+    tree.nodesById.reserve(appendBase + patch.appendedNodes.size());
+    for (const WaveTreeNode& encoded : patch.appendedNodes) {
+        WaveTreeNode node = encoded;
+        node.parentId = remapPatchNodeId(node.parentId, appendBase);
+        node.firstChild = remapPatchNodeId(node.firstChild, appendBase);
+        node.nextSibling = remapPatchNodeId(node.nextSibling, appendBase);
+        tree.nodesById.push_back(node);
+    }
+    WaveTreeNode mounted = patch.mountNode;
+    mounted.firstChild = remapPatchNodeId(mounted.firstChild, appendBase);
+    tree.nodesById[patch.mountNodeId] = mounted;
+    return true;
+}
+
+bool materializeSubtreeReferences(WaveTreeInfo& tree, QString& error) {
+    if (!tree.valid || tree.nodesById.size() <= 1) return true;
+    const int sourceNodeCount = tree.nodesById.size();
+    for (int nodeId = 1; nodeId < sourceNodeCount; ++nodeId) {
+        const WaveTreeNode& node = tree.nodesById.at(nodeId);
+        if (!node.valid || node.kind != kNodeKindReference ||
+            node.firstChild != 0) {
+            continue;
+        }
+        WaveSubtreeReferencePatch patch;
+        if (!buildSubtreeReferencePatch(tree, nodeId, patch, error, nullptr) ||
+            !applySubtreeReferencePatch(tree, patch, error)) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -4322,6 +4529,22 @@ bool decodeRawWdatPayloadForCompare(const QByteArray& payload,
 
 } // namespace
 
+bool buildWaveSubtreeReferencePatch(
+    const WaveTreeInfo& sourceTree,
+    int mountNodeId,
+    WaveSubtreeReferencePatch& patch,
+    QString& error,
+    const std::atomic_bool* cancel) {
+    return buildSubtreeReferencePatch(sourceTree, mountNodeId, patch, error, cancel);
+}
+
+bool applyWaveSubtreeReferencePatch(
+    WaveTreeInfo& destinationTree,
+    const WaveSubtreeReferencePatch& patch,
+    QString& error) {
+    return applySubtreeReferencePatch(destinationTree, patch, error);
+}
+
 struct WaveParser4Reader::Impl {
     QString filePath;
     u32 headerSize = 0;
@@ -4393,7 +4616,7 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
         ((next->headerFeatureFlags & kHeaderFeatureLodTables) != 0);
 
     if (!isSupportedFormatVersion(version)) {
-        error = QStringLiteral("Unsupported WVZ4 version: %1 (this Viewer supports v15 only)").arg(version);
+        error = QStringLiteral("Unsupported WVZ4 version: %1 (this Viewer supports v15-v16)").arg(version);
         return false;
     }
     if (next->headerSize < 64 || quint64(next->headerSize) > quint64(file.size())) {
@@ -4519,7 +4742,7 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
             haveSignalLayout = true;
         } else if (sh.tag == "NREF" || sh.tag == "NRFZ" ||
                    sh.tag == "SIGT" || sh.tag == "SIGZ") {
-            error = QStringLiteral("WVZ4 v15 Viewer requires compact NODI/SIGD layout sections");
+            error = QStringLiteral("WVZ4 v15-v16 Viewer requires compact NODI/SIGD layout sections");
             return false;
         } else if (sh.tag == "CLKD") {
             if (!parseClockSection(payload, next->clocks, error)) return false;
@@ -5736,6 +5959,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
                                    outWave.tree, error)) {
                 return false;
             }
+            if (!materializeSubtreeReferences(outWave.tree, error)) return false;
         }
 
         outputInitialized = true;

@@ -4,6 +4,7 @@
 
 #include <QString>
 #include <QVector>
+#include <atomic>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -160,3 +161,17 @@ private:
     struct Impl;
     std::unique_ptr<Impl> d;
 };
+
+// Build is read-only and may run on a worker thread. Apply must run on the
+// thread that owns consumers of the destination WaveTreeInfo (the Viewer UI
+// thread in normal use).
+bool buildWaveSubtreeReferencePatch(
+    const WaveTreeInfo& sourceTree,
+    int mountNodeId,
+    WaveSubtreeReferencePatch& patch,
+    QString& error,
+    const std::atomic_bool* cancel = nullptr);
+bool applyWaveSubtreeReferencePatch(
+    WaveTreeInfo& destinationTree,
+    const WaveSubtreeReferencePatch& patch,
+    QString& error);

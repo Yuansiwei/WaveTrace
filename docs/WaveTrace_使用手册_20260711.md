@@ -265,14 +265,26 @@ Dynamic target 示例：
 
 ```cpp
 class DynamicChannel : public wave::DynamicTraceTargetFor<DynamicChannel> {
-    // reflected members and write methods
+public:
+    void write(const Payload& next) {
+        payload = next;
+        wave_dirty_hook()->mark_dirty();
+    }
+
+private:
+    Payload payload{};
 };
 
 wave::ensure_dynamic_type_registered<DynamicChannel>();
 wave::ensure_dynamic_type_registered<Payload>();
 ```
 
-注册必须在首次展开前完成。Dynamic/peek 最终映射到构建阶段记录的物理 block cursor/range；周期采样面向物理 storage，不递归扫描逻辑 alias。
+注册必须在首次展开前完成。`DynamicTraceTarget` 默认采用 Dirty 主动上报，
+不进入每周期 Flat 轮询；每条修改 reflected 数据的业务写路径都必须在修改后调用
+`wave_dirty_hook()->mark_dirty()`。只有显式设置
+`options.enable_dynamic_dirty_groups = false` 时，Dynamic 才回退到旧的 Flat 轮询。
+Dynamic/peek 最终映射到构建阶段记录的物理 block cursor/range；周期采样面向物理
+storage，不递归扫描逻辑 alias。
 
 ## 9. 常用 `BuildOptions`
 
@@ -310,6 +322,7 @@ storage id、leaf-ref、byte-map 和 shadow 会随外层元素一起重定位。
 | `enable_wave_array_dirty` | `true` | `wave::array` dirty 范围采样 |
 | `enable_wave_value_dirty` | `true` | `WaveValue` 写驱动采样 |
 | `enable_dirty_peek_groups` | `false` | dirty peek hook 优化，需显式开启 |
+| `enable_dynamic_dirty_groups` | `true` | Dynamic target 主动上报；设为 `false` 才回退 Flat |
 | `dump_leaf_distribution_after_topology` | `true` | 首次展开后输出叶子分布 |
 | `dump_memory_usage_after_topology` | `false` | 输出拓扑内存报告 |
 

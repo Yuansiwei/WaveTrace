@@ -63,12 +63,12 @@ using u64 = std::uint64_t;
 using u32 = std::uint32_t;
 using u8  = std::uint8_t;
 
-static const u32 kFormatVersion = 15;
+static const u32 kFormatVersion = 16;
 static const u8 kSignalFlagStorageOnly = 1u << 0;
 static const u32 kMaxScalarBytes = 8;
 static const u32 kLodLevelCount = 4;
 // v4 adds numeric array-index node names to layout frames.
-static const u32 kWriterProcessProtocolVersion = 5;
+static const u32 kWriterProcessProtocolVersion = 6;
 
 // Raw WDAT payload encoding flags. The outer WDAT section and block index remain
 // unchanged; these flags describe the uncompressed raw_payload inside each block.
@@ -118,7 +118,8 @@ enum class NodeKind : u8 {
     Field       = 3,
     ArrayElem   = 4,  // e.g. sm[0], warp[3] is stored directly as node name.
     Container   = 5,
-    SignalLeaf  = 6
+    SignalLeaf  = 6,
+    Reference   = 7
 };
 
 enum class ValueType : u8 {
@@ -238,6 +239,9 @@ struct NodeRecord {
     // Stored child table. first_child points to first child node; siblings form a chain.
     u32 first_child = 0;
     u32 next_sibling = 0;
+    // Reference nodes mount the already-defined subtree rooted here. The
+    // target is always an earlier node in the compact v16 layout.
+    u32 reference_target_id = 0;
 };
 
 struct SignalDefinition {
@@ -796,6 +800,7 @@ inline bool is_valid_node_kind(NodeKind k) {
     case NodeKind::ArrayElem:
     case NodeKind::Container:
     case NodeKind::SignalLeaf:
+    case NodeKind::Reference:
         return true;
     default:
         return false;
@@ -1901,16 +1906,16 @@ private:
     bool validate_latest_layout_encoding_(std::string& error) const {
         for (std::size_t i = 0; i < layout_.names.size(); ++i) {
             if (layout_.names[i].name_id != static_cast<u32>(i + 1u)) {
-                error = "WVZ4 v15 requires a dense NameTable ordered by name_id";
+                error = "WVZ4 v16 requires a dense NameTable ordered by name_id";
                 return false;
             }
         }
         if (!can_build_compact_node_layout_payload(layout_)) {
-            error = "WVZ4 v15 requires dense preorder node_id values and forward child/sibling links";
+            error = "WVZ4 v16 requires dense preorder node_id values and forward child/sibling links";
             return false;
         }
         if (!can_build_compact_signal_layout_payload(layout_)) {
-            error = "WVZ4 v15 requires dense signal_id values and backward storage_id references";
+            error = "WVZ4 v16 requires dense signal_id values and backward storage_id references";
             return false;
         }
         return true;
@@ -1949,7 +1954,7 @@ private:
             if ((r.parent_id != 0 && r.parent_id >= r.node_id) ||
                 (r.first_child != 0 && r.first_child <= r.node_id) ||
                 (r.next_sibling != 0 && r.next_sibling <= r.node_id)) {
-                error = "WVZ4 v15 requires preorder nodes with forward child/sibling links";
+                error = "WVZ4 v16 requires preorder nodes with forward child/sibling links";
                 return false;
             }
             if (r.name_id != 0 && r.name_id > name_count) {
@@ -1970,6 +1975,17 @@ private:
             }
             if (r.next_sibling > node_count) {
                 error = detail::make_error("NodeRecord references missing next_sibling: ", r.next_sibling);
+                return false;
+            }
+            if (r.kind == NodeKind::Reference) {
+                if (r.reference_target_id == 0 ||
+                    r.reference_target_id >= r.node_id ||
+                    r.first_child != 0) {
+                    error = detail::make_error("invalid subtree reference for node_id: ", r.node_id);
+                    return false;
+                }
+            } else if (r.reference_target_id != 0) {
+                error = detail::make_error("non-reference node has reference target: ", r.node_id);
                 return false;
             }
             node_parent[r.node_id] = r.parent_id;
@@ -2200,6 +2216,17 @@ private:
             }
             if (r.next_sibling != 0 && (r.next_sibling >= seen_nodes.size() || !seen_nodes[r.next_sibling])) {
                 error = detail::make_error("NodeRecord references missing next_sibling: ", r.next_sibling); return false;
+            }
+            if (r.kind == NodeKind::Reference) {
+                if (r.reference_target_id == 0 ||
+                    r.reference_target_id >= seen_nodes.size() ||
+                    !seen_nodes[r.reference_target_id] ||
+                    r.reference_target_id >= r.node_id ||
+                    r.first_child != 0) {
+                    error = detail::make_error("invalid subtree reference for node_id: ", r.node_id); return false;
+                }
+            } else if (r.reference_target_id != 0) {
+                error = detail::make_error("non-reference node has reference target: ", r.node_id); return false;
             }
         }
         for (std::size_t i = 0; i < layout_.nodes.size(); ++i) {
@@ -2740,7 +2767,11 @@ private:
             if (n.node_id != id ||
                 (n.parent_id != 0 && n.parent_id >= id) ||
                 (n.first_child != 0 && n.first_child <= id) ||
-                (n.next_sibling != 0 && n.next_sibling <= id)) {
+                (n.next_sibling != 0 && n.next_sibling <= id) ||
+                (n.kind == NodeKind::Reference &&
+                 (n.reference_target_id == 0 || n.reference_target_id >= id ||
+                  n.first_child != 0)) ||
+                (n.kind != NodeKind::Reference && n.reference_target_id != 0)) {
                 return false;
             }
         }
@@ -2771,6 +2802,9 @@ private:
             detail::append_u8(payload, static_cast<u8>(n.kind));
             detail::append_varuint(payload, n.first_child == 0 ? 0u : static_cast<u64>(n.first_child - id));
             detail::append_varuint(payload, n.next_sibling == 0 ? 0u : static_cast<u64>(n.next_sibling - id));
+            if (n.kind == NodeKind::Reference) {
+                detail::append_varuint(payload, static_cast<u64>(id - n.reference_target_id));
+            }
         }
     }
 
@@ -2905,6 +2939,10 @@ private:
                     if (!writer.append_u8(static_cast<u8>(n.kind), local_error)) return false;
                     if (!writer.append_varuint(n.first_child == 0 ? 0u : static_cast<u64>(n.first_child - id), local_error)) return false;
                     if (!writer.append_varuint(n.next_sibling == 0 ? 0u : static_cast<u64>(n.next_sibling - id), local_error)) return false;
+                    if (n.kind == NodeKind::Reference &&
+                        !writer.append_varuint(static_cast<u64>(id - n.reference_target_id), local_error)) {
+                        return false;
+                    }
                 }
                 return true;
             }, error);
@@ -6541,6 +6579,7 @@ inline void serialize_layout(std::vector<u8>& out, const Layout& l) {
         append_u8(out, static_cast<u8>(n.kind));
         append_varuint(out, n.first_child);
         append_varuint(out, n.next_sibling);
+        append_varuint(out, n.reference_target_id);
     }
     append_varuint(out, static_cast<u64>(l.signals.size()));
     for (std::size_t i = 0; i < l.signals.size(); ++i) {
@@ -6624,6 +6663,7 @@ inline bool deserialize_layout(PayloadReader& r, Layout& l) {
         if (!r.read_u8(b)) return false; rec.kind = static_cast<NodeKind>(b);
         if (!r.read_varuint(tmp)) return false; rec.first_child = static_cast<u32>(tmp);
         if (!r.read_varuint(tmp)) return false; rec.next_sibling = static_cast<u32>(tmp);
+        if (!r.read_varuint(tmp)) return false; rec.reference_target_id = static_cast<u32>(tmp);
         l.nodes.push_back(rec);
     }
     if (!r.read_varuint(n)) return false;
@@ -7392,7 +7432,7 @@ private:
         for (std::size_t start = 0; start < layout.nodes.size(); ) {
             const std::size_t count = (std::min)(kRecordChunkCount, layout.nodes.size() - start);
             payload.clear();
-            payload.reserve(16u + count * 25u);
+            payload.reserve(16u + count * 29u);
             detail::append_u64(payload, static_cast<u64>(start));
             detail::append_u64(payload, static_cast<u64>(count));
             for (std::size_t i = 0; i < count; ++i) {
@@ -7404,6 +7444,7 @@ private:
                 detail::append_u8(payload, static_cast<u8>(n.kind));
                 detail::append_u32(payload, n.first_child);
                 detail::append_u32(payload, n.next_sibling);
+                detail::append_u32(payload, n.reference_target_id);
             }
             if (!send_layout_frame(WriterProcessFrameType::LayoutNodes)) return false;
             start += count;
@@ -8086,7 +8127,8 @@ public:
                         !r.read_u32(rec.array_index) ||
                         !r.read_u8(kind) ||
                         !r.read_u32(rec.first_child) ||
-                        !r.read_u32(rec.next_sibling)) {
+                        !r.read_u32(rec.next_sibling) ||
+                        !r.read_u32(rec.reference_target_id)) {
                         error = "WVZ4 writer helper received corrupt streamed node record";
                         return false;
                     }

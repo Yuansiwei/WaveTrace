@@ -240,6 +240,13 @@ private:
 
 The tracer automatically binds the hook to the dirty group when the `peek()` source is expanded. If no hook is visible, or `enable_dirty_peek_groups` is false, the node remains on the normal poll path.
 
+`DynamicTraceTarget` uses the same dirty queue and sampling engine, but its
+`enable_dynamic_dirty_groups` switch defaults to `true` independently of the
+peek switch. Every Dynamic write path must call
+`wave_dirty_hook()->mark_dirty()` after modifying reflected storage. Set
+`enable_dynamic_dirty_groups=false` only for legacy Dynamic targets that still
+need flat polling.
+
 ### Dynamic dirty group task split
 
 After collecting dirty group ids, this version can split dirty-group sampling per cycle by group count or by group leaf weight. It uses pre-existing worker threads and preallocated vectors where possible. No hash/map/set/sort is used in the per-cycle dirty group split.

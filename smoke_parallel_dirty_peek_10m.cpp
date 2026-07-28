@@ -1,11 +1,14 @@
 #include "wave_runtime.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
+#include <vector>
 
 #if defined(_WIN32)
 #include <psapi.h>
@@ -193,12 +196,14 @@ int main(int argc, char** argv) {
     std::size_t thread_count = 16u;
     std::size_t batch_elements = 131072u;
     bool sample_once = false;
+    bool multithread_sample = false;
     if (argc > 1) element_count = static_cast<std::size_t>(std::strtoull(argv[1], NULL, 10));
     if (argc > 2) thread_count = static_cast<std::size_t>(std::strtoull(argv[2], NULL, 10));
     if (argc > 3) batch_elements = static_cast<std::size_t>(std::strtoull(argv[3], NULL, 10));
     if (argc > 4) {
         const std::string mode(argv[4]);
         sample_once = mode == "sample";
+        multithread_sample = mode == "multithread";
         g_dynamic_object_layout = mode == "dynamic_layout";
 #if defined(WAVE_RUNTIME_BENCH_FAULT_INJECTION)
         g_force_parallel_fragment_error = mode == "force_error";
@@ -260,12 +265,6 @@ int main(int argc, char** argv) {
             std::cout << "parallel_error_propagated=1 message=" << error.what() << "\n";
             return 0;
         }
-        if (g_force_parallel_storage_alias &&
-            std::string(error.what()) ==
-                "WaveTrace parallel dirty-peek storage alias conflict") {
-            std::cout << "parallel_alias_error_propagated=1 message=" << error.what() << "\n";
-            return 0;
-        }
 #if defined(WAVE_RUNTIME_BENCH_FAULT_INJECTION)
         if (g_force_parallel_fragment_error || g_force_parallel_storage_alias) {
             std::cerr << "unexpected_parallel_error=" << error.what() << "\n";
@@ -282,13 +281,96 @@ int main(int argc, char** argv) {
         std::cerr << "forced parallel fragment failure was hidden\n";
         return 5;
     }
-    if (g_force_parallel_storage_alias) {
-        std::cerr << "forced parallel storage alias was hidden\n";
-        return 6;
-    }
 #endif
     const BenchClock::time_point end = BenchClock::now();
-    if (sample_once) tracer.sample(0);
+    if (sample_once) {
+        tracer.sample(0);
+    } else if (multithread_sample) {
+        tracer.sample(0);
+        sink.samples = 0;
+
+        std::atomic<std::size_t> ready_threads(0);
+        std::atomic<bool> release_threads(false);
+        std::vector<std::thread> workers;
+        workers.reserve(thread_count);
+        for (std::size_t worker = 0; worker < thread_count; ++worker) {
+            workers.push_back(std::thread([&, worker]() {
+                if ((worker & 1u) == 0u) {
+                    tracer.attach_current_thread_for_dirty_peek();
+                }
+                const std::size_t begin_index =
+                    element_count * worker / thread_count;
+                const std::size_t end_index =
+                    element_count * (worker + 1u) / thread_count;
+                for (std::size_t i = begin_index; i < end_index; ++i) {
+                    elements[i].peek.value.status += 1u;
+                    elements[i].peek.wave_dirty_hook()->mark_dirty();
+                }
+                ready_threads.fetch_add(1u, std::memory_order_release);
+                while (!release_threads.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+            }));
+        }
+        while (ready_threads.load(std::memory_order_acquire) != thread_count) {
+            std::this_thread::yield();
+        }
+        tracer.sample(1);
+        release_threads.store(true, std::memory_order_release);
+        for (std::size_t i = 0; i < workers.size(); ++i) {
+            workers[i].join();
+        }
+        if (sink.samples != element_count) {
+            std::cerr << "live worker dirty sample count mismatch expected="
+                      << element_count << " actual=" << sink.samples << "\n";
+            return 8;
+        }
+
+        workers.clear();
+        for (std::size_t worker = 0; worker < thread_count; ++worker) {
+            workers.push_back(std::thread([&, worker]() {
+                const std::size_t begin_index =
+                    element_count * worker / thread_count;
+                const std::size_t end_index =
+                    element_count * (worker + 1u) / thread_count;
+                for (std::size_t i = begin_index; i < end_index; ++i) {
+                    elements[i].peek.value.counter += 1u;
+                    elements[i].peek.wave_dirty_hook()->mark_dirty();
+                }
+            }));
+        }
+        for (std::size_t i = 0; i < workers.size(); ++i) {
+            workers[i].join();
+        }
+        tracer.sample(2);
+
+        elements[0].peek.value.lane += 1u;
+        workers.clear();
+        ready_threads.store(0u, std::memory_order_relaxed);
+        release_threads.store(false, std::memory_order_relaxed);
+        for (std::size_t worker = 0; worker < thread_count; ++worker) {
+            workers.push_back(std::thread([&, worker]() {
+                if ((worker & 1u) == 0u) {
+                    tracer.attach_current_thread_for_dirty_peek();
+                }
+                for (std::size_t repeat = 0; repeat < 4096u; ++repeat) {
+                    elements[0].peek.wave_dirty_hook()->mark_dirty();
+                }
+                ready_threads.fetch_add(1u, std::memory_order_release);
+                while (!release_threads.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+            }));
+        }
+        while (ready_threads.load(std::memory_order_acquire) != thread_count) {
+            std::this_thread::yield();
+        }
+        tracer.sample(3);
+        release_threads.store(true, std::memory_order_release);
+        for (std::size_t i = 0; i < workers.size(); ++i) {
+            workers[i].join();
+        }
+    }
 
     const std::size_t peek_element_count = g_dynamic_object_layout
         ? (element_count + 1u) / 2u
@@ -307,6 +389,13 @@ int main(int argc, char** argv) {
               << " samples=" << sink.samples
               << " summary={" << tracer.topology_debug_summary(1u) << "}"
               << "\n";
+#if defined(WAVE_RUNTIME_BENCH_FAULT_INJECTION)
+    if (g_force_parallel_storage_alias) {
+        std::cout << "parallel_leaf_alias_allowed=1"
+                  << " fallback_batches=" << tracer.parallel_topology_fallback_batches()
+                  << "\n";
+    }
+#endif
     if (sink.tracks != expected_tracks) {
         std::cerr << "track count mismatch\n";
         return 2;
@@ -314,6 +403,11 @@ int main(int argc, char** argv) {
     if (sample_once && sink.samples != expected_tracks) {
         std::cerr << "sample count mismatch\n";
         return 4;
+    }
+    if (multithread_sample && sink.samples != element_count * 2u + 1u) {
+        std::cerr << "multithread dirty sample count mismatch expected="
+                  << element_count * 2u + 1u << " actual=" << sink.samples << "\n";
+        return 9;
     }
     if (tracer.parallel_topology_batches() == 0u ||
         tracer.parallel_topology_expanded_elements() + 1u != element_count ||

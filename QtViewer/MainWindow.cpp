@@ -86,6 +86,8 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
 #include <future>
 #include <functional>
 #include <limits>
@@ -98,6 +100,15 @@
 #include <cstring>
 #include <cstdint>
 #include <vector>
+
+struct TreeWarmupControl {
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::deque<int> priorityReferences;
+    // 0 = background pending, 1 = priority queued, 2 = started.
+    QVector<quint8> referenceStateByNodeId;
+    int pendingUiBatches = 0;
+};
 
 #if defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2) || defined(__SSE2__)
 #define WAVETRACE_COMPARE_HAS_SSE2 1
@@ -1236,7 +1247,17 @@ struct SignalLogicTree {
 
     bool hasChildren(int nodeId) const {
         if (waveTree) {
-            return isValidNodeId(nodeId) && waveTree->nodesById.at(nodeId).firstChild != 0;
+            if (!isValidNodeId(nodeId)) return false;
+            const WaveTreeNode& node = waveTree->nodesById.at(nodeId);
+            if (node.firstChild != 0) return true;
+            if (node.kind != kWaveTreeNodeKindReference ||
+                node.referenceTargetId <= 0 ||
+                node.referenceTargetId >= waveTree->nodesById.size()) {
+                return false;
+            }
+            const WaveTreeNode& target =
+                waveTree->nodesById.at(node.referenceTargetId);
+            return target.valid && target.firstChild != 0;
         }
         if (nodeId < 0 || nodeId >= nodes.size()) return false;
         const int listId = nodes[nodeId].childListId;
@@ -1264,6 +1285,18 @@ struct SignalLogicTree {
         const int listId = nodes[nodeId].childListId;
         if (listId < 0 || listId >= childLists.size()) return nullptr;
         return &childLists[listId];
+    }
+
+    bool isPendingReference(int nodeId) const {
+        if (!waveTree || !isValidNodeId(nodeId)) return false;
+        const WaveTreeNode& node = waveTree->nodesById.at(nodeId);
+        return node.kind == kWaveTreeNodeKindReference &&
+               node.referenceTargetId > 0 &&
+               node.firstChild == 0;
+    }
+
+    void invalidateWaveChildList(int nodeId) {
+        if (waveTree) waveChildLists.erase(nodeId);
     }
 
     LogicChildList& ensureChildList(int nodeId) {
@@ -3096,7 +3129,10 @@ public:
     }
 
     bool hasChildren(const QModelIndex& parent = QModelIndex()) const override {
-        return rowCount(parent) > 0;
+        if (!parent.isValid()) return rowCount(parent) > 0;
+        if (!m_tree || parent.column() > 0) return false;
+        const int parentNodeId = nodeIdFromIndex(parent);
+        return m_tree->hasChildren(parentNodeId);
     }
 
     QVariant data(const QModelIndex& index, int role = Qt::DisplayRole) const override {
@@ -3165,6 +3201,56 @@ public:
 
     Qt::DropActions supportedDragActions() const override {
         return Qt::CopyAction;
+    }
+
+    bool installReferencePatch(WaveTreeInfo& tree,
+                               const WaveSubtreeReferencePatch& patch,
+                               QString& error) {
+        if (!m_tree || !m_tree->isValidNodeId(patch.mountNodeId)) {
+            error = QStringLiteral("Reference mount is no longer present in the tree");
+            return false;
+        }
+        if (!m_tree->isPendingReference(patch.mountNodeId)) return true;
+
+        int directChildCount = 0;
+        int encodedChild = patch.mountNode.firstChild;
+        int guard = 0;
+        while (encodedChild < 0 &&
+               guard++ <= patch.appendedNodes.size()) {
+            ++directChildCount;
+            const int localIndex = -encodedChild - 1;
+            if (localIndex < 0 || localIndex >= patch.appendedNodes.size()) {
+                error = QStringLiteral("Reference patch contains an invalid child id");
+                return false;
+            }
+            encodedChild = patch.appendedNodes.at(localIndex).nextSibling;
+        }
+        if (encodedChild != 0) {
+            error = QStringLiteral("Reference patch contains a non-local child id");
+            return false;
+        }
+
+        if (m_searchMode) {
+            beginResetModel();
+            const bool ok = applyWaveSubtreeReferencePatch(tree, patch, error);
+            m_tree->invalidateWaveChildList(patch.mountNodeId);
+            clearSearchStorage();
+            m_searchMode = false;
+            endResetModel();
+            return ok;
+        }
+
+        const QModelIndex mountIndex = indexForNode(patch.mountNodeId);
+        if (directChildCount > 0) {
+            beginInsertRows(mountIndex, 0, directChildCount - 1);
+        }
+        const bool ok = applyWaveSubtreeReferencePatch(tree, patch, error);
+        m_tree->invalidateWaveChildList(patch.mountNodeId);
+        if (directChildCount > 0) endInsertRows();
+        if (ok && mountIndex.isValid()) {
+            emit dataChanged(mountIndex, mountIndex);
+        }
+        return ok;
     }
 
 private:
@@ -4997,6 +5083,11 @@ void MainWindow::buildUi() {
     });
 
     connect(m_tree, &QTreeView::doubleClicked, this, &MainWindow::onTreeIndexDoubleClicked);
+    connect(m_tree, &QTreeView::expanded, this, [this](const QModelIndex& index) {
+        SignalTreeModel* model = signalTreeModelFrom(m_treeModel);
+        if (!model) return;
+        prioritizeTreeReference(model->nodeIdFromIndex(index));
+    });
     connect(m_treeSearchEdit, &QLineEdit::returnPressed, this, [this]() {
         onTreeSearchTextChanged(m_treeSearchEdit ? m_treeSearchEdit->text() : QString());
     });
@@ -9181,11 +9272,38 @@ void MainWindow::stopTreeWarmup() {
     if (m_treeWarmupCancel) {
         m_treeWarmupCancel->store(true, std::memory_order_release);
     }
+    if (m_treeWarmupControl) {
+        m_treeWarmupControl->condition.notify_all();
+    }
     if (m_treeWarmupThread.joinable()) {
         m_treeWarmupThread.join();
     }
     m_treeWarmupCancel.reset();
+    m_treeWarmupControl.reset();
     ++m_treeWarmupGeneration;
+}
+
+void MainWindow::prioritizeTreeReference(int nodeId) {
+    if (!m_signalTreeModel ||
+        !m_signalTreeModel->isPendingReference(nodeId) ||
+        !m_treeWarmupControl ||
+        !m_treeWarmupCancel ||
+        m_treeWarmupCancel->load(std::memory_order_acquire)) {
+        return;
+    }
+
+    const std::shared_ptr<TreeWarmupControl> control = m_treeWarmupControl;
+    {
+        std::lock_guard<std::mutex> lock(control->mutex);
+        if (nodeId <= 0 ||
+            nodeId >= control->referenceStateByNodeId.size() ||
+            control->referenceStateByNodeId.at(nodeId) != 0) {
+            return;
+        }
+        control->referenceStateByNodeId[nodeId] = 1;
+        control->priorityReferences.push_back(nodeId);
+    }
+    control->condition.notify_all();
 }
 
 void MainWindow::scheduleTreeWarmup() {
@@ -9196,63 +9314,234 @@ void MainWindow::scheduleTreeWarmup() {
 
     // QVector copies are implicitly shared.  The worker keeps immutable
     // snapshots alive if another wave replaces m_wave while it is running.
-    QVector<WaveTreeNode> nodes = m_wave.tree.nodesById;
-    QVector<QByteArray> names = m_wave.tree.namesById;
+    WaveTreeInfo sourceTree = m_wave.tree;
+    QVector<int> referenceNodeIds;
+    referenceNodeIds.reserve(256);
+    for (int nodeId = 1; nodeId < sourceTree.nodesById.size(); ++nodeId) {
+        const WaveTreeNode& node = sourceTree.nodesById.at(nodeId);
+        if (node.valid &&
+            node.kind == kWaveTreeNodeKindReference &&
+            node.referenceTargetId > 0 &&
+            node.firstChild == 0) {
+            referenceNodeIds.push_back(nodeId);
+        }
+    }
+
     const quint64 generation = m_treeWarmupGeneration;
     const std::shared_ptr<std::atomic_bool> cancel =
         std::make_shared<std::atomic_bool>(false);
+    const std::shared_ptr<TreeWarmupControl> control =
+        std::make_shared<TreeWarmupControl>();
+    control->referenceStateByNodeId.resize(sourceTree.nodesById.size());
+    std::fill(control->referenceStateByNodeId.begin(),
+              control->referenceStateByNodeId.end(), quint8(0));
     m_treeWarmupCancel = cancel;
+    m_treeWarmupControl = control;
 
     struct WarmupResult {
         SignalLogicTree::WaveChildListCache childLists;
         QVector<QString> nameStrings;
         qint64 elapsedMs = 0;
     };
+    struct ReferenceBatch {
+        QVector<WaveSubtreeReferencePatch> patches;
+    };
 
     m_treeWarmupThread = std::thread(
-        [this, generation, cancel, nodes = std::move(nodes), names = std::move(names)]() mutable {
+        [this, generation, cancel, control,
+         sourceTree = std::move(sourceTree),
+         referenceNodeIds = std::move(referenceNodeIds)]() mutable {
             const auto started = std::chrono::steady_clock::now();
-            std::shared_ptr<WarmupResult> result = std::make_shared<WarmupResult>();
+            int nextBackgroundReference = 0;
+            std::shared_ptr<ReferenceBatch> batch =
+                std::make_shared<ReferenceBatch>();
+            int batchNodeCount = 0;
 
-            result->nameStrings.resize(names.size());
-            for (int nameId = 0; nameId < names.size(); ++nameId) {
-                if ((nameId & 0x3ff) == 0 && cancel->load(std::memory_order_acquire)) return;
-                result->nameStrings[nameId] = QString::fromUtf8(names.at(nameId));
+            auto releasePendingBatch = [control]() {
+                {
+                    std::lock_guard<std::mutex> lock(control->mutex);
+                    if (control->pendingUiBatches > 0) {
+                        --control->pendingUiBatches;
+                    }
+                }
+                control->condition.notify_all();
+            };
+
+            auto postBatch = [&](bool force) -> bool {
+                if (batch->patches.isEmpty()) return true;
+                if (!force && batch->patches.size() < 16 &&
+                    batchNodeCount < 65536) {
+                    return true;
+                }
+                {
+                    std::unique_lock<std::mutex> lock(control->mutex);
+                    control->condition.wait(lock, [&]() {
+                        return cancel->load(std::memory_order_acquire) ||
+                               control->pendingUiBatches < 2;
+                    });
+                    if (cancel->load(std::memory_order_acquire)) return false;
+                    ++control->pendingUiBatches;
+                }
+
+                std::shared_ptr<ReferenceBatch> posted = std::move(batch);
+                batch = std::make_shared<ReferenceBatch>();
+                batchNodeCount = 0;
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, generation, cancel, control, posted,
+                     releasePendingBatch]() mutable {
+                        if (!cancel->load(std::memory_order_acquire) &&
+                            generation == m_treeWarmupGeneration &&
+                            m_signalTreeModel &&
+                            m_signalTreeModel->usesDirectWaveTree()) {
+                            SignalTreeModel* model =
+                                signalTreeModelFrom(m_treeModel);
+                            QString patchError;
+                            for (const WaveSubtreeReferencePatch& patch :
+                                 posted->patches) {
+                                if (!model ||
+                                    !model->installReferencePatch(
+                                        m_wave.tree, patch, patchError)) {
+                                    if (!patchError.isEmpty()) {
+                                        statusBar()->showMessage(
+                                            QStringLiteral(
+                                                "Tree reference load failed: %1")
+                                                .arg(patchError),
+                                            5000);
+                                    }
+                                    break;
+                                }
+                            }
+                            if (m_tree) m_tree->viewport()->update();
+                        }
+                        releasePendingBatch();
+                    },
+                    Qt::QueuedConnection);
+                return true;
+            };
+
+            while (!cancel->load(std::memory_order_acquire)) {
+                int nodeId = 0;
+                bool priority = false;
+                {
+                    std::lock_guard<std::mutex> lock(control->mutex);
+                    while (!control->priorityReferences.empty()) {
+                        const int candidate =
+                            control->priorityReferences.front();
+                        control->priorityReferences.pop_front();
+                        if (candidate > 0 &&
+                            candidate <
+                                control->referenceStateByNodeId.size() &&
+                            control->referenceStateByNodeId.at(candidate) == 1) {
+                            control->referenceStateByNodeId[candidate] = 2;
+                            nodeId = candidate;
+                            priority = true;
+                            break;
+                        }
+                    }
+                    while (nodeId == 0 &&
+                           nextBackgroundReference <
+                               referenceNodeIds.size()) {
+                        const int candidate =
+                            referenceNodeIds.at(nextBackgroundReference++);
+                        if (candidate > 0 &&
+                            candidate <
+                                control->referenceStateByNodeId.size() &&
+                            control->referenceStateByNodeId.at(candidate) == 0) {
+                            control->referenceStateByNodeId[candidate] = 2;
+                            nodeId = candidate;
+                            break;
+                        }
+                    }
+                }
+                if (nodeId == 0) break;
+
+                // Do not leave an explicitly expanded reference behind an
+                // older low-priority batch waiting for its size threshold.
+                if (priority && !postBatch(true)) return;
+
+                WaveSubtreeReferencePatch patch;
+                QString patchError;
+                if (!buildWaveSubtreeReferencePatch(
+                        sourceTree, nodeId, patch, patchError, cancel.get())) {
+                    if (cancel->load(std::memory_order_acquire)) return;
+                    continue;
+                }
+                batchNodeCount += patch.appendedNodes.size();
+                batch->patches.push_back(std::move(patch));
+                if (!postBatch(priority)) return;
+            }
+            if (!postBatch(true) ||
+                cancel->load(std::memory_order_acquire)) {
+                return;
             }
 
-            for (int nodeId = 1; nodeId < nodes.size(); ++nodeId) {
-                if ((nodeId & 0xfff) == 0 && cancel->load(std::memory_order_acquire)) return;
-                const WaveTreeNode& node = nodes.at(nodeId);
+            std::shared_ptr<WarmupResult> result =
+                std::make_shared<WarmupResult>();
+            result->nameStrings.resize(sourceTree.namesById.size());
+            for (int nameId = 0;
+                 nameId < sourceTree.namesById.size();
+                 ++nameId) {
+                if ((nameId & 0x3ff) == 0 &&
+                    cancel->load(std::memory_order_acquire)) {
+                    return;
+                }
+                result->nameStrings[nameId] =
+                    QString::fromUtf8(sourceTree.namesById.at(nameId));
+            }
+
+            for (int nodeId = 1;
+                 nodeId < sourceTree.nodesById.size();
+                 ++nodeId) {
+                if ((nodeId & 0xfff) == 0 &&
+                    cancel->load(std::memory_order_acquire)) {
+                    return;
+                }
+                const WaveTreeNode& node =
+                    sourceTree.nodesById.at(nodeId);
                 if (!node.valid || node.firstChild == 0) continue;
 
-                std::unique_ptr<LogicChildList> list(new LogicChildList());
+                std::unique_ptr<LogicChildList> list(
+                    new LogicChildList());
                 int childId = node.firstChild;
                 int guard = 0;
-                while (childId != 0 && guard++ < nodes.size()) {
-                    if (childId <= 0 || childId >= nodes.size() || !nodes.at(childId).valid) return;
+                while (childId != 0 &&
+                       guard++ < sourceTree.nodesById.size()) {
+                    if (childId <= 0 ||
+                        childId >= sourceTree.nodesById.size() ||
+                        !sourceTree.nodesById.at(childId).valid) {
+                        return;
+                    }
                     list->children.push_back(childId);
-                    childId = nodes.at(childId).nextSibling;
+                    childId =
+                        sourceTree.nodesById.at(childId).nextSibling;
                 }
                 if (childId != 0) return;
                 result->childLists.emplace(nodeId, std::move(list));
             }
             if (cancel->load(std::memory_order_acquire)) return;
 
-            result->elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - started).count();
-            QMetaObject::invokeMethod(this,
+            result->elapsedMs =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started)
+                    .count();
+            QMetaObject::invokeMethod(
+                this,
                 [this, generation, cancel, result]() mutable {
                     if (cancel->load(std::memory_order_acquire) ||
                         generation != m_treeWarmupGeneration ||
-                        !m_signalTreeModel || !m_signalTreeModel->usesDirectWaveTree()) {
+                        !m_signalTreeModel ||
+                        !m_signalTreeModel->usesDirectWaveTree()) {
                         return;
                     }
-                    m_signalTreeModel->installWaveWarmup(std::move(result->childLists),
-                                                         std::move(result->nameStrings));
+                    m_signalTreeModel->installWaveWarmup(
+                        std::move(result->childLists),
+                        std::move(result->nameStrings));
                     if (viewerPerfLogEnabled()) {
-                        viewerPerfLog("tree.warmup", result->elapsedMs,
-                                      waveSignalCount(m_wave.signalList),
-                                      m_wave.tree.nodesById.size());
+                        viewerPerfLog(
+                            "tree.warmup", result->elapsedMs,
+                            waveSignalCount(m_wave.signalList),
+                            m_wave.tree.nodesById.size());
                     }
                 },
                 Qt::QueuedConnection);

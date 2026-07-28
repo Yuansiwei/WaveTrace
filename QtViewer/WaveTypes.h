@@ -222,10 +222,13 @@ struct WaveTreeNode {
     int rowInParent = -1;
     int signalIndex = -1;   // -1 means module/container node
     int signalId = -1;
+    int referenceTargetId = 0;
     quint32 nameToken = 0;  // NAME id, or kWaveNameTokenArrayFlag | numeric array index
     quint8 kind = 0;
     bool valid = false;
 };
+
+constexpr quint8 kWaveTreeNodeKindReference = 7;
 
 struct WaveTreeInfo {
     bool valid = false;
@@ -238,6 +241,15 @@ struct WaveTreeInfo {
     // Directory-only v15 loads build this while decoding SIGD. Values store
     // signalIndex + 1 so zero remains the missing-id sentinel used by MainWindow.
     QVector<int> signalIndexBySignalId;
+};
+
+// A subtree-reference patch is built off the UI thread. Negative structural
+// node ids in appendedNodes are patch-local ids; applying the patch remaps
+// them to the destination tree's appended node range.
+struct WaveSubtreeReferencePatch {
+    int mountNodeId = 0;
+    WaveTreeNode mountNode;
+    QVector<WaveTreeNode> appendedNodes;
 };
 
 struct WaveMeta {

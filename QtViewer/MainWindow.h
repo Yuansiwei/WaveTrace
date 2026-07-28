@@ -42,6 +42,7 @@ class WaveBlockCacheLoader;
 class ActiveSignalListWidget;
 class AgentRpcServer;
 struct SignalLogicTree;
+struct TreeWarmupControl;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -196,6 +197,7 @@ private:
     std::thread m_treeWarmupThread;
     std::thread m_viewportLoadThread;
     std::shared_ptr<std::atomic_bool> m_treeWarmupCancel;
+    std::shared_ptr<TreeWarmupControl> m_treeWarmupControl;
     quint64 m_treeWarmupGeneration = 0;
     quint64 m_waveFileGeneration = 0;
     quint64 m_viewportLoadSerial = 0;
@@ -224,6 +226,7 @@ private:
     void rebuildTree();
     void scheduleTreeWarmup();
     void stopTreeWarmup();
+    void prioritizeTreeReference(int nodeId);
     void resetTreeViewModel();
     void collectSignalIndexesFromLogicNode(int nodeId, QSet<int>& seen, QList<int>& output) const;
     QList<int> selectedActiveSignalIndexesForJump() const;
