@@ -74,13 +74,17 @@ public:
             Tracer& tracer,
             ::PathStableWvz4Recorder& recorder,
             sc_core::sc_clock& clock)
-        : sc_core::sc_module(name), tracer_(&tracer), recorder_(&recorder) {
+        : sc_core::sc_module(name),
+          tracer_(&tracer),
+          recorder_(&recorder) {
         if (tracer_->trace_cycle_zero_only()) {
             recorder_->disable_lod_tables_for_cycle_zero_snapshot();
         }
-        SC_METHOD(sample_on_clock_falling_edge_);
-        sensitive << clock.negedge_event();
-        dont_initialize();
+        if (automatic_sampling_required_()) {
+            SC_METHOD(sample_on_clock_falling_edge_);
+            sensitive << clock.negedge_event();
+            dont_initialize();
+        }
     }
 #else
     WaveTap(Tracer& tracer, ::PathStableWvz4Recorder& recorder)
@@ -143,11 +147,8 @@ public:
 
 #if defined(WAVE_TAP_HAS_SYSTEMC_)
     void start_of_simulation() noexcept override {
-        if (!sample_one_cycle()) {
-            report_automatic_failure_once_("start_of_simulation");
-        } else {
-            automatic_error_reported_ = false;
-        }
+        if (!automatic_sampling_required_()) return;
+        run_automatic_sample_("start_of_simulation");
     }
 #endif
 
@@ -167,12 +168,25 @@ public:
 
 private:
 #if defined(WAVE_TAP_HAS_SYSTEMC_)
+    static bool automatic_sampling_required_() {
+        const ::wave::config::RuntimeConfig& config =
+            ::wave::config::runtime_config();
+        // Malformed configuration must still reach sample_one_cycle() so its
+        // existing diagnostic is reported. Only an explicit, valid disabled
+        // state suppresses automatic SystemC sampling entirely.
+        return !config.valid || config.wave_trace;
+    }
+
     void sample_on_clock_falling_edge_() noexcept {
-        if (!sample_one_cycle()) {
-            report_automatic_failure_once_("falling-edge");
-        } else {
+        run_automatic_sample_("falling-edge");
+    }
+
+    void run_automatic_sample_(const char* source) noexcept {
+        if (sample_one_cycle()) {
             automatic_error_reported_ = false;
+            return;
         }
+        report_automatic_failure_once_(source);
     }
 
     void report_automatic_failure_once_(const char* source) noexcept {
@@ -225,23 +239,17 @@ private:
             error += config.error;
             return false;
         }
-        // The business loop keeps calling this once per cycle. Disabled and
-        // out-of-window cycles are successful no-ops so WaveTrace never changes
-        // business control flow or forces call-site conditionals.
-        if (!config.wave_trace ||
-            static_cast<std::uint64_t>(cycle) < config.wave_trace_start ||
-            static_cast<std::uint64_t>(cycle) > config.wave_trace_end ||
-            (tracer_->trace_cycle_zero_only() && cycle != 0)) {
-            // Tracer::sample() normally owns cycle progress reporting.  This
-            // no-op path intentionally bypasses sample(), so report here to
-            // keep the business-cycle counter visible even when waveform
-            // tracing is disabled (or the cycle is outside the trace window).
-            // The same BuildOptions enable/period controls are still honored.
-            tracer_->maybe_print_cycle_progress(cycle, false);
-            if (next_cycle_ != (std::numeric_limits<Cycle>::max)()) ++next_cycle_;
-            last_error_.clear();
-            return true;
-        }
+        // Manual callers may still invoke sample_one_cycle() while tracing is
+        // disabled. Treat that as a quiet successful no-op.
+        if (!config.wave_trace) return finish_skipped_cycle_(cycle, false);
+
+        const std::uint64_t cycle_value = static_cast<std::uint64_t>(cycle);
+        const bool outside_capture_window =
+            cycle_value < config.wave_trace_start ||
+            cycle_value > config.wave_trace_end ||
+            (tracer_->trace_cycle_zero_only() && cycle != 0);
+        if (outside_capture_window) return finish_skipped_cycle_(cycle, true);
+
         // Lazy topology freeze. User code does not call prepare_topology().
         // This is intentionally done before begin_cycle() so topology/layout
         // declaration failures cannot leave a partially-open cycle frame.
@@ -260,6 +268,13 @@ private:
         }
 
         ++next_cycle_;
+        last_error_.clear();
+        return true;
+    }
+
+    bool finish_skipped_cycle_(Cycle cycle, bool show_progress) {
+        if (show_progress) tracer_->maybe_print_cycle_progress(cycle, false);
+        if (next_cycle_ != (std::numeric_limits<Cycle>::max)()) ++next_cycle_;
         last_error_.clear();
         return true;
     }

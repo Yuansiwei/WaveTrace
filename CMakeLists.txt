@@ -17,6 +17,20 @@ if(NOT DEFINED ARCH AND DEFINED ENV{ARCH})
 	set(ARCH "$ENV{ARCH}")
 endif()
 
+if(DEFINED ENV{DEBUG_DUMP})
+	set(DEBUG_DUMP "$ENV{DEBUG_DUMP}")
+else()
+	set(DEBUG_DUMP OFF)
+endif()
+if(DEBUG_DUMP STREQUAL "1" OR
+	DEBUG_DUMP STREQUAL "ON" OR
+	DEBUG_DUMP STREQUAL "TRUE" OR
+	DEBUG_DUMP STREQUAL "true")
+	set(DEBUG_DUMP ON)
+else()
+	set(DEBUG_DUMP OFF)
+endif()
+
 #define custom configuration
 
 option(GPGPU_ONLY "only GPGPU build" ON)

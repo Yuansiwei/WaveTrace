@@ -101,11 +101,21 @@
 #include <cstdint>
 #include <vector>
 
+#if defined(Q_OS_WIN)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 struct TreeWarmupControl {
     std::mutex mutex;
     std::condition_variable condition;
     std::deque<int> priorityReferences;
-    // 0 = background pending, 1 = priority queued, 2 = started.
+    // 0 = not requested, 1 = priority queued, 2 = started.
     QVector<quint8> referenceStateByNodeId;
     int pendingUiBatches = 0;
 };
@@ -158,9 +168,26 @@ int treeEventReductionThreshold() {
 quint64 viewerCacheBudgetBytes() {
     bool ok = false;
     const quint64 configuredMb = qEnvironmentVariable("WV_VIEWER_CACHE_LIMIT_MB").toULongLong(&ok);
-    if (!ok || configuredMb == 0) return kViewerCacheBudgetBytes;
-    const quint64 boundedMb = qMin<quint64>(configuredMb, 32ull * 1024ull);
-    return boundedMb * 1024ull * 1024ull;
+    if (ok && configuredMb != 0) {
+        const quint64 boundedMb = qMin<quint64>(configuredMb, 32ull * 1024ull);
+        return boundedMb * 1024ull * 1024ull;
+    }
+
+    quint64 budget = kViewerCacheBudgetBytes;
+#if defined(Q_OS_WIN)
+    MEMORYSTATUSEX memory = {};
+    memory.dwLength = sizeof(memory);
+    if (GlobalMemoryStatusEx(&memory)) {
+        // 32 GiB is a ceiling, not a target.  Leave at least half of both
+        // physical RAM and currently available RAM to the tree, Qt, the OS,
+        // and temporary block assembly.  The environment override above is
+        // intentionally exact for controlled performance experiments.
+        const quint64 physicalShare = memory.ullTotalPhys / 2ull;
+        const quint64 availableShare = memory.ullAvailPhys / 2ull;
+        budget = qMin(budget, qMin(physicalShare, availableShare));
+    }
+#endif
+    return budget;
 }
 
 // Extract a literal that every match must contain, but only for a deliberately
@@ -1150,7 +1177,6 @@ struct SignalLogicTree {
 
     SmallStrPool names;
     QVector<QByteArray> waveNamesById;
-    QVector<QString> waveNameStringsById;
     bool usesWaveNameTokens = false;
     QVector<SignalPathEntry> signalPaths;
     QVector<LogicTreeNode> nodes;
@@ -1162,11 +1188,15 @@ struct SignalLogicTree {
     const WaveTreeInfo* waveTree = nullptr;
     const WaveSignalList* waveSignalDefs = nullptr;
     mutable WaveChildListCache waveChildLists;
+    // Expression lookup asks for only a handful of names.  Cache the matching
+    // compact tree tokens instead of materializing a QString/hash entry for
+    // every signal in a potentially multi-million-node waveform.
+    mutable QHash<QString, QVector<quint32>> exactNameTokenCache;
+    mutable QHash<QString, int> exactSignalPathCache;
 
     void clear() {
         names = SmallStrPool();
         waveNamesById.clear();
-        waveNameStringsById.clear();
         usesWaveNameTokens = false;
         signalPaths.clear();
         nodes.clear();
@@ -1178,12 +1208,8 @@ struct SignalLogicTree {
         waveTree = nullptr;
         waveSignalDefs = nullptr;
         waveChildLists.clear();
-    }
-
-    void installWaveWarmup(WaveChildListCache&& childListCache,
-                           QVector<QString>&& nameStrings) {
-        waveChildLists = std::move(childListCache);
-        waveNameStringsById = std::move(nameStrings);
+        exactNameTokenCache.clear();
+        exactSignalPathCache.clear();
     }
 
     bool usesDirectWaveTree() const { return waveTree != nullptr; }
@@ -1480,9 +1506,6 @@ struct SignalLogicTree {
             }
             const quint32 nameId = waveNameTokenValue(nameToken);
             if (nameId >= quint32(waveNamesById.size())) return QString();
-            if (nameId < quint32(waveNameStringsById.size())) {
-                return waveNameStringsById.at(int(nameId));
-            }
             return QString::fromUtf8(waveNamesById.at(int(nameId)));
         }
         const quint32 localNameId = nameToken - 1u;
@@ -1567,15 +1590,37 @@ struct SignalLogicTree {
         if (!nodeNameEquals(nodeId, parts.at(partIndex), caseSensitivity)) return false;
         if (partIndex == parts.size() - 1) return true;
 
+        const QString& next = parts.at(partIndex + 1);
+        if (waveTree) {
+            int childSourceId = nodeId;
+            int referenceGuard = 0;
+            while (isValidNodeId(childSourceId) &&
+                   waveTree->nodesById.at(childSourceId).firstChild == 0 &&
+                   waveTree->nodesById.at(childSourceId).kind ==
+                       kWaveTreeNodeKindReference &&
+                   ++referenceGuard < waveTree->nodesById.size()) {
+                childSourceId =
+                    waveTree->nodesById.at(childSourceId).referenceTargetId;
+            }
+            if (!isValidNodeId(childSourceId)) return false;
+            for (int childNodeId = waveTree->nodesById.at(childSourceId).firstChild;
+                 childNodeId != 0;
+                 childNodeId = waveTree->nodesById.at(childNodeId).nextSibling) {
+                if (nodeNameEquals(childNodeId, next, caseSensitivity) &&
+                    directPathMatchesFrom(childNodeId, parts, partIndex + 1,
+                                          caseSensitivity)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         const LogicChildList* list = childListForNode(nodeId);
         if (!list) return false;
-
-        const QString& next = parts.at(partIndex + 1);
         for (int childNodeId : list->children) {
             if (nodeNameEquals(childNodeId, next, caseSensitivity) &&
-                directPathMatchesFrom(childNodeId, parts, partIndex + 1, caseSensitivity)) {
-                return true;
-            }
+                directPathMatchesFrom(childNodeId, parts, partIndex + 1,
+                                      caseSensitivity)) return true;
         }
         return false;
     }
@@ -1585,16 +1630,192 @@ struct SignalLogicTree {
         if (!nodeNameEquals(nodeId, parts.at(partIndex), caseSensitivity)) return -1;
         if (partIndex == parts.size() - 1) return nodeId;
 
+        const QString& next = parts.at(partIndex + 1);
+        if (waveTree) {
+            int childSourceId = nodeId;
+            int referenceGuard = 0;
+            while (isValidNodeId(childSourceId) &&
+                   waveTree->nodesById.at(childSourceId).firstChild == 0 &&
+                   waveTree->nodesById.at(childSourceId).kind ==
+                       kWaveTreeNodeKindReference &&
+                   ++referenceGuard < waveTree->nodesById.size()) {
+                childSourceId =
+                    waveTree->nodesById.at(childSourceId).referenceTargetId;
+            }
+            if (!isValidNodeId(childSourceId)) return -1;
+            for (int childNodeId = waveTree->nodesById.at(childSourceId).firstChild;
+                 childNodeId != 0;
+                 childNodeId = waveTree->nodesById.at(childNodeId).nextSibling) {
+                if (!nodeNameEquals(childNodeId, next, caseSensitivity)) continue;
+                const int endNode = directPathEndNodeFrom(
+                    childNodeId, parts, partIndex + 1, caseSensitivity);
+                if (endNode >= 0) return endNode;
+            }
+            return -1;
+        }
+
         const LogicChildList* list = childListForNode(nodeId);
         if (!list) return -1;
-
-        const QString& next = parts.at(partIndex + 1);
         for (int childNodeId : list->children) {
             if (!nodeNameEquals(childNodeId, next, caseSensitivity)) continue;
-            const int endNode = directPathEndNodeFrom(childNodeId, parts, partIndex + 1, caseSensitivity);
+            const int endNode = directPathEndNodeFrom(
+                childNodeId, parts, partIndex + 1, caseSensitivity);
             if (endNode >= 0) return endNode;
         }
         return -1;
+    }
+
+    QVector<quint32> exactNameTokens(const QString& name) const {
+        const auto cached = exactNameTokenCache.constFind(name);
+        if (cached != exactNameTokenCache.constEnd()) return cached.value();
+
+        QVector<quint32> result;
+        if (name.size() >= 3 && name.front() == QLatin1Char('[') &&
+            name.back() == QLatin1Char(']')) {
+            bool ok = false;
+            const qulonglong index = name.mid(1, name.size() - 2).toULongLong(&ok);
+            if (ok && index <= kWaveNameTokenValueMask) {
+                result.push_back(waveArrayIndexToken(quint32(index)));
+            }
+        }
+
+        if (result.isEmpty()) {
+            const QByteArray utf8 = name.toUtf8();
+            if (usesWaveNameTokens) {
+                for (int nameId = 1; nameId < waveNamesById.size(); ++nameId) {
+                    if (waveNamesById.at(nameId) == utf8) {
+                        result.push_back(waveNameIdToken(quint32(nameId)));
+                    }
+                }
+            } else {
+                for (int nameId = 0; nameId < names.strings.size(); ++nameId) {
+                    if (names.get(nameId).toQString() == name) {
+                        result.push_back(quint32(nameId) + 1u);
+                    }
+                }
+            }
+        }
+
+        exactNameTokenCache.insert(name, result);
+        return result;
+    }
+
+    bool resolveExactSignalPath(const QString& path, int& signalIndex,
+                                int& width, bool& ambiguous) const {
+        signalIndex = -1;
+        width = 1;
+        ambiguous = false;
+        const QStringList parts = splitSearchPath(path);
+        if (parts.isEmpty()) return false;
+
+        int matchedNode = -1;
+        for (int rootNodeId : roots) {
+            if (!nodeNameEquals(rootNodeId, parts.first(), Qt::CaseSensitive)) continue;
+            const int endNode = directPathEndNodeFrom(
+                rootNodeId, parts, 0, Qt::CaseSensitive);
+            if (endNode < 0 || nodeSignalIndex(endNode) < 0) continue;
+            if (matchedNode >= 0 && matchedNode != endNode) {
+                ambiguous = true;
+                return false;
+            }
+            matchedNode = endNode;
+        }
+        if (matchedNode >= 0 && nodeSignalIndex(matchedNode) >= 0) {
+            signalIndex = nodeSignalIndex(matchedNode);
+            width = nodeWidth(matchedNode);
+            exactSignalPathCache.insert(path, signalIndex);
+            return true;
+        }
+
+        const auto cached = exactSignalPathCache.constFind(path);
+        if (cached != exactSignalPathCache.constEnd()) {
+            signalIndex = cached.value();
+            if (signalIndex < 0) return false;
+            width = waveSignalDefs && signalIndex < waveSignalDefs->size()
+                ? waveSignalDefs->at(signalIndex).width : 1;
+            return true;
+        }
+
+        // A directory-only WVZ4 keeps repeated subtrees as references.  The
+        // display path of an indexed leaf is still available through its
+        // parent chain, even when a forward walk reaches an unmaterialized
+        // reference mount.  Fall back to a compact token comparison over the
+        // signal-to-node table: no QString is built, and the successful path
+        // is cached for every subsequent expression.
+        if (waveTree && waveNodeIdBySignalIndex) {
+            QVector<QVector<quint32>> partTokens;
+            partTokens.reserve(parts.size());
+            for (const QString& part : parts) {
+                QVector<quint32> tokens = exactNameTokens(part);
+                if (tokens.isEmpty()) {
+                    exactSignalPathCache.insert(path, -1);
+                    return false;
+                }
+                partTokens.push_back(std::move(tokens));
+            }
+
+            for (int candidateSignal = 0;
+                 candidateSignal < waveNodeIdBySignalIndex->size();
+                 ++candidateSignal) {
+                int nodeId = waveNodeIdBySignalIndex->at(candidateSignal);
+                int partIndex = partTokens.size() - 1;
+                while (partIndex >= 0 && isValidNodeId(nodeId)) {
+                    const quint32 token = nodeNameToken(nodeId);
+                    bool matches = false;
+                    for (quint32 expected : partTokens.at(partIndex)) {
+                        if (token == expected) {
+                            matches = true;
+                            break;
+                        }
+                    }
+                    if (!matches) break;
+                    --partIndex;
+                    nodeId = nodeParent(nodeId);
+                }
+                if (partIndex >= 0 || nodeId >= 0) continue;
+                signalIndex = candidateSignal;
+                width = waveSignalDefs && candidateSignal < waveSignalDefs->size()
+                    ? waveSignalDefs->at(candidateSignal).width : 1;
+                exactSignalPathCache.insert(path, signalIndex);
+                return true;
+            }
+        }
+
+        exactSignalPathCache.insert(path, -1);
+        return false;
+    }
+
+    bool resolveUniqueLeafSignal(const QString& leaf, int& signalIndex,
+                                 int& width, bool& ambiguous) const {
+        signalIndex = -1;
+        width = 1;
+        ambiguous = false;
+        const QVector<quint32> tokens = exactNameTokens(leaf);
+        if (tokens.isEmpty()) return false;
+
+        const int count = nodeCount();
+        for (int nodeId = usesDirectWaveTree() ? 1 : 0; nodeId < count; ++nodeId) {
+            if (!isValidNodeId(nodeId) || nodeSignalIndex(nodeId) < 0) continue;
+            const quint32 token = nodeNameToken(nodeId);
+            bool tokenMatches = false;
+            for (quint32 candidate : tokens) {
+                if (candidate == token) {
+                    tokenMatches = true;
+                    break;
+                }
+            }
+            if (!tokenMatches) continue;
+
+            const int foundSignalIndex = nodeSignalIndex(nodeId);
+            if (signalIndex >= 0 && signalIndex != foundSignalIndex) {
+                ambiguous = true;
+                signalIndex = -1;
+                return false;
+            }
+            signalIndex = foundSignalIndex;
+            width = nodeWidth(nodeId);
+        }
+        return signalIndex >= 0;
     }
 
     QVector<int> searchTreeQuery(const QString& query, int maxResults,
@@ -3198,12 +3419,54 @@ public:
         }
 
         if (m_searchMode) {
-            beginResetModel();
+            // A background subtree-reference patch must not cancel an active
+            // search.  The old reset path cleared m_searchMode, so results
+            // disappeared shortly after the search completed when tree warmup
+            // delivered its next batch.
+            //
+            // Only a matched container (or a descendant of one) exposes its
+            // complete subtree in search mode.  Such a mount gains visible
+            // rows and can be updated incrementally.  An ordinary ancestor
+            // path keeps filtering out the newly materialized children, so
+            // the patch does not change the model's visible row structure.
+            const bool exposesPatchedChildren =
+                isSearchVisibleNode(patch.mountNodeId) &&
+                isSearchSubtreeComplete(patch.mountNodeId);
+            const QModelIndex mountIndex =
+                exposesPatchedChildren
+                    ? indexForNode(patch.mountNodeId)
+                    : QModelIndex();
+            const bool insertVisibleRows =
+                exposesPatchedChildren && mountIndex.isValid() &&
+                directChildCount > 0;
+            if (insertVisibleRows) {
+                beginInsertRows(mountIndex, 0, directChildCount - 1);
+            }
+
+            const int oldSearchNodeCount = m_searchVisible.size();
             const bool ok = applyWaveSubtreeReferencePatch(tree, patch, error);
             m_tree->invalidateWaveChildList(patch.mountNodeId);
-            clearSearchStorage();
-            rebuildSearchStorage();
-            endResetModel();
+            if (ok) {
+                const int newNodeCount = m_tree->nodeCount();
+                if (newNodeCount > oldSearchNodeCount) {
+                    m_searchVisible.resize(newNodeCount);
+                    std::fill(m_searchVisible.begin() + oldSearchNodeCount,
+                              m_searchVisible.end(), uchar(0));
+                    m_searchSubtreeComplete.resize(newNodeCount);
+                    std::fill(m_searchSubtreeComplete.begin() + oldSearchNodeCount,
+                              m_searchSubtreeComplete.end(), uchar(0));
+                    m_searchRowByNodeId.resize(newNodeCount);
+                    std::fill(m_searchRowByNodeId.begin() + oldSearchNodeCount,
+                              m_searchRowByNodeId.end(), -1);
+                }
+                if (exposesPatchedChildren) {
+                    // Revisit this mount even though it was already marked
+                    // complete; the patch added descendants after that mark.
+                    m_searchSubtreeComplete[patch.mountNodeId] = 0;
+                    markSubtreeVisible(patch.mountNodeId);
+                }
+            }
+            if (insertVisibleRows) endInsertRows();
             return ok;
         }
 
@@ -3950,7 +4213,12 @@ private:
         if (open <= 0) return name + suffix;
 
         const QString body = name.mid(open + 1, name.size() - open - 2).trimmed();
-        if (body.isEmpty()) return name + suffix;
+        // Viewer width decoration is always "[msb:0]".  A single numeric
+        // suffix such as "[0]" is a real array path segment and must remain
+        // part of the signal name.
+        if (body.isEmpty() || !body.contains(QLatin1Char(':'))) {
+            return name + suffix;
+        }
         bool ok = true;
         bool sawDigit = false;
         for (int i = 0; i < body.size(); ++i) {
@@ -4038,11 +4306,14 @@ private:
         int right = -1;
         int width = 1;
         quint64 mask = 1;
+        quint64 dependencyMask = 0;
+        bool hasOverflowDependency = false;
     };
 
     struct DerivedExpressionProgram {
         QVector<DerivedExprNode> nodes;
         QVector<int> dependencyIndexes;
+        QVector<int> evaluationNodeIndexes;
         int root = -1;
         int inferredWidth = 1;
     };
@@ -4077,6 +4348,13 @@ private:
             out.dependencyIndexes = std::move(m_dependencyIndexes);
             out.root = root;
             out.inferredWidth = qBound(1, out.nodes.at(root).width, 64);
+            out.evaluationNodeIndexes.reserve(out.nodes.size());
+            for (int nodeIndex = 0; nodeIndex < out.nodes.size(); ++nodeIndex) {
+                const DerivedExprNode::Kind kind = out.nodes.at(nodeIndex).kind;
+                if (kind == DerivedExprNode::Unary || kind == DerivedExprNode::Binary) {
+                    out.evaluationNodeIndexes.push_back(nodeIndex);
+                }
+            }
             return true;
         }
 
@@ -4265,6 +4543,12 @@ private:
                 node.op = derivedExprOpFromText(op);
                 node.left = lhs;
                 node.right = rhs;
+                node.dependencyMask =
+                    m_nodes.at(lhs).dependencyMask |
+                    m_nodes.at(rhs).dependencyMask;
+                node.hasOverflowDependency =
+                    m_nodes.at(lhs).hasOverflowDependency ||
+                    m_nodes.at(rhs).hasOverflowDependency;
                 if (op == QStringLiteral("&&") || op == QStringLiteral("||") ||
                     op == QStringLiteral("==") || op == QStringLiteral("!=") ||
                     op == QStringLiteral("<") || op == QStringLiteral("<=") ||
@@ -4298,6 +4582,9 @@ private:
                 else if (op == QStringLiteral("!")) node.op = DerivedExprOp::LogicalNot;
                 else node.op = DerivedExprOp::BitwiseNot;
                 node.left = child;
+                node.dependencyMask = m_nodes.at(child).dependencyMask;
+                node.hasOverflowDependency =
+                    m_nodes.at(child).hasOverflowDependency;
                 node.width = (op == QStringLiteral("!")) ? 1 : m_nodes.at(child).width;
                 return addNode(std::move(node));
             }
@@ -4337,6 +4624,8 @@ private:
                 node.kind = DerivedExprNode::Signal;
                 node.signalIndex = signalIndex;
                 node.signalSlot = slot;
+                if (slot < 64) node.dependencyMask = quint64(1) << slot;
+                else node.hasOverflowDependency = true;
                 node.width = width;
                 nextToken();
                 return addNode(std::move(node));
@@ -4370,29 +4659,50 @@ private:
 
     DerivedEvalValue evalDerivedExpression(const DerivedExpressionProgram& program,
                                            const QVector<DerivedEvalValue>& currentValues,
-                                           QVector<DerivedEvalValue>& workspace) {
+                                           QVector<DerivedEvalValue>& workspace,
+                                           quint64 changedDependencyMask,
+                                           bool forceAllDependencies,
+                                           bool initialize) {
         if (program.root < 0 || program.root >= program.nodes.size()) return DerivedEvalValue();
         if (workspace.size() != program.nodes.size()) workspace.resize(program.nodes.size());
 
+        // Literals never change.  Signal leaves are updated only when their
+        // dependency changed; operator nodes below carry the union of their
+        // input dependency bits and can skip unrelated branches.
         for (int nodeIndex = 0; nodeIndex < program.nodes.size(); ++nodeIndex) {
             const DerivedExprNode& node = program.nodes.at(nodeIndex);
-            DerivedEvalValue out;
-
             if (node.kind == DerivedExprNode::Literal) {
+                if (!initialize) continue;
+                DerivedEvalValue out;
                 out.known = true;
                 out.bits = node.literal & node.mask;
                 workspace[nodeIndex] = out;
                 continue;
             }
-
             if (node.kind == DerivedExprNode::Signal) {
+                const bool changed = initialize || forceAllDependencies ||
+                    node.hasOverflowDependency ||
+                    (node.dependencyMask & changedDependencyMask) != 0;
+                if (!changed) continue;
+                DerivedEvalValue out;
                 if (node.signalSlot >= 0 && node.signalSlot < currentValues.size()) {
                     out = currentValues.at(node.signalSlot);
                     if (out.known) out.bits &= node.mask;
                 }
                 workspace[nodeIndex] = out;
+            }
+        }
+
+        for (int nodeIndex : program.evaluationNodeIndexes) {
+            if (nodeIndex < 0 || nodeIndex >= program.nodes.size()) continue;
+            const DerivedExprNode& node = program.nodes.at(nodeIndex);
+            if (!initialize && !forceAllDependencies &&
+                !node.hasOverflowDependency &&
+                (node.dependencyMask & changedDependencyMask) == 0) {
                 continue;
             }
+
+            DerivedEvalValue out;
 
             if (node.left < 0 || node.left >= nodeIndex) {
                 workspace[nodeIndex] = out;
@@ -4465,19 +4775,16 @@ private:
         return workspace.at(program.root);
     }
 
-    WaveSample makeDerivedSample(qint64 time, const DerivedEvalValue& value, int width, ValueRadix radix) {
+    WaveSample makeDerivedSample(qint64 time, const DerivedEvalValue& value, int width) {
         WaveSample sample;
         sample.time = time;
         sample.rawFieldsReady = true;
         if (!value.known) {
             sample.isZ = true;
-            sample.value = QStringLiteral("Z");
             return sample;
         }
 
-        const SignalKind kind = (width <= 1) ? SignalKind::Bit : SignalKind::Bus;
         sample.rawBits = value.bits & waveBitMaskForWidth(width);
-        sample.value = waveSampleRawText(kind, width, radix, sample);
         return sample;
     }
 
@@ -4503,12 +4810,6 @@ private:
         for (int signalIndex : dependencyIndexes) {
             if (signalIndex < 0 || signalIndex >= wave.signalList.size()) continue;
             collect(wave.signalList.at(signalIndex));
-        }
-        if (buckets.isEmpty()) {
-            for (const WaveSignal& signal : wave.signalList) {
-                collect(signal);
-                if (!buckets.isEmpty()) break;
-            }
         }
         if (buckets.isEmpty()) {
             buckets = QVector<qint64>{10, 100, 1000, 10000};
@@ -8542,13 +8843,11 @@ void MainWindow::runValueFind() {
                       signalIndexes.size(), m_wave.tree.nodesById.size(),
                       m_valueFindHits.size());
     }
-    if (!m_valueFindHits.isEmpty()) {
-        jumpToValueFindHit(0);
-    } else {
-        updateValueFindNavigationState();
-    }
+    // Finding a value should not move the waveform viewport implicitly.
+    // Double-clicking a result or using Previous/Next remains an explicit jump.
+    updateValueFindNavigationState();
     if (viewerPerfLogEnabled()) {
-        viewerPerfLog("find.jump", findStageTimer.elapsed(),
+        viewerPerfLog("find.finalize", findStageTimer.elapsed(),
                       signalIndexes.size(), m_wave.tree.nodesById.size(),
                       m_valueFindHits.size());
     }
@@ -8971,53 +9270,66 @@ bool MainWindow::createDerivedSignal(const QString& name, const QString& express
         return false;
     }
 
-    QHash<QString, int> leafByName;
-    QSet<QString> duplicateLeaf;
-    QHash<QString, int> fullPathByName;
-    QSet<QString> duplicateFullPath;
-    bool fullPathIndexReady = false;
-
-    auto addLeaf = [&](const QString& rawName, int signalIndex) {
-        const QString key = stripDisplayRangeSuffix(rawName);
-        if (key.isEmpty()) return;
-        const int dot = key.lastIndexOf(QLatin1Char('.'));
-        const QString leaf = (dot >= 0) ? key.mid(dot + 1) : key;
-        if (leaf.isEmpty()) return;
-        if (leafByName.contains(leaf) && leafByName.value(leaf) != signalIndex) {
-            duplicateLeaf.insert(leaf);
-        } else {
-            leafByName.insert(leaf, signalIndex);
+    auto resolveExplicitNamedSignal = [&](const QString& key, bool leafOnly,
+                                          int& signalIndex, int& width,
+                                          bool& ambiguous) {
+        signalIndex = -1;
+        width = 1;
+        ambiguous = false;
+        // Normal WVZ4 signals are represented by compact TREE tokens and have
+        // no QString name here.  This reverse scan is therefore primarily for
+        // the small set of temporary signals appended by the Viewer.
+        const int firstExplicitSignal =
+            m_wave.tree.valid
+                ? qMin(int(m_wave.signalList.size()),
+                       int(m_wave.tree.signalIndexToNodeId.size()))
+                : 0;
+        for (int i = int(m_wave.signalList.size()) - 1;
+             i >= firstExplicitSignal; --i) {
+            const WaveSignal& signal = m_wave.signalList.at(i);
+            if (signal.name.isEmpty()) continue;
+            QString candidate = stripDisplayRangeSuffix(signal.name);
+            if (leafOnly) {
+                const int dot = candidate.lastIndexOf(QLatin1Char('.'));
+                if (dot >= 0) candidate = candidate.mid(dot + 1);
+            }
+            if (candidate != key) continue;
+            if (signalIndex >= 0 && signalIndex != i) {
+                ambiguous = true;
+                signalIndex = -1;
+                return false;
+            }
+            signalIndex = i;
+            width = signal.width;
         }
+        return signalIndex >= 0;
     };
 
-    leafByName.reserve(waveSignalCount(m_wave.signalList));
-    for (int i = 0; i < m_wave.signalList.size(); ++i) {
-        const QString rawName = waveSignalSegmentName(m_wave, i);
-        addLeaf(rawName, i);
-    }
-
-    auto ensureFullPathIndex = [&]() {
-        if (fullPathIndexReady) return;
-        fullPathIndexReady = true;
-        fullPathByName.reserve(waveSignalCount(m_wave.signalList));
-        for (int i = 0; i < m_wave.signalList.size(); ++i) {
-            const QString key = stripDisplayRangeSuffix(signalDisplayName(i));
-            if (key.isEmpty()) continue;
-            const auto found = fullPathByName.constFind(key);
-            if (found != fullPathByName.constEnd() && found.value() != i) {
-                duplicateFullPath.insert(key);
-            } else {
-                fullPathByName.insert(key, i);
-            }
+    auto resolveIndexedSignal = [&](const QString& key, int& signalIndex,
+                                    int& width, bool& ambiguous) {
+        signalIndex = -1;
+        width = 1;
+        ambiguous = false;
+        const bool leafOnly = !key.contains(QLatin1Char('.'));
+        if (m_signalTreeModel) {
+            const bool found = leafOnly
+                ? m_signalTreeModel->resolveUniqueLeafSignal(
+                      key, signalIndex, width, ambiguous)
+                : m_signalTreeModel->resolveExactSignalPath(
+                      key, signalIndex, width, ambiguous);
+            if (found || ambiguous) return found;
         }
+        return resolveExplicitNamedSignal(
+            key, leafOnly, signalIndex, width, ambiguous);
     };
 
     const QString normalizedSignalName = stripDisplayRangeSuffix(signalName);
-    bool signalNameExists = leafByName.contains(normalizedSignalName);
-    if (!signalNameExists && normalizedSignalName.contains(QLatin1Char('.'))) {
-        ensureFullPathIndex();
-        signalNameExists = fullPathByName.contains(normalizedSignalName);
-    }
+    int existingSignalIndex = -1;
+    int existingWidth = 1;
+    bool existingNameAmbiguous = false;
+    const bool signalNameExists = resolveIndexedSignal(
+        normalizedSignalName, existingSignalIndex, existingWidth,
+        existingNameAmbiguous) || existingNameAmbiguous;
     if (signalNameExists) {
         QMessageBox::warning(this,
             QStringLiteral("Create temporary signal"),
@@ -9032,29 +9344,17 @@ bool MainWindow::createDerivedSignal(const QString& name, const QString& express
             return false;
         }
 
-        if (!key.contains(QLatin1Char('.'))) {
-            if (duplicateLeaf.contains(key)) {
-                error = QStringLiteral("Leaf signal name '%1' is ambiguous; use the full path in backticks.").arg(rawName);
-                return false;
-            }
-            if (leafByName.contains(key)) {
-                signalIndex = leafByName.value(key);
-                if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) return false;
-                width = qBound(1, m_wave.signalList.at(signalIndex).width, 64);
-                return true;
-            }
-        } else {
-            ensureFullPathIndex();
-            if (duplicateFullPath.contains(key)) {
-                error = QStringLiteral("Signal name '%1' is ambiguous; use a unique full path.").arg(rawName);
-                return false;
-            }
-            if (fullPathByName.contains(key)) {
-                signalIndex = fullPathByName.value(key);
-                if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) return false;
-                width = qBound(1, m_wave.signalList.at(signalIndex).width, 64);
-                return true;
-            }
+        bool ambiguous = false;
+        if (resolveIndexedSignal(key, signalIndex, width, ambiguous)) {
+            if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) return false;
+            width = qBound(1, m_wave.signalList.at(signalIndex).width, 64);
+            return true;
+        }
+        if (ambiguous) {
+            error = key.contains(QLatin1Char('.'))
+                ? QStringLiteral("Signal name '%1' is ambiguous; use a unique full path.").arg(rawName)
+                : QStringLiteral("Leaf signal name '%1' is ambiguous; use the full path in backticks.").arg(rawName);
+            return false;
         }
 
         error = QStringLiteral("Unknown signal '%1'.").arg(rawName);
@@ -9065,6 +9365,12 @@ bool MainWindow::createDerivedSignal(const QString& name, const QString& express
     QString parseError;
     DerivedExpressionParser parser(expr, resolveSignal);
     if (!parser.parse(program, parseError)) {
+        if (signalName == QStringLiteral("__derived_expression_benchmark")) {
+            qWarning().noquote() << "Derived expression parse failed:" << parseError;
+            std::fprintf(stderr, "Derived expression parse failed: %s\n",
+                         parseError.toLocal8Bit().constData());
+            std::fflush(stderr);
+        }
         QMessageBox::warning(this, QStringLiteral("Create temporary signal"), parseError);
         return false;
     }
@@ -9102,42 +9408,46 @@ bool MainWindow::createDerivedSignal(const QString& name, const QString& express
     outputSamples.reserve(qMax(1, initialReserve));
     outputChangeTimes.reserve(qMax(0, initialReserve - 1));
 
-    auto consumeSlotAtOrBefore = [&](int slot, qint64 t) {
-        if (slot < 0 || slot >= program.dependencyIndexes.size()) return;
+    auto consumeSlotAtOrBefore = [&](int slot, qint64 t) -> bool {
+        if (slot < 0 || slot >= program.dependencyIndexes.size()) return false;
         const int signalIndex = program.dependencyIndexes.at(slot);
-        if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) return;
-        const WaveSignal& sig = m_wave.signalList.at(signalIndex);
+        if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) return false;
+        WaveSignal& sig = m_wave.signalList[signalIndex];
         int& pos = samplePositions[slot];
+        const DerivedEvalValue previous = currentValues.at(slot);
         while (pos < sig.samples.size() && sig.samples.at(pos).time <= t) {
-            const WaveSample& source = sig.samples.at(pos++);
+            WaveSample& source = sig.samples[pos++];
             DerivedEvalValue value;
             if (!source.isAbsent && !source.isZ) {
-                if (source.rawFieldsReady) {
+                if (!source.rawFieldsReady) {
+                    hydrateWaveSampleRawFields(sig.kind, sig.width, source);
+                }
+                if (!source.isAbsent && !source.isZ && source.rawFieldsReady) {
                     value.known = true;
                     value.bits = source.rawBits;
-                } else {
-                    WaveSample hydrated = source;
-                    hydrateWaveSampleRawFields(sig.kind, sig.width, hydrated);
-                    if (!hydrated.isAbsent && !hydrated.isZ) {
-                        value.known = true;
-                        value.bits = hydrated.rawBits;
-                    }
                 }
             }
             currentValues[slot] = value;
         }
+        const DerivedEvalValue& current = currentValues.at(slot);
+        return previous.known != current.known ||
+            (current.known && previous.bits != current.bits);
     };
 
     bool haveLastResult = false;
     DerivedEvalValue lastResult;
-    auto appendResultAt = [&](qint64 t) -> bool {
-        DerivedEvalValue value = evalDerivedExpression(program, currentValues, evalWorkspace);
+    auto appendResultAt = [&](qint64 t, quint64 changedMask,
+                              bool forceAllDependencies,
+                              bool initialize) -> bool {
+        DerivedEvalValue value = evalDerivedExpression(
+            program, currentValues, evalWorkspace, changedMask,
+            forceAllDependencies, initialize);
         if (value.known) value.bits &= waveBitMaskForWidth(outputWidth);
         const bool unchanged = haveLastResult && value.known == lastResult.known &&
             (!value.known || value.bits == lastResult.bits);
         if (unchanged) return true;
 
-        WaveSample sample = makeDerivedSample(t, value, outputWidth, outputRadix);
+        WaveSample sample = makeDerivedSample(t, value, outputWidth);
         if (!outputSamples.isEmpty()) outputChangeTimes.push_back(t);
         outputSamples.push_back(std::move(sample));
         haveLastResult = true;
@@ -9150,7 +9460,7 @@ bool MainWindow::createDerivedSignal(const QString& name, const QString& express
     for (int slot = 0; slot < program.dependencyIndexes.size(); ++slot) {
         consumeSlotAtOrBefore(slot, startTime);
     }
-    if (!appendResultAt(startTime)) {
+    if (!appendResultAt(startTime, ~quint64(0), true, true)) {
         QMessageBox::warning(this,
             QStringLiteral("Create temporary signal"),
             QStringLiteral("The derived signal generated too many transitions."));
@@ -9179,8 +9489,9 @@ bool MainWindow::createDerivedSignal(const QString& name, const QString& express
         const int pos = samplePositions.at(slot);
         if (pos < sig.samples.size()) pendingEvents.push(PendingDerivedEvent{sig.samples.at(pos).time, slot});
     };
-    auto appendOrReportOverflow = [&](qint64 time) {
-        if (appendResultAt(time)) return true;
+    auto appendOrReportOverflow = [&](qint64 time, quint64 changedMask,
+                                      bool forceAllDependencies) {
+        if (appendResultAt(time, changedMask, forceAllDependencies, false)) return true;
         QMessageBox::warning(this,
             QStringLiteral("Create temporary signal"),
             QStringLiteral("The derived signal generated too many transitions."));
@@ -9193,22 +9504,64 @@ bool MainWindow::createDerivedSignal(const QString& name, const QString& express
             const WaveSignal& sig = m_wave.signalList.at(signalIndex);
             while (samplePositions.first() < sig.samples.size()) {
                 const qint64 nextTime = sig.samples.at(samplePositions.first()).time;
-                consumeSlotAtOrBefore(0, nextTime);
-                if (!appendOrReportOverflow(nextTime)) return false;
+                if (consumeSlotAtOrBefore(0, nextTime) &&
+                    !appendOrReportOverflow(nextTime, 1u, false)) {
+                    return false;
+                }
+            }
+        }
+    } else if (program.dependencyIndexes.size() <= 8) {
+        // Most interactive expressions reference only two or three signals.
+        // A tiny linear merge beats priority_queue churn and branchy heap
+        // maintenance for this common case.
+        for (;;) {
+            qint64 nextTime = std::numeric_limits<qint64>::max();
+            for (int slot = 0; slot < program.dependencyIndexes.size(); ++slot) {
+                const int signalIndex = program.dependencyIndexes.at(slot);
+                if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
+                const WaveSignal& sig = m_wave.signalList.at(signalIndex);
+                const int pos = samplePositions.at(slot);
+                if (pos < sig.samples.size()) nextTime = qMin(nextTime, sig.samples.at(pos).time);
+            }
+            if (nextTime == std::numeric_limits<qint64>::max()) break;
+
+            quint64 changedMask = 0;
+            bool forceAllDependencies = false;
+            for (int slot = 0; slot < program.dependencyIndexes.size(); ++slot) {
+                const int signalIndex = program.dependencyIndexes.at(slot);
+                if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
+                const WaveSignal& sig = m_wave.signalList.at(signalIndex);
+                const int pos = samplePositions.at(slot);
+                if (pos >= sig.samples.size() || sig.samples.at(pos).time != nextTime) continue;
+                if (!consumeSlotAtOrBefore(slot, nextTime)) continue;
+                if (slot < 64) changedMask |= quint64(1) << slot;
+                else forceAllDependencies = true;
+            }
+            if ((changedMask != 0 || forceAllDependencies) &&
+                !appendOrReportOverflow(nextTime, changedMask, forceAllDependencies)) {
+                return false;
             }
         }
     } else {
         for (int slot = 0; slot < program.dependencyIndexes.size(); ++slot) queueNextSlotEvent(slot);
         while (!pendingEvents.empty()) {
             const qint64 nextTime = pendingEvents.top().time;
+            quint64 changedMask = 0;
+            bool forceAllDependencies = false;
             do {
                 const int slot = pendingEvents.top().slot;
                 pendingEvents.pop();
-                consumeSlotAtOrBefore(slot, nextTime);
+                if (consumeSlotAtOrBefore(slot, nextTime)) {
+                    if (slot < 64) changedMask |= quint64(1) << slot;
+                    else forceAllDependencies = true;
+                }
                 queueNextSlotEvent(slot);
             } while (!pendingEvents.empty() && pendingEvents.top().time == nextTime);
 
-            if (!appendOrReportOverflow(nextTime)) return false;
+            if ((changedMask != 0 || forceAllDependencies) &&
+                !appendOrReportOverflow(nextTime, changedMask, forceAllDependencies)) {
+                return false;
+            }
         }
     }
 
@@ -9223,9 +9576,9 @@ bool MainWindow::createDerivedSignal(const QString& name, const QString& express
                       program.dependencyIndexes.size(), m_wave.tree.nodesById.size(), outputSamples.size());
     }
 
-    int maxSignalId = -1;
-    for (const WaveSignal& sig : m_wave.signalList) {
-        maxSignalId = qMax(maxSignalId, sig.signalId);
+    int maxSignalId = m_signalIndexBySignalId.size() - 1;
+    while (maxSignalId >= 0 && m_signalIndexBySignalId.at(maxSignalId) == 0) {
+        --maxSignalId;
     }
 
     WaveSignal derived;
@@ -9274,6 +9627,56 @@ bool MainWindow::createDerivedSignal(const QString& name, const QString& express
         QStringLiteral("Temporary signal '%1' created with %2 transition sample(s).")
             .arg(signalName)
             .arg(m_wave.signalList.at(newSignalIndex).samples.size()));
+    return true;
+}
+
+bool MainWindow::runDerivedExpressionForBenchmark(
+    const QString& expression, int widthOverride, qint64* elapsedMs,
+    qint64* outputSampleCount, quint64* outputChecksum) {
+    if (elapsedMs) *elapsedMs = -1;
+    if (outputSampleCount) *outputSampleCount = 0;
+    if (outputChecksum) *outputChecksum = 0;
+
+    const int previousSignalCount = int(m_wave.signalList.size());
+    QString benchmarkDialogText;
+    QTimer dialogCloser;
+    dialogCloser.setInterval(10);
+    connect(&dialogCloser, &QTimer::timeout, this, [&benchmarkDialogText]() {
+        if (QWidget* modal = QApplication::activeModalWidget()) {
+            if (QMessageBox* messageBox = qobject_cast<QMessageBox*>(modal)) {
+                benchmarkDialogText = messageBox->text();
+            }
+            modal->close();
+        }
+    });
+    dialogCloser.start();
+    QElapsedTimer timer;
+    timer.start();
+    const bool ok = createDerivedSignal(
+        QStringLiteral("__derived_expression_benchmark"), expression,
+        widthOverride);
+    dialogCloser.stop();
+    if (elapsedMs) *elapsedMs = timer.elapsed();
+    if (!ok || int(m_wave.signalList.size()) != previousSignalCount + 1) {
+        if (!benchmarkDialogText.isEmpty()) {
+            qWarning().noquote() << "Derived expression benchmark failed:"
+                                 << benchmarkDialogText;
+        }
+        return false;
+    }
+
+    const WaveSignal& result = m_wave.signalList.back();
+    quint64 checksum = 1469598103934665603ull;
+    for (const WaveSample& sample : result.samples) {
+        checksum ^= quint64(sample.time);
+        checksum *= 1099511628211ull;
+        checksum ^= sample.rawBits;
+        checksum *= 1099511628211ull;
+        checksum ^= sample.isZ ? 1ull : 0ull;
+        checksum *= 1099511628211ull;
+    }
+    if (outputSampleCount) *outputSampleCount = qint64(result.samples.size());
+    if (outputChecksum) *outputChecksum = checksum;
     return true;
 }
 
@@ -9373,17 +9776,18 @@ void MainWindow::scheduleTreeWarmup() {
     // QVector copies are implicitly shared.  The worker keeps immutable
     // snapshots alive if another wave replaces m_wave while it is running.
     WaveTreeInfo sourceTree = m_wave.tree;
-    QVector<int> referenceNodeIds;
-    referenceNodeIds.reserve(256);
+    bool hasPendingReference = false;
     for (int nodeId = 1; nodeId < sourceTree.nodesById.size(); ++nodeId) {
         const WaveTreeNode& node = sourceTree.nodesById.at(nodeId);
         if (node.valid &&
             node.kind == kWaveTreeNodeKindReference &&
             node.referenceTargetId > 0 &&
             node.firstChild == 0) {
-            referenceNodeIds.push_back(nodeId);
+            hasPendingReference = true;
+            break;
         }
     }
+    if (!hasPendingReference) return;
 
     const quint64 generation = m_treeWarmupGeneration;
     const std::shared_ptr<std::atomic_bool> cancel =
@@ -9396,21 +9800,13 @@ void MainWindow::scheduleTreeWarmup() {
     m_treeWarmupCancel = cancel;
     m_treeWarmupControl = control;
 
-    struct WarmupResult {
-        SignalLogicTree::WaveChildListCache childLists;
-        QVector<QString> nameStrings;
-        qint64 elapsedMs = 0;
-    };
     struct ReferenceBatch {
         QVector<WaveSubtreeReferencePatch> patches;
     };
 
     m_treeWarmupThread = std::thread(
         [this, generation, cancel, control,
-         sourceTree = std::move(sourceTree),
-         referenceNodeIds = std::move(referenceNodeIds)]() mutable {
-            const auto started = std::chrono::steady_clock::now();
-            int nextBackgroundReference = 0;
+         sourceTree = std::move(sourceTree)]() mutable {
             std::shared_ptr<ReferenceBatch> batch =
                 std::make_shared<ReferenceBatch>();
             int batchNodeCount = 0;
@@ -9478,9 +9874,13 @@ void MainWindow::scheduleTreeWarmup() {
 
             while (!cancel->load(std::memory_order_acquire)) {
                 int nodeId = 0;
-                bool priority = false;
                 {
-                    std::lock_guard<std::mutex> lock(control->mutex);
+                    std::unique_lock<std::mutex> lock(control->mutex);
+                    control->condition.wait(lock, [&]() {
+                        return cancel->load(std::memory_order_acquire) ||
+                               !control->priorityReferences.empty();
+                    });
+                    if (cancel->load(std::memory_order_acquire)) return;
                     while (!control->priorityReferences.empty()) {
                         const int candidate =
                             control->priorityReferences.front();
@@ -9491,30 +9891,17 @@ void MainWindow::scheduleTreeWarmup() {
                             control->referenceStateByNodeId.at(candidate) == 1) {
                             control->referenceStateByNodeId[candidate] = 2;
                             nodeId = candidate;
-                            priority = true;
-                            break;
-                        }
-                    }
-                    while (nodeId == 0 &&
-                           nextBackgroundReference <
-                               referenceNodeIds.size()) {
-                        const int candidate =
-                            referenceNodeIds.at(nextBackgroundReference++);
-                        if (candidate > 0 &&
-                            candidate <
-                                control->referenceStateByNodeId.size() &&
-                            control->referenceStateByNodeId.at(candidate) == 0) {
-                            control->referenceStateByNodeId[candidate] = 2;
-                            nodeId = candidate;
                             break;
                         }
                     }
                 }
-                if (nodeId == 0) break;
+                if (nodeId == 0) continue;
 
-                // Do not leave an explicitly expanded reference behind an
-                // older low-priority batch waiting for its size threshold.
-                if (priority && !postBatch(true)) return;
+                // References are materialized only when the user reaches one.
+                // Posting each requested mount immediately keeps navigation
+                // responsive without allowing an idle full-tree expansion to
+                // consume gigabytes and later stall the GUI thread.
+                if (!postBatch(true)) return;
 
                 WaveSubtreeReferencePatch patch;
                 QString patchError;
@@ -9525,89 +9912,8 @@ void MainWindow::scheduleTreeWarmup() {
                 }
                 batchNodeCount += patch.appendedNodes.size();
                 batch->patches.push_back(std::move(patch));
-                if (!postBatch(priority)) return;
+                if (!postBatch(true)) return;
             }
-            if (!postBatch(true) ||
-                cancel->load(std::memory_order_acquire)) {
-                return;
-            }
-
-            std::shared_ptr<WarmupResult> result =
-                std::make_shared<WarmupResult>();
-            result->nameStrings.resize(sourceTree.namesById.size());
-            for (int nameId = 0;
-                 nameId < sourceTree.namesById.size();
-                 ++nameId) {
-                if ((nameId & 0x3ff) == 0 &&
-                    cancel->load(std::memory_order_acquire)) {
-                    return;
-                }
-                result->nameStrings[nameId] =
-                    QString::fromUtf8(sourceTree.namesById.at(nameId));
-            }
-
-            for (int nodeId = 1;
-                 nodeId < sourceTree.nodesById.size();
-                 ++nodeId) {
-                if ((nodeId & 0xfff) == 0 &&
-                    cancel->load(std::memory_order_acquire)) {
-                    return;
-                }
-                const WaveTreeNode& node =
-                    sourceTree.nodesById.at(nodeId);
-                if (!node.valid || node.firstChild == 0) continue;
-
-                std::unique_ptr<LogicChildList> list(
-                    new LogicChildList());
-                int childId = node.firstChild;
-                int guard = 0;
-                while (childId != 0 &&
-                       guard++ < sourceTree.nodesById.size()) {
-                    if (childId <= 0 ||
-                        childId >= sourceTree.nodesById.size() ||
-                        !sourceTree.nodesById.at(childId).valid) {
-                        return;
-                    }
-                    list->children.push_back(childId);
-                    childId =
-                        sourceTree.nodesById.at(childId).nextSibling;
-                }
-                if (childId != 0) return;
-                result->childLists.emplace(nodeId, std::move(list));
-            }
-            if (cancel->load(std::memory_order_acquire)) return;
-
-            result->elapsedMs =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - started)
-                    .count();
-            QMetaObject::invokeMethod(
-                this,
-                [this, generation, cancel, result]() mutable {
-                    if (cancel->load(std::memory_order_acquire) ||
-                        generation != m_treeWarmupGeneration ||
-                        !m_signalTreeModel ||
-                        !m_signalTreeModel->usesDirectWaveTree()) {
-                        return;
-                    }
-                    m_signalTreeModel->installWaveWarmup(
-                        std::move(result->childLists),
-                        std::move(result->nameStrings));
-                    const QString treeSearchQuery =
-                        m_treeSearchEdit
-                            ? m_treeSearchEdit->text().trimmed()
-                            : QString();
-                    if (!treeSearchQuery.isEmpty()) {
-                        showTreeSearchResults(treeSearchQuery);
-                    }
-                    if (viewerPerfLogEnabled()) {
-                        viewerPerfLog(
-                            "tree.warmup", result->elapsedMs,
-                            waveSignalCount(m_wave.signalList),
-                            m_wave.tree.nodesById.size());
-                    }
-                },
-                Qt::QueuedConnection);
         });
 }
 

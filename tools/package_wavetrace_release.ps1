@@ -1,6 +1,7 @@
 param(
     [string]$OutputDir = "",
-    [string]$PackageName = ""
+    [string]$PackageName = "",
+    [switch]$ExcludeDependencies
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,6 +50,7 @@ function Copy-ReleaseDir([string]$relativePath) {
 }
 
 $files = @(
+    "CMakeLists.txt",
     "WaveTrace_使用说明.md",
     "WaveViewer_使用说明.md",
     "README_BUILD_VS.md",
@@ -72,28 +74,35 @@ $files = @(
     "props\zstd_embed.props",
     "tools\bin\wavetrace_reflectgen.exe",
     "tools\bin\wvz4_writer_monitor.exe",
-    "tools\bin\libclang.dll",
-    "tools\bin\LLVM-C.dll",
-    "tools\bin\LTO.dll",
-    "tools\bin\Remarks.dll",
-    "tools\bin\libomp.dll",
-    "tools\bin\libiomp5md.dll",
     "tools\package_wavetrace_release.ps1",
     "tools\collect_cmake_build_type_files.ps1",
     "tools\collect_cmake_build_type_files_oneclick.bat",
     "tools\set_vcxproj_mp32.ps1",
-    "tools\set_vcxproj_mp32_oneclick.bat",
-    "tools\lib\zstd_release.lib",
-    "tools\lib\zstd_debug.lib",
-    "third_party\zstd\include\zstd.h",
-    "third_party\zstd\include\zstd_errors.h"
+    "tools\set_vcxproj_mp32_oneclick.bat"
 )
 
 foreach ($file in $files) {
     Copy-ReleaseFile $file
 }
 
-Copy-ReleaseDir "tools\lib\clang"
+if (!$ExcludeDependencies) {
+    $dependencyFiles = @(
+        "tools\bin\libclang.dll",
+        "tools\bin\LLVM-C.dll",
+        "tools\bin\LTO.dll",
+        "tools\bin\Remarks.dll",
+        "tools\bin\libomp.dll",
+        "tools\bin\libiomp5md.dll",
+        "tools\lib\zstd_release.lib",
+        "tools\lib\zstd_debug.lib",
+        "third_party\zstd\include\zstd.h",
+        "third_party\zstd\include\zstd_errors.h"
+    )
+    foreach ($file in $dependencyFiles) {
+        Copy-ReleaseFile $file
+    }
+    Copy-ReleaseDir "tools\lib\clang"
+}
 
 $viewerFiles = @(
     "QtViewer\ActiveSignalItemWidget.cpp",
@@ -129,39 +138,46 @@ foreach ($file in $viewerFiles) {
 }
 
 $viewerRuntimeFiles = @(
-    "QtViewer\build\x64\Release\WaveViewer.exe",
-    "QtViewer\build\x64\Release\Qt5Core.dll",
-    "QtViewer\build\x64\Release\Qt5Gui.dll",
-    "QtViewer\build\x64\Release\Qt5Widgets.dll",
-    "QtViewer\build\x64\Release\platforms\qwindows.dll"
+    "QtViewer\build\x64\Release\WaveViewer.exe"
 )
 
 foreach ($file in $viewerRuntimeFiles) {
     Copy-ReleaseFile $file
 }
 
-$qtRoot = "QtViewer\third_party\Qt\5.15.2\msvc2019_64"
-$qtFiles = @(
-    "bin\moc.exe",
-    "bin\rcc.exe",
-    "bin\uic.exe",
-    "bin\Qt5Core.dll",
-    "bin\Qt5Gui.dll",
-    "bin\Qt5Widgets.dll",
-    "lib\qtmain.lib",
-    "lib\Qt5Core.lib",
-    "lib\Qt5Gui.lib",
-    "lib\Qt5Widgets.lib",
-    "plugins\platforms\qwindows.dll"
-)
+if (!$ExcludeDependencies) {
+    $viewerDependencyFiles = @(
+        "QtViewer\build\x64\Release\Qt5Core.dll",
+        "QtViewer\build\x64\Release\Qt5Gui.dll",
+        "QtViewer\build\x64\Release\Qt5Widgets.dll",
+        "QtViewer\build\x64\Release\platforms\qwindows.dll"
+    )
+    foreach ($file in $viewerDependencyFiles) {
+        Copy-ReleaseFile $file
+    }
 
-foreach ($file in $qtFiles) {
-    Copy-ReleaseFile (Join-Path $qtRoot $file)
+    $qtRoot = "QtViewer\third_party\Qt\5.15.2\msvc2019_64"
+    $qtFiles = @(
+        "bin\moc.exe",
+        "bin\rcc.exe",
+        "bin\uic.exe",
+        "bin\Qt5Core.dll",
+        "bin\Qt5Gui.dll",
+        "bin\Qt5Widgets.dll",
+        "lib\qtmain.lib",
+        "lib\Qt5Core.lib",
+        "lib\Qt5Gui.lib",
+        "lib\Qt5Widgets.lib",
+        "plugins\platforms\qwindows.dll"
+    )
+    foreach ($file in $qtFiles) {
+        Copy-ReleaseFile (Join-Path $qtRoot $file)
+    }
+
+    Copy-ReleaseDir (Join-Path $qtRoot "include\QtCore")
+    Copy-ReleaseDir (Join-Path $qtRoot "include\QtGui")
+    Copy-ReleaseDir (Join-Path $qtRoot "include\QtWidgets")
 }
-
-Copy-ReleaseDir (Join-Path $qtRoot "include\QtCore")
-Copy-ReleaseDir (Join-Path $qtRoot "include\QtGui")
-Copy-ReleaseDir (Join-Path $qtRoot "include\QtWidgets")
 
 Compress-Archive -Path (Join-Path $stageParent $packageTop) -DestinationPath $zipPath -Force
 Remove-Item -LiteralPath $stageParent -Recurse -Force
@@ -178,6 +194,24 @@ $blocked = @(
     "wvz4_writer_monitor.vcxproj",
     "third_party\llvm"
 )
+if ($ExcludeDependencies) {
+    $blocked += @(
+        "\third_party\",
+        "/third_party/",
+        "\tools\lib\",
+        "/tools/lib/",
+        "libclang.dll",
+        "LLVM-C.dll",
+        "LTO.dll",
+        "Remarks.dll",
+        "libomp.dll",
+        "libiomp5md.dll",
+        "Qt5Core.dll",
+        "Qt5Gui.dll",
+        "Qt5Widgets.dll",
+        "qwindows.dll"
+    )
+}
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)

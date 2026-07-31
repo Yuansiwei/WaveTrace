@@ -18,6 +18,9 @@
 #include <QGuiApplication>
 #include <QIcon>
 #include <QImage>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QJsonValue>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
@@ -2000,33 +2003,129 @@ static int runSignalConditionSearchBenchmark(QApplication& app,
         QModelIndex parent;
         int depth = 0;
     };
-    QVector<PendingIndex> pending;
-    pending.push_back(PendingIndex{QModelIndex(), 0});
-    qint64 visibleNodes = 0;
-    int maxDepth = 0;
-    while (!pending.isEmpty() && visibleNodes < 2000000) {
-        const PendingIndex current = pending.takeLast();
-        const int rows = model ? model->rowCount(current.parent) : 0;
-        for (int row = 0; row < rows; ++row) {
-            const QModelIndex child = model->index(row, 0, current.parent);
-            if (!child.isValid()) continue;
-            ++visibleNodes;
-            maxDepth = qMax(maxDepth, current.depth + 1);
-            if (model->hasChildren(child)) {
-                pending.push_back(PendingIndex{child, current.depth + 1});
+    auto collectVisibleTreeStats = [model](qint64& visibleNodes,
+                                           int& maxDepth) {
+        QVector<PendingIndex> pending;
+        pending.push_back(PendingIndex{QModelIndex(), 0});
+        visibleNodes = 0;
+        maxDepth = 0;
+        while (!pending.isEmpty() && visibleNodes < 2000000) {
+            const PendingIndex current = pending.takeLast();
+            const int rows = model ? model->rowCount(current.parent) : 0;
+            for (int row = 0; row < rows; ++row) {
+                const QModelIndex child = model->index(row, 0, current.parent);
+                if (!child.isValid()) continue;
+                ++visibleNodes;
+                maxDepth = qMax(maxDepth, current.depth + 1);
+                if (model->hasChildren(child)) {
+                    pending.push_back(PendingIndex{child, current.depth + 1});
+                }
             }
         }
-    }
+    };
+    qint64 visibleNodes = 0;
+    int maxDepth = 0;
+    collectVisibleTreeStats(visibleNodes, maxDepth);
+    const int topLevelRows = model ? model->rowCount() : 0;
+    const qint64 searchWallMs = wallTimer.elapsed();
+
+    const int stabilityWaitMs =
+        qMax(0, qEnvironmentVariableIntValue(
+                    "WV_SIGNAL_SEARCH_STABILITY_MS"));
+    if (stabilityWaitMs > 0) processEventsFor(app, stabilityWaitMs);
+    qint64 postWarmupVisibleNodes = 0;
+    int postWarmupMaxDepth = 0;
+    collectVisibleTreeStats(postWarmupVisibleNodes, postWarmupMaxDepth);
+    const int postWarmupTopLevelRows = model ? model->rowCount() : 0;
+    const bool emptySearchStayedFiltered =
+        matchedSignals != 0 ||
+        (topLevelRows == 0 && postWarmupTopLevelRows == 0 &&
+         visibleNodes == 0 && postWarmupVisibleNodes == 0);
 
     QTextStream out(stdout);
-    out << "signal_condition_search,wall_ms," << wallTimer.elapsed()
+    out << "signal_condition_search,wall_ms," << searchWallMs
         << ",matched," << matchedSignals
-        << ",top_level_rows," << (model ? model->rowCount() : 0)
+        << ",top_level_rows," << topLevelRows
         << ",visible_tree_nodes," << visibleNodes
         << ",max_tree_depth," << maxDepth
+        << ",stability_wait_ms," << stabilityWaitMs
+        << ",post_warmup_top_level_rows," << postWarmupTopLevelRows
+        << ",post_warmup_visible_tree_nodes," << postWarmupVisibleNodes
+        << ",post_warmup_max_tree_depth," << postWarmupMaxDepth
+        << ",empty_search_stayed_filtered,"
+        << (emptySearchStayedFiltered ? 1 : 0)
         << ",status," << csvField(statusText) << '\n';
     out.flush();
-    return statusText.startsWith(QStringLiteral("完成：")) ? 0 : 7;
+    return (statusText.startsWith(QStringLiteral("完成：")) &&
+            emptySearchStayedFiltered)
+        ? 0
+        : 7;
+}
+
+static int runDerivedExpressionBenchmark(QApplication& app,
+                                         const QStringList& args) {
+    if (args.size() < 4) return 2;
+    bool widthOk = true;
+    const int width = args.size() >= 5 ? args.at(4).toInt(&widthOk) : 0;
+    if (!widthOk) return 2;
+
+    MainWindow window;
+    if (!window.openWaveFilePath(args.at(2), false)) return 3;
+    processEventsFor(app, 20);
+
+    QString expression = args.at(3);
+    if (expression == QStringLiteral("@first-two") ||
+        expression == QStringLiteral("@last-two")) {
+        int errorCode = 0;
+        QString errorMessage;
+        QJsonArray signalResults;
+        if (expression == QStringLiteral("@first-two")) {
+            const QJsonValue result = window.handleAgentRpc(
+                QStringLiteral("signals.search"),
+                QJsonObject{{QStringLiteral("query"), QString()},
+                            {QStringLiteral("limit"), 2}},
+                &errorCode, &errorMessage);
+            signalResults = result.toObject()
+                                .value(QStringLiteral("signals"))
+                                .toArray();
+        } else {
+            const QJsonObject state = window.handleAgentRpc(
+                QStringLiteral("viewer.state"), QJsonObject(),
+                &errorCode, &errorMessage).toObject();
+            const int signalCount = int(state.value(
+                QStringLiteral("signal_count")).toDouble());
+            for (int index = qMax(0, signalCount - 2);
+                 index < signalCount; ++index) {
+                signalResults.append(window.handleAgentRpc(
+                    QStringLiteral("signals.describe"),
+                    QJsonObject{{QStringLiteral("index"), index}},
+                    &errorCode, &errorMessage));
+            }
+        }
+        if (signalResults.size() < 2) return 3;
+        const QString left = signalResults.at(0).toObject()
+                                 .value(QStringLiteral("path"))
+                                 .toString();
+        const QString right = signalResults.at(1).toObject()
+                                  .value(QStringLiteral("path"))
+                                  .toString();
+        if (left.isEmpty() || right.isEmpty()) return 3;
+        expression = QStringLiteral("`%1` ^ `%2`").arg(left, right);
+    }
+
+    qint64 elapsedMs = -1;
+    qint64 sampleCount = 0;
+    quint64 checksum = 0;
+    const bool ok = window.runDerivedExpressionForBenchmark(
+        expression, width, &elapsedMs, &sampleCount, &checksum);
+    QTextStream out(stdout);
+    out << "status," << (ok ? "ok" : "failed")
+        << ",elapsed_ms," << elapsedMs
+        << ",samples," << sampleCount
+        << ",checksum,0x" << QString::number(checksum, 16)
+        << ",expression," << expression << '\n';
+    out.flush();
+    return ok ? 0 : 4;
 }
 
 static int runTreeReferenceSearchBenchmark(QApplication& app,
@@ -2102,6 +2201,11 @@ int main(int argc, char *argv[]) {
 
     QApplication a(argc, argv);
     const QStringList args = a.arguments();
+
+    if (args.size() >= 2 &&
+        args.at(1) == QStringLiteral("--derived-expression-benchmark")) {
+        return runDerivedExpressionBenchmark(a, args);
+    }
 
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--capture-zoom-sequence")) {
         qputenv("WV_VIEWER_STRICT_RENDER_CHECKS", QByteArray("1"));

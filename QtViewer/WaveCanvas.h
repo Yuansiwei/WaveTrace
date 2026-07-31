@@ -128,6 +128,7 @@ private:
     QRectF overviewThumbRect() const;
     qint64 xToTime(double x) const;
     double timeToX(qint64 t) const;
+    qint64 snapCursorClickTime(qint64 t) const;
     qint64 overviewXToTime(double x) const;
     int visibleRowCapacity() const;
     int effectiveVisibleRowCount() const;

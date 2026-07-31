@@ -160,7 +160,7 @@ namespace
     struct WavePtrReflectionConfig
     {
         std::string path;
-        bool waveTrace = true;
+        bool waveTrace = false;
         std::string waveTraceFileName = "wave.wvz4";
         std::string waveTraceStart;
         std::string waveTraceEnd;
@@ -7866,7 +7866,7 @@ namespace
         // Keep the aggregate include contract and wave runtime API intact.  Only
         // reflection bodies are empty, so business code that includes the usual
         // project header continues to compile unchanged.
-        if (!EmitAggregateHeader(aggregateHeader, generatedPlaceholders, false)) return false;
+        if (!EmitAggregateHeader(aggregateHeader, generatedPlaceholders, true)) return false;
         if (!CommitWavePtrReflectionConfig(config)) return false;
 
         std::cout << "[WaveTrace config] WaveTrace=false; skipped libclang/AST reflection\n";

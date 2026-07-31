@@ -1998,7 +1998,11 @@ bool finalizeCompactDirectorySignals(const QVector<SigRec>& sigs,
     std::fill(boolStorageByStorageId.begin(), boolStorageByStorageId.end(), -1);
 
     outputSignals.clear();
-    outputSignals.reserve(signalCount);
+    // Keep a small tail capacity for Viewer-created expression signals.  With
+    // tens of millions of definitions, growing this vector by one later would
+    // otherwise move every WaveSignal and make a trivial expression appear to
+    // take seconds.
+    outputSignals.reserve(std::size_t(signalCount) + 256u);
     tree.signalIndexToNodeId.clear();
     tree.signalIndexToNodeId.reserve(signalCount);
     tree.signalIndexBySignalId.resize(signalCount + 1);
@@ -4865,7 +4869,7 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
     WaveSignalList outputSignals;
     QHash<int, int> outputIndexBySignalId;
     QHash<int, QVector<int>> outputIndexesByStorageId;
-    outputSignals.reserve(signalIds.size());
+    outputSignals.reserve(std::size_t(signalIds.size()) + 256u);
     outputIndexBySignalId.reserve(signalIds.size() * 2 + 1);
     outputIndexesByStorageId.reserve(signalIds.size() * 2 + 1);
     for (int sid : signalIds) {
@@ -5342,7 +5346,7 @@ bool WaveParser4Reader::loadSignalLodImpl(const QVector<int>& signalIds,
     const QSet<int> clockSignalIds = proceduralClockSignalIds(d->clocks);
     WaveSignalList outputSignals;
     QVector<int> outputIndexBySignalId;
-    outputSignals.reserve(signalIds.size());
+    outputSignals.reserve(std::size_t(signalIds.size()) + 256u);
     outputIndexBySignalId.reserve(signalIds.size());
     for (int sid : signalIds) {
         if (sid <= 0 || sid > d->sigs.size() || emittedSignalIds.contains(sid)) continue;
@@ -5895,7 +5899,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
         };
 
         if (options.includeAllSignalDefinitions) {
-            outputSignals.reserve(sigs.size());
+            outputSignals.reserve(std::size_t(sigs.size()) + 256u);
             outputIndexBySignalId.reserve(sigs.size());
             for (int i = 0; i < sigs.size(); ++i) {
                 const SigRec& s = sigs.at(i);
@@ -5916,7 +5920,9 @@ bool WaveParser4::loadFromFile(const QString& filePath,
                 }
             }
         } else {
-            outputSignals.reserve(allSelectedSignalIds ? sigs.size() : selectedIds.size());
+            outputSignals.reserve(
+                std::size_t(allSelectedSignalIds ? sigs.size()
+                                                 : selectedIds.size()) + 256u);
             outputIndexBySignalId.reserve(allSelectedSignalIds ? sigs.size() : selectedIds.size());
             for (int i = 0; i < sigs.size(); ++i) {
                 const SigRec& s = sigs.at(i);

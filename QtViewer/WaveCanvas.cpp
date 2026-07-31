@@ -1467,6 +1467,30 @@ double WaveCanvas::timeToX(qint64 t) const {
     return m_padX + (double(t - m_viewStart) / double(span())) * usable;
 }
 
+qint64 WaveCanvas::snapCursorClickTime(qint64 t) const {
+    const qint64 step = kWaveViewerDisplayTicksPerCycle;
+    if (step <= 1) return t;
+
+    const qint64 remainder = t % step;
+    const qint64 towardZero = t - remainder;
+    qint64 nearest = towardZero;
+    if (remainder >= 0 &&
+        remainder * 2 >= step &&
+        towardZero <= (std::numeric_limits<qint64>::max)() - step) {
+        nearest = towardZero + step;
+    } else if (remainder < 0 &&
+               (-remainder) * 2 >= step &&
+               towardZero >= (std::numeric_limits<qint64>::min)() + step) {
+        nearest = towardZero - step;
+    }
+    if (nearest < fullStart() || nearest > fullEnd()) return t;
+
+    constexpr double kCursorCycleSnapPixels = 6.0;
+    return std::abs(timeToX(nearest) - timeToX(t)) <= kCursorCycleSnapPixels
+        ? nearest
+        : t;
+}
+
 qint64 WaveCanvas::overviewXToTime(double x) const {
     const QRect r = overviewRect();
     const qint64 total = qMax<qint64>(1, fullEnd() - fullStart());
@@ -2979,7 +3003,7 @@ void WaveCanvas::mouseReleaseEvent(QMouseEvent* event) {
             m_cursorTime = ns + (ne - ns) / 2;
         }
         else {
-            m_cursorTime = t1;
+            m_cursorTime = snapCursorClickTime(t1);
             if (m_pendingClickRow >= 0) {
                 m_selectedEntryIndex = m_pendingClickRow;
                 Q_EMIT entryClicked(m_pendingClickRow, m_pendingClickCtrlHeld);

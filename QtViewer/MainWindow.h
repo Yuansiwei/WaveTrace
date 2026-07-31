@@ -63,6 +63,11 @@ public:
     void resetViewForBenchmark();
     bool benchmarkActiveViewportCoverage(int* covered, int* total) const;
     bool benchmarkValidateRawCaches(QString* error);
+    bool runDerivedExpressionForBenchmark(const QString& expression,
+                                          int widthOverride,
+                                          qint64* elapsedMs,
+                                          qint64* outputSampleCount,
+                                          quint64* outputChecksum);
     bool compareWaveFilePaths(const QString& leftPath,
                               const QString& rightPath,
                               bool showProgress = true,

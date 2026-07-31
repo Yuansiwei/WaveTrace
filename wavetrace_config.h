@@ -31,7 +31,7 @@ struct RuntimeConfig {
     std::string path = WAVETRACE_CONFIG_PATH;
     std::string error;
 
-    bool wave_trace = true;
+    bool wave_trace = false;
     std::string wave_trace_file_name = "wave.wvz4";
     std::uint64_t wave_trace_start = 0;
     std::uint64_t wave_trace_end = (std::numeric_limits<std::uint64_t>::max)();
@@ -417,7 +417,7 @@ inline bool read_optional_u64(const std::string& text,
 inline RuntimeConfig load_runtime_config() {
     RuntimeConfig cfg;
     std::ifstream input(cfg.path.c_str(), std::ios::in | std::ios::binary);
-    if (!input) return cfg; // Missing config keeps backward-compatible defaults.
+    if (!input) return cfg; // Missing config fails closed: waveform tracing stays disabled.
 
     std::ostringstream buffer;
     buffer << input.rdbuf();
