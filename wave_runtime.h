@@ -64,6 +64,7 @@
 #include <array>
 #include <algorithm>
 #include <atomic>
+#include <bitset>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -293,6 +294,53 @@ struct TrackDecl {
     bool storage_only = false;
 };
 
+struct BitsetDecl {
+    NodeId node_id = 0;
+    TrackId first_storage_id = 0;
+    std::uint32_t bit_count = 0;
+    std::uint32_t word_count = 0;
+};
+
+enum class ArraySchemaNodeKind : unsigned char {
+    Object = 1,
+    Field = 2,
+    Array = 3,
+    Leaf = 4
+};
+
+// A compact wave::array stores one element schema and one contiguous byte
+// block. Offsets are relative to the first byte of the outermost array block.
+// Array schema nodes describe repeated layout; they are not runtime instances.
+struct ArraySchemaNodeDecl {
+    std::uint32_t schema_node_id = 0;
+    std::uint32_t parent_schema_node_id = 0;
+    std::string name;
+    ArraySchemaNodeKind kind = ArraySchemaNodeKind::Field;
+    std::uint64_t byte_offset = 0;
+    std::uint64_t byte_size = 0;
+    std::uint64_t element_count = 0;
+    std::uint64_t element_stride = 0;
+    ValueKind value_kind = ValueKind::Unknown;
+    std::uint32_t bit_width = 0;
+    std::uint32_t bit_offset = 0;
+};
+
+struct ArrayBlockDecl {
+    NodeId node_id = 0;
+    std::uint64_t total_bytes = 0;
+    std::uint64_t element_count = 0;
+    std::uint64_t element_stride = 0;
+    std::vector<ArraySchemaNodeDecl> schema;
+};
+
+struct ArrayPatchEvent {
+    Cycle cycle = 0;
+    NodeId node_id = 0;
+    std::uint64_t byte_offset = 0;
+    const unsigned char* data = NULL;
+    std::uint32_t byte_count = 0;
+};
+
 class IWaveSink {
 public:
     virtual ~IWaveSink() {}
@@ -346,6 +394,11 @@ public:
         on_node_declared_fast(node_id, parent_id, name, kind);
     }
     virtual void on_subtree_reference_declared(NodeId, NodeId) {}
+    virtual void on_bitset_declared_fast(NodeId,
+                                         TrackId,
+                                         std::uint32_t,
+                                         std::uint32_t) {}
+    virtual void on_array_block_declared(const ArrayBlockDecl&) {}
     virtual void on_track_declared(const TrackDecl& decl) = 0;
     virtual void on_track_declared_fast(TrackId track_id,
                                         TrackId storage_id,
@@ -367,14 +420,24 @@ public:
         on_track_declared(decl);
     }
     virtual void on_sample(const TrackEvent& ev) = 0;
+    virtual void on_array_patch(const ArrayPatchEvent&) {}
 };
 
 class InMemoryWaveSink : public IWaveSink {
 public:
     std::vector<NodeDecl> node_declarations;
     std::vector<std::pair<NodeId, NodeId> > subtree_references;
+    std::vector<BitsetDecl> bitset_declarations;
+    std::vector<ArrayBlockDecl> array_block_declarations;
     std::vector<TrackDecl> declarations;
     std::vector<TrackEvent> events;
+    struct OwnedArrayPatch {
+        Cycle cycle = 0;
+        NodeId node_id = 0;
+        std::uint64_t byte_offset = 0;
+        std::vector<unsigned char> data;
+    };
+    std::vector<OwnedArrayPatch> array_patches;
 
     virtual void on_node_declared(const NodeDecl& decl) {
         node_declarations.push_back(decl);
@@ -388,8 +451,36 @@ public:
         subtree_references.push_back(std::make_pair(node_id, target_node_id));
     }
 
+    virtual void on_bitset_declared_fast(NodeId node_id,
+                                         TrackId first_storage_id,
+                                         std::uint32_t bit_count,
+                                         std::uint32_t word_count) {
+        BitsetDecl decl;
+        decl.node_id = node_id;
+        decl.first_storage_id = first_storage_id;
+        decl.bit_count = bit_count;
+        decl.word_count = word_count;
+        bitset_declarations.push_back(decl);
+    }
+
+    virtual void on_array_block_declared(const ArrayBlockDecl& decl) {
+        array_block_declarations.push_back(decl);
+    }
+
     virtual void on_sample(const TrackEvent& ev) {
         events.push_back(ev);
+    }
+
+
+    virtual void on_array_patch(const ArrayPatchEvent& ev) {
+        OwnedArrayPatch copy;
+        copy.cycle = ev.cycle;
+        copy.node_id = ev.node_id;
+        copy.byte_offset = ev.byte_offset;
+        if (ev.data && ev.byte_count != 0) {
+            copy.data.assign(ev.data, ev.data + ev.byte_count);
+        }
+        array_patches.push_back(std::move(copy));
     }
 };
 
@@ -1079,6 +1170,209 @@ struct is_std_array : std::false_type {};
 
 template <typename T, std::size_t N>
 struct is_std_array<std::array<T, N> > : std::true_type {};
+
+template <typename T>
+struct is_std_bitset : std::false_type {};
+
+template <std::size_t N>
+struct is_std_bitset<std::bitset<N> > : std::true_type {};
+
+enum class BitsetRawEndian : unsigned char {
+    Unknown = 0,
+    Little = 1,
+    Big = 2
+};
+
+struct BitsetRawAbiInfo {
+    BitsetRawEndian endian;
+    unsigned char small_unit_bytes;
+    unsigned char large_unit_bytes;
+    bool supported;
+
+    BitsetRawAbiInfo()
+        : endian(BitsetRawEndian::Unknown), small_unit_bytes(0),
+          large_unit_bytes(0), supported(false) {}
+};
+
+inline BitsetRawEndian native_bitset_probe_endian() noexcept {
+    const std::uint32_t marker = UINT32_C(0x01020304);
+    unsigned char bytes[sizeof(marker)] = {};
+    std::memcpy(bytes, &marker, sizeof(marker));
+    if (bytes[0] == 0x04u && bytes[3] == 0x01u) return BitsetRawEndian::Little;
+    if (bytes[0] == 0x01u && bytes[3] == 0x04u) return BitsetRawEndian::Big;
+    return BitsetRawEndian::Unknown;
+}
+
+template <std::size_t N>
+bool std_bitset_matches_native_sequential_layout(unsigned char unit_bytes,
+                                                 BitsetRawEndian endian) {
+    if (N == 0 || unit_bytes == 0 || unit_bytes > 8 ||
+        endian == BitsetRawEndian::Unknown) {
+        return false;
+    }
+    const std::size_t unit_bits = static_cast<std::size_t>(unit_bytes) * 8u;
+    const std::size_t unit_count = N / unit_bits + (N % unit_bits != 0u ? 1u : 0u);
+    if (unit_count == 0 || unit_count >
+            (std::numeric_limits<std::size_t>::max)() / unit_bytes ||
+        sizeof(std::bitset<N>) != unit_count * unit_bytes) {
+        return false;
+    }
+
+    const std::bitset<N> zero;
+    unsigned char zero_bytes[sizeof(zero)] = {};
+    std::memcpy(zero_bytes, &zero, sizeof(zero));
+    // This is deliberately an exact one-hot ABI probe, not a statistical
+    // pattern check. It runs once per process for a small representative set
+    // before topology construction starts.
+    for (std::size_t bit = 0; bit < N; ++bit) {
+        std::bitset<N> one;
+        one.set(bit);
+        unsigned char one_bytes[sizeof(one)] = {};
+        std::memcpy(one_bytes, &one, sizeof(one));
+
+        const std::size_t unit = bit / unit_bits;
+        const std::size_t bit_in_unit = bit % unit_bits;
+        const std::size_t byte_in_unit = bit_in_unit / 8u;
+        const std::size_t expected_byte = unit * unit_bytes +
+            (endian == BitsetRawEndian::Little
+                ? byte_in_unit
+                : static_cast<std::size_t>(unit_bytes) - 1u - byte_in_unit);
+        const unsigned char expected_mask = static_cast<unsigned char>(
+            1u << static_cast<unsigned>(bit_in_unit % 8u));
+
+        for (std::size_t byte = 0; byte < sizeof(one); ++byte) {
+            const unsigned char diff = static_cast<unsigned char>(
+                one_bytes[byte] ^ zero_bytes[byte]);
+            const unsigned char expected = byte == expected_byte ? expected_mask : 0u;
+            if (diff != expected) return false;
+        }
+    }
+    return true;
+}
+
+template <std::size_t N>
+unsigned char detect_std_bitset_native_unit_bytes(BitsetRawEndian endian) {
+    const unsigned char candidates[] = {8u, 4u, 2u, 1u};
+    for (std::size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        if (std_bitset_matches_native_sequential_layout<N>(candidates[i], endian)) {
+            return candidates[i];
+        }
+    }
+    return 0;
+}
+
+inline BitsetRawAbiInfo detect_std_bitset_raw_abi() {
+    BitsetRawAbiInfo info;
+    info.endian = native_bitset_probe_endian();
+    if (info.endian == BitsetRawEndian::Unknown) return info;
+
+    // The unambiguous edge sizes choose the unit width. Boundary probes then
+    // verify that the same policy holds on both sides of 32/64 bits. Choosing
+    // each ambiguous width independently would falsely reject a valid 32-bit
+    // block implementation on a little-endian host.
+    const unsigned char small_unit = detect_std_bitset_native_unit_bytes<1>(info.endian);
+    const unsigned char large_unit = detect_std_bitset_native_unit_bytes<130>(info.endian);
+    if (small_unit == 0 || large_unit == 0 ||
+        !std_bitset_matches_native_sequential_layout<32>(small_unit, info.endian) ||
+        !std_bitset_matches_native_sequential_layout<33>(large_unit, info.endian) ||
+        !std_bitset_matches_native_sequential_layout<64>(large_unit, info.endian) ||
+        !std_bitset_matches_native_sequential_layout<65>(large_unit, info.endian)) {
+        return info;
+    }
+    info.small_unit_bytes = small_unit;
+    info.large_unit_bytes = large_unit;
+    info.supported = true;
+    return info;
+}
+
+inline const BitsetRawAbiInfo& std_bitset_raw_abi_info() {
+    static const BitsetRawAbiInfo info = detect_std_bitset_raw_abi();
+    return info;
+}
+
+template <std::size_t N>
+bool std_bitset_type_matches_native_sequential_layout(unsigned char unit_bytes,
+                                                      BitsetRawEndian endian) {
+    if (N == 0 || unit_bytes == 0 || unit_bytes > 8 ||
+        endian == BitsetRawEndian::Unknown) {
+        return false;
+    }
+    const std::size_t unit_bits = static_cast<std::size_t>(unit_bytes) * 8u;
+    const std::size_t unit_count = N / unit_bits + (N % unit_bits != 0u ? 1u : 0u);
+    if (unit_count == 0 || unit_count >
+            (std::numeric_limits<std::size_t>::max)() / unit_bytes ||
+        sizeof(std::bitset<N>) != unit_count * unit_bytes) {
+        return false;
+    }
+
+    try {
+        std::unique_ptr<std::bitset<N> > value(new std::bitset<N>());
+        std::vector<unsigned char> baseline(sizeof(std::bitset<N>), 0u);
+        std::vector<unsigned char> expected(sizeof(std::bitset<N>), 0u);
+        std::vector<unsigned char> actual(sizeof(std::bitset<N>), 0u);
+        std::memcpy(baseline.data(), value.get(), baseline.size());
+
+        // Pattern 0 marks every logical bit. Remaining patterns encode the
+        // logical bit index in binary. Together they give every bit a unique
+        // non-zero signature, so byte/word permutation, endian reversal, and
+        // padding reuse are detected without an O(N^2) one-hot scan.
+        std::size_t index_pattern_count = 0;
+        for (std::size_t max_index = N - 1u; max_index != 0u; max_index >>= 1u) {
+            ++index_pattern_count;
+        }
+        for (std::size_t pattern = 0; pattern <= index_pattern_count; ++pattern) {
+            value->reset();
+            std::fill(expected.begin(), expected.end(), 0u);
+            for (std::size_t bit = 0; bit < N; ++bit) {
+                const bool set = pattern == 0u ||
+                    ((bit >> static_cast<unsigned>(pattern - 1u)) & 1u) != 0u;
+                if (!set) continue;
+                value->set(bit);
+
+                const std::size_t unit = bit / unit_bits;
+                const std::size_t bit_in_unit = bit % unit_bits;
+                const std::size_t byte_in_unit = bit_in_unit / 8u;
+                const std::size_t expected_byte = unit * unit_bytes +
+                    (endian == BitsetRawEndian::Little
+                        ? byte_in_unit
+                        : static_cast<std::size_t>(unit_bytes) - 1u - byte_in_unit);
+                expected[expected_byte] = static_cast<unsigned char>(
+                    expected[expected_byte] |
+                    static_cast<unsigned char>(1u << static_cast<unsigned>(bit_in_unit % 8u)));
+            }
+            std::memcpy(actual.data(), value.get(), actual.size());
+            for (std::size_t byte = 0; byte < actual.size(); ++byte) {
+                if (static_cast<unsigned char>(actual[byte] ^ baseline[byte]) != expected[byte]) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+template <std::size_t N>
+unsigned char std_bitset_raw_unit_bytes() {
+    if (N == 0) return 0;
+    const BitsetRawAbiInfo& info = std_bitset_raw_abi_info();
+    if (!info.supported) return 0;
+    const unsigned char unit_bytes = N <= 32u
+        ? info.small_unit_bytes
+        : info.large_unit_bytes;
+    if (unit_bytes == 0) return 0;
+    const std::size_t unit_bits = static_cast<std::size_t>(unit_bytes) * 8u;
+    const std::size_t unit_count = N / unit_bits + (N % unit_bits != 0u ? 1u : 0u);
+    if (unit_count == 0 || unit_count >
+            (std::numeric_limits<std::size_t>::max)() / unit_bytes ||
+        sizeof(std::bitset<N>) != unit_count * unit_bytes) {
+        return 0;
+    }
+    static const bool type_layout_verified =
+        std_bitset_type_matches_native_sequential_layout<N>(unit_bytes, info.endian);
+    return type_layout_verified ? unit_bytes : 0;
+}
 
 template <typename T>
 struct is_std_pair : std::false_type {};
@@ -1956,7 +2250,7 @@ struct ScalarSnapshot {
           i64_value(0), u64_value(0), f64_value(0.0) {}
 };
 
-typedef bool (*ScalarReadFn)(const void*, ScalarSnapshot&);
+typedef bool (*ScalarReadFn)(const void*, std::uint32_t, ScalarSnapshot&);
 
 struct TrackDesc {
     std::uint32_t id;
@@ -1964,6 +2258,7 @@ struct TrackDesc {
     std::uint32_t next_in_node;
     std::uint32_t storage_id;
     const void* sample_ctx;
+    std::uint32_t scalar_reader_arg;
     ScalarReadFn scalar_reader;
     const void* memory_ctx;
     std::uint32_t path_id;
@@ -1980,7 +2275,7 @@ struct TrackDesc {
     bool dirty_wave_array_managed;
 
     TrackDesc() : id(0), node_id(0), next_in_node(0), storage_id(0),
-                  sample_ctx(NULL), scalar_reader(NULL), memory_ctx(NULL),
+                  sample_ctx(NULL), scalar_reader_arg(0), scalar_reader(NULL), memory_ctx(NULL),
                   path_id(kInvalidIndex), bit_width(0), bit_offset(0), memory_byte_width(0),
                   dirty_peek_group_id(kInvalidIndex),
                   dirty_wave_value_group_id(kInvalidIndex),
@@ -2014,10 +2309,52 @@ struct NodeDesc {
     std::uint32_t reference_target_id;
     NodeKind kind;
     bool alive;
+    bool bitset_container;
+    bool array_block_container;
 
     NodeDesc() : id(0), parent_id(0), first_child(0), next_sibling(0), first_track(0),
                  object_id(0), name_id(kInvalidIndex), debug_path_id(kInvalidIndex),
-                 reference_target_id(0), kind(NodeKind::Aggregate), alive(true) {}
+                  reference_target_id(0), kind(NodeKind::Aggregate), alive(true),
+                  bitset_container(false), array_block_container(false) {}
+};
+
+struct BitsetDesc {
+    std::uint32_t node_id;
+    std::uint32_t first_storage_id;
+    std::uint32_t bit_count;
+    std::uint32_t word_count;
+
+    BitsetDesc()
+        : node_id(0), first_storage_id(0), bit_count(0), word_count(0) {}
+};
+
+struct CompactArrayBlock {
+    std::uint32_t node_id;
+    const unsigned char* base;
+    std::size_t total_bytes;
+    std::size_t element_count;
+    std::size_t element_stride;
+    std::vector<ArraySchemaNodeDecl> schema;
+    std::vector<unsigned char> shadow;
+    std::vector<std::uint64_t> dirty_words;
+    std::unique_ptr<std::mutex> dirty_mutex;
+    bool initial_sample_done;
+
+    CompactArrayBlock()
+        : node_id(0), base(NULL), total_bytes(0), element_count(0),
+          element_stride(0), dirty_mutex(new std::mutex()),
+          initial_sample_done(false) {}
+};
+
+struct CompactArrayAddressRange {
+    std::uintptr_t begin;
+    std::uintptr_t end;
+    std::uint32_t block_index;
+
+    CompactArrayAddressRange()
+        : begin(0), end(0), block_index(0) {}
+    CompactArrayAddressRange(std::uintptr_t b, std::uintptr_t e, std::uint32_t i)
+        : begin(b), end(e), block_index(i) {}
 };
 
 struct ObjectEntry {
@@ -2161,6 +2498,9 @@ class Tracer {
                 options_.trace_array_first_element_only = true;
             }
         }
+        // Resolve std::bitset ABI support before any root can be expanded or
+        // sampled. Unsupported layouts are reported and skipped explicitly.
+        (void)detail::std_bitset_raw_abi_info();
         node_name_hot_cache_.reserve(128u);
         open_debug_log();
         open_parallel_flat_leaf_load_log_();
@@ -2325,6 +2665,89 @@ public:
         (void)::SetConsoleTitleA(title);
     }
 
+    void emit_compact_array_patch_(Cycle cycle,
+                                   const CompactArrayBlock& block,
+                                   std::size_t offset,
+                                   std::size_t byte_count) {
+        static const std::size_t kMaxPatchBytes = 1u << 20;
+        while (byte_count != 0) {
+            const std::size_t part = (std::min)(byte_count, kMaxPatchBytes);
+            ArrayPatchEvent event;
+            event.cycle = cycle;
+            event.node_id = block.node_id;
+            event.byte_offset = static_cast<std::uint64_t>(offset);
+            event.data = block.base + offset;
+            event.byte_count = static_cast<std::uint32_t>(part);
+            sink_.on_array_patch(event);
+            offset += part;
+            byte_count -= part;
+        }
+    }
+
+    void sample_compact_array_blocks_(Cycle cycle) {
+        static const std::size_t kDirtyChunkBytes = 64u;
+        for (std::size_t block_index = 0;
+             block_index < compact_array_blocks_.size();
+             ++block_index) {
+            if (!compact_array_blocks_[block_index]) continue;
+            CompactArrayBlock& block = *compact_array_blocks_[block_index];
+            if (!block.initial_sample_done) {
+                if (block.total_bytes != 0) {
+                    std::memcpy(block.shadow.data(), block.base, block.total_bytes);
+                    emit_compact_array_patch_(cycle, block, 0, block.total_bytes);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(*block.dirty_mutex);
+                    std::fill(block.dirty_words.begin(), block.dirty_words.end(), UINT64_C(0));
+                }
+                block.initial_sample_done = true;
+                continue;
+            }
+
+            std::vector<std::uint64_t> dirty;
+            {
+                std::lock_guard<std::mutex> lock(*block.dirty_mutex);
+                dirty = block.dirty_words;
+                std::fill(block.dirty_words.begin(), block.dirty_words.end(), UINT64_C(0));
+            }
+            std::size_t open_run = block.total_bytes;
+            std::size_t open_run_end = block.total_bytes;
+            for (std::size_t word = 0; word < dirty.size(); ++word) {
+                std::uint64_t bits = dirty[word];
+                while (bits != 0) {
+                    unsigned bit = 0;
+                    while (((bits >> bit) & UINT64_C(1)) == 0u) ++bit;
+                    bits &= ~(UINT64_C(1) << bit);
+                    const std::size_t chunk = word * 64u + bit;
+                    const std::size_t begin = chunk * kDirtyChunkBytes;
+                    if (begin >= block.total_bytes) continue;
+                    const std::size_t end = (std::min)(
+                        block.total_bytes, begin + kDirtyChunkBytes);
+                    for (std::size_t pos = begin; pos < end; ++pos) {
+                        const unsigned char value = block.base[pos];
+                        if (value == block.shadow[pos]) continue;
+                        block.shadow[pos] = value;
+                        if (open_run == block.total_bytes) {
+                            open_run = pos;
+                            open_run_end = pos + 1u;
+                        } else if (pos == open_run_end) {
+                            ++open_run_end;
+                        } else {
+                            emit_compact_array_patch_(
+                                cycle, block, open_run, open_run_end - open_run);
+                            open_run = pos;
+                            open_run_end = pos + 1u;
+                        }
+                    }
+                }
+            }
+            if (open_run != block.total_bytes) {
+                emit_compact_array_patch_(
+                    cycle, block, open_run, open_run_end - open_run);
+            }
+        }
+    }
+
     void sample(Cycle cycle) {
         if (!::wave::config::cycle_in_range(static_cast<std::uint64_t>(cycle))) return;
         const bool snapshot_complete =
@@ -2368,6 +2791,7 @@ public:
         }
         if (options_.enable_wave_array_dirty) {
             sample_dirty_wave_array_ranges(cycle);
+            sample_compact_array_blocks_(cycle);
         }
         if (dirty_object_groups_enabled_() || options_.enable_wave_value_dirty || options_.enable_wave_array_dirty) {
             ++dirty_epoch_;
@@ -2406,6 +2830,7 @@ public:
             try_ensure_wave_value_tls_capacity_for_current_thread();
         }
         if (options_.enable_wave_array_dirty) {
+            ensure_compact_array_address_ranges_sorted_();
             if (!dirty_wave_array_chunk_lookup_valid_) {
                 rebuild_dirty_wave_array_chunk_lookup_();
             }
@@ -2420,6 +2845,9 @@ public:
 
     const std::vector<NodeDesc>& nodes() const { return nodes_; }
     const std::vector<TrackDesc>& tracks() const { return tracks_; }
+    std::size_t compact_array_block_count() const noexcept {
+        return compact_array_blocks_.size();
+    }
     std::size_t parallel_topology_expanded_elements() const noexcept {
         return parallel_topology_expanded_elements_;
     }
@@ -2613,6 +3041,9 @@ public:
     static void wave_array_index_notify_bridge_(std::size_t index, const void* element_address, const void* element_type_tag, std::size_t element_size) noexcept {
         if (!detail::wave_notifications_enabled()) return;
         ThreadTraceLocal& tls = current_thread_trace_local();
+        if (tls.owner && tls.owner->try_mark_compact_array_range_(element_address, element_size)) {
+            return;
+        }
         if (tls.owner && element_size <= static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())) {
             const std::uint32_t range_id = tls.owner->lookup_dirty_wave_array_slice_by_address_(
                 element_address,
@@ -2716,6 +3147,11 @@ public:
         if (!detail::wave_notifications_enabled()) return true;
         ThreadTraceLocal& tls = current_thread_trace_local();
         if (tls.owner) {
+            std::size_t compact_bytes = 0;
+            if (checked_wave_array_bulk_byte_count_(element_size, element_count, compact_bytes) &&
+                tls.owner->try_mark_compact_array_range_(first_element_address, compact_bytes)) {
+                return true;
+            }
             const std::uint32_t range_id = tls.owner->lookup_dirty_wave_array_bulk_range_(
                 first_element_address,
                 element_type_tag,
@@ -2742,6 +3178,16 @@ public:
             // key in that tracer means this array is local/untracked; do not
             // rescan the global tracer list or any physical block table.
             return true;
+        }
+
+        std::size_t compact_bytes = 0;
+        if (checked_wave_array_bulk_byte_count_(element_size, element_count, compact_bytes)) {
+            Tracer* compact_owner = resolve_compact_array_owner_for_range_(
+                first_element_address, compact_bytes);
+            if (compact_owner && compact_owner->try_mark_compact_array_range_(
+                    first_element_address, compact_bytes)) {
+                return true;
+            }
         }
 
         std::uint32_t range_id = kInvalidIndex;
@@ -2897,6 +3343,76 @@ public:
         return true;
     }
 
+    void ensure_compact_array_address_ranges_sorted_() {
+        if (compact_array_address_ranges_sorted_) return;
+        std::sort(compact_array_address_ranges_.begin(),
+                  compact_array_address_ranges_.end(),
+                  [](const CompactArrayAddressRange& a,
+                     const CompactArrayAddressRange& b) {
+                      if (a.begin != b.begin) return a.begin < b.begin;
+                      return a.end > b.end;
+                  });
+        compact_array_address_ranges_sorted_ = true;
+    }
+
+    std::uint32_t lookup_compact_array_block_for_range_(
+        const void* address,
+        std::size_t byte_count) const noexcept {
+        if (!address || byte_count == 0 || !compact_array_address_ranges_sorted_ ||
+            compact_array_address_ranges_.empty()) {
+            return kInvalidIndex;
+        }
+        const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(address);
+        if (begin > (std::numeric_limits<std::uintptr_t>::max)() - byte_count) {
+            return kInvalidIndex;
+        }
+        const std::uintptr_t end = begin + byte_count;
+        std::size_t lo = 0;
+        std::size_t hi = compact_array_address_ranges_.size();
+        while (lo < hi) {
+            const std::size_t mid = lo + ((hi - lo) >> 1);
+            if (compact_array_address_ranges_[mid].begin <= begin) lo = mid + 1u;
+            else hi = mid;
+        }
+        while (lo != 0) {
+            const CompactArrayAddressRange& range = compact_array_address_ranges_[--lo];
+            if (range.begin <= begin && end <= range.end) return range.block_index;
+            if (range.end <= begin) break;
+        }
+        return kInvalidIndex;
+    }
+
+    bool try_mark_compact_array_range_(const void* address,
+                                       std::size_t byte_count) noexcept {
+        if (!options_.enable_wave_array_dirty || !address || byte_count == 0) return false;
+        const std::uint32_t block_index =
+            lookup_compact_array_block_for_range_(address, byte_count);
+        if (block_index == kInvalidIndex || block_index >= compact_array_blocks_.size() ||
+            !compact_array_blocks_[block_index]) {
+            return false;
+        }
+        CompactArrayBlock& block = *compact_array_blocks_[block_index];
+        const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(block.base);
+        const std::uintptr_t value = reinterpret_cast<std::uintptr_t>(address);
+        const std::size_t offset = static_cast<std::size_t>(value - base);
+        if (offset > block.total_bytes || byte_count > block.total_bytes - offset) return false;
+        static const std::size_t kDirtyChunkBytes = 64u;
+        const std::size_t first_chunk = offset / kDirtyChunkBytes;
+        const std::size_t last_chunk = (offset + byte_count - 1u) / kDirtyChunkBytes;
+        try {
+            std::lock_guard<std::mutex> lock(*block.dirty_mutex);
+            for (std::size_t chunk = first_chunk; chunk <= last_chunk; ++chunk) {
+                const std::size_t word = chunk / 64u;
+                const std::size_t bit = chunk % 64u;
+                if (word >= block.dirty_words.size()) return false;
+                block.dirty_words[word] |= (UINT64_C(1) << bit);
+            }
+        } catch (...) {
+            return false;
+        }
+        return true;
+    }
+
     void mark_dirty_wave_value_address(const void* address) noexcept {
         (void)try_mark_dirty_wave_value_address(address);
     }
@@ -2904,6 +3420,7 @@ public:
     bool try_mark_dirty_wave_array_element_address(std::size_t index, const void* element_address, const void* element_type_tag, std::size_t element_size) noexcept {
         (void)index;
         if (!options_.enable_wave_array_dirty || !element_address || !element_type_tag || element_size == 0) return false;
+        if (try_mark_compact_array_range_(element_address, element_size)) return true;
         if (element_size > static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())) {
             fail_dirty_wave_array_bulk_notify_("element_size too large", element_address, element_type_tag, element_size, 1);
         }
@@ -3094,10 +3611,33 @@ private:
             for (std::size_t i = 0; i < tracers.size(); ++i) {
                 Tracer* tracer = tracers[i];
                 if (!tracer || !tracer->options_.enable_wave_array_dirty) continue;
+                if (tracer->lookup_compact_array_block_for_range_(
+                        element_address, element_size) != kInvalidIndex) {
+                    return tracer;
+                }
                 if (element_size <= static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)()) &&
                     tracer->lookup_dirty_wave_array_slice_by_address_(element_address,
                                                                       element_type_tag,
                                                                       static_cast<std::uint32_t>(element_size)) != kInvalidIndex) {
+                    return tracer;
+                }
+            }
+        } catch (...) {}
+        return NULL;
+    }
+
+    static Tracer* resolve_compact_array_owner_for_range_(
+        const void* address,
+        std::size_t byte_count) noexcept {
+        if (!address || byte_count == 0) return NULL;
+        try {
+            std::lock_guard<std::mutex> lock(active_tracers_mutex_());
+            std::vector<Tracer*>& tracers = active_tracers_();
+            for (std::size_t i = 0; i < tracers.size(); ++i) {
+                Tracer* tracer = tracers[i];
+                if (!tracer || !tracer->options_.enable_wave_array_dirty) continue;
+                if (tracer->lookup_compact_array_block_for_range_(address, byte_count) !=
+                    kInvalidIndex) {
                     return tracer;
                 }
             }
@@ -3254,6 +3794,10 @@ private:
     std::size_t direct_topology_cloned_elements_ = 0;
     std::size_t dynamic_array_entry_attempts_ = 0;
     std::size_t dynamic_array_entry_successes_ = 0;
+    std::size_t bitset_fields_seen_ = 0;
+    std::size_t bitset_fields_traced_ = 0;
+    std::size_t bitset_fields_skipped_layout_ = 0;
+    std::uint32_t bitset_raw_unit_bytes_mask_ = 0;
 
     // Id-indexed storage. Id 0 is unused, so NodeId/TrackId/WatchId can be used
     // as a direct vector index. This removes per-cycle unordered_map iteration and
@@ -3270,6 +3814,7 @@ private:
     std::uint32_t active_generated_member_name_id_;
     std::deque<std::string> node_debug_paths_;
     std::vector<TrackDesc> tracks_;
+    std::vector<BitsetDesc> bitsets_;
     std::deque<std::string> track_paths_;
     std::vector<TrackRuntimeState> track_runtime_;
     std::vector<std::unique_ptr<ScalarGetterStorageBase> > scalar_getter_storage_;
@@ -3309,13 +3854,14 @@ private:
         std::uint32_t track_id;
         std::uint32_t storage_id;
         std::uint32_t memory_byte_width;
+        std::uint32_t scalar_reader_arg;
         ScalarSampleKind scalar_kind;
         ValueKind value_kind;
         bool has_last;
 
         FlatLeafFast()
-            : sample_ctx(NULL), memory_ctx(NULL), scalar_reader(NULL), last_bits(0),
-              track_id(0), storage_id(0), memory_byte_width(0), scalar_kind(ScalarSampleKind::None),
+              : sample_ctx(NULL), memory_ctx(NULL), scalar_reader(NULL), last_bits(0),
+              track_id(0), storage_id(0), memory_byte_width(0), scalar_reader_arg(0), scalar_kind(ScalarSampleKind::None),
               value_kind(ValueKind::Unknown), has_last(false) {}
     };
 
@@ -3602,13 +4148,14 @@ private:
         std::uint32_t track_id;
         std::uint32_t storage_id;
         std::uint32_t memory_byte_width;
+        std::uint32_t scalar_reader_arg;
         ScalarSampleKind scalar_kind;
         ValueKind value_kind;
         bool has_last;
 
         DirtyWaveValueLeaf()
             : sample_ctx(NULL), memory_ctx(NULL), scalar_reader(NULL), last_bits(0),
-              track_id(0), storage_id(0), memory_byte_width(0), scalar_kind(ScalarSampleKind::None),
+              track_id(0), storage_id(0), memory_byte_width(0), scalar_reader_arg(0), scalar_kind(ScalarSampleKind::None),
               value_kind(ValueKind::Unknown), has_last(false) {}
     };
 
@@ -3857,6 +4404,12 @@ private:
     std::uint32_t dirty_wave_array_submit_storage_epoch_ = 1;
     std::uint32_t active_dirty_wave_array_capture_depth_ = 0;
     std::uint32_t active_dirty_wave_array_open_block_id_ = kInvalidIndex;
+
+    // Compact wave::array path. One entry owns the complete outer array byte
+    // range; nested wave::array members are represented only in its schema.
+    std::vector<std::unique_ptr<CompactArrayBlock> > compact_array_blocks_;
+    std::vector<CompactArrayAddressRange> compact_array_address_ranges_;
+    bool compact_array_address_ranges_sorted_ = true;
 
     std::vector<TrackEvent> caller_parallel_events_;
     std::vector<std::uint32_t> submitted_storage_epochs_;
@@ -4184,7 +4737,7 @@ private:
         }
     }
 
-    static bool read_bitfield_storage(const void* storage_ptr, ScalarSnapshot& sample) {
+    static bool read_bitfield_storage(const void* storage_ptr, std::uint32_t, ScalarSnapshot& sample) {
         const BitfieldStorageReadStorage* storage = static_cast<const BitfieldStorageReadStorage*>(storage_ptr);
         if (!storage || !storage->address || storage->byte_count == 0 || storage->byte_count > 8) return false;
         std::uint64_t bits = 0;
@@ -4200,7 +4753,7 @@ private:
     }
 
     static bool read_scalar_snapshot(const TrackDesc& track, ScalarSnapshot& sample) {
-        if (track.scalar_reader) return track.scalar_reader(track.sample_ctx, sample);
+        if (track.scalar_reader) return track.scalar_reader(track.sample_ctx, track.scalar_reader_arg, sample);
         const void* p = track.sample_ctx;
         if (!p) return false;
         switch (track.scalar_kind) {
@@ -4479,6 +5032,7 @@ private:
             leaf.sample_ctx = track.sample_ctx;
             leaf.memory_ctx = track.memory_ctx;
             leaf.memory_byte_width = track.memory_byte_width;
+            leaf.scalar_reader_arg = track.scalar_reader_arg;
             leaf.scalar_reader = track.scalar_reader;
             leaf.scalar_kind = track.scalar_kind;
             leaf.value_kind = track.kind;
@@ -4520,7 +5074,7 @@ private:
     }
 
     static bool read_flat_leaf_snapshot(const FlatLeafFast& leaf, ScalarSnapshot& sample) {
-        if (leaf.scalar_reader) return leaf.scalar_reader(leaf.sample_ctx, sample);
+        if (leaf.scalar_reader) return leaf.scalar_reader(leaf.sample_ctx, leaf.scalar_reader_arg, sample);
         const void* p = leaf.sample_ctx;
         if (!p) return false;
         switch (leaf.scalar_kind) {
@@ -4764,7 +5318,8 @@ private:
                             ? next_ref.end_addr
                             : chunk_end_addr;
                         const std::size_t candidate_bytes = static_cast<std::size_t>(candidate_end - chunk_base_addr);
-                        if (chunk_end > chunk_begin && split_target_bytes != 0 && candidate_bytes > split_target_bytes) break;
+                        if (chunk_end > chunk_begin && split_target_bytes != 0 &&
+                            candidate_bytes > split_target_bytes) break;
                         chunk_end_addr = candidate_end;
                         ++chunk_end;
                     }
@@ -4853,8 +5408,10 @@ private:
                 current_base_addr = begin_addr;
                 current_end_addr = end_addr;
             } else {
-                current_end = end;
-                current_end_addr = end_addr;
+                if (end_addr > current_end_addr) {
+                    current_end = end;
+                    current_end_addr = end_addr;
+                }
             }
 
             CandidateRef ref;
@@ -7223,8 +7780,6 @@ private:
                                            leaf_bytes);
             return false;
         }
-        const std::uintptr_t leaf_end_addr = leaf_begin_addr + leaf_bytes;
-
         bool start_new_block = active_dirty_peek_open_block_id_ == kInvalidIndex ||
                                active_dirty_peek_open_block_id_ >= dirty_peek_memory_blocks_.size();
         if (!start_new_block) {
@@ -7750,13 +8305,14 @@ private:
     }
 
     bool read_dirty_wave_value_leaf_snapshot(const DirtyWaveValueLeaf& leaf, ScalarSnapshot& sample) const {
-        if (leaf.scalar_reader) return leaf.scalar_reader(leaf.sample_ctx, sample);
+        if (leaf.scalar_reader) return leaf.scalar_reader(leaf.sample_ctx, leaf.scalar_reader_arg, sample);
         FlatLeafFast tmp;
         tmp.track_id = leaf.track_id;
         tmp.storage_id = leaf.storage_id != 0 ? leaf.storage_id : leaf.track_id;
         tmp.sample_ctx = leaf.sample_ctx;
         tmp.memory_ctx = leaf.memory_ctx;
         tmp.memory_byte_width = leaf.memory_byte_width;
+        tmp.scalar_reader_arg = leaf.scalar_reader_arg;
         tmp.scalar_reader = leaf.scalar_reader;
         tmp.scalar_kind = leaf.scalar_kind;
         tmp.value_kind = leaf.value_kind;
@@ -7770,6 +8326,7 @@ private:
         tmp.sample_ctx = leaf.sample_ctx;
         tmp.memory_ctx = leaf.memory_ctx;
         tmp.memory_byte_width = leaf.memory_byte_width;
+        tmp.scalar_reader_arg = leaf.scalar_reader_arg;
         tmp.scalar_reader = leaf.scalar_reader;
         tmp.scalar_kind = leaf.scalar_kind;
         tmp.value_kind = leaf.value_kind;
@@ -8023,8 +8580,6 @@ private:
             fail_dirty_wave_array_bulk_notify_("wave::array leaf physical storage overflows address", NULL, NULL, 0, 0);
             return false;
         }
-        const std::uintptr_t leaf_end_addr = leaf_begin_addr + leaf_bytes;
-
         bool start_new_block = active_dirty_wave_array_open_block_id_ == kInvalidIndex ||
                                active_dirty_wave_array_open_block_id_ >= dirty_wave_array_memory_blocks_.size();
         if (!start_new_block) {
@@ -9375,6 +9930,7 @@ private:
         std::size_t node_names_size;
         std::size_t node_debug_paths_size;
         std::size_t tracks_size;
+        std::size_t bitsets_size;
         std::size_t track_paths_size;
         std::size_t track_runtime_size;
         std::size_t scalar_getter_storage_size;
@@ -9435,6 +9991,7 @@ private:
         cp.node_names_size = node_names_.size();
         cp.node_debug_paths_size = node_debug_paths_.size();
         cp.tracks_size = tracks_.size();
+        cp.bitsets_size = bitsets_.size();
         cp.track_paths_size = track_paths_.size();
         cp.track_runtime_size = track_runtime_.size();
         cp.scalar_getter_storage_size = scalar_getter_storage_.size();
@@ -9754,6 +10311,7 @@ private:
         // surviving nodes or the name lookup table.
         node_debug_paths_.resize(cp.node_debug_paths_size);
         tracks_.resize(cp.tracks_size);
+        bitsets_.resize(cp.bitsets_size);
         track_paths_.resize(cp.track_paths_size);
         track_runtime_.resize(cp.track_runtime_size);
         scalar_getter_storage_.resize(cp.scalar_getter_storage_size);
@@ -10393,6 +10951,27 @@ private:
         }
 
         std::fprintf(fp, "Reflection wave leaf distribution\n");
+        const detail::BitsetRawAbiInfo& bitset_abi = detail::std_bitset_raw_abi_info();
+        const char* bitset_endian = bitset_abi.endian == detail::BitsetRawEndian::Little
+            ? "little"
+            : (bitset_abi.endian == detail::BitsetRawEndian::Big ? "big" : "unknown");
+        std::string bitset_unit_bytes;
+        for (unsigned bytes = 1; bytes <= 8; ++bytes) {
+            if ((bitset_raw_unit_bytes_mask_ & (std::uint32_t(1u) << bytes)) == 0u) continue;
+            if (!bitset_unit_bytes.empty()) bitset_unit_bytes += ",";
+            bitset_unit_bytes += detail::to_string_unsigned(bytes);
+        }
+        if (bitset_unit_bytes.empty()) bitset_unit_bytes = "none";
+        std::fprintf(fp,
+                     "bitset_raw_tracking=%s host_endian=%s probe=exact-native-sequential representative_widths=1,32,33,64,65,130 per_type_probe=unique-bit-signature small_unit_bytes=%u large_unit_bytes=%u observed_unit_bytes=%s fields_seen=%llu fields_traced=%llu fields_skipped_layout=%llu\n",
+                     bitset_abi.supported ? "enabled" : "disabled",
+                     bitset_endian,
+                     static_cast<unsigned>(bitset_abi.small_unit_bytes),
+                     static_cast<unsigned>(bitset_abi.large_unit_bytes),
+                     bitset_unit_bytes.c_str(),
+                     static_cast<unsigned long long>(bitset_fields_seen_),
+                     static_cast<unsigned long long>(bitset_fields_traced_),
+                     static_cast<unsigned long long>(bitset_fields_skipped_layout_));
         const std::size_t dirty_wave_array_bulk_range_count =
             dirty_wave_array_registered_bulk_range_count_();
         const std::size_t dirty_wave_array_slice_range_count =
@@ -10674,7 +11253,8 @@ private:
     bool node_has_signal_subtree(NodeId node_id) const {
         const NodeDesc* node = find_node(node_id);
         return node && node->alive &&
-               (node->first_track != 0 || node->first_child != 0 ||
+               (node->first_track != 0 || node->first_child != 0 || node->bitset_container ||
+                node->array_block_container ||
                 (node->kind == NodeKind::Reference && node->reference_target_id != 0));
     }
 
@@ -10791,6 +11371,24 @@ private:
                 sink_.on_subtree_reference_declared(node.id, node.reference_target_id);
             }
             ++exported_count;
+        }
+        for (std::size_t i = 0; i < bitsets_.size(); ++i) {
+            const BitsetDesc& bitset = bitsets_[i];
+            sink_.on_bitset_declared_fast(bitset.node_id,
+                                          bitset.first_storage_id,
+                                          bitset.bit_count,
+                                          bitset.word_count);
+        }
+        for (std::size_t i = 0; i < compact_array_blocks_.size(); ++i) {
+            if (!compact_array_blocks_[i]) continue;
+            const CompactArrayBlock& block = *compact_array_blocks_[i];
+            ArrayBlockDecl decl;
+            decl.node_id = block.node_id;
+            decl.total_bytes = static_cast<std::uint64_t>(block.total_bytes);
+            decl.element_count = static_cast<std::uint64_t>(block.element_count);
+            decl.element_stride = static_cast<std::uint64_t>(block.element_stride);
+            decl.schema = block.schema;
+            sink_.on_array_block_declared(decl);
         }
 
         // Do not permanently mark an empty pre-root prepare as exported.  That
@@ -11062,7 +11660,7 @@ private:
             sink_.on_track_declared_fast(
                 track.id,
                 track.storage_id != 0 ? track.storage_id : track.id,
-                node_id,
+                track.storage_only ? 0 : node_id,
                 kind,
                 track.bit_width != 0 ? track.bit_width : scalar_bit_width(track.scalar_kind),
                 track.bit_offset,
@@ -11447,6 +12045,7 @@ private:
         leaf.sample_ctx = track.sample_ctx;
         leaf.memory_ctx = track.memory_ctx;
         leaf.memory_byte_width = track.memory_byte_width;
+        leaf.scalar_reader_arg = track.scalar_reader_arg;
         leaf.scalar_reader = track.scalar_reader;
         leaf.scalar_kind = track.scalar_kind;
         leaf.value_kind = track.kind;
@@ -11775,8 +12374,104 @@ private:
         return created;
     }
 
+    template <std::size_t N>
+    static bool read_std_bitset_word_storage(const void* ptr,
+                                             std::uint32_t reader_arg,
+                                             ScalarSnapshot& sample) {
+        const unsigned char unit_bytes = detail::std_bitset_raw_unit_bytes<N>();
+        const std::size_t word_bytes = static_cast<std::size_t>(reader_arg & 0xffu);
+        const std::size_t valid_bits = static_cast<std::size_t>((reader_arg >> 8u) & 0xffu);
+        if (!ptr || unit_bytes == 0 || word_bytes == 0 || word_bytes > 8u ||
+            word_bytes % unit_bytes != 0u || valid_bits == 0 || valid_bits > 64u) return false;
+        const std::size_t unit_bits = static_cast<std::size_t>(unit_bytes) * 8u;
+        const std::size_t units_in_word = word_bytes / unit_bytes;
+        const unsigned char* raw = static_cast<const unsigned char*>(ptr);
+        std::uint64_t value = 0;
+        for (std::size_t unit = 0; unit < units_in_word; ++unit) {
+            const std::size_t byte_offset = unit * unit_bytes;
+            std::uint64_t native_value = 0;
+            switch (unit_bytes) {
+            case 1u: {
+                std::uint8_t v = 0; std::memcpy(&v, raw + byte_offset, sizeof(v)); native_value = v; break;
+            }
+            case 2u: {
+                std::uint16_t v = 0; std::memcpy(&v, raw + byte_offset, sizeof(v)); native_value = v; break;
+            }
+            case 4u: {
+                std::uint32_t v = 0; std::memcpy(&v, raw + byte_offset, sizeof(v)); native_value = v; break;
+            }
+            case 8u: {
+                std::uint64_t v = 0; std::memcpy(&v, raw + byte_offset, sizeof(v)); native_value = v; break;
+            }
+            default:
+                return false;
+            }
+            value |= native_value << static_cast<unsigned>(unit * unit_bits);
+        }
+        if (valid_bits < 64u) {
+            value &= (std::uint64_t(1) << static_cast<unsigned>(valid_bits)) - 1u;
+        }
+        sample.sample_kind = ScalarSampleKind::U64;
+        sample.bool_value = value != 0;
+        sample.u64_value = value;
+        sample.i64_value = static_cast<std::int64_t>(sample.u64_value);
+        sample.bits = sample.u64_value;
+        return true;
+    }
+
+    template <std::size_t N>
+    TrackId create_std_bitset_word_track(NodeId node_id,
+                                         const std::string& path,
+                                         const std::bitset<N>* ptr,
+                                         std::size_t word_index) {
+        const std::size_t word_count = N / 64u + (N % 64u != 0u ? 1u : 0u);
+        const unsigned char unit_bytes = detail::std_bitset_raw_unit_bytes<N>();
+        const std::size_t byte_offset = word_index * 8u;
+        const std::size_t word_bytes = byte_offset < sizeof(std::bitset<N>)
+            ? (std::min)(std::size_t(8u), sizeof(std::bitset<N>) - byte_offset)
+            : 0u;
+        const std::size_t first_bit = word_index * 64u;
+        const std::size_t valid_bits = first_bit < N
+            ? (std::min)(std::size_t(64u), N - first_bit)
+            : 0u;
+        if (!ptr || unit_bytes == 0 || word_index >= word_count ||
+            word_bytes == 0 || word_bytes > 0xffu || valid_bits == 0 || valid_bits > 0xffu ||
+            sizeof(std::bitset<N>) > static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())) {
+            return 0;
+        }
+        const void* word_address = static_cast<const void*>(
+            reinterpret_cast<const unsigned char*>(ptr) + byte_offset);
+        const TrackId id = next_track_id_++;
+        TrackDesc& track = ensure_id_slot_reserved(tracks_, id, options_.id_slot_track_growth_chunk);
+        track = TrackDesc();
+        track.id = compact_topology_id_(id, "track id");
+        // Keep the physical word owned by the bitset container for runtime
+        // liveness. It is still exported as node_id=0 because it is hidden
+        // storage rather than a visible tree leaf.
+        track.node_id = compact_topology_id_(node_id, "bitset word node id");
+        track.kind = ValueKind::UnsignedInt;
+        TrackRuntimeState& runtime = ensure_id_slot_reserved(track_runtime_, id, options_.id_slot_track_growth_chunk);
+        runtime = TrackRuntimeState();
+        track.sample_ctx = word_address;
+        track.scalar_reader_arg = static_cast<std::uint32_t>(word_bytes | (valid_bits << 8u));
+        track.scalar_reader = &read_std_bitset_word_storage<N>;
+        track.memory_ctx = word_address;
+        track.memory_byte_width = static_cast<std::uint32_t>(word_bytes);
+        track.scalar_kind = ScalarSampleKind::U64;
+        track.bit_width = 64u;
+        track.thread_class = TrackThreadClass::ParallelSafe;
+        track.storage_only = true;
+        if (active_dirty_peek_group_id_ != kInvalidIndex) {
+            track.dirty_peek_group_id = active_dirty_peek_group_id_;
+        }
+        const TrackId created = finish_track_create(node_id, path, ValueKind::UnsignedInt, track);
+        record_dirty_peek_leaf_for_track(created);
+        record_dirty_wave_array_leaf_for_track(created);
+        return created;
+    }
+
     template <typename T>
-    static bool read_bool_storage_ptr_storage(const void* ptr, ScalarSnapshot& sample) {
+    static bool read_bool_storage_ptr_storage(const void* ptr, std::uint32_t, ScalarSnapshot& sample) {
         typedef typename detail::remove_cvref<T>::type RawT;
         const RawT* p = static_cast<const RawT*>(ptr);
         if (!p) return false;
@@ -11852,7 +12547,7 @@ private:
     }
 
     template <typename T>
-    static bool read_scalar_volatile_ptr_storage(const void* ptr, ScalarSnapshot& sample) {
+    static bool read_scalar_volatile_ptr_storage(const void* ptr, std::uint32_t, ScalarSnapshot& sample) {
         const volatile T* vp = static_cast<const volatile T*>(ptr);
         if (!vp) return false;
         const T value = static_cast<T>(*vp);
@@ -12456,6 +13151,13 @@ private:
         for (std::size_t local_id = 1; local_id < fragment.tracks_.size(); ++local_id) {
             remap_topology_fragment_track_(result, fragment.tracks_[local_id]);
         }
+        for (std::size_t i = 0; i < fragment.bitsets_.size(); ++i) {
+            BitsetDesc& bitset = fragment.bitsets_[i];
+            bitset.node_id = remap_parallel_topology_id_unchecked_(
+                result.node_base + bitset.node_id);
+            bitset.first_storage_id = remap_parallel_topology_id_unchecked_(
+                result.track_base + bitset.first_storage_id);
+        }
 
         for (std::size_t i = 0; i < result.root_node_ids.size(); ++i) {
             result.root_node_ids[i] = compact_topology_id_(
@@ -12850,6 +13552,7 @@ private:
         std::size_t ranged_object_count) {
         std::size_t add_nodes = 0;
         std::size_t add_tracks = 0;
+        std::size_t add_bitsets = 0;
         std::size_t add_objects = 0;
         std::size_t add_getters = 0;
         std::size_t add_weak_keepalives = 0;
@@ -12875,6 +13578,7 @@ private:
             const Tracer& fragment = *fragments[i]->tracer;
             add_nodes += fragment.nodes_.size() - 1u;
             add_tracks += fragment.tracks_.size() - 1u;
+            add_bitsets += fragment.bitsets_.size();
             add_objects += fragment.objects_.size() - 1u;
             add_getters += fragment.scalar_getter_storage_.size();
             add_weak_keepalives += fragment.annotated_weak_ptr_keepalives_.size();
@@ -12899,6 +13603,7 @@ private:
         }
         reserve_parallel_batch_vector_(nodes_, add_nodes);
         reserve_parallel_batch_vector_(tracks_, add_tracks);
+        reserve_parallel_batch_vector_(bitsets_, add_bitsets);
         reserve_parallel_batch_vector_(track_runtime_, add_tracks);
         reserve_parallel_batch_vector_(objects_, add_objects);
         if (ranged_object_count > add_objects) {
@@ -13006,6 +13711,11 @@ private:
             }
         }
         append_fragment_vector_without_sentinel_(nodes_, fragment.nodes_);
+        append_fragment_vector_(bitsets_, fragment.bitsets_);
+        bitset_fields_seen_ += fragment.bitset_fields_seen_;
+        bitset_fields_traced_ += fragment.bitset_fields_traced_;
+        bitset_fields_skipped_layout_ += fragment.bitset_fields_skipped_layout_;
+        bitset_raw_unit_bytes_mask_ |= fragment.bitset_raw_unit_bytes_mask_;
         if (parent_id != 0) {
             NodeDesc* parent = find_node(parent_id);
             if (parent) {
@@ -13026,7 +13736,7 @@ private:
             sink_.on_track_declared_fast(
                 track.id,
                 track.storage_id != 0 ? track.storage_id : track.id,
-                track.node_id,
+                track.storage_only ? 0 : track.node_id,
                 track.kind,
                 track.bit_width != 0 ? track.bit_width : scalar_bit_width(track.scalar_kind),
                 track.bit_offset,
@@ -14712,9 +15422,191 @@ private:
         return 0;
     }
 
+    struct CompactArraySchemaBuild {
+        const unsigned char* block_base;
+        std::size_t element_bytes;
+        std::vector<ArraySchemaNodeDecl> nodes;
+        bool expandable_reference;
+        bool unsupported;
+
+        CompactArraySchemaBuild(const void* base, std::size_t bytes)
+            : block_base(static_cast<const unsigned char*>(base)),
+              element_bytes(bytes),
+              expandable_reference(false), unsupported(false) {}
+    };
+
+    std::uint32_t append_compact_array_schema_node_(
+        CompactArraySchemaBuild& build,
+        std::uint32_t parent,
+        const char* name,
+        ArraySchemaNodeKind kind,
+        const void* address,
+        std::size_t byte_size) {
+        if (!address || !build.block_base ||
+            build.nodes.size() >= static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())) {
+            build.unsupported = true;
+            return 0;
+        }
+        const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(build.block_base);
+        const std::uintptr_t value = reinterpret_cast<std::uintptr_t>(address);
+        if (value < base || byte_size > build.element_bytes ||
+            value - base > build.element_bytes - byte_size) {
+            // A reflected reference is visited as the address of its referent.
+            // It therefore falls outside the element's own storage and must use
+            // topology expansion instead of being serialized as inline bytes.
+            build.expandable_reference = true;
+            return 0;
+        }
+        ArraySchemaNodeDecl node;
+        node.schema_node_id = static_cast<std::uint32_t>(build.nodes.size() + 1u);
+        node.parent_schema_node_id = parent;
+        if (name) node.name = name;
+        node.kind = kind;
+        node.byte_offset = static_cast<std::uint64_t>(value - base);
+        node.byte_size = static_cast<std::uint64_t>(byte_size);
+        build.nodes.push_back(node);
+        return node.schema_node_id;
+    }
+
+    template <typename T>
+    typename std::enable_if<
+        detail::is_leaf_scalar<typename detail::remove_cvref<T>::type>::value &&
+        !detail::is_std_string<typename detail::remove_cvref<T>::type>::value,
+        bool>::type
+    collect_compact_array_schema_value_(CompactArraySchemaBuild& build,
+                                        std::uint32_t parent,
+                                        const char* name,
+                                        const T* ptr) {
+        typedef typename detail::remove_cvref<T>::type CleanT;
+        const std::uint32_t id = append_compact_array_schema_node_(
+            build, parent, name, ArraySchemaNodeKind::Leaf, ptr, sizeof(CleanT));
+        if (id == 0) return false;
+        ArraySchemaNodeDecl& node = build.nodes[id - 1u];
+        node.value_kind = detail::classify_value_kind<CleanT>();
+        node.bit_width = std::is_same<CleanT, bool>::value
+            ? 1u
+            : static_cast<std::uint32_t>(sizeof(CleanT) * 8u);
+        return true;
+    }
+
+    template <typename T>
+    typename std::enable_if<detail::is_wave_array<typename detail::remove_cvref<T>::type>::value, bool>::type
+    collect_compact_array_schema_value_(CompactArraySchemaBuild& build,
+                                        std::uint32_t parent,
+                                        const char* name,
+                                        const T* ptr) {
+        typedef typename detail::remove_cvref<T>::type CleanT;
+        typedef typename wave_array_traits<CleanT>::element_type ElemT;
+        const std::size_t count = wave_array_traits<CleanT>::size;
+        const std::uint32_t id = append_compact_array_schema_node_(
+            build, parent, name, ArraySchemaNodeKind::Array, ptr, sizeof(CleanT));
+        if (id == 0) return false;
+        ArraySchemaNodeDecl& node = build.nodes[id - 1u];
+        node.element_count = static_cast<std::uint64_t>(count);
+        node.element_stride = static_cast<std::uint64_t>(sizeof(ElemT));
+        if (count == 0) {
+            build.unsupported = true;
+            return false;
+        }
+        const ElemT* first = std::addressof((*ptr)[0]);
+        return collect_compact_array_schema_value_<ElemT>(build, id, NULL, first);
+    }
+
+    template <typename T>
+    typename std::enable_if<reflect::is_reflected<typename detail::remove_cvref<T>::type>::value, bool>::type
+    collect_compact_array_schema_value_(CompactArraySchemaBuild& build,
+                                        std::uint32_t parent,
+                                        const char* name,
+                                        const T* ptr) {
+        typedef typename detail::remove_cvref<T>::type CleanT;
+        const std::uint32_t id = append_compact_array_schema_node_(
+            build,
+            parent,
+            name,
+            name && name[0] != '\0' ? ArraySchemaNodeKind::Field : ArraySchemaNodeKind::Object,
+            ptr,
+            sizeof(CleanT));
+        if (id == 0) return false;
+        bool ok = true;
+        detail::call_reflected_visit<CleanT>(
+            ptr,
+            [this, &build, id, &ok](const char* child_name, auto child_field_ptr, auto...) {
+                typedef typename std::remove_pointer<decltype(child_field_ptr)>::type RawFieldT;
+                typedef typename detail::remove_cvref<RawFieldT>::type FieldT;
+                const bool pointer_like =
+                    std::is_pointer<FieldT>::value ||
+                    detail::is_unique_ptr_scalar<FieldT>::value ||
+                    detail::is_unique_ptr_array<FieldT>::value ||
+                    detail::is_shared_ptr<FieldT>::value ||
+                    detail::is_weak_ptr<FieldT>::value;
+                if (pointer_like) {
+                    build.expandable_reference = true;
+                    ok = false;
+                    return;
+                }
+                if (!collect_compact_array_schema_value_<FieldT>(
+                        build, id, child_name, child_field_ptr)) {
+                    ok = false;
+                }
+            },
+            [&build, &ok](const char*, const auto&) {
+                build.unsupported = true;
+                ok = false;
+            },
+            [this, &build, id, ptr, &ok](const char* child_name, auto getter, auto... meta) {
+                typedef typename detail::remove_cvref<decltype(getter(ptr))>::type GetterT;
+                const std::uint32_t width = getter_bit_width_or_zero(meta...);
+                const long long bit_offset = getter_bit_offset_or_negative(meta...);
+                if (!detail::is_leaf_scalar<GetterT>::value ||
+                    detail::is_std_string<GetterT>::value ||
+                    width == 0 || bit_offset < 0) {
+                    build.unsupported = true;
+                    ok = false;
+                    return;
+                }
+                const std::size_t byte_offset = static_cast<std::size_t>(bit_offset / 8);
+                const std::size_t local_bit_offset = static_cast<std::size_t>(bit_offset % 8);
+                const std::size_t byte_count = (local_bit_offset + width + 7u) / 8u;
+                const unsigned char* address =
+                    reinterpret_cast<const unsigned char*>(ptr) + byte_offset;
+                const std::uint32_t leaf_id = append_compact_array_schema_node_(
+                    build, id, child_name, ArraySchemaNodeKind::Leaf, address, byte_count);
+                if (leaf_id == 0) {
+                    ok = false;
+                    return;
+                }
+                ArraySchemaNodeDecl& node = build.nodes[leaf_id - 1u];
+                node.value_kind = detail::classify_value_kind<GetterT>();
+                node.bit_width = width;
+                node.bit_offset = static_cast<std::uint32_t>(local_bit_offset);
+            });
+        return ok;
+    }
+
+    template <typename T>
+    typename std::enable_if<
+        !detail::is_leaf_scalar<typename detail::remove_cvref<T>::type>::value &&
+        !detail::is_wave_array<typename detail::remove_cvref<T>::type>::value &&
+        !reflect::is_reflected<typename detail::remove_cvref<T>::type>::value,
+        bool>::type
+    collect_compact_array_schema_value_(CompactArraySchemaBuild& build,
+                                        std::uint32_t,
+                                        const char*,
+                                        const T*) {
+        typedef typename detail::remove_cvref<T>::type CleanT;
+        build.expandable_reference =
+            std::is_pointer<CleanT>::value ||
+            detail::is_unique_ptr_scalar<CleanT>::value ||
+            detail::is_unique_ptr_array<CleanT>::value ||
+            detail::is_shared_ptr<CleanT>::value ||
+            detail::is_weak_ptr<CleanT>::value;
+        if (!build.expandable_reference) build.unsupported = true;
+        return false;
+    }
+
     template <typename ArrT>
     typename std::enable_if<detail::is_wave_array<ArrT>::value, NodeId>::type
-    expand_wave_array_field_impl(const std::string& path, NodeId parent_id, const ArrT* ptr) {
+    expand_wave_array_field_legacy_(const std::string& path, NodeId parent_id, const ArrT* ptr) {
         if (!ptr) return 0;
         const std::size_t logical_count = wave_array_traits<ArrT>::size;
         const std::size_t traced_count = traced_array_element_count_(logical_count);
@@ -14815,6 +15707,81 @@ private:
         return kept;
     }
 
+    template <typename ArrT>
+    typename std::enable_if<detail::is_wave_array<ArrT>::value, NodeId>::type
+    expand_wave_array_field_impl(const std::string& path, NodeId parent_id, const ArrT* ptr) {
+        if (!ptr) return 0;
+        typedef typename wave_array_traits<ArrT>::element_type ElemT;
+        const std::size_t count = wave_array_traits<ArrT>::size;
+        if (count == 0 || count > (std::numeric_limits<std::size_t>::max)() / sizeof(ElemT)) {
+            throw std::logic_error("WaveTrace compact wave::array requires a non-empty bounded array");
+        }
+        const ElemT* first = std::addressof((*ptr)[0]);
+        CompactArraySchemaBuild schema(first, sizeof(ElemT));
+        const bool schema_ok = collect_compact_array_schema_value_<ElemT>(
+            schema, 0, NULL, first);
+        if (!schema_ok) {
+            if (schema.expandable_reference && !schema.unsupported) {
+                // Arrays whose element topology contains an expanding pointer or
+                // reference are outside compact-array semantics by definition.
+                return expand_wave_array_field_legacy_<ArrT>(path, parent_id, ptr);
+            }
+            throw std::logic_error(
+                "WaveTrace compact wave::array schema contains an unsupported non-pointer member");
+        }
+        if (!options_.enable_wave_array_dirty) {
+            throw std::logic_error(
+                "WaveTrace compact wave::array requires active wave::array dirty reporting");
+        }
+
+        const std::size_t total_bytes = count * sizeof(ElemT);
+        const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(first);
+        if (begin > (std::numeric_limits<std::uintptr_t>::max)() - total_bytes) {
+            throw std::overflow_error("WaveTrace compact wave::array address range overflow");
+        }
+
+        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
+        const NodeId node_id = create_node(
+            parent_id, path, NodeKind::FixedIndexedContainer, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        NodeDesc* node = find_node(node_id);
+        if (!node) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        node->array_block_container = true;
+
+        std::unique_ptr<CompactArrayBlock> block(new CompactArrayBlock());
+        block->node_id = compact_topology_id_(node_id, "compact array node id");
+        block->base = reinterpret_cast<const unsigned char*>(first);
+        block->total_bytes = total_bytes;
+        block->element_count = count;
+        block->element_stride = sizeof(ElemT);
+        block->schema.swap(schema.nodes);
+        block->shadow.resize(total_bytes, 0u);
+        static const std::size_t kDirtyChunkBytes = 64u;
+        const std::size_t chunk_count =
+            total_bytes / kDirtyChunkBytes + (total_bytes % kDirtyChunkBytes != 0u ? 1u : 0u);
+        block->dirty_words.resize(
+            chunk_count / 64u + (chunk_count % 64u != 0u ? 1u : 0u), 0u);
+
+        if (compact_array_blocks_.size() >=
+            static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())) {
+            rollback_topology_to(cp);
+            throw std::overflow_error("WaveTrace compact wave::array block count overflow");
+        }
+        const std::uint32_t block_index =
+            static_cast<std::uint32_t>(compact_array_blocks_.size());
+        compact_array_blocks_.push_back(std::move(block));
+        compact_array_address_ranges_.push_back(
+            CompactArrayAddressRange(begin, begin + total_bytes, block_index));
+        compact_array_address_ranges_sorted_ = false;
+        return keep_node_or_rollback(cp, node_id);
+    }
+
     template <typename T>
     typename std::enable_if<detail::is_wave_array<T>::value, NodeId>::type
     expand_field(const std::string& path, NodeId parent_id, const T* ptr) {
@@ -14889,6 +15856,74 @@ private:
                 make_index_child_path_(array_path, i), node_id, std::addressof((*ptr)[i]));
         }
         return keep_node_or_rollback(cp, node_id);
+    }
+
+    template <std::size_t N>
+    NodeId expand_std_bitset_field_impl(const std::string& path,
+                                        NodeId parent_id,
+                                        const std::bitset<N>* ptr) {
+        if (!ptr) return 0;
+        ++bitset_fields_seen_;
+        const unsigned char unit_bytes = detail::std_bitset_raw_unit_bytes<N>();
+        if (unit_bytes == 0) {
+            ++bitset_fields_skipped_layout_;
+            if (options_.debug_log) {
+                debug_log_msg(std::string("std_bitset skip unsupported raw ABI path=") + path +
+                              " bits=" + detail::to_string_unsigned(N) +
+                              " sizeof=" + detail::to_string_unsigned(sizeof(std::bitset<N>)));
+            }
+            return 0;
+        }
+        if (N == 0 ||
+            N > static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())) {
+            ++bitset_fields_skipped_layout_;
+            return 0;
+        }
+        const std::size_t word_count = N / 64u + (N % 64u != 0u ? 1u : 0u);
+        if (word_count == 0 ||
+            word_count > static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())) {
+            return 0;
+        }
+        std::string annotated_array_path;
+        const std::string& array_path =
+            make_array_container_path_(path, N, annotated_array_path);
+        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
+        const NodeId node_id = create_node(parent_id, array_path, NodeKind::Aggregate, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        const TrackId first_storage_id = next_track_id_;
+        for (std::size_t word = 0; word < word_count; ++word) {
+            if (create_std_bitset_word_track<N>(node_id, array_path, ptr, word) == 0) {
+                rollback_topology_to(cp);
+                return 0;
+            }
+        }
+        NodeDesc* node = find_node(node_id);
+        if (!node) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        node->bitset_container = true;
+
+        BitsetDesc bitset;
+        bitset.node_id = compact_topology_id_(node_id, "bitset node id");
+        bitset.first_storage_id = compact_topology_id_(first_storage_id, "bitset storage id");
+        bitset.bit_count = static_cast<std::uint32_t>(N);
+        bitset.word_count = static_cast<std::uint32_t>(word_count);
+        bitsets_.push_back(bitset);
+        ++bitset_fields_traced_;
+        bitset_raw_unit_bytes_mask_ |=
+            (std::uint32_t(1u) << static_cast<unsigned>(unit_bytes));
+        return node_id;
+    }
+
+    template <std::size_t N>
+    NodeId expand_field(const std::string& path,
+                        NodeId parent_id,
+                        const std::bitset<N>* ptr) {
+        return expand_std_bitset_field_impl<N>(path, parent_id, ptr);
     }
 
     template <typename T>
@@ -15994,7 +17029,8 @@ private:
         for (std::size_t i = first_track + tracks_per_element; i < tracks_.size(); ++i) {
             const TrackDesc& track = tracks_[i];
             sink_.on_track_declared_fast(
-                track.id, track.storage_id, track.node_id, track.kind,
+                track.id, track.storage_id,
+                track.storage_only ? 0 : track.node_id, track.kind,
                 track.bit_width != 0 ? track.bit_width : scalar_bit_width(track.scalar_kind),
                 track.bit_offset, track.storage_only, empty_node_string());
         }
@@ -17107,6 +18143,7 @@ private:
             is_wave_array = detail::is_wave_array<FieldT>::value,
             is_wave_value = detail::is_wave_value<FieldT>::value,
             is_wave_ptr = detail::is_wave_ptr<FieldT>::value,
+            is_std_bitset = detail::is_std_bitset<FieldT>::value,
             is_c_string = std::is_same<typename detail::remove_cvref<FieldT>::type, char*>::value ||
                           std::is_same<typename detail::remove_cvref<FieldT>::type, const char*>::value,
             is_pointer_or_smart = std::is_pointer<FieldT>::value ||
@@ -17126,7 +18163,8 @@ private:
 #else
             is_systemc_whitelist = false,
 #endif
-            value = detail::is_dynamic_trace_target<FieldT>::value &&
+            value = is_std_bitset ? 18 :
+                    detail::is_dynamic_trace_target<FieldT>::value &&
                     !detail::is_peek_trace_source<FieldT>::value ? 17 :
                     is_c_array ? 16 :
                     is_wave_ptr ? 15 :
@@ -17152,6 +18190,15 @@ private:
                     0
         };
     };
+
+    template <typename FieldT>
+    NodeId expand_member_clean_dispatch_selected(const std::string& path,
+                                                 NodeId parent_id,
+                                                 const FieldT* clean_ptr,
+                                                 std::integral_constant<int, 18>) {
+        if (options_.debug_log) debug_log_msg(std::string("member dispatch branch=std_bitset path=") + path);
+        return expand_std_bitset_field_impl(path, parent_id, clean_ptr);
+    }
 
     template <typename FieldT>
     NodeId expand_member_clean_dispatch_selected(const std::string& path,
@@ -17283,6 +18330,7 @@ private:
                             !detail::is_leaf_scalar<T>::value &&
                             !std::is_array<T>::value &&
                             !detail::is_std_array<T>::value &&
+                            !detail::is_std_bitset<T>::value &&
                             !detail::is_wave_array<T>::value &&
                             !detail::is_std_pair<T>::value &&
                             !detail::is_blacklisted_stl<T>::value &&

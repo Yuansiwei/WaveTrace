@@ -353,12 +353,16 @@ options.memory_usage_dump_path = "wave_memory_usage.txt";
 ```cpp
 output.emit_default_clk = true;
 output.default_clk_name = "clk";
-output.clk_initial_value = false;
+output.clk_initial_value = true;
 output.clk_period_ticks = 10;
 output.clk_fall_offset_ticks = 5;
 ```
 
-业务 cycle `n` 映射到 writer 时间 `n * clk_period_ticks`。关闭 `emit_default_clk` 只隐藏合成 clk 信号，不改变 writer 时间单位。
+业务 cycle `n` 映射到 writer 时间 `n * clk_period_ticks`。默认合成 `clk` 从高电平开始，
+每 5 tick 翻转；业务事件时间不做半周期偏移，因此显示在 `clk` 上升沿位置。
+这里的合成 `clk` 只负责 WVZ4 显示相位；`WaveTap` 的采样触发仍然是传入 SystemC
+时钟的 `negedge_event()`，本次初值调整不改变实际采样触发边沿。
+关闭 `emit_default_clk` 只隐藏合成 clk 信号，不改变 writer 时间单位。
 
 ### 10.2 压缩和流水线
 

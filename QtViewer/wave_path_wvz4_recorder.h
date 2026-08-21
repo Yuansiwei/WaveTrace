@@ -62,7 +62,9 @@ public:
         // synthetic clk track, it does not change the writer time unit.
         bool emit_default_clk = true;
         std::string default_clk_name = "clk";
-        bool clk_initial_value = false;
+        // Display phase only. WaveTap sampling remains sensitive to the input
+        // SystemC clock's negedge_event().
+        bool clk_initial_value = true;
         wvz4::u64 clk_period_ticks = 10;
         // In v4 this is interpreted as simple toggle period for CLKD. Keep the
         // old field name to preserve existing config source compatibility.

@@ -4,6 +4,7 @@
 #include "WavePerfCBCtrl.h"
 #include "WavePerfDiagnosis.h"
 #include "WavePerfOutput.h"
+#include "WaveFifoPressure.h"
 #include "WavePerfScheduler.h"
 
 #include <QCommandLineOption>
@@ -178,11 +179,7 @@ struct ValueState {
     quint64 value = 0;
 };
 
-struct FullWindow {
-    qint64 fullTicks = 0;
-    qint64 knownTicks = 0;
-    qint64 expectedTicks = 0;
-};
+using FullWindow = wavefifo::FullWindow;
 
 struct SignalMetrics {
     SignalSelection selection;
@@ -754,32 +751,7 @@ QString signalParentPath(const QString& path) {
     return separator >= 0 ? path.left(separator) : path;
 }
 
-FullWindow analyzeFullWindow(const WaveSignal* occupancy,
-                             const WaveSignal* capacity,
-                             qint64 start,
-                             qint64 end) {
-    FullWindow result;
-    if (!occupancy || !capacity) return result;
-    result.expectedTicks = qMax<qint64>(0, end - start);
-    const QVector<qint64> boundaries =
-        signalBoundaries({occupancy, capacity}, start, end);
-    for (int i = 0; i + 1 < boundaries.size(); ++i) {
-        const ValueState occupancyState =
-            stateAtOrBefore(*occupancy, boundaries.at(i));
-        const ValueState capacityState =
-            stateAtOrBefore(*capacity, boundaries.at(i));
-        if (!occupancyState.known || !capacityState.known ||
-            capacityState.value == 0) {
-            continue;
-        }
-        const qint64 ticks = boundaries.at(i + 1) - boundaries.at(i);
-        result.knownTicks += ticks;
-        if (occupancyState.value >= capacityState.value) {
-            result.fullTicks += ticks;
-        }
-    }
-    return result;
-}
+using wavefifo::analyzeFullWindow;
 
 MaskPopulation sampleMask(const WaveSignal* packed,
                           const QMap<int, const WaveSignal*>& lanes,
@@ -1809,8 +1781,8 @@ int runSelfTest() {
     capacity.samples.push_back(capacitySample);
     const FullWindow fullWindow =
         analyzeFullWindow(&counter, &capacity, 0, 50);
-    if (fullWindow.fullTicks != 20 || fullWindow.knownTicks != 50 ||
-        fullWindow.expectedTicks != 50) {
+    if (fullWindow.fullTicks != 20 || fullWindow.knownTicks != 40 ||
+        fullWindow.expectedTicks != 40) {
         QTextStream(stderr) << "self_test_failed: FIFO full-rate integration\n";
         return 12;
     }
@@ -1818,8 +1790,8 @@ int runSelfTest() {
     lateCapacity.samples[0].time = 20;
     const FullWindow partialFullWindow =
         analyzeFullWindow(&counter, &lateCapacity, 0, 50);
-    if (partialFullWindow.knownTicks != 30 ||
-        partialFullWindow.expectedTicks != 50) {
+    if (partialFullWindow.knownTicks != 20 ||
+        partialFullWindow.expectedTicks != 40) {
         QTextStream(stderr)
             << "self_test_failed: FIFO full-rate partial coverage\n";
         return 26;

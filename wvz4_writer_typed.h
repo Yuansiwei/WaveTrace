@@ -63,12 +63,12 @@ using u64 = std::uint64_t;
 using u32 = std::uint32_t;
 using u8  = std::uint8_t;
 
-static const u32 kFormatVersion = 16;
+static const u32 kFormatVersion = 17;
 static const u8 kSignalFlagStorageOnly = 1u << 0;
 static const u32 kMaxScalarBytes = 8;
 static const u32 kLodLevelCount = 4;
 // v4 adds numeric array-index node names to layout frames.
-static const u32 kWriterProcessProtocolVersion = 6;
+static const u32 kWriterProcessProtocolVersion = 8;
 
 // Raw WDAT payload encoding flags. The outer WDAT section and block index remain
 // unchanged; these flags describe the uncompressed raw_payload inside each block.
@@ -88,6 +88,8 @@ static const u64 kHeaderFeatureByteMaskCodec     = 1ull << 4;
 static const u64 kHeaderFeatureNibbleMaskCodec   = 1ull << 5;
 static const u64 kHeaderFeatureLodTables         = 1ull << 6;
 static const u64 kHeaderFeatureResidualLodTables = 1ull << 7;
+static const u64 kHeaderFeatureBitsetDefinitions = 1ull << 8;
+static const u64 kHeaderFeatureArrayBlocks       = 1ull << 9;
 
 enum class ValueRecordCodec : u8 {
     FullValues = 0,       // time + full fixed-width value for every transition
@@ -231,7 +233,7 @@ struct NodeRecord {
     u32 node_id = 0;       // positive, unique
     u32 parent_id = 0;     // 0 only for root-level nodes
     // name_id == 0 marks a numeric array element. Its array_index is encoded
-    // directly in WVZ4 v15 NODE instead of materializing "[N]" in NAME.
+    // directly in WVZ4 v17 NODI instead of materializing "[N]" in NAME.
     u32 name_id = 0;
     u32 array_index = 0;
     NodeKind kind = NodeKind::Object;
@@ -240,7 +242,7 @@ struct NodeRecord {
     u32 first_child = 0;
     u32 next_sibling = 0;
     // Reference nodes mount the already-defined subtree rooted here. The
-    // target is always an earlier node in the compact v16 layout.
+    // target is always an earlier node in the compact v17 layout.
     u32 reference_target_id = 0;
 };
 
@@ -264,6 +266,44 @@ struct ClockDefinition {
     u64 period_ticks = 1;
 };
 
+// std::bitset storage consists of consecutive hidden U64 streams. The Viewer
+// creates logical bit leaves only when this container is expanded.
+struct BitsetDefinition {
+    u32 node_id = 0;
+    u32 first_storage_id = 0;
+    u32 bit_count = 0;
+    u32 word_count = 0;
+};
+
+enum class ArraySchemaKind : u8 {
+    Object = 1,
+    Field = 2,
+    Array = 3,
+    Leaf = 4
+};
+
+struct ArraySchemaNode {
+    u32 schema_node_id = 0;
+    u32 parent_schema_node_id = 0;
+    u32 name_id = 0;
+    ArraySchemaKind kind = ArraySchemaKind::Field;
+    u64 byte_offset = 0;
+    u64 byte_size = 0;
+    u64 element_count = 0;
+    u64 element_stride = 0;
+    ValueType value_type = ValueType::U64;
+    u32 bit_width = 0;
+    u32 bit_offset = 0;
+};
+
+struct ArrayDefinition {
+    u32 node_id = 0;
+    u64 total_bytes = 0;
+    u64 element_count = 0;
+    u64 element_stride = 0;
+    std::vector<ArraySchemaNode> schema;
+};
+
 struct Layout {
     // Optional contiguous storage for NameRecord strings.  When name_size is
     // non-zero, NameRecord::name is intentionally empty and the writer reads the
@@ -274,6 +314,8 @@ struct Layout {
     std::vector<NodeRecord> nodes;
     std::vector<SignalDefinition> signals;
     std::vector<ClockDefinition> clocks;
+    std::vector<BitsetDefinition> bitsets;
+    std::vector<ArrayDefinition> arrays;
 };
 
 inline bool layout_name_uses_blob(const NameRecord& r) {
@@ -475,6 +517,12 @@ private:
     }
 };
 
+struct ArrayPatchUpdate {
+    u32 node_id = 0;
+    u64 byte_offset = 0;
+    std::vector<u8> bytes;
+};
+
 struct CycleValueWidthGroup {
     std::vector<u32> signal_ids;
     std::vector<u8> values;
@@ -522,10 +570,12 @@ struct CycleSubmission {
     // byte width is stored once per group rather than once per changed signal.
     std::vector<CycleValueUpdate> updates;
     std::array<CycleValueWidthGroup, kMaxScalarBytes + 1u> width_groups;
+    std::vector<ArrayPatchUpdate> array_patches;
 
     void clear_updates() {
         updates.clear();
         for (std::size_t i = 0; i < width_groups.size(); ++i) width_groups[i].clear();
+        array_patches.clear();
     }
 
     std::size_t grouped_update_count() const {
@@ -539,7 +589,7 @@ struct CycleSubmission {
     }
 
     bool empty() const {
-        return updates.empty() && grouped_update_count() == 0;
+        return updates.empty() && grouped_update_count() == 0 && array_patches.empty();
     }
 
     bool append_grouped_raw(u8 byte_count, u32 signal_id, const void* data) {
@@ -556,6 +606,9 @@ struct CycleSubmission {
         for (std::size_t i = 0; i < width_groups.size(); ++i) {
             bytes += width_groups[i].signal_ids.size() * sizeof(u32);
             bytes += width_groups[i].values.size();
+        }
+        for (std::size_t i = 0; i < array_patches.size(); ++i) {
+            bytes += array_patches[i].bytes.size();
         }
         return bytes;
     }
@@ -589,10 +642,10 @@ inline std::size_t parse_backlog_log_size_env(const char* name, std::size_t fall
 }
 
 inline unsigned long long backlog_now_ms() {
-    typedef std::chrono::steady_clock clock_t;
-    static const clock_t::time_point start = clock_t::now();
+    typedef std::chrono::steady_clock steady_clock_type;
+    static const steady_clock_type::time_point start = steady_clock_type::now();
     return static_cast<unsigned long long>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(clock_t::now() - start).count());
+        std::chrono::duration_cast<std::chrono::milliseconds>(steady_clock_type::now() - start).count());
 }
 
 inline void init_backlog_log_locked(BacklogLogState& state) {
@@ -953,6 +1006,9 @@ public:
             start_block_pipeline();
             writer_init_diag_log_("writer-start-block-pipeline", phase_start);
         }
+        if (options_.enable_lod_tables && !residual_lod_enabled()) {
+            start_lod_pipeline();
+        }
         writer_init_diag_log_("writer-open-total", open_start);
         return true;
     }
@@ -1030,6 +1086,19 @@ public:
                 if (!validate_update(group.signal_ids[i], byte_count)) return false;
             }
         }
+        for (std::size_t i = 0; i < submission.array_patches.size(); ++i) {
+            const ArrayPatchUpdate& patch = submission.array_patches[i];
+            std::map<u32, u64>::const_iterator found = array_total_bytes_by_node_.find(patch.node_id);
+            if (found == array_total_bytes_by_node_.end()) {
+                error = detail::make_error("array patch targets undefined node_id: ", patch.node_id);
+                return false;
+            }
+            if (patch.bytes.empty() || patch.byte_offset > found->second ||
+                static_cast<u64>(patch.bytes.size()) > found->second - patch.byte_offset) {
+                error = detail::make_error("array patch range is invalid for node_id: ", patch.node_id);
+                return false;
+            }
+        }
 
         const i64 flush_cycle = (update_count == 0 && submission.cycle > 0)
             ? (submission.cycle - 1)
@@ -1047,6 +1116,7 @@ public:
         if (diag_block_end >= 0 && flush_cycle >= diag_block_end) {
             writer_diag_log_("writer-submit-after-flush", &submission, diag_block_end);
         }
+        if (!submission.array_patches.empty() && !write_array_patch_sections_(submission, error)) return false;
 
         std::size_t scratch_index = 0;
         auto apply_update = [&](u32 signal_id, const ScalarValue& value) {
@@ -1112,7 +1182,7 @@ public:
         }
         current_cycle_ = submission.cycle;
         have_submitted_cycle_ = true;
-        last_submission_empty_ = (update_count == 0);
+        last_submission_empty_ = submission.empty();
         return true;
     }
 
@@ -1151,6 +1221,14 @@ public:
                 }
             }
         }
+        if (ok && options_.enable_lod_tables) {
+            if (lod_pipeline_.running) {
+                if (!enqueue_lodz_snapshot(current_cycle_, true, local_error)) ok = false;
+            } else if (!write_lodz_chunks(local_error)) {
+                ok = false;
+            }
+        }
+        if (!stop_lod_pipeline(local_error)) ok = false;
         if (!stop_block_pipeline(local_error)) ok = false;
         if (ok && !write_footer_and_patch_header(local_error)) ok = false;
         if (ok && options_.enable_stats_log && !write_stats_log(local_error)) ok = false;
@@ -1398,6 +1476,24 @@ private:
         u64 record_count = 0;
     };
 
+    struct ArrayDataIndexRecord {
+        u32 node_id = 0;
+        u64 page_index = 0;
+        i64 start_cycle = 0;
+        i64 end_cycle = 0;
+        u64 file_offset = 0;
+        u64 file_size = 0;
+        u64 raw_size = 0;
+        Compression compression = Compression::None;
+        u64 record_count = 0;
+    };
+
+    struct ArrayPageFragment {
+        u64 page_offset = 0;
+        const u8* bytes = NULL;
+        std::size_t size = 0;
+    };
+
     struct LodValidRange {
         i64 start_cycle = 0;
         i64 end_cycle = 0;
@@ -1446,6 +1542,23 @@ private:
         const std::vector<Transition>* transition_source = NULL;
         std::vector<Transition> transitions;
         std::vector<LodValidRange> valid_ranges;
+        std::size_t cursor = 0;
+    };
+
+    struct LodFlushEntry {
+        u32 storage_id = 0;
+        u32 level_index = 0;
+        u8 byte_width = 0;
+        ValueType value_type = ValueType::U64;
+        std::vector<Transition> transitions;
+    };
+
+    struct LodFlushJob {
+        std::vector<LodFlushEntry> entries;
+    };
+
+    struct LodFlushRef {
+        const LodFlushEntry* entry = NULL;
         std::size_t cursor = 0;
     };
 
@@ -1502,6 +1615,18 @@ private:
         u32 diag_log_lines = 0;
     };
 
+    struct LodPipelineState {
+        bool running = false;
+        bool stop_requested = false;
+        std::mutex mutex;
+        std::condition_variable cv_jobs;
+        std::condition_variable cv_space;
+        std::deque<LodFlushJob> jobs;
+        std::vector<std::vector<Transition> > recycled_transition_vectors;
+        std::vector<std::thread> workers;
+        std::string error;
+    };
+
 private:
     static u32 choose_pipeline_threads() {
         unsigned hw = std::thread::hardware_concurrency();
@@ -1547,6 +1672,7 @@ private:
         initialize_lod_bucket_cycles();
         lod_states_.clear();
         lod_states_.resize(signal_states_.size());
+        lod_active_storage_ids_.clear();
         for (std::size_t i = 0; i < signal_order_.size(); ++i) {
             const u32 storage_id = signal_order_[i];
             if (storage_id >= lod_states_.size()) continue;
@@ -1903,19 +2029,142 @@ private:
         }
     }
 
+    bool validate_bitset_definitions_(std::string& error) const {
+        std::vector<u8> seen_nodes(layout_.nodes.size() + 1u, 0u);
+        for (std::size_t i = 0; i < layout_.bitsets.size(); ++i) {
+            const BitsetDefinition& bitset = layout_.bitsets[i];
+            if (bitset.node_id == 0 || bitset.node_id > layout_.nodes.size()) {
+                error = detail::make_error("BitsetDefinition references missing node_id: ", bitset.node_id);
+                return false;
+            }
+            if (seen_nodes[bitset.node_id]) {
+                error = detail::make_error("duplicate BitsetDefinition node_id: ", bitset.node_id);
+                return false;
+            }
+            seen_nodes[bitset.node_id] = 1u;
+            const NodeRecord& node = layout_.nodes[bitset.node_id - 1u];
+            if (node.node_id != bitset.node_id ||
+                node.kind == NodeKind::SignalLeaf || node.first_child != 0) {
+                error = detail::make_error(
+                    "BitsetDefinition requires an empty container node_id: ", bitset.node_id);
+                return false;
+            }
+            if (bitset.bit_count == 0 || bitset.word_count == 0 ||
+                static_cast<u64>(bitset.word_count) !=
+                    (static_cast<u64>(bitset.bit_count) + 63ull) / 64ull) {
+                error = detail::make_error("invalid BitsetDefinition width for node_id: ", bitset.node_id);
+                return false;
+            }
+            if (bitset.first_storage_id == 0 ||
+                bitset.first_storage_id >= signal_states_.size() ||
+                bitset.word_count > signal_states_.size() - bitset.first_storage_id) {
+                error = detail::make_error("BitsetDefinition storage range is invalid for node_id: ", bitset.node_id);
+                return false;
+            }
+            for (u32 word = 0; word < bitset.word_count; ++word) {
+                const u32 storage_id = bitset.first_storage_id + word;
+                const SignalState& storage = signal_states_[storage_id];
+                if (!storage.valid || !storage.def.storage_only ||
+                    storage.def.signal_id != storage_id ||
+                    storage.def.storage_id != storage_id ||
+                    storage.def.type != ValueType::U64 ||
+                    storage.def.bit_width != 64u) {
+                    error = detail::make_error(
+                        "BitsetDefinition requires consecutive hidden U64 storage_id: ", storage_id);
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool validate_array_definitions_(std::string& error) {
+        array_total_bytes_by_node_.clear();
+        for (std::size_t i = 0; i < layout_.arrays.size(); ++i) {
+            const ArrayDefinition& array = layout_.arrays[i];
+            if (array.node_id == 0 || array.node_id > layout_.nodes.size() ||
+                layout_.nodes[array.node_id - 1u].node_id != array.node_id) {
+                error = detail::make_error("ArrayDefinition references missing node_id: ", array.node_id);
+                return false;
+            }
+            const NodeRecord& node = layout_.nodes[array.node_id - 1u];
+            if (node.kind == NodeKind::SignalLeaf || node.first_child != 0) {
+                error = detail::make_error("ArrayDefinition requires an empty container node_id: ", array.node_id);
+                return false;
+            }
+            if (array_total_bytes_by_node_.count(array.node_id) != 0) {
+                error = detail::make_error("duplicate ArrayDefinition node_id: ", array.node_id);
+                return false;
+            }
+            if (array.total_bytes == 0 || array.element_count == 0 || array.element_stride == 0 ||
+                array.element_count > (std::numeric_limits<u64>::max)() / array.element_stride ||
+                array.element_count * array.element_stride != array.total_bytes) {
+                error = detail::make_error("invalid ArrayDefinition extent for node_id: ", array.node_id);
+                return false;
+            }
+            if (array.schema.empty()) {
+                error = detail::make_error("ArrayDefinition requires a non-empty element schema for node_id: ", array.node_id);
+                return false;
+            }
+            for (std::size_t j = 0; j < array.schema.size(); ++j) {
+                const ArraySchemaNode& sn = array.schema[j];
+                const u32 expected_id = static_cast<u32>(j + 1u);
+                if (sn.schema_node_id != expected_id ||
+                    (sn.parent_schema_node_id != 0 && sn.parent_schema_node_id >= expected_id) ||
+                    sn.byte_offset > array.element_stride ||
+                    sn.byte_size > array.element_stride - sn.byte_offset) {
+                    error = detail::make_error("invalid ArrayDefinition schema for node_id: ", array.node_id);
+                    return false;
+                }
+                if (sn.name_id != 0 && sn.name_id > layout_.names.size()) {
+                    error = detail::make_error("ArrayDefinition schema references missing name_id for node_id: ", array.node_id);
+                    return false;
+                }
+                if (sn.kind == ArraySchemaKind::Array) {
+                    if (sn.element_count == 0 || sn.element_stride == 0 ||
+                        sn.element_count > (std::numeric_limits<u64>::max)() / sn.element_stride ||
+                        sn.element_count * sn.element_stride > sn.byte_size) {
+                        error = detail::make_error("invalid nested array schema for node_id: ", array.node_id);
+                        return false;
+                    }
+                } else if (sn.kind == ArraySchemaKind::Leaf) {
+                    u8 width = 0;
+                    if (!detail::value_type_byte_width(sn.value_type, width) || sn.bit_width == 0 ||
+                        sn.byte_size == 0 || sn.byte_size > 8u ||
+                        sn.bit_width > static_cast<u32>(width) * 8u ||
+                        sn.bit_offset + sn.bit_width > sn.byte_size * 8u) {
+                        error = detail::make_error("invalid array leaf schema for node_id: ", array.node_id);
+                        return false;
+                    }
+                } else if (sn.kind != ArraySchemaKind::Object && sn.kind != ArraySchemaKind::Field) {
+                    error = detail::make_error("invalid ArraySchemaKind for node_id: ", array.node_id);
+                    return false;
+                }
+            }
+            if (array.schema.front().parent_schema_node_id != 0 ||
+                array.schema.front().byte_offset != 0 ||
+                array.schema.front().byte_size > array.element_stride) {
+                error = detail::make_error("invalid ArrayDefinition root schema for node_id: ", array.node_id);
+                return false;
+            }
+            array_total_bytes_by_node_[array.node_id] = array.total_bytes;
+        }
+        return true;
+    }
+
     bool validate_latest_layout_encoding_(std::string& error) const {
         for (std::size_t i = 0; i < layout_.names.size(); ++i) {
             if (layout_.names[i].name_id != static_cast<u32>(i + 1u)) {
-                error = "WVZ4 v16 requires a dense NameTable ordered by name_id";
+                error = "WVZ4 v17 requires a dense NameTable ordered by name_id";
                 return false;
             }
         }
         if (!can_build_compact_node_layout_payload(layout_)) {
-            error = "WVZ4 v16 requires dense preorder node_id values and forward child/sibling links";
+            error = "WVZ4 v17 requires dense preorder node_id values and forward child/sibling links";
             return false;
         }
         if (!can_build_compact_signal_layout_payload(layout_)) {
-            error = "WVZ4 v16 requires dense signal_id values and backward storage_id references";
+            error = "WVZ4 v17 requires dense signal_id values and backward storage_id references";
             return false;
         }
         return true;
@@ -1954,7 +2203,7 @@ private:
             if ((r.parent_id != 0 && r.parent_id >= r.node_id) ||
                 (r.first_child != 0 && r.first_child <= r.node_id) ||
                 (r.next_sibling != 0 && r.next_sibling <= r.node_id)) {
-                error = "WVZ4 v16 requires preorder nodes with forward child/sibling links";
+                error = "WVZ4 v17 requires preorder nodes with forward child/sibling links";
                 return false;
             }
             if (r.name_id != 0 && r.name_id > name_count) {
@@ -2120,6 +2369,7 @@ private:
             seen_clocks[c.signal_id] = 1;
         }
 
+        if (!validate_bitset_definitions_(error)) return false;
         finish_layout_validation_common_();
         return true;
     }
@@ -2130,7 +2380,10 @@ private:
         LodStorageState& storage = lod_states_[storage_id];
         if (!storage.valid || storage.byte_width == 0) return;
         ++storage.raw_transition_count;
-        if (storage.levels.empty()) initialize_lod_levels(storage);
+        if (storage.levels.empty()) {
+            initialize_lod_levels(storage);
+            lod_active_storage_ids_.push_back(storage_id);
+        }
         Transition tr = transition;
         tr.value.byte_count = storage.byte_width;
         if (residual_lod_enabled()) {
@@ -2158,9 +2411,11 @@ private:
         layout_ = std::move(layout);
         if (layout_.names.empty()) { error = "WVZ4 layout requires a non-empty NameTable"; return false; }
         if (layout_.nodes.empty()) { error = "WVZ4 layout requires a non-empty NodeTable"; return false; }
-        if (layout_.signals.empty()) { error = "WVZ4 layout requires a non-empty SignalTable"; return false; }
+        if (layout_.signals.empty() && layout_.arrays.empty()) { error = "WVZ4 layout requires signals or array blocks"; return false; }
 
-        if (try_validate_and_prepare_dense_self_storage_layout_(error)) return true;
+        if (try_validate_and_prepare_dense_self_storage_layout_(error)) {
+            return validate_array_definitions_(error);
+        }
         if (!error.empty()) return false;
 
         u32 max_name_id = 0, max_node_id = 0, max_signal_id = 0;
@@ -2170,7 +2425,7 @@ private:
             max_signal_id = (std::max)(max_signal_id, layout_.signals[i].signal_id);
             max_signal_id = (std::max)(max_signal_id, layout_.signals[i].storage_id != 0 ? layout_.signals[i].storage_id : layout_.signals[i].signal_id);
         }
-        if (max_name_id == 0 || max_node_id == 0 || max_signal_id == 0) {
+        if (max_name_id == 0 || max_node_id == 0 || (max_signal_id == 0 && layout_.arrays.empty())) {
             error = "WVZ4 ids must be positive";
             return false;
         }
@@ -2383,6 +2638,8 @@ private:
         // These vectors are maintained incrementally in submit_cycle(), so
         // commit_block() no longer needs to rescan all transitions and sort.
         if (!validate_latest_layout_encoding_(error)) return false;
+        if (!validate_bitset_definitions_(error)) return false;
+        if (!validate_array_definitions_(error)) return false;
         finish_layout_validation_common_();
         return true;
     }
@@ -2430,6 +2687,8 @@ private:
         if (options_.enable_value_byte_mask_encoding) feature_flags |= kHeaderFeatureNibbleMaskCodec;
         if (options_.enable_lod_tables) feature_flags |= kHeaderFeatureLodTables;
         if (residual_lod_enabled()) feature_flags |= kHeaderFeatureResidualLodTables;
+        if (!layout_.bitsets.empty()) feature_flags |= kHeaderFeatureBitsetDefinitions;
+        if (!layout_.arrays.empty()) feature_flags |= kHeaderFeatureArrayBlocks;
         if (!detail::write_u64(out_, feature_flags)) { error = "failed to write WVZ4 feature flags"; return false; }
         if (!detail::write_u64(out_, 0)) { error = "failed to write WVZ4 reserved"; return false; }
         if (!detail::write_u32(out_, 0)) { error = "failed to write WVZ4 reserved"; return false; }
@@ -2446,7 +2705,8 @@ private:
         if (key == "WDAT") stats_.wdat_section_bytes += section_bytes;
         else if (key == "FOOT") stats_.foot_section_bytes += section_bytes;
         else if (key == "NAME" || key == "NAMZ" || key == "NODI" || key == "NIZ2" ||
-                 key == "SIGD" || key == "SGZ2" || key == "CLKD" || key == "CLKZ") {
+                 key == "SIGD" || key == "SGZ2" || key == "CLKD" || key == "CLKZ" ||
+                 key == "BSET" || key == "BSZ2" || key == "ARRY" || key == "ARZ2") {
             stats_.layout_section_bytes += section_bytes;
         } else {
             stats_.other_section_bytes += section_bytes;
@@ -2886,6 +3146,59 @@ private:
         }
     }
 
+    static void build_bitset_layout_payload(const Layout& layout, std::vector<u8>& payload) {
+        payload.clear();
+        detail::append_varuint(payload, static_cast<u64>(layout.bitsets.size()));
+        for (std::size_t i = 0; i < layout.bitsets.size(); ++i) {
+            const BitsetDefinition& bitset = layout.bitsets[i];
+            detail::append_varuint(payload, bitset.node_id);
+            detail::append_varuint(payload, bitset.first_storage_id);
+            detail::append_varuint(payload, bitset.bit_count);
+            detail::append_varuint(payload, bitset.word_count);
+        }
+    }
+
+    static void build_array_layout_payload(const Layout& layout, std::vector<u8>& payload) {
+        payload.clear();
+        detail::append_varuint(payload, static_cast<u64>(layout.arrays.size()));
+        for (std::size_t i = 0; i < layout.arrays.size(); ++i) {
+            const ArrayDefinition& a = layout.arrays[i];
+            detail::append_varuint(payload, a.node_id);
+            detail::append_varuint(payload, a.total_bytes);
+            detail::append_varuint(payload, a.element_count);
+            detail::append_varuint(payload, a.element_stride);
+            detail::append_varuint(payload, static_cast<u64>(a.schema.size()));
+            for (std::size_t j = 0; j < a.schema.size(); ++j) {
+                const ArraySchemaNode& n = a.schema[j];
+                detail::append_varuint(payload, n.schema_node_id);
+                detail::append_varuint(payload, n.parent_schema_node_id);
+                detail::append_varuint(payload, n.name_id);
+                detail::append_u8(payload, static_cast<u8>(n.kind));
+                detail::append_varuint(payload, n.byte_offset);
+                detail::append_varuint(payload, n.byte_size);
+                detail::append_varuint(payload, n.element_count);
+                detail::append_varuint(payload, n.element_stride);
+                detail::append_u8(payload, static_cast<u8>(n.value_type));
+                detail::append_varuint(payload, n.bit_width);
+                detail::append_varuint(payload, n.bit_offset);
+            }
+        }
+    }
+
+    bool write_bitset_layout_section_(const Layout& layout, std::string& error) {
+        if (layout.bitsets.empty()) return true;
+        std::vector<u8> payload;
+        build_bitset_layout_payload(layout, payload);
+        return write_layout_section("BSET", "BSZ2", payload, error);
+    }
+
+    bool write_array_layout_section_(const Layout& layout, std::string& error) {
+        if (layout.arrays.empty()) return true;
+        std::vector<u8> payload;
+        build_array_layout_payload(layout, payload);
+        return write_layout_section("ARRY", "ARZ2", payload, error);
+    }
+
     bool should_stream_layout_sections_(const Layout& layout) const {
         if (options_.compression != Compression::None) return false;
         if (!names_sorted_by_id(layout.names) ||
@@ -2898,7 +3211,9 @@ private:
             static_cast<u64>(layout.names.size()) +
             static_cast<u64>(layout.nodes.size()) +
             static_cast<u64>(layout.signals.size()) +
-            static_cast<u64>(layout.clocks.size());
+            static_cast<u64>(layout.clocks.size()) +
+            static_cast<u64>(layout.bitsets.size()) +
+            static_cast<u64>(layout.arrays.size());
         return record_count >= 1000000ull;
     }
 
@@ -3007,6 +3322,8 @@ private:
         if (!layout.clocks.empty()) {
             if (!stream_clock_layout_section_(layout, error)) return false;
         }
+        if (!write_bitset_layout_section_(layout, error)) return false;
+        if (!write_array_layout_section_(layout, error)) return false;
         writer_init_diag_log_("writer-layout-stream-total", total_start);
         return true;
     }
@@ -3125,6 +3442,8 @@ private:
             if (!write_layout_section("CLKD", "CLKZ", clock_payload, error)) return false;
             writer_init_diag_log_bytes_("writer-layout-write-CLKD", phase_start, static_cast<u64>(clock_payload.size()));
         }
+        if (!write_bitset_layout_section_(layout, error)) return false;
+        if (!write_array_layout_section_(layout, error)) return false;
         writer_init_diag_log_("writer-layout-parallel-total", total_start);
         return true;
     }
@@ -3260,6 +3579,8 @@ private:
             if (!write_layout_section("CLKD", "CLKZ", clock_payload, error)) return false;
             writer_init_diag_log_bytes_("writer-layout-write-CLKD", phase_start, static_cast<u64>(clock_payload.size()));
         }
+        if (!write_bitset_layout_section_(layout, error)) return false;
+        if (!write_array_layout_section_(layout, error)) return false;
         writer_init_diag_log_("writer-layout-parallel-compress-total", total_start);
         return true;
     }
@@ -3307,8 +3628,85 @@ private:
             if (!write_layout_section("CLKD", "CLKZ", payload, error)) return false;
             writer_init_diag_log_bytes_("writer-layout-write-CLKD", phase_start, static_cast<u64>(payload.size()));
         }
+        if (!write_bitset_layout_section_(layout, error)) return false;
+        if (!write_array_layout_section_(layout, error)) return false;
         return true;
     }
+
+    bool write_array_patch_sections_(const CycleSubmission& submission, std::string& error) {
+        static const u64 kArrayPageBytes = 64ull * 1024ull;
+        typedef std::pair<u32, u64> PageKey;
+        std::map<PageKey, std::vector<ArrayPageFragment> > pages;
+        for (std::size_t i = 0; i < submission.array_patches.size(); ++i) {
+            const ArrayPatchUpdate& patch = submission.array_patches[i];
+            u64 absolute = patch.byte_offset;
+            std::size_t consumed = 0;
+            while (consumed < patch.bytes.size()) {
+                const u64 page_index = absolute / kArrayPageBytes;
+                const u64 page_offset = absolute % kArrayPageBytes;
+                const std::size_t count = (std::min<std::size_t>)(
+                    patch.bytes.size() - consumed,
+                    static_cast<std::size_t>(kArrayPageBytes - page_offset));
+                ArrayPageFragment fragment;
+                fragment.page_offset = page_offset;
+                fragment.bytes = patch.bytes.data() + consumed;
+                fragment.size = count;
+                pages[PageKey(patch.node_id, page_index)].push_back(fragment);
+                absolute += static_cast<u64>(count);
+                consumed += count;
+            }
+        }
+
+        for (std::map<PageKey, std::vector<ArrayPageFragment> >::const_iterator it = pages.begin();
+             it != pages.end(); ++it) {
+            std::vector<u8> raw;
+            detail::append_varuint(raw, static_cast<u64>(it->second.size()));
+            for (std::size_t i = 0; i < it->second.size(); ++i) {
+                const ArrayPageFragment& fragment = it->second[i];
+                detail::append_varuint(raw, fragment.page_offset);
+                detail::append_varuint(raw, static_cast<u64>(fragment.size));
+                detail::append_bytes(raw, fragment.bytes, fragment.size);
+            }
+            std::vector<u8> compressed;
+            const std::vector<u8>* stored = &raw;
+            Compression compression = Compression::None;
+            if (options_.compression == Compression::Zstd && !raw.empty()) {
+                if (!compress_payload_zstd(raw, compressed, error)) return false;
+                if (!compressed.empty() && compressed.size() < raw.size()) {
+                    stored = &compressed;
+                    compression = Compression::Zstd;
+                }
+            }
+            std::vector<u8> payload;
+            detail::append_varuint(payload, it->first.first);
+            detail::append_varuint(payload, it->first.second);
+            detail::append_i64(payload, submission.cycle);
+            detail::append_i64(payload, submission.cycle + 1);
+            detail::append_u8(payload, static_cast<u8>(compression));
+            detail::append_varuint(payload, static_cast<u64>(raw.size()));
+            detail::append_varuint(payload, static_cast<u64>(stored->size()));
+            detail::append_vector_bytes(payload, *stored);
+
+            std::lock_guard<std::mutex> output_lock(output_mutex_);
+            const u64 offset = static_cast<u64>(out_.tellp());
+            if (!write_section("ADAT", payload, error)) return false;
+            const u64 end = static_cast<u64>(out_.tellp());
+            ArrayDataIndexRecord index;
+            index.node_id = it->first.first;
+            index.page_index = it->first.second;
+            index.start_cycle = submission.cycle;
+            index.end_cycle = submission.cycle + 1;
+            index.file_offset = offset;
+            index.file_size = end - offset;
+            index.raw_size = static_cast<u64>(raw.size());
+            index.compression = compression;
+            index.record_count = static_cast<u64>(it->second.size());
+            array_data_index_.push_back(index);
+        }
+        return true;
+    }
+
+    bool flush_completed_lodz_chunks(i64 cutoff_cycle, std::string& error);
 
     bool flush_until(i64 cycle, std::string& error) {
         const i64 span = static_cast<i64>(options_.target_block_span);
@@ -3332,6 +3730,7 @@ private:
                 // so pending transitions are strictly before end_cycle here.
                 writer_diag_log_("writer-commit-begin", NULL, end_cycle);
                 if (!commit_block(end_cycle, error)) return false;
+                if (!flush_completed_lodz_chunks(end_cycle, error)) return false;
                 writer_diag_log_("writer-commit-end", NULL, end_cycle);
                 current_block_start_ = static_cast<u64>(end_cycle);
                 rebuild_current_block_shared_times_from_transitions();
@@ -3344,6 +3743,7 @@ private:
             const u64 span_u = options_.target_block_span;
             const u64 target = (static_cast<u64>(cycle) / span_u) * span_u;
             if (target < current_block_start_) return true; // defensive; cycle is monotonic.
+            if (!flush_completed_lodz_chunks(static_cast<i64>(target), error)) return false;
             current_block_start_ = target;
             rebuild_current_block_shared_times_from_transitions();
             return true;
@@ -5168,6 +5568,7 @@ private:
     }
 
     bool write_encoded_block(const EncodedBlock& e, std::string& error) {
+        std::lock_guard<std::mutex> output_lock(output_mutex_);
         if (!out_) { error = "output stream is invalid before block write"; return false; }
         const u64 offset = static_cast<u64>(out_.tellp());
         std::vector<u8> payload;
@@ -5602,7 +6003,8 @@ private:
     void build_lod_transition_payload(const std::vector<Transition>& transitions,
                                       std::size_t begin,
                                       std::size_t end,
-                                      const LodStorageState& storage,
+                                      u8 byte_width,
+                                      ValueType value_type,
                                       std::vector<u8>& out,
                                       u64& record_count) const {
         out.clear();
@@ -5612,20 +6014,24 @@ private:
         const TransitionSpan slice(transitions, begin, end);
         record_count = static_cast<u64>(slice.size());
         if (residual_lod_enabled()) {
-            append_value_residual_fast_record(slice, 0, storage.byte_width,
-                                              storage.value_type, false, NULL, out);
+            append_value_residual_fast_record(slice, 0, byte_width,
+                                              value_type, false, NULL, out);
         } else {
-            append_value_best_record(slice, 0, storage.byte_width,
-                                     storage.value_type, false, NULL, out);
+            append_value_best_record(slice, 0, byte_width,
+                                     value_type, false, NULL, out);
         }
     }
 
-    std::vector<LodSelectedLevel> select_lod_levels_to_store(const LodStorageState& storage) const {
+    std::vector<LodSelectedLevel> select_lod_levels_to_store(
+        const LodStorageState& storage,
+        bool include_pending) const {
         std::vector<LodSelectedLevel> selected;
         for (std::size_t level = 0; level < storage.levels.size(); ++level) {
             const LodLevelState& lod_level = storage.levels[level];
             if (lod_level.disabled) continue;
-            const u64 sampled_count = lod_level_materialized_count(lod_level);
+            const u64 sampled_count = include_pending
+                ? lod_level_materialized_count(lod_level)
+                : static_cast<u64>(lod_level.transitions.size());
             if (sampled_count == 0) continue;
             LodSelectedLevel s;
             s.level = level;
@@ -5693,6 +6099,7 @@ private:
         detail::append_varuint(section_payload, static_cast<u64>(encoded->size()));
         detail::append_vector_bytes(section_payload, *encoded);
 
+        std::lock_guard<std::mutex> output_lock(output_mutex_);
         const u64 offset = static_cast<u64>(out_.tellp());
         if (!write_section("LODZ", section_payload, error)) return false;
         const u64 end = static_cast<u64>(out_.tellp());
@@ -5713,8 +6120,9 @@ private:
         return true;
     }
 
-    bool write_lodz_chunks(std::string& error) {
-        lod_chunk_index_.clear();
+    bool write_lodz_chunks(std::string& error,
+                           bool include_pending = true,
+                           bool clear_written = false) {
         if (!options_.enable_lod_tables || lod_bucket_cycles_.empty() || lod_states_.empty()) return true;
 
         std::vector<std::map<u32, std::vector<LodSelectedStorageLevel> > > selected_by_level_and_chunk(lod_bucket_cycles_.size());
@@ -5722,13 +6130,16 @@ private:
             ? options_.signals_per_chunk
             : ((max_signal_id_ == 0) ? 1u : max_signal_id_);
 
-        for (std::size_t sid = 0; sid < lod_states_.size(); ++sid) {
-            const LodStorageState& storage = lod_states_[sid];
+        for (std::size_t active_index = 0;
+             active_index < lod_active_storage_ids_.size();
+             ++active_index) {
+            const u32 storage_id = lod_active_storage_ids_[active_index];
+            if (storage_id == 0 || storage_id >= lod_states_.size()) continue;
+            const LodStorageState& storage = lod_states_[storage_id];
             if (!storage.valid || storage.levels.empty()) continue;
-            const std::vector<LodSelectedLevel> selected_levels = select_lod_levels_to_store(storage);
+            const std::vector<LodSelectedLevel> selected_levels =
+                select_lod_levels_to_store(storage, include_pending);
             if (selected_levels.empty()) continue;
-            const u32 storage_id = static_cast<u32>(sid);
-            if (storage_id == 0) continue;
             const u32 signal_chunk_id = options_.enable_signal_chunking
                 ? ((storage_id - 1u) / spc)
                 : 0u;
@@ -5761,7 +6172,7 @@ private:
                     ref.storage_id = storage_id;
                     ref.storage = &storage;
                     ref.lod_level = &lod_level;
-                    if (residual_lod_enabled()) {
+                    if (residual_lod_enabled() || !include_pending) {
                         if (lod_level.transitions.empty()) continue;
                         ref.transition_source = &lod_level.transitions;
                     } else {
@@ -5807,7 +6218,9 @@ private:
                         }
                         u64 slice_count = 0;
                         build_lod_transition_payload(transitions, begin, refs[r].cursor,
-                                                     *refs[r].storage, stream_payload, slice_count);
+                                                     refs[r].storage->byte_width,
+                                                     refs[r].storage->value_type,
+                                                     stream_payload, slice_count);
                         if (slice_count == 0 || stream_payload.empty()) continue;
 
                         u64 valid_range_count = 0;
@@ -5846,7 +6259,281 @@ private:
                 }
             }
         }
+        if (clear_written && !residual_lod_enabled()) {
+            for (std::size_t i = 0; i < lod_active_storage_ids_.size(); ++i) {
+                const u32 storage_id = lod_active_storage_ids_[i];
+                if (storage_id >= lod_states_.size()) continue;
+                LodStorageState& storage = lod_states_[storage_id];
+                for (std::size_t level = 0; level < storage.levels.size(); ++level) {
+                    storage.levels[level].transitions.clear();
+                }
+            }
+        }
         return true;
+    }
+
+    bool write_lodz_snapshot(const LodFlushJob& job, std::string& error) {
+        if (job.entries.empty()) return true;
+        std::vector<std::map<u32, std::vector<const LodFlushEntry*> > > by_level_and_chunk(
+            lod_bucket_cycles_.size());
+        const u32 spc = (options_.enable_signal_chunking && options_.signals_per_chunk != 0)
+            ? options_.signals_per_chunk
+            : ((max_signal_id_ == 0) ? 1u : max_signal_id_);
+        for (std::size_t i = 0; i < job.entries.size(); ++i) {
+            const LodFlushEntry& entry = job.entries[i];
+            if (entry.transitions.empty() || entry.level_index >= by_level_and_chunk.size()) continue;
+            const u32 signal_chunk_id = options_.enable_signal_chunking
+                ? ((entry.storage_id - 1u) / spc)
+                : 0u;
+            by_level_and_chunk[entry.level_index][signal_chunk_id].push_back(&entry);
+        }
+
+        for (std::size_t level = 0; level < by_level_and_chunk.size(); ++level) {
+            const u64 span = lod_time_chunk_span(lod_bucket_cycles_[level]);
+            std::map<u32, std::vector<const LodFlushEntry*> >& by_chunk = by_level_and_chunk[level];
+            for (std::map<u32, std::vector<const LodFlushEntry*> >::iterator it = by_chunk.begin();
+                 it != by_chunk.end(); ++it) {
+                std::vector<LodFlushRef> refs;
+                refs.reserve(it->second.size());
+                for (std::size_t i = 0; i < it->second.size(); ++i) {
+                    LodFlushRef ref;
+                    ref.entry = it->second[i];
+                    refs.push_back(ref);
+                }
+
+                std::vector<u8> raw_payload;
+                std::vector<u8> stream_payload;
+                while (true) {
+                    bool have_next = false;
+                    i64 window_start = (std::numeric_limits<i64>::max)();
+                    for (std::size_t r = 0; r < refs.size(); ++r) {
+                        const std::vector<Transition>& transitions = refs[r].entry->transitions;
+                        if (refs[r].cursor >= transitions.size()) continue;
+                        const i64 candidate = lod_time_window_start(transitions[refs[r].cursor].cycle, span);
+                        if (!have_next || candidate < window_start) {
+                            have_next = true;
+                            window_start = candidate;
+                        }
+                    }
+                    if (!have_next) break;
+                    const i64 window_end = lod_time_window_end(window_start, span);
+
+                    std::vector<u8> records_payload;
+                    u64 storage_count = 0;
+                    u64 record_count = 0;
+                    for (std::size_t r = 0; r < refs.size(); ++r) {
+                        const LodFlushEntry& entry = *refs[r].entry;
+                        const std::vector<Transition>& transitions = entry.transitions;
+                        if (refs[r].cursor >= transitions.size()) continue;
+                        if (lod_time_window_start(transitions[refs[r].cursor].cycle, span) != window_start) continue;
+
+                        const std::size_t begin = refs[r].cursor;
+                        while (refs[r].cursor < transitions.size() &&
+                               transitions[refs[r].cursor].cycle < window_end) {
+                            ++refs[r].cursor;
+                        }
+                        u64 slice_count = 0;
+                        build_lod_transition_payload(transitions, begin, refs[r].cursor,
+                                                     entry.byte_width, entry.value_type,
+                                                     stream_payload, slice_count);
+                        if (slice_count == 0 || stream_payload.empty()) continue;
+
+                        const i64 valid_start = options_.implicit_zero_initial_values
+                            ? 0
+                            : transitions.front().cycle;
+                        if (valid_start >= window_end) continue;
+                        detail::append_varuint(records_payload, entry.storage_id);
+                        detail::append_varuint(records_payload, entry.byte_width);
+                        detail::append_varuint(records_payload, 1u);
+                        detail::append_i64(records_payload, valid_start);
+                        detail::append_i64(records_payload, (std::numeric_limits<i64>::max)());
+                        detail::append_varuint(records_payload, slice_count);
+                        detail::append_varuint(records_payload, static_cast<u64>(stream_payload.size()));
+                        detail::append_vector_bytes(records_payload, stream_payload);
+                        ++storage_count;
+                        record_count += slice_count;
+                    }
+
+                    if (storage_count == 0 || record_count == 0) continue;
+                    raw_payload.clear();
+                    detail::append_varuint(raw_payload, storage_count);
+                    detail::append_vector_bytes(raw_payload, records_payload);
+                    if (!write_lodz_section(static_cast<u32>(level), it->first,
+                                            window_start, window_end, raw_payload,
+                                            storage_count, record_count, error)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    bool enqueue_lodz_snapshot(i64 cutoff_cycle,
+                               bool include_pending,
+                               std::string& error) {
+        if (!options_.enable_lod_tables || residual_lod_enabled()) return true;
+
+        LodFlushJob job;
+        if (lod_active_storage_ids_.size() <=
+            (std::numeric_limits<std::size_t>::max)() / kLodLevelCount) {
+            job.entries.reserve(lod_active_storage_ids_.size() * kLodLevelCount);
+        }
+        std::vector<std::vector<Transition> > recycled;
+        {
+            std::lock_guard<std::mutex> lock(lod_pipeline_.mutex);
+            recycled.swap(lod_pipeline_.recycled_transition_vectors);
+        }
+        for (std::size_t i = 0; i < lod_active_storage_ids_.size(); ++i) {
+            const u32 storage_id = lod_active_storage_ids_[i];
+            if (storage_id == 0 || storage_id >= lod_states_.size()) continue;
+            LodStorageState& storage = lod_states_[storage_id];
+            for (std::size_t level = 0; level < storage.levels.size(); ++level) {
+                LodLevelState& lod_level = storage.levels[level];
+                if (lod_level.disabled) continue;
+                if (!include_pending && lod_level.has_pending_window &&
+                    lod_level.min_cycle_delta != 0) {
+                    const i64 window_end = lod_sampling_window_end(
+                        lod_level.pending_window_start, lod_level.min_cycle_delta);
+                    if (window_end <= cutoff_cycle) {
+                        append_lod_transition(lod_level, lod_level.pending_transition);
+                        extend_lod_valid_range(lod_level, lod_level.pending_window_start);
+                        lod_level.has_pending_window = false;
+                    }
+                }
+                LodFlushEntry entry;
+                entry.storage_id = storage_id;
+                entry.level_index = static_cast<u32>(level);
+                entry.byte_width = storage.byte_width;
+                entry.value_type = storage.value_type;
+                if (include_pending) {
+                    entry.transitions = materialize_lod_level_transitions(lod_level);
+                    lod_level.transitions.clear();
+                    lod_level.has_pending_window = false;
+                } else {
+                    entry.transitions.swap(lod_level.transitions);
+                    if (!recycled.empty()) {
+                        lod_level.transitions = std::move(recycled.back());
+                        recycled.pop_back();
+                    }
+                }
+                if (!entry.transitions.empty()) job.entries.push_back(std::move(entry));
+            }
+        }
+        if (job.entries.empty()) {
+            if (!recycled.empty()) {
+                std::lock_guard<std::mutex> lock(lod_pipeline_.mutex);
+                for (std::size_t i = 0; i < recycled.size(); ++i) {
+                    lod_pipeline_.recycled_transition_vectors.push_back(std::move(recycled[i]));
+                }
+            }
+            return true;
+        }
+
+        std::unique_lock<std::mutex> lock(lod_pipeline_.mutex);
+        for (std::size_t i = 0; i < recycled.size(); ++i) {
+            lod_pipeline_.recycled_transition_vectors.push_back(std::move(recycled[i]));
+        }
+        lod_pipeline_.cv_space.wait(lock, [this]() {
+            return lod_pipeline_.jobs.size() < 2u ||
+                   !lod_pipeline_.error.empty() ||
+                   lod_pipeline_.stop_requested;
+        });
+        if (!lod_pipeline_.error.empty()) {
+            error = lod_pipeline_.error;
+            return false;
+        }
+        if (!lod_pipeline_.running || lod_pipeline_.stop_requested) {
+            error = "LOD pipeline is not running";
+            return false;
+        }
+        lod_pipeline_.jobs.push_back(std::move(job));
+        lod_pipeline_.cv_jobs.notify_one();
+        return true;
+    }
+
+    void start_lod_pipeline() {
+        lod_pipeline_.running = true;
+        lod_pipeline_.stop_requested = false;
+        lod_pipeline_.error.clear();
+        lod_pipeline_.jobs.clear();
+        lod_pipeline_.recycled_transition_vectors.clear();
+        lod_pipeline_.workers.clear();
+        const u32 lod_worker_count = std::thread::hardware_concurrency() > 1u ? 2u : 1u;
+        lod_pipeline_.workers.reserve(lod_worker_count);
+        for (u32 worker_index = 0; worker_index < lod_worker_count; ++worker_index) {
+            lod_pipeline_.workers.push_back(std::thread([this]() {
+                while (true) {
+                    LodFlushJob job;
+                    {
+                        std::unique_lock<std::mutex> lock(lod_pipeline_.mutex);
+                        lod_pipeline_.cv_jobs.wait(lock, [this]() {
+                            return lod_pipeline_.stop_requested || !lod_pipeline_.jobs.empty();
+                        });
+                        if (lod_pipeline_.jobs.empty()) {
+                            if (lod_pipeline_.stop_requested) return;
+                            continue;
+                        }
+                        job = std::move(lod_pipeline_.jobs.front());
+                        lod_pipeline_.jobs.pop_front();
+                        lod_pipeline_.cv_space.notify_one();
+                    }
+                    std::string error;
+                    if (!write_lodz_snapshot(job, error)) {
+                        std::lock_guard<std::mutex> lock(lod_pipeline_.mutex);
+                        if (lod_pipeline_.error.empty()) {
+                            lod_pipeline_.error = error.empty() ? "LOD pipeline write failed" : error;
+                        }
+                        lod_pipeline_.stop_requested = true;
+                        lod_pipeline_.jobs.clear();
+                        lod_pipeline_.cv_jobs.notify_all();
+                        lod_pipeline_.cv_space.notify_all();
+                        return;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(lod_pipeline_.mutex);
+                        const std::size_t needed = lod_pipeline_.recycled_transition_vectors.size() +
+                            job.entries.size();
+                        if (lod_pipeline_.recycled_transition_vectors.capacity() < needed) {
+                            lod_pipeline_.recycled_transition_vectors.reserve(needed);
+                        }
+                        for (std::size_t i = 0; i < job.entries.size(); ++i) {
+                            job.entries[i].transitions.clear();
+                            lod_pipeline_.recycled_transition_vectors.push_back(
+                                std::move(job.entries[i].transitions));
+                        }
+                    }
+                }
+            }));
+        }
+    }
+
+    bool stop_lod_pipeline(std::string& error) {
+        if (!lod_pipeline_.running) return true;
+        {
+            std::lock_guard<std::mutex> lock(lod_pipeline_.mutex);
+            lod_pipeline_.stop_requested = true;
+            lod_pipeline_.cv_jobs.notify_all();
+            lod_pipeline_.cv_space.notify_all();
+        }
+        for (std::size_t i = 0; i < lod_pipeline_.workers.size(); ++i) {
+            if (lod_pipeline_.workers[i].joinable()) lod_pipeline_.workers[i].join();
+        }
+        bool ok = true;
+        {
+            std::lock_guard<std::mutex> lock(lod_pipeline_.mutex);
+            if (!lod_pipeline_.error.empty()) {
+                error = lod_pipeline_.error;
+                ok = false;
+            }
+            lod_pipeline_.running = false;
+            lod_pipeline_.stop_requested = false;
+            lod_pipeline_.jobs.clear();
+            lod_pipeline_.recycled_transition_vectors.clear();
+            lod_pipeline_.workers.clear();
+            lod_pipeline_.error.clear();
+        }
+        return ok;
     }
 
     void append_lodz_index_to_footer(std::vector<u8>& payload) const {
@@ -5873,7 +6560,6 @@ private:
     }
 
     bool write_footer_and_patch_header(std::string& error) {
-        if (!write_lodz_chunks(error)) return false;
         footer_offset_ = static_cast<u64>(out_.tellp());
         std::vector<u8> payload;
         detail::append_varuint(payload, static_cast<u64>(block_index_.size()));
@@ -5907,6 +6593,19 @@ private:
             }
         }
         append_lodz_index_to_footer(payload);
+        detail::append_varuint(payload, static_cast<u64>(array_data_index_.size()));
+        for (std::size_t i = 0; i < array_data_index_.size(); ++i) {
+            const ArrayDataIndexRecord& r = array_data_index_[i];
+            detail::append_varuint(payload, r.node_id);
+            detail::append_varuint(payload, r.page_index);
+            detail::append_i64(payload, r.start_cycle);
+            detail::append_i64(payload, r.end_cycle);
+            detail::append_varuint(payload, r.file_offset);
+            detail::append_varuint(payload, r.file_size);
+            detail::append_varuint(payload, r.raw_size);
+            detail::append_u8(payload, static_cast<u8>(r.compression));
+            detail::append_varuint(payload, r.record_count);
+        }
         if (!write_section("FOOT", payload, error)) return false;
 
         out_.seekp(8 + 4 + 4 + 8, std::ios::beg); // magic + version + header_size + block_span
@@ -5922,9 +6621,12 @@ private:
         signal_states_.clear();
         signal_order_.clear();
         lod_states_.clear();
+        lod_active_storage_ids_.clear();
         lod_bucket_cycles_.clear();
         block_index_.clear();
         lod_chunk_index_.clear();
+        array_data_index_.clear();
+        array_total_bytes_by_node_.clear();
         current_block_shared_times_by_chunk_.clear();
         max_signal_id_ = 0;
         have_pending_content_ = false;
@@ -5971,12 +6673,16 @@ private:
     std::string output_path_;
     bool opened_ = false;
     std::ofstream out_;
+    std::mutex output_mutex_;
     std::vector<SignalState> signal_states_; // indexed by signal_id
     std::vector<u32> signal_order_;          // ascending signal_id order
     std::vector<LodStorageState> lod_states_; // indexed by physical storage_id
+    std::vector<u32> lod_active_storage_ids_; // storages that allocated LOD levels
     std::vector<u64> lod_bucket_cycles_;
     std::vector<BlockIndexRecord> block_index_;
     std::vector<LodChunkIndexRecord> lod_chunk_index_;
+    std::vector<ArrayDataIndexRecord> array_data_index_;
+    std::map<u32, u64> array_total_bytes_by_node_;
     std::vector<std::vector<u64> > current_block_shared_times_by_chunk_;
     u32 max_signal_id_ = 0;
     bool have_pending_content_ = false;
@@ -5988,6 +6694,7 @@ private:
     u64 footer_offset_ = 0;
     i64 next_residual_finalize_cycle_ = (std::numeric_limits<i64>::max)();
     PipelineState pipeline_;
+    LodPipelineState lod_pipeline_;
     std::vector<SignalState*> update_state_scratch_;
     std::vector<u32> update_seen_stamp_;
     u32 update_seen_epoch_ = 1;
@@ -5995,6 +6702,11 @@ private:
     u64 writer_submit_count_ = 0;
     u32 writer_diag_log_lines_ = 0;
 };
+
+inline bool Writer::flush_completed_lodz_chunks(i64 cutoff_cycle, std::string& error) {
+    if (!options_.enable_lod_tables || residual_lod_enabled()) return true;
+    return enqueue_lodz_snapshot(cutoff_cycle, false, error);
+}
 
 // Optional cycle-submission queue. This moves Writer::submit_cycle onto a single
 // background thread. Writer itself is still accessed by exactly one thread.
@@ -6538,6 +7250,8 @@ inline void serialize_layout(std::vector<u8>& out, const Layout& l) {
                 l.nodes.size() * 20u +
                 l.signals.size() * 24u +
                 l.clocks.size() * 12u +
+                l.bitsets.size() * 20u +
+                l.arrays.size() * 32u +
                 l.name_blob.size() + 16u);
     bool can_use_compact_blob_names = !l.name_blob.empty();
     std::size_t expected_name_offset = 0;
@@ -6599,6 +7313,37 @@ inline void serialize_layout(std::vector<u8>& out, const Layout& l) {
         append_varuint(out, c.signal_id);
         append_u8(out, c.initial_value ? 1u : 0u);
         append_varuint(out, c.period_ticks);
+    }
+    append_varuint(out, static_cast<u64>(l.bitsets.size()));
+    for (std::size_t i = 0; i < l.bitsets.size(); ++i) {
+        const BitsetDefinition& b = l.bitsets[i];
+        append_varuint(out, b.node_id);
+        append_varuint(out, b.first_storage_id);
+        append_varuint(out, b.bit_count);
+        append_varuint(out, b.word_count);
+    }
+    append_varuint(out, static_cast<u64>(l.arrays.size()));
+    for (std::size_t i = 0; i < l.arrays.size(); ++i) {
+        const ArrayDefinition& a = l.arrays[i];
+        append_varuint(out, a.node_id);
+        append_varuint(out, a.total_bytes);
+        append_varuint(out, a.element_count);
+        append_varuint(out, a.element_stride);
+        append_varuint(out, static_cast<u64>(a.schema.size()));
+        for (std::size_t j = 0; j < a.schema.size(); ++j) {
+            const ArraySchemaNode& n = a.schema[j];
+            append_varuint(out, n.schema_node_id);
+            append_varuint(out, n.parent_schema_node_id);
+            append_varuint(out, n.name_id);
+            append_u8(out, static_cast<u8>(n.kind));
+            append_varuint(out, n.byte_offset);
+            append_varuint(out, n.byte_size);
+            append_varuint(out, n.element_count);
+            append_varuint(out, n.element_stride);
+            append_u8(out, static_cast<u8>(n.value_type));
+            append_varuint(out, n.bit_width);
+            append_varuint(out, n.bit_offset);
+        }
     }
 }
 
@@ -6689,6 +7434,53 @@ inline bool deserialize_layout(PayloadReader& r, Layout& l) {
         if (!r.read_u8(b)) return false; rec.initial_value = (b != 0);
         if (!r.read_varuint(tmp)) return false; rec.period_ticks = tmp;
         l.clocks.push_back(rec);
+    }
+    if (!r.read_varuint(n)) return false;
+    l.bitsets.clear(); l.bitsets.reserve(static_cast<std::size_t>(n));
+    for (u64 i = 0; i < n; ++i) {
+        BitsetDefinition rec; u64 tmp = 0;
+        if (!r.read_varuint(tmp) || tmp > static_cast<u64>((std::numeric_limits<u32>::max)())) return false;
+        rec.node_id = static_cast<u32>(tmp);
+        if (!r.read_varuint(tmp) || tmp > static_cast<u64>((std::numeric_limits<u32>::max)())) return false;
+        rec.first_storage_id = static_cast<u32>(tmp);
+        if (!r.read_varuint(tmp) || tmp > static_cast<u64>((std::numeric_limits<u32>::max)())) return false;
+        rec.bit_count = static_cast<u32>(tmp);
+        if (!r.read_varuint(tmp) || tmp > static_cast<u64>((std::numeric_limits<u32>::max)())) return false;
+        rec.word_count = static_cast<u32>(tmp);
+        l.bitsets.push_back(rec);
+    }
+    if (!r.read_varuint(n)) return false;
+    l.arrays.clear(); l.arrays.reserve(static_cast<std::size_t>(n));
+    for (u64 i = 0; i < n; ++i) {
+        ArrayDefinition rec; u64 tmp = 0, schema_count = 0;
+        if (!r.read_varuint(tmp) || tmp > static_cast<u64>((std::numeric_limits<u32>::max)())) return false;
+        rec.node_id = static_cast<u32>(tmp);
+        if (!r.read_varuint(rec.total_bytes) ||
+            !r.read_varuint(rec.element_count) ||
+            !r.read_varuint(rec.element_stride) ||
+            !r.read_varuint(schema_count) ||
+            schema_count > static_cast<u64>((std::numeric_limits<std::size_t>::max)())) return false;
+        rec.schema.reserve(static_cast<std::size_t>(schema_count));
+        for (u64 j = 0; j < schema_count; ++j) {
+            ArraySchemaNode sn; u8 kind = 0, value_type = 0;
+            if (!r.read_varuint(tmp) || tmp > static_cast<u64>((std::numeric_limits<u32>::max)())) return false;
+            sn.schema_node_id = static_cast<u32>(tmp);
+            if (!r.read_varuint(tmp) || tmp > static_cast<u64>((std::numeric_limits<u32>::max)())) return false;
+            sn.parent_schema_node_id = static_cast<u32>(tmp);
+            if (!r.read_varuint(tmp) || tmp > static_cast<u64>((std::numeric_limits<u32>::max)())) return false;
+            sn.name_id = static_cast<u32>(tmp);
+            if (!r.read_u8(kind)) return false; sn.kind = static_cast<ArraySchemaKind>(kind);
+            if (!r.read_varuint(sn.byte_offset) || !r.read_varuint(sn.byte_size) ||
+                !r.read_varuint(sn.element_count) || !r.read_varuint(sn.element_stride) ||
+                !r.read_u8(value_type)) return false;
+            sn.value_type = static_cast<ValueType>(value_type);
+            if (!r.read_varuint(tmp) || tmp > static_cast<u64>((std::numeric_limits<u32>::max)())) return false;
+            sn.bit_width = static_cast<u32>(tmp);
+            if (!r.read_varuint(tmp) || tmp > static_cast<u64>((std::numeric_limits<u32>::max)())) return false;
+            sn.bit_offset = static_cast<u32>(tmp);
+            rec.schema.push_back(sn);
+        }
+        l.arrays.push_back(std::move(rec));
     }
     return true;
 }
@@ -6842,6 +7634,14 @@ inline void serialize_cycle(std::vector<u8>& out, const CycleSubmission& s) {
                         width);
         }
     }
+    append_varuint(out, static_cast<u64>(s.array_patches.size()));
+    for (std::size_t i = 0; i < s.array_patches.size(); ++i) {
+        const ArrayPatchUpdate& p = s.array_patches[i];
+        append_varuint(out, p.node_id);
+        append_varuint(out, p.byte_offset);
+        append_varuint(out, static_cast<u64>(p.bytes.size()));
+        append_vector_bytes(out, p.bytes);
+    }
 }
 
 inline bool deserialize_cycle(PayloadReader& r, CycleSubmission& s) {
@@ -6891,7 +7691,21 @@ inline bool deserialize_cycle(PayloadReader& r, CycleSubmission& s) {
             std::memcpy(out_group.values.data() + old_value_size, values, value_bytes);
         }
     }
-    return s.total_update_count() == static_cast<std::size_t>(total);
+    if (s.total_update_count() != static_cast<std::size_t>(total)) return false;
+    u64 patch_count = 0;
+    if (!r.read_varuint(patch_count) || patch_count > static_cast<u64>((std::numeric_limits<std::size_t>::max)())) return false;
+    s.array_patches.reserve(static_cast<std::size_t>(patch_count));
+    for (u64 i = 0; i < patch_count; ++i) {
+        ArrayPatchUpdate p; u64 node = 0, size = 0; const u8* bytes = NULL;
+        if (!r.read_varuint(node) || node > static_cast<u64>((std::numeric_limits<u32>::max)()) ||
+            !r.read_varuint(p.byte_offset) || !r.read_varuint(size) ||
+            size > static_cast<u64>(r.remaining()) ||
+            !r.read_bytes_ptr(bytes, static_cast<std::size_t>(size))) return false;
+        p.node_id = static_cast<u32>(node);
+        p.bytes.assign(bytes, bytes + static_cast<std::size_t>(size));
+        s.array_patches.push_back(std::move(p));
+    }
+    return true;
 }
 
 static const u32 kIpcMagic = 0x34504957u;    // "WIP4" little-endian spelling.
@@ -6901,7 +7715,7 @@ static const std::size_t kIpcAckHeaderSize = 24;
 static const u64 kMaxIpcPayloadBytes = 512ull * 1024ull * 1024ull;
 static const u32 kIpcChecksumDisabled = 0u;
 static const std::size_t kIpcChecksumLargePayloadThreshold = 1024u * 1024u;
-static const long kWriterProcessCycleCredits = 32768;
+static const long kWriterProcessCycleCredits = 2048;
 static const std::size_t kWriterProcessQueueBytesLimit = static_cast<std::size_t>(1024ull * 1024ull * 1024ull);
 } // namespace detail
 
@@ -6915,7 +7729,9 @@ enum class WriterProcessFrameType : u32 {
     LayoutNodes      = 7,
     LayoutSignals    = 8,
     LayoutClocks     = 9,
-    LayoutEnd        = 10
+    LayoutBitsets    = 10,
+    LayoutEnd        = 11,
+    LayoutArrays     = 12
 };
 
 inline const char* writer_process_frame_type_name(WriterProcessFrameType type) {
@@ -6929,6 +7745,8 @@ inline const char* writer_process_frame_type_name(WriterProcessFrameType type) {
     case WriterProcessFrameType::LayoutNodes: return "LayoutNodes";
     case WriterProcessFrameType::LayoutSignals: return "LayoutSignals";
     case WriterProcessFrameType::LayoutClocks: return "LayoutClocks";
+    case WriterProcessFrameType::LayoutBitsets: return "LayoutBitsets";
+    case WriterProcessFrameType::LayoutArrays: return "LayoutArrays";
     case WriterProcessFrameType::LayoutEnd: return "LayoutEnd";
     default: return "Unknown";
     }
@@ -6943,6 +7761,8 @@ inline bool writer_process_frame_is_layout_init(WriterProcessFrameType type) {
     case WriterProcessFrameType::LayoutNodes:
     case WriterProcessFrameType::LayoutSignals:
     case WriterProcessFrameType::LayoutClocks:
+    case WriterProcessFrameType::LayoutBitsets:
+    case WriterProcessFrameType::LayoutArrays:
     case WriterProcessFrameType::LayoutEnd:
         return true;
     default:
@@ -7118,7 +7938,7 @@ public:
                << detail::describe_cycle_payload_composition(submission, payload.size());
             detail::writer_process_diag_log(diag_log_path_, os.str());
         }
-        if (!send_frame(WriterProcessFrameType::Cycle, payload, error)) {
+        if (!send_frame(WriterProcessFrameType::Cycle, payload, error, NULL)) {
             cycle_credits_.fetch_add(1, std::memory_order_release);
             set_ack_error(error);
             return false;
@@ -7170,6 +7990,8 @@ private:
 
     static std::string resolve_helper_path(const std::string& explicit_path) {
         if (!explicit_path.empty() && detail::file_exists(explicit_path)) return explicit_path;
+        const char* env_path = std::getenv("WVZ4_WRITER_HELPER_PATH");
+        if (env_path && env_path[0] && detail::file_exists(env_path)) return std::string(env_path);
 
         std::vector<std::string> candidates;
         const std::string source_dir = detail::parent_dir(std::string(__FILE__));
@@ -7336,7 +8158,8 @@ private:
             (layout.names.size() + kRecordChunkCount - 1u) / kRecordChunkCount +
             (layout.nodes.size() + kRecordChunkCount - 1u) / kRecordChunkCount +
             (layout.signals.size() + kRecordChunkCount - 1u) / kRecordChunkCount +
-            (layout.clocks.size() + kRecordChunkCount - 1u) / kRecordChunkCount);
+            (layout.clocks.size() + kRecordChunkCount - 1u) / kRecordChunkCount +
+            (layout.bitsets.size() + kRecordChunkCount - 1u) / kRecordChunkCount);
 
         const auto send_layout_frame = [&](WriterProcessFrameType type) -> bool {
             u64 sent_seq = 0;
@@ -7382,6 +8205,8 @@ private:
         detail::append_u64(payload, static_cast<u64>(layout.nodes.size()));
         detail::append_u64(payload, static_cast<u64>(layout.signals.size()));
         detail::append_u64(payload, static_cast<u64>(layout.clocks.size()));
+        detail::append_u64(payload, static_cast<u64>(layout.bitsets.size()));
+        detail::append_u64(payload, static_cast<u64>(layout.arrays.size()));
         if (!send_layout_frame(WriterProcessFrameType::LayoutBegin)) return false;
         log_stream_stage("begin", stage_start, 0, frames_before, bytes_before);
 
@@ -7495,6 +8320,62 @@ private:
             start += count;
         }
         log_stream_stage("clocks", stage_start, static_cast<u64>(layout.clocks.size()), frames_before, bytes_before);
+
+        stage_start = std::chrono::steady_clock::now();
+        frames_before = layout_frame_count;
+        bytes_before = layout_payload_bytes;
+        for (std::size_t start = 0; start < layout.bitsets.size(); ) {
+            const std::size_t count = (std::min)(kRecordChunkCount, layout.bitsets.size() - start);
+            payload.clear();
+            payload.reserve(16u + count * 16u);
+            detail::append_u64(payload, static_cast<u64>(start));
+            detail::append_u64(payload, static_cast<u64>(count));
+            for (std::size_t i = 0; i < count; ++i) {
+                const BitsetDefinition& b = layout.bitsets[start + i];
+                detail::append_u32(payload, b.node_id);
+                detail::append_u32(payload, b.first_storage_id);
+                detail::append_u32(payload, b.bit_count);
+                detail::append_u32(payload, b.word_count);
+            }
+            if (!send_layout_frame(WriterProcessFrameType::LayoutBitsets)) return false;
+            start += count;
+        }
+        log_stream_stage("bitsets", stage_start, static_cast<u64>(layout.bitsets.size()), frames_before, bytes_before);
+
+        stage_start = std::chrono::steady_clock::now();
+        frames_before = layout_frame_count;
+        bytes_before = layout_payload_bytes;
+        for (std::size_t start = 0; start < layout.arrays.size(); ) {
+            const std::size_t count = (std::min)(kRecordChunkCount, layout.arrays.size() - start);
+            payload.clear();
+            detail::append_u64(payload, static_cast<u64>(start));
+            detail::append_u64(payload, static_cast<u64>(count));
+            for (std::size_t i = 0; i < count; ++i) {
+                const ArrayDefinition& a = layout.arrays[start + i];
+                detail::append_u32(payload, a.node_id);
+                detail::append_u64(payload, a.total_bytes);
+                detail::append_u64(payload, a.element_count);
+                detail::append_u64(payload, a.element_stride);
+                detail::append_u64(payload, static_cast<u64>(a.schema.size()));
+                for (std::size_t j = 0; j < a.schema.size(); ++j) {
+                    const ArraySchemaNode& n = a.schema[j];
+                    detail::append_u32(payload, n.schema_node_id);
+                    detail::append_u32(payload, n.parent_schema_node_id);
+                    detail::append_u32(payload, n.name_id);
+                    detail::append_u8(payload, static_cast<u8>(n.kind));
+                    detail::append_u64(payload, n.byte_offset);
+                    detail::append_u64(payload, n.byte_size);
+                    detail::append_u64(payload, n.element_count);
+                    detail::append_u64(payload, n.element_stride);
+                    detail::append_u8(payload, static_cast<u8>(n.value_type));
+                    detail::append_u32(payload, n.bit_width);
+                    detail::append_u32(payload, n.bit_offset);
+                }
+            }
+            if (!send_layout_frame(WriterProcessFrameType::LayoutArrays)) return false;
+            start += count;
+        }
+        log_stream_stage("arrays", stage_start, static_cast<u64>(layout.arrays.size()), frames_before, bytes_before);
 
         stage_start = std::chrono::steady_clock::now();
         frames_before = layout_frame_count;
@@ -7801,7 +8682,7 @@ private:
         ack_cv_.wait(lock, [this, target_seq]() {
             return ack_failed_ || ack_last_seq_ >= target_seq;
         });
-        if (ack_failed_ && ack_last_seq_ < target_seq) {
+        if (ack_failed_) {
             error = ack_error_;
             return false;
         }
@@ -8001,6 +8882,8 @@ public:
             u64 expected_nodes = 0;
             u64 expected_signals = 0;
             u64 expected_clocks = 0;
+            u64 expected_bitsets = 0;
+            u64 expected_arrays = 0;
 
             void reset() {
                 active = false;
@@ -8012,6 +8895,8 @@ public:
                 expected_nodes = 0;
                 expected_signals = 0;
                 expected_clocks = 0;
+                expected_bitsets = 0;
+                expected_arrays = 0;
             }
 
             static bool fits_size_t(u64 value) {
@@ -8026,6 +8911,8 @@ public:
                     !r.read_u64(expected_nodes) ||
                     !r.read_u64(expected_signals) ||
                     !r.read_u64(expected_clocks) ||
+                    !r.read_u64(expected_bitsets) ||
+                    !r.read_u64(expected_arrays) ||
                     !r.at_end()) {
                     error = "WVZ4 writer helper received corrupt streamed layout begin";
                     return false;
@@ -8035,6 +8922,8 @@ public:
                     !fits_size_t(expected_nodes) ||
                     !fits_size_t(expected_signals) ||
                     !fits_size_t(expected_clocks) ||
+                    !fits_size_t(expected_bitsets) ||
+                    !fits_size_t(expected_arrays) ||
                     expected_name_blob_size > static_cast<u64>((std::numeric_limits<u32>::max)())) {
                     error = "WVZ4 writer helper streamed layout is too large";
                     return false;
@@ -8044,6 +8933,8 @@ public:
                 layout.nodes.reserve(static_cast<std::size_t>(expected_nodes));
                 layout.signals.reserve(static_cast<std::size_t>(expected_signals));
                 layout.clocks.reserve(static_cast<std::size_t>(expected_clocks));
+                layout.bitsets.reserve(static_cast<std::size_t>(expected_bitsets));
+                layout.arrays.reserve(static_cast<std::size_t>(expected_arrays));
                 active = true;
                 return true;
             }
@@ -8206,6 +9097,75 @@ public:
                 return true;
             }
 
+            bool append_bitsets(detail::PayloadReader& r, std::string& error) {
+                u64 start = 0, count = 0;
+                if (!active || !r.read_u64(start) || !r.read_u64(count) ||
+                    !fits_size_t(start) || !fits_size_t(count) ||
+                    start != static_cast<u64>(layout.bitsets.size()) ||
+                    start + count > expected_bitsets) {
+                    error = "WVZ4 writer helper received out-of-order streamed bitsets";
+                    return false;
+                }
+                for (u64 i = 0; i < count; ++i) {
+                    BitsetDefinition rec;
+                    if (!r.read_u32(rec.node_id) ||
+                        !r.read_u32(rec.first_storage_id) ||
+                        !r.read_u32(rec.bit_count) ||
+                        !r.read_u32(rec.word_count)) {
+                        error = "WVZ4 writer helper received corrupt streamed bitset record";
+                        return false;
+                    }
+                    layout.bitsets.push_back(rec);
+                }
+                if (!r.at_end()) {
+                    error = "WVZ4 writer helper received trailing bytes in streamed bitsets";
+                    return false;
+                }
+                return true;
+            }
+
+            bool append_arrays(detail::PayloadReader& r, std::string& error) {
+                u64 start = 0, count = 0;
+                if (!active || !r.read_u64(start) || !r.read_u64(count) ||
+                    !fits_size_t(start) || !fits_size_t(count) ||
+                    start != static_cast<u64>(layout.arrays.size()) ||
+                    start + count > expected_arrays) {
+                    error = "WVZ4 writer helper received out-of-order streamed arrays";
+                    return false;
+                }
+                for (u64 i = 0; i < count; ++i) {
+                    ArrayDefinition rec; u64 schema_count = 0;
+                    if (!r.read_u32(rec.node_id) || !r.read_u64(rec.total_bytes) ||
+                        !r.read_u64(rec.element_count) || !r.read_u64(rec.element_stride) ||
+                        !r.read_u64(schema_count) || !fits_size_t(schema_count)) {
+                        error = "WVZ4 writer helper received corrupt streamed array record";
+                        return false;
+                    }
+                    rec.schema.reserve(static_cast<std::size_t>(schema_count));
+                    for (u64 j = 0; j < schema_count; ++j) {
+                        ArraySchemaNode sn; u8 kind = 0, value_type = 0;
+                        if (!r.read_u32(sn.schema_node_id) || !r.read_u32(sn.parent_schema_node_id) ||
+                            !r.read_u32(sn.name_id) || !r.read_u8(kind) ||
+                            !r.read_u64(sn.byte_offset) || !r.read_u64(sn.byte_size) ||
+                            !r.read_u64(sn.element_count) || !r.read_u64(sn.element_stride) ||
+                            !r.read_u8(value_type) || !r.read_u32(sn.bit_width) ||
+                            !r.read_u32(sn.bit_offset)) {
+                            error = "WVZ4 writer helper received corrupt streamed array schema";
+                            return false;
+                        }
+                        sn.kind = static_cast<ArraySchemaKind>(kind);
+                        sn.value_type = static_cast<ValueType>(value_type);
+                        rec.schema.push_back(sn);
+                    }
+                    layout.arrays.push_back(std::move(rec));
+                }
+                if (!r.at_end()) {
+                    error = "WVZ4 writer helper received trailing bytes in streamed arrays";
+                    return false;
+                }
+                return true;
+            }
+
             bool finish(detail::PayloadReader& r, std::string& error) {
                 if (!active || !r.at_end()) {
                     error = "WVZ4 writer helper received corrupt streamed layout end";
@@ -8215,7 +9175,9 @@ public:
                     static_cast<u64>(layout.names.size()) != expected_names ||
                     static_cast<u64>(layout.nodes.size()) != expected_nodes ||
                     static_cast<u64>(layout.signals.size()) != expected_signals ||
-                    static_cast<u64>(layout.clocks.size()) != expected_clocks) {
+                    static_cast<u64>(layout.clocks.size()) != expected_clocks ||
+                    static_cast<u64>(layout.bitsets.size()) != expected_bitsets ||
+                    static_cast<u64>(layout.arrays.size()) != expected_arrays) {
                     error = "WVZ4 writer helper received incomplete streamed layout";
                     return false;
                 }
@@ -8230,6 +9192,8 @@ public:
         bool logged_nodes = false;
         bool logged_signals = false;
         bool logged_clocks = false;
+        bool logged_bitsets = false;
+        bool logged_arrays = false;
         const auto reset_layout_stream_logs = [&]() {
             layout_stream_start = std::chrono::steady_clock::now();
             logged_name_blob = false;
@@ -8237,6 +9201,8 @@ public:
             logged_nodes = false;
             logged_signals = false;
             logged_clocks = false;
+            logged_bitsets = false;
+            logged_arrays = false;
         };
         const auto log_layout_stream_stage = [&](const char* stage, u64 records) {
             std::ostringstream os;
@@ -8251,7 +9217,11 @@ public:
                << " signals=" << static_cast<unsigned long long>(layout_stream.layout.signals.size())
                << "/" << static_cast<unsigned long long>(layout_stream.expected_signals)
                << " clocks=" << static_cast<unsigned long long>(layout_stream.layout.clocks.size())
-               << "/" << static_cast<unsigned long long>(layout_stream.expected_clocks);
+               << "/" << static_cast<unsigned long long>(layout_stream.expected_clocks)
+               << " bitsets=" << static_cast<unsigned long long>(layout_stream.layout.bitsets.size())
+               << "/" << static_cast<unsigned long long>(layout_stream.expected_bitsets)
+               << " arrays=" << static_cast<unsigned long long>(layout_stream.layout.arrays.size())
+               << "/" << static_cast<unsigned long long>(layout_stream.expected_arrays);
             detail::writer_process_diag_log_phase(log_path, "server-layout-stream-stage", layout_stream_start, os.str());
         };
         bool result = true;
@@ -8306,7 +9276,8 @@ public:
                             os << "names=" << static_cast<unsigned long long>(layout.names.size())
                                << " nodes=" << static_cast<unsigned long long>(layout.nodes.size())
                                << " signals=" << static_cast<unsigned long long>(layout.signals.size())
-                               << " clocks=" << static_cast<unsigned long long>(layout.clocks.size());
+                               << " clocks=" << static_cast<unsigned long long>(layout.clocks.size())
+                               << " bitsets=" << static_cast<unsigned long long>(layout.bitsets.size());
                             detail::writer_process_diag_log_phase(log_path, "server-inline-layout-decode", layout_decode_start, os.str());
                         }
                         if (opt.enable_stats_log && opt.stats_log_path.empty()) opt.stats_log_path = output_path + ".log";
@@ -8330,7 +9301,9 @@ public:
                            << " expected_names=" << static_cast<unsigned long long>(layout_stream.expected_names)
                            << " expected_nodes=" << static_cast<unsigned long long>(layout_stream.expected_nodes)
                            << " expected_signals=" << static_cast<unsigned long long>(layout_stream.expected_signals)
-                           << " expected_clocks=" << static_cast<unsigned long long>(layout_stream.expected_clocks);
+                           << " expected_clocks=" << static_cast<unsigned long long>(layout_stream.expected_clocks)
+                           << " expected_bitsets=" << static_cast<unsigned long long>(layout_stream.expected_bitsets);
+                        os << " expected_arrays=" << static_cast<unsigned long long>(layout_stream.expected_arrays);
                         detail::writer_process_diag_log_phase(log_path, "server-layout-stream-begin", layout_stream_start, os.str());
                     }
                 }
@@ -8368,6 +9341,20 @@ public:
                     static_cast<u64>(layout_stream.layout.clocks.size()) == layout_stream.expected_clocks) {
                     logged_clocks = true;
                     log_layout_stream_stage("clocks_complete", layout_stream.expected_clocks);
+                }
+            } else if (type == WriterProcessFrameType::LayoutBitsets) {
+                ok = layout_stream.append_bitsets(r, op_error);
+                if (ok && !logged_bitsets &&
+                    static_cast<u64>(layout_stream.layout.bitsets.size()) == layout_stream.expected_bitsets) {
+                    logged_bitsets = true;
+                    log_layout_stream_stage("bitsets_complete", layout_stream.expected_bitsets);
+                }
+            } else if (type == WriterProcessFrameType::LayoutArrays) {
+                ok = layout_stream.append_arrays(r, op_error);
+                if (ok && !logged_arrays &&
+                    static_cast<u64>(layout_stream.layout.arrays.size()) == layout_stream.expected_arrays) {
+                    logged_arrays = true;
+                    log_layout_stream_stage("arrays_complete", layout_stream.expected_arrays);
                 }
             } else if (type == WriterProcessFrameType::LayoutEnd) {
                 if (have_writer) {

@@ -59,15 +59,19 @@ Assert-True ((Test-Path $config) -and (Test-Path $aggregate) -and (Test-Path $cl
 Assert-True (-not (Test-Path (Join-Path $buildRoot "WaveTracer"))) "runner created a build-tree WaveTracer output"
 Assert-True ((Get-Content $closure -Raw).Contains('ReflectAccess<struct Root>')) "enabled runner output lacks Root reflection"
 
-Write-Host "[2/5] Every CMake runner invocation executes ReflectGen"
+Write-Host "[2/5] CMake runner executes ReflectGen without touching identical generated outputs"
 $firstStamp = (Get-Item $aggregate).LastWriteTimeUtc
+$firstClosureStamp = (Get-Item $closure).LastWriteTimeUtc
+$firstLogStamp = (Get-Item $log).LastWriteTimeUtc
 Start-Sleep -Milliseconds 1200
 & cmake @cmakeArgs | Out-Host
 Assert-True ($LASTEXITCODE -eq 0) "incremental CMake runner failed"
-Assert-True ((Get-Item $aggregate).LastWriteTimeUtc -gt $firstStamp) "unchanged runner did not execute ReflectGen"
+Assert-True ((Get-Item $log).LastWriteTimeUtc -gt $firstLogStamp) "unchanged runner did not execute ReflectGen"
+Assert-True ((Get-Item $aggregate).LastWriteTimeUtc -eq $firstStamp) "unchanged runner touched aggregate header"
+Assert-True ((Get-Item $closure).LastWriteTimeUtc -eq $firstClosureStamp) "unchanged runner touched closure header"
 
 Write-Host "[3/5] ReflectGen owns the WaveTrace=false decision"
-$enabledStamp = (Get-Item $aggregate).LastWriteTimeUtc
+$enabledStamp = (Get-Item $closure).LastWriteTimeUtc
 $json = Get-Content $config -Raw | ConvertFrom-Json
 $json.WaveTrace = $false
 Write-Utf8 $config ($json | ConvertTo-Json -Depth 10)
@@ -75,12 +79,12 @@ Start-Sleep -Milliseconds 1200
 & cmake @cmakeArgs | Out-Host
 Assert-True ($LASTEXITCODE -eq 0) "disabled CMake runner failed"
 Assert-True (-not (Get-Content $closure -Raw).Contains('ReflectAccess<struct Root>')) "WaveTrace=false did not emit empty reflection"
-$disabledStamp = (Get-Item $aggregate).LastWriteTimeUtc
+$disabledStamp = (Get-Item $closure).LastWriteTimeUtc
 Assert-True ($disabledStamp -gt $enabledStamp) "disabled runner did not execute ReflectGen"
 Start-Sleep -Milliseconds 1200
 & cmake @cmakeArgs | Out-Host
 Assert-True ($LASTEXITCODE -eq 0) "settled disabled CMake runner failed"
-Assert-True ((Get-Item $aggregate).LastWriteTimeUtc -gt $disabledStamp) "settled disabled runner did not execute ReflectGen"
+Assert-True ((Get-Item $closure).LastWriteTimeUtc -eq $disabledStamp) "settled disabled runner touched unchanged output"
 
 Write-Host "[4/5] MSBuild props resolve source paths and C++-safe slashes"
 $propsPath = (Join-Path $repoRoot "props\wavetrace_reflectgen_reference.props").Replace('\','/')

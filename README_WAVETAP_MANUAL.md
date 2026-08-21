@@ -36,8 +36,12 @@ sc_core::sc_clock clk("clk", sc_core::sc_time(1, sc_core::SC_NS));
 
 PathStableWvz4Recorder recorder;
 PathStableWvz4Recorder::OpenConfig cfg;
+cfg.clk_initial_value = true; // default: synthetic clk starts high
 cfg.clk_period_ticks = 10;
 cfg.clk_fall_offset_ticks = 5;
+
+// clk_initial_value only controls the synthesized WVZ4 clock display phase.
+// WaveTap is still triggered by the input SystemC clock's negedge_event().
 
 // target_block_span is in writer ticks.  If emit_default_clk=true and
 // clk_period_ticks=10, 10000 business cycles means 100000 writer ticks.

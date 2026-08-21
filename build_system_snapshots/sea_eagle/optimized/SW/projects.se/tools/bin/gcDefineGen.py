@@ -8,10 +8,23 @@ featureDB = "CModelFeatureDB.csv"
 import os
 import re
 import sys
-import datetime
 import csv
-import io
+import errno
 import stat
+import time
+
+try:
+    from StringIO import StringIO
+except ImportError:
+    from io import StringIO
+
+if os.name == 'nt':
+    import ctypes
+
+try:
+    textType = unicode
+except NameError:
+    textType = str
 
 
 # We assume workbook must be organized by following format
@@ -56,7 +69,7 @@ def GenDefineHeader(fileHandler, arch):
     fileHandler.write(
 '''// This file is generated automatically by {}
 // do NOT change it manually!!!
-// Chip --{}-- generated at {} CST\n\n'''.format(__file__, arch, datetime.datetime.now().strftime('%H:%M:%S, %B %d, %Y')))
+// Chip --{}-- generated at {} CST\n\n'''.format(__file__, arch, time.strftime('%H:%M:%S, %B %d, %Y')))
     
     if useHack:
         fileHandler.write('// !!!!!! GENERATED using {} for HACKING !!!!!!\n\n'.format(HackDBFile))
@@ -65,28 +78,63 @@ def NormalizeGeneratedHeader(text):
     return re.sub(r'// Chip --([^\n]*)-- generated at .* CST', r'// Chip --\1-- generated at <timestamp> CST', text)
 
 
+def ReplaceFile(src, dst):
+    if os.name != 'nt':
+        os.rename(src, dst)
+        return
+
+    if not isinstance(src, textType):
+        src = src.decode(sys.getfilesystemencoding())
+    if not isinstance(dst, textType):
+        dst = dst.decode(sys.getfilesystemencoding())
+    if not ctypes.windll.kernel32.MoveFileExW(src, dst, 0x1 | 0x8):
+        raise ctypes.WinError()
+
+
+def RetryOnWindows(operation, *args):
+    for retry in range(100):
+        try:
+            return operation(*args)
+        except (IOError, OSError) as error:
+            sharingError = (getattr(error, 'winerror', None) in (5, 32, 33) or
+                            getattr(error, 'errno', None) == errno.EACCES)
+            if os.name != 'nt' or not sharingError or retry == 99:
+                raise
+            time.sleep(0.05)
+
+
+def ReadFile(path):
+    with open(path, 'r') as f:
+        return f.read()
+
+
 def WriteIfChanged(path, content):
-    old = None
     try:
-        with open(path, 'r') as f:
-            old = f.read()
-    except FileNotFoundError:
+        old = RetryOnWindows(ReadFile, path)
+    except (IOError, OSError) as error:
+        if getattr(error, 'errno', None) != errno.ENOENT:
+            raise
         old = None
 
     if old is not None and NormalizeGeneratedHeader(old) == NormalizeGeneratedHeader(content):
         print('[gcDefineGen] INFO: {} unchanged.'.format(path))
         return False
 
-    tmp = '{}.tmp'.format(path)
     try:
         if os.path.exists(path):
             os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
     except Exception:
         pass
 
-    with open(tmp, 'w') as f:
-        f.write(content)
-    os.replace(tmp, path)
+    tmp = '{}.{}.tmp'.format(path, os.getpid())
+    try:
+        with open(tmp, 'w') as f:
+            f.write(content)
+        RetryOnWindows(ReplaceFile, tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
     print('[gcDefineGen] INFO: {} updated.'.format(path))
     return True
 
@@ -96,7 +144,7 @@ def GenDefineHppFromCsv(cmodel_path, arch):
     reader = csv.DictReader(csvf)
 
     gcDefineGen = os.path.join(cmodel_path, 'inc', 'gcDefines.h')
-    gcDefineFileHandler = io.StringIO()
+    gcDefineFileHandler = StringIO()
     GenDefineHeader(gcDefineFileHandler, arch)
  
     isChipInfo = True
@@ -150,7 +198,9 @@ if "__main__" == __name__:
                     pair = line.split()
                     hackD[pair[0]] = pair[1]
             print("[gcDefineGen] INFO: hack gcDefines.h using {}.".format(HackDBFile))
-        except FileNotFoundError:
+        except (IOError, OSError) as error:
+            if getattr(error, 'errno', None) != errno.ENOENT:
+                raise
             print("[gcDefineGen] WARNING: no gcDefine hack used since {} not found.".format(HackDBFile))
 
     GenDefineHppFromCsv(cmodel_path, arch)

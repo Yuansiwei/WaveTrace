@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals"><VCProjectVersion>16.0</VCProjectVersion><Keyword>Win32Proj</Keyword><ProjectGuid>{59CD22F3-36E4-4E08-B7A6-B617329026EA}</ProjectGuid><RootNamespace>smoke_wvz4_bitset_parser</RootNamespace><WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration"><ConfigurationType>Application</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries><PlatformToolset>v142</PlatformToolset><CharacterSet>Unicode</CharacterSet><WholeProgramOptimization>true</WholeProgramOptimization></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="QtLocal.props" Condition="Exists('QtLocal.props')" />
+  <Import Project="props\zstd_embed.props" Condition="Exists('props\zstd_embed.props')" />
+  <PropertyGroup><OutDir>$(ProjectDir)build\$(Platform)\$(Configuration)\</OutDir><IntDir>$(ProjectDir)build\obj\$(Platform)\$(Configuration)\smoke_wvz4_bitset_parser\</IntDir><TargetName>smoke_wvz4_bitset_parser</TargetName></PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile><MultiProcessorCompilation>true</MultiProcessorCompilation><WarningLevel>Level3</WarningLevel><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode><LanguageStandard>stdcpp14</LanguageStandard><ExceptionHandling>Sync</ExceptionHandling><AdditionalIncludeDirectories>$(MSBuildProjectDirectory);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories><PreprocessorDefinitions>WIN32;_WINDOWS;NOMINMAX;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions><AdditionalOptions>/utf-8 /Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions></ClCompile>
+    <Link><SubSystem>Console</SubSystem><GenerateDebugInformation>true</GenerateDebugInformation></Link>
+  </ItemDefinitionGroup>
+  <ItemGroup><ClCompile Include="smoke_wvz4_bitset_parser.cpp" /><ClCompile Include="WaveParser4.cpp" /></ItemGroup>
+  <ItemGroup><ClInclude Include="WaveParser4.h" /><ClInclude Include="WaveTypes.h" /><ClInclude Include="..\wvz4_writer_typed.h" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

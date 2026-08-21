@@ -884,6 +884,217 @@ static int runBitStateRenderRegression(QApplication& app, const QStringList& arg
     return ok ? 0 : 6;
 }
 
+static int runLodDisappearanceStress(QApplication& app, const QStringList& args) {
+    struct StressCase {
+        QString name;
+        SignalKind kind = SignalKind::Bus;
+        int width = 32;
+        qint64 fileEnd = 100000;
+        qint64 viewStart = 0;
+        qint64 viewEnd = 100000;
+        qint64 bucketCycles = 1000;
+        QVector<WaveSample> lodSamples;
+        qint64 requiredVisibleStart = 0;
+        qint64 requiredVisibleEnd = 0;
+    };
+
+    auto makeSample = [](qint64 time, quint64 value) {
+        WaveSample sample;
+        sample.time = time;
+        sample.rawBits = value;
+        sample.rawFieldsReady = true;
+        return sample;
+    };
+    QVector<StressCase> cases;
+    const QVector<int> widths{ 8, 16, 32, 64 };
+    const QVector<qint64> spans{ 100000, 1000000, 1000000000ll };
+    for (int width : widths) {
+        for (qint64 span : spans) {
+            StressCase beforeFirst;
+            beforeFirst.name = QStringLiteral("bus_w%1_span%2_before_first_event").arg(width).arg(span);
+            beforeFirst.width = width;
+            beforeFirst.fileEnd = span;
+            beforeFirst.viewEnd = span / 2;
+            beforeFirst.bucketCycles = qMax<qint64>(10, span / 100);
+            beforeFirst.lodSamples.push_back(makeSample(span * 3 / 4, 1));
+            beforeFirst.requiredVisibleStart = 0;
+            beforeFirst.requiredVisibleEnd = beforeFirst.viewEnd;
+            cases.push_back(beforeFirst);
+
+            StressCase initialZero;
+            initialZero.name = QStringLiteral("bus_w%1_span%2_initial_zero_prefix").arg(width).arg(span);
+            initialZero.width = width;
+            initialZero.fileEnd = span;
+            initialZero.viewEnd = span;
+            initialZero.bucketCycles = qMax<qint64>(10, span / 100);
+            initialZero.lodSamples.push_back(makeSample(span / 2, quint64(width + 1)));
+            initialZero.requiredVisibleStart = 0;
+            initialZero.requiredVisibleEnd = span / 2;
+            cases.push_back(initialZero);
+
+            StressCase afterEvent;
+            afterEvent.name = QStringLiteral("bus_w%1_span%2_after_prior_event").arg(width).arg(span);
+            afterEvent.width = width;
+            afterEvent.fileEnd = span;
+            afterEvent.viewStart = span / 2;
+            afterEvent.viewEnd = span;
+            afterEvent.bucketCycles = qMax<qint64>(10, span / 100);
+            afterEvent.lodSamples.push_back(makeSample(span / 4, quint64(width + 3)));
+            afterEvent.requiredVisibleStart = afterEvent.viewStart;
+            afterEvent.requiredVisibleEnd = afterEvent.viewEnd;
+            cases.push_back(afterEvent);
+
+            StressCase fragmented;
+            fragmented.name = QStringLiteral("bus_w%1_span%2_multi_event").arg(width).arg(span);
+            fragmented.width = width;
+            fragmented.fileEnd = span;
+            fragmented.viewEnd = span;
+            fragmented.bucketCycles = qMax<qint64>(10, span / 100);
+            fragmented.lodSamples.push_back(makeSample(span / 5, 1));
+            fragmented.lodSamples.push_back(makeSample(span * 2 / 5, 0));
+            fragmented.lodSamples.push_back(makeSample(span * 4 / 5, quint64(width + 7)));
+            fragmented.requiredVisibleStart = 0;
+            fragmented.requiredVisibleEnd = span / 5;
+            cases.push_back(fragmented);
+        }
+    }
+
+    // Exercise the dense sample-LOD branch independently.  Its anchor logic is
+    // intentionally separate from the sparse frame renderer.
+    for (int width : widths) {
+        StressCase dense;
+        dense.name = QStringLiteral("bus_w%1_dense_lod_initial_zero").arg(width);
+        dense.width = width;
+        dense.fileEnd = 1000000;
+        dense.viewEnd = dense.fileEnd;
+        dense.bucketCycles = 1000;
+        for (int i = 0; i < 420; ++i) {
+            const qint64 time = 250000 + qint64(i) * 1500;
+            dense.lodSamples.push_back(makeSample(time, quint64(i + 1)));
+        }
+        dense.requiredVisibleStart = 0;
+        dense.requiredVisibleEnd = 240000;
+        cases.push_back(std::move(dense));
+    }
+
+    // Bit signals are controls: the established implicit-zero path must remain
+    // visible while the bus fix is stressed across the same boundary shapes.
+    for (qint64 span : spans) {
+        StressCase bit;
+        bit.name = QStringLiteral("bit_span%1_before_first_event").arg(span);
+        bit.kind = SignalKind::Bit;
+        bit.width = 1;
+        bit.fileEnd = span;
+        bit.viewEnd = span / 2;
+        bit.bucketCycles = qMax<qint64>(10, span / 100);
+        bit.lodSamples.push_back(makeSample(span * 3 / 4, 1));
+        bit.requiredVisibleStart = 0;
+        bit.requiredVisibleEnd = bit.viewEnd;
+        cases.push_back(bit);
+    }
+
+    QString outputPath;
+    if (args.size() >= 3) {
+        outputPath = args.at(2);
+        if (!QDir(outputPath).exists() && !QDir().mkpath(outputPath)) return 3;
+    }
+
+    const int canvasWidth = 720;
+    WaveCanvas canvas;
+    canvas.resize(canvasWidth, 130);
+    ActiveSignalRef entry;
+    entry.signalIndex = 0;
+    entry.format = ValueRadix::Hex;
+    canvas.setVisibleEntries(QVector<ActiveSignalRef>{ entry });
+    canvas.setVisibleEntryWindow(0, 1);
+    canvas.show();
+    processEventsFor(app, 40);
+
+    auto isGreen = [](QRgb pixel) {
+        const QColor color(pixel);
+        return color.green() >= 90 && color.green() >= color.red() + 24 &&
+            color.green() >= color.blue() + 24;
+    };
+    QStringList failures;
+    qint64 renderedGreenPixels = 0;
+    const QDir failureDir(outputPath);
+
+    for (const StressCase& one : cases) {
+        WaveFile wave;
+        wave.meta.start = 0;
+        wave.meta.end = one.fileEnd;
+        WaveSignal signal;
+        signal.name = one.name;
+        signal.kind = one.kind;
+        signal.width = one.width;
+        signal.defaultRadix = one.kind == SignalKind::Bit ? ValueRadix::Bin : ValueRadix::Hex;
+        signal.currentRadix = signal.defaultRadix;
+        signal.samplesLoaded = false;
+        WaveLodLevel level;
+        level.bucketCycles = one.bucketCycles;
+        level.samples = one.lodSamples;
+        level.loadedRanges.push_back(WaveLodValidRange{ 0, one.fileEnd });
+        signal.lodLevels.push_back(std::move(level));
+        wave.signalList.push_back(std::move(signal));
+
+        canvas.setWave(&wave);
+        canvas.commitViewportRange(one.viewStart, one.viewEnd);
+        const QImage image = renderCanvasImage(canvas);
+
+        const int plotLeft = 10;
+        const int plotWidth = canvasWidth - 20;
+        auto timeToPixel = [&](qint64 time) {
+            const long double fraction = static_cast<long double>(time - one.viewStart) /
+                static_cast<long double>(qMax<qint64>(1, one.viewEnd - one.viewStart));
+            return qBound(plotLeft, plotLeft + int(std::floor(fraction * plotWidth)),
+                          plotLeft + plotWidth);
+        };
+        const int requiredX1 = timeToPixel(one.requiredVisibleStart);
+        const int requiredX2 = timeToPixel(one.requiredVisibleEnd);
+        int requiredGreen = 0;
+        int totalGreen = 0;
+        for (int y = 42; y <= 72; ++y) {
+            for (int x = plotLeft; x < plotLeft + plotWidth; ++x) {
+                if (!isGreen(image.pixel(x, y))) continue;
+                ++totalGreen;
+                if (x >= requiredX1 && x < requiredX2) ++requiredGreen;
+            }
+        }
+        renderedGreenPixels += totalGreen;
+        const int requiredWidth = qMax(1, requiredX2 - requiredX1);
+        const int minimumRequiredGreen = one.kind == SignalKind::Bit
+            ? qMax(4, requiredWidth / 2)
+            : qMax(8, requiredWidth);
+        const bool visible = totalGreen >= 8 && requiredGreen >= minimumRequiredGreen;
+        if (!visible) {
+            failures.push_back(QStringLiteral("%1,total=%2,required=%3,min=%4")
+                                   .arg(one.name).arg(totalGreen).arg(requiredGreen)
+                                   .arg(minimumRequiredGreen));
+            if (!outputPath.isEmpty() && failures.size() <= 12) {
+                image.save(failureDir.filePath(one.name + QStringLiteral(".png")));
+            }
+        }
+    }
+
+    QTextStream out(stdout);
+    out << "lod_disappearance_stress,cases," << cases.size()
+        << ",failures," << failures.size()
+        << ",green_pixels," << renderedGreenPixels << "\n";
+    for (const QString& failure : failures) out << "failure," << failure << "\n";
+    out << "result," << (failures.isEmpty() ? "pass" : "fail") << "\n";
+    out.flush();
+
+    if (!outputPath.isEmpty()) {
+        QFile report(failureDir.filePath(QStringLiteral("lod_disappearance_stress.csv")));
+        if (report.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QTextStream stream(&report);
+            stream << "cases," << cases.size() << "\nfailures," << failures.size() << "\n";
+            for (const QString& failure : failures) stream << failure << "\n";
+        }
+    }
+    return failures.isEmpty() ? 0 : 6;
+}
+
 static LodVisualCompareMetrics compareRenderedImages(const QImage& raw,
                                                      const QImage& lod,
                                                      int step,
@@ -1926,6 +2137,8 @@ static int runSignalConditionSearchBenchmark(QApplication& app,
         window.findChild<QLineEdit*>(QStringLiteral("signalConditionName"));
     QCheckBox* scopeCheck =
         window.findChild<QCheckBox*>(QStringLiteral("signalConditionScope"));
+    QCheckBox* cropTreeCheck =
+        window.findChild<QCheckBox*>(QStringLiteral("signalConditionCropTree"));
     QCheckBox* regexCheck =
         window.findChild<QCheckBox*>(QStringLiteral("signalConditionRegex"));
     QCheckBox* caseCheck =
@@ -1942,13 +2155,15 @@ static int runSignalConditionSearchBenchmark(QApplication& app,
         window.findChild<QPushButton*>(QStringLiteral("signalConditionCancel"));
     QLabel* status =
         window.findChild<QLabel*>(QStringLiteral("signalConditionStatus"));
-    if (!dialog || !nameEdit || !scopeCheck || !regexCheck || !caseCheck ||
+    if (!dialog || !nameEdit || !scopeCheck || !cropTreeCheck ||
+        !regexCheck || !caseCheck ||
         !changeMin || !changeMax || !addValue || !search || !cancel || !status) {
         return 5;
     }
 
     nameEdit->setText(optionalText(args.at(3)));
     scopeCheck->setChecked(scopeDepth >= 0);
+    cropTreeCheck->setChecked(true);
     regexCheck->setChecked(args.at(4).toInt() != 0);
     caseCheck->setChecked(false);
     changeMin->setText(optionalText(args.at(5)));
@@ -2143,11 +2358,27 @@ static int runTreeReferenceSearchBenchmark(QApplication& app,
         window.findChild<QTreeView*>(QStringLiteral("signalTree"));
     QLineEdit* search =
         window.findChild<QLineEdit*>(QStringLiteral("signalTreeSearch"));
-    if (!tree || !search || !tree->model()) return 4;
+    QPushButton* previous =
+        window.findChild<QPushButton*>(QStringLiteral("signalTreeSearchPrevious"));
+    QPushButton* next =
+        window.findChild<QPushButton*>(QStringLiteral("signalTreeSearchNext"));
+    if (!tree || !search || !previous || !next || !tree->model()) return 4;
+
+    const int fullTopLevelRows = tree->model()->rowCount();
 
     search->setText(args.at(3));
     QMetaObject::invokeMethod(search, "returnPressed", Qt::DirectConnection);
     processEventsFor(app, settleMs);
+    const bool queryRetained = search->text() == args.at(3);
+    const int searchedTopLevelRows = tree->model()->rowCount();
+    const QModelIndex firstMatch = tree->currentIndex();
+    bool navigationChangedTarget = true;
+    if (next->isEnabled()) {
+        next->click();
+        processEventsFor(app, 20);
+        navigationChangedTarget = tree->currentIndex().isValid() &&
+                                  tree->currentIndex() != firstMatch;
+    }
 
     const QAbstractItemModel* model = tree->model();
     struct PendingIndex {
@@ -2173,19 +2404,47 @@ static int runTreeReferenceSearchBenchmark(QApplication& app,
         }
     }
 
+    search->clear();
+    processEventsFor(app, 20);
+    const int cancelledTopLevelRows = tree->model()->rowCount();
+
     QTextStream out(stdout);
     out << "tree_reference_search,query," << csvField(args.at(3))
         << ",settle_ms," << settleMs
         << ",visible_nodes," << visibleNodes
         << ",max_depth," << maxDepth
-        << ",query_retained,"
-        << (search->text() == args.at(3) ? 1 : 0)
+        << ",query_retained," << (queryRetained ? 1 : 0)
+        << ",full_top_level_rows," << fullTopLevelRows
+        << ",searched_top_level_rows," << searchedTopLevelRows
+        << ",cancelled_top_level_rows," << cancelledTopLevelRows
+        << ",navigation_changed_target," << (navigationChangedTarget ? 1 : 0)
         << '\n';
     out.flush();
     return visibleNodes > 0 && visibleNodes < traversalLimit &&
-                   search->text() == args.at(3)
+                   queryRetained &&
+                   searchedTopLevelRows == fullTopLevelRows &&
+                   cancelledTopLevelRows == fullTopLevelRows &&
+                   navigationChangedTarget
         ? 0
         : 5;
+}
+
+static int runViewerSessionStateRegression(QApplication& app,
+                                           const QStringList& args) {
+    if (args.size() < 3) return 2;
+    MainWindow window;
+    window.resize(1600, 800);
+    window.show();
+    if (!window.openWaveFilePath(args.at(2), false)) return 3;
+    processEventsFor(app, 50);
+    QString error;
+    const bool ok = window.runViewerSessionStateRegressionForBenchmark(&error);
+    QTextStream out(stdout);
+    out << "viewer_session_state,ok," << (ok ? 1 : 0);
+    if (!error.isEmpty()) out << ",error," << csvField(error);
+    out << '\n';
+    out.flush();
+    return ok ? 0 : 5;
 }
 
 int main(int argc, char *argv[]) {
@@ -2242,6 +2501,10 @@ int main(int argc, char *argv[]) {
         args.at(1) == QStringLiteral("--tree-reference-search-benchmark")) {
         return runTreeReferenceSearchBenchmark(a, args);
     }
+    if (args.size() >= 2 &&
+        args.at(1) == QStringLiteral("--viewer-session-state-regression")) {
+        return runViewerSessionStateRegression(a, args);
+    }
 
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--value-find-benchmark")) {
         return runValueFindBenchmark(args);
@@ -2260,6 +2523,11 @@ int main(int argc, char *argv[]) {
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--bit-state-render-regression")) {
         qputenv("WV_VIEWER_STRICT_RENDER_CHECKS", QByteArray("1"));
         return runBitStateRenderRegression(a, args);
+    }
+
+    if (args.size() >= 2 && args.at(1) == QStringLiteral("--lod-disappearance-stress")) {
+        qputenv("WV_VIEWER_STRICT_RENDER_CHECKS", QByteArray("1"));
+        return runLodDisappearanceStress(a, args);
     }
 
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--lod-visual-compare")) {

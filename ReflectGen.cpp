@@ -101,6 +101,7 @@ namespace
         std::string annotatedPointerCountExpr;
         bool annotatedPointerTargetArray = false;
         bool annotatedPointerStorageArray = false;
+        bool privateTrace = false;
     };
 
     struct TemplateParamInfo
@@ -138,6 +139,7 @@ namespace
         // must use ::Foo rather than an elaborated type specifier like struct ::Foo.
         bool isAnonymousTypedefAlias = false;
         bool allowPrivateReflect = false;
+        bool allowMarkedPrivateReflect = false;
         RecordTemplateKind templateKind = RecordTemplateKind::None;
         std::vector<TemplateParamInfo> templateParams;
         std::string explicitReflectedType;
@@ -319,12 +321,14 @@ namespace
         std::size_t fieldsKept = 0;
         std::size_t fieldsSkippedEmptyName = 0;
         std::size_t fieldsSkippedSystemC = 0;
-        std::vector<std::string> annotatedPointerErrors;
+        std::size_t fieldsSkippedNoTrace = 0;
+        std::vector<std::string> fieldAnnotationErrors;
     };
 
     bool gDebugAst = false;
 
     static const char* kReflectFriendMarkerTypeAliasName = "wave_reflect_friend_marker_do_not_use";
+    static const char* kReflectMarkedFriendMarkerTypeAliasName = "wave_reflect_marked_friend_marker_do_not_use";
 
     // Hot-path caches for repeated source-path, source-text, and record-access
     // checks during one aggregate parse.
@@ -415,7 +419,7 @@ namespace
 
     bool CursorHasReflectAccessFriend(CXTranslationUnit tu, CXCursor cursor);
 
-    bool RecordAllowsAccess(const RecordInfo& rec, CX_CXXAccessSpecifier access);
+    bool FieldAllowsAccess(const RecordInfo& rec, const FieldInfo& field);
 
     void PrintUsage();
 
@@ -560,6 +564,16 @@ namespace
     void PrintFileOpenFailure(const std::string& label, const std::string& path);
 
     bool FlushAndCheckFile(std::ofstream& os, const std::string& path, const std::string& label);
+
+    bool OpenGeneratedOutputFile(const std::string& path,
+                                 std::string& temporaryPath,
+                                 std::ofstream& os,
+                                 const std::string& label);
+
+    bool CommitGeneratedOutputFile(std::ofstream& os,
+                                   const std::string& temporaryPath,
+                                   const std::string& path,
+                                   const std::string& label);
 
     void RunClangxxDiagnosticProbe(const Options& opt);
 
@@ -1086,10 +1100,31 @@ namespace
         return true;
     }
 
-    std::string PointerAnnotationFromFieldTokens(CXTranslationUnit tu,
-                                                 CXCursor fieldCursor)
+    std::string ReflectionAnnotationFromFieldTokens(CXTranslationUnit tu,
+                                                    CXCursor fieldCursor,
+                                                    std::string* privateTraceMember)
     {
-        const auto parseTokens = [](const std::string& source) -> std::string {
+        const auto parseTokens = [privateTraceMember](const std::string& source) -> std::string {
+            const auto containsMacro = [&source](const std::string& macro) {
+                std::size_t pos = source.find(macro);
+                while (pos != std::string::npos)
+                {
+                    const bool leftBoundary = pos == 0u ||
+                        (!std::isalnum(static_cast<unsigned char>(source[pos - 1u])) && source[pos - 1u] != '_');
+                    const std::size_t end = pos + macro.size();
+                    const bool rightBoundary = end >= source.size() ||
+                        (!std::isalnum(static_cast<unsigned char>(source[end])) && source[end] != '_');
+                    if (leftBoundary && rightBoundary) return true;
+                    pos = source.find(macro, end);
+                }
+                return false;
+            };
+
+            if (containsMacro("WAVE_TRACE_PRIVATE") && privateTraceMember)
+                *privateTraceMember = "marked";
+
+            if (containsMacro("WAVE_NO_TRACE")) return "wavetrace.no_trace";
+
             const std::string arrayMacro = "WAVE_PTR_ARRAY";
             const std::size_t arrayPos = source.find(arrayMacro);
             if (arrayPos != std::string::npos)
@@ -1109,23 +1144,9 @@ namespace
                 }
             }
 
-            const std::string scalarMacro = "WAVE_PTR";
-            std::size_t pos = source.find(scalarMacro);
-            while (pos != std::string::npos)
-            {
-                const bool leftBoundary = pos == 0u ||
-                    (!std::isalnum(static_cast<unsigned char>(source[pos - 1u])) && source[pos - 1u] != '_');
-                const std::size_t end = pos + scalarMacro.size();
-                const bool rightBoundary = end >= source.size() ||
-                    (!std::isalnum(static_cast<unsigned char>(source[end])) && source[end] != '_');
-                if (leftBoundary && rightBoundary) return "wavetrace.ptr";
-                pos = source.find(scalarMacro, end);
-            }
+            if (containsMacro("WAVE_PTR")) return "wavetrace.ptr";
             return std::string();
         };
-
-        std::string result = parseTokens(GetCursorSourceText(tu, fieldCursor));
-        if (!result.empty()) return result;
 
         CXFile file = NULL;
         unsigned offset = 0;
@@ -1140,7 +1161,7 @@ namespace
         while (beginOffset > 0u)
         {
             const char c = fileText[beginOffset - 1u];
-            if (c == ';' || c == '{' || c == '}') break;
+            if (c == ';' || c == '{' || c == '}' || c == '\n' || c == '\r') break;
             --beginOffset;
         }
         if (beginOffset >= offset) return std::string();
@@ -1177,10 +1198,10 @@ namespace
             if ((state == StringLiteral && c == '"') || (state == CharLiteral && c == '\'')) state = Normal;
             prefix += ' ';
         }
-        result = parseTokens(prefix);
+        const std::string result = parseTokens(prefix);
         if (gDebugAst)
         {
-            std::cerr << "[pointer annotation token fallback] field="
+            std::cerr << "[reflection annotation token fallback] field="
                       << ToStdString(clang_getCursorSpelling(fieldCursor))
                       << " direct=[" << ShortenForDebugLog(GetCursorSourceText(tu, fieldCursor), 360u)
                       << "] prefix=[" << ShortenForDebugLog(prefix, 360u)
@@ -1204,10 +1225,10 @@ namespace
             std::to_string(column) + ": error: " + message;
     }
 
-    void CollectAnnotatedPointerMetadata(CXCursor fieldCursor,
-                                         const RecordInfo& owner,
-                                         FieldInfo& field,
-                                         CollectContext* ctx)
+    bool CollectFieldAnnotationMetadata(CXCursor fieldCursor,
+                                        const RecordInfo& owner,
+                                        FieldInfo& field,
+                                        CollectContext* ctx)
     {
         struct Payload
         {
@@ -1225,6 +1246,45 @@ namespace
             },
             &payload);
 
+        std::string tokenPrivateTraceMember;
+        std::string tokenAnnotation;
+        if (ctx)
+        {
+            tokenAnnotation = ReflectionAnnotationFromFieldTokens(
+                ctx->tu, fieldCursor, &tokenPrivateTraceMember);
+        }
+
+        for (std::size_t i = 0; i < payload.annotations.size(); ++i)
+        {
+            if (payload.annotations[i] == "wavetrace.no_trace")
+            {
+                if (ctx) ++ctx->fieldsSkippedNoTrace;
+                PrintCursorDebugLine("[field skipped]", fieldCursor,
+                    "reason=WAVE_NO_TRACE owner=[" + owner.qualifiedName + "] field=[" + field.name + "]");
+                return false;
+            }
+        }
+        if (tokenAnnotation == "wavetrace.no_trace")
+        {
+            ++ctx->fieldsSkippedNoTrace;
+            PrintCursorDebugLine("[field skipped]", fieldCursor,
+                "reason=WAVE_NO_TRACE-token-fallback owner=[" + owner.qualifiedName + "] field=[" + field.name + "]");
+            return false;
+        }
+
+        bool privateTrace = false;
+        for (std::size_t i = 0; i < payload.annotations.size(); ++i)
+        {
+            const std::string& candidate = payload.annotations[i];
+            if (candidate == "wavetrace.private_trace")
+            {
+                privateTrace = true;
+                break;
+            }
+        }
+        if (!privateTrace && !tokenPrivateTraceMember.empty()) privateTrace = true;
+        field.privateTrace = privateTrace;
+
         std::string annotation;
         for (std::size_t i = 0; i < payload.annotations.size(); ++i)
         {
@@ -1236,24 +1296,18 @@ namespace
                 {
                     field.annotatedPointerKind = AnnotatedPointerKind::Strong;
                     field.annotatedPointerCountExpr = "1";
-                    if (ctx) ctx->annotatedPointerErrors.push_back(
+                    if (ctx) ctx->fieldAnnotationErrors.push_back(
                         FormatAnnotatedPointerDiagnostic(
                             fieldCursor,
                             owner.qualifiedName + "::" + field.name +
                             ": multiple conflicting WaveTrace pointer annotations"));
-                    return;
+                    return true;
                 }
                 annotation = candidate;
             }
         }
-        if (annotation.empty() && ctx)
-        {
-            // Some libclang versions omit AnnotateAttr children for dependent
-            // template fields such as `WAVE_PTR T*`. The original field tokens
-            // still retain the macro spelling, so use them as a narrow fallback.
-            annotation = PointerAnnotationFromFieldTokens(ctx->tu, fieldCursor);
-        }
-        if (annotation.empty()) return;
+        if (annotation.empty()) annotation = tokenAnnotation;
+        if (annotation.empty()) return true;
 
         field.annotatedPointerKind = AnnotatedPointerKind::Strong;
         field.annotatedPointerCountExpr = "1";
@@ -1325,12 +1379,13 @@ namespace
 
         if (!error.empty() && ctx)
         {
-            ctx->annotatedPointerErrors.push_back(
+            ctx->fieldAnnotationErrors.push_back(
                 FormatAnnotatedPointerDiagnostic(
                     fieldCursor,
                     owner.qualifiedName + "::" + field.name + ": " + error +
                     " (type='" + field.typeName + "')"));
         }
+        return true;
     }
 
     bool IsDirectWavePtrField(const FieldInfo& field)
@@ -2036,6 +2091,8 @@ namespace
     {
         // Macro spellings are accepted in record-body token fallback.
         if (spelling == "WAVE_REFLECT_FRIEND" ||
+            spelling == "WAVE_REFLECT_MARKED_FRIEND" ||
+            spelling == "WAVE_TRACE_PRIVATE" ||
             spelling == "WAVE_REFLECT_ACCESS" ||
             spelling == "REFLECT_FRIEND")
         {
@@ -2146,7 +2203,7 @@ namespace
         return gSourceFileTextCache[key];
     }
 
-    bool CursorHasReflectFriendMarkerDecl(CXCursor cursor)
+    bool CursorHasMarkerDecl(CXCursor cursor, const char* markerName)
     {
         struct Payload
         {
@@ -2154,14 +2211,21 @@ namespace
         } payload;
         payload.found = false;
 
+        struct MarkerPayload
+        {
+            Payload* result;
+            const char* markerName;
+        } markerPayload{ &payload, markerName };
+
         clang_visitChildren(
             cursor,
             [](CXCursor child, CXCursor, CXClientData clientData) {
-                Payload* p = static_cast<Payload*>(clientData);
+                MarkerPayload* marker = static_cast<MarkerPayload*>(clientData);
+                Payload* p = marker->result;
                 if (p->found) return CXChildVisit_Break;
 
                 const std::string name = ToStdString(clang_getCursorSpelling(child));
-                if (name != kReflectFriendMarkerTypeAliasName)
+                if (name != marker->markerName)
                 {
                     return CXChildVisit_Continue;
                 }
@@ -2184,9 +2248,34 @@ namespace
 
                 return CXChildVisit_Continue;
             },
-            &payload);
+            &markerPayload);
 
         return payload.found;
+    }
+
+    bool CursorHasReflectFriendMarkerDecl(CXCursor cursor)
+    {
+        return CursorHasMarkerDecl(cursor, kReflectFriendMarkerTypeAliasName);
+    }
+
+    bool CursorHasReflectMarkedFriendMarkerDecl(CXCursor cursor)
+    {
+        return CursorHasMarkerDecl(cursor, kReflectMarkedFriendMarkerTypeAliasName);
+    }
+
+    bool CursorHasReflectMarkedFriend(CXTranslationUnit tu, CXCursor cursor)
+    {
+        if (CursorHasReflectMarkedFriendMarkerDecl(cursor)) return true;
+        if (!tu) return false;
+        ScopedTokens tokens(tu, clang_getCursorExtent(cursor));
+        for (unsigned i = 0; i < tokens.size(); ++i)
+        {
+            if (clang_getTokenKind(tokens[i]) != CXToken_Identifier) continue;
+            const std::string spelling = ToStdString(clang_getTokenSpelling(tu, tokens[i]));
+            if (spelling == "WAVE_REFLECT_MARKED_FRIEND" ||
+                spelling == "WAVE_TRACE_PRIVATE") return true;
+        }
+        return false;
     }
 
     bool CursorExpansionLocationIsFromMainFile(CXTranslationUnit tu, CXCursor cursor)
@@ -2257,9 +2346,10 @@ namespace
         return result;
     }
 
-    bool RecordAllowsAccess(const RecordInfo& rec, CX_CXXAccessSpecifier access)
+    bool FieldAllowsAccess(const RecordInfo& rec, const FieldInfo& field)
     {
-        return rec.allowPrivateReflect || IsPublicAccess(access);
+        return rec.allowPrivateReflect || IsPublicAccess(field.access) ||
+            (rec.allowMarkedPrivateReflect && field.privateTrace);
     }
 
     void PrintUsage()
@@ -3164,6 +3254,7 @@ namespace
             << " fieldsKept=" << ctx.fieldsKept
             << " fieldsSkippedEmptyName=" << ctx.fieldsSkippedEmptyName
             << " fieldsSkippedSystemC=" << ctx.fieldsSkippedSystemC
+            << " fieldsSkippedNoTrace=" << ctx.fieldsSkippedNoTrace
             << " emittedRecords=" << ctx.records.size()
             << "\n";
 
@@ -3183,12 +3274,12 @@ namespace
         }
     }
 
-    bool AnnotatedPointerMetadataIsValid(const CollectContext& ctx)
+    bool FieldAnnotationMetadataIsValid(const CollectContext& ctx)
     {
-        if (ctx.annotatedPointerErrors.empty()) return true;
-        for (std::size_t i = 0; i < ctx.annotatedPointerErrors.size(); ++i)
+        if (ctx.fieldAnnotationErrors.empty()) return true;
+        for (std::size_t i = 0; i < ctx.fieldAnnotationErrors.size(); ++i)
         {
-            std::cerr << ctx.annotatedPointerErrors[i] << "\n";
+            std::cerr << ctx.fieldAnnotationErrors[i] << "\n";
         }
         return false;
     }
@@ -3574,7 +3665,11 @@ namespace
                             " width=" + std::to_string(f.bitWidth));
                     }
                 }
-                CollectAnnotatedPointerMetadata(child, *out, f, ctx);
+                if (!CollectFieldAnnotationMetadata(child, *out, f, ctx))
+                {
+                    if (payload->foundBody) *payload->foundBody = true;
+                    return CXChildVisit_Continue;
+                }
                 if (!ShouldCollectReflectedField(*out, f, ctx))
                 {
                     if (payload->foundBody) *payload->foundBody = true;
@@ -3591,8 +3686,9 @@ namespace
 
     void CollectRecordBody(CXTranslationUnit tu, CXCursor recordCursor, RecordInfo& rec, CollectContext* ctx)
     {
+        rec.allowMarkedPrivateReflect = CursorHasReflectMarkedFriend(tu, recordCursor);
         const bool friendAllowedBeforeFields = CursorHasReflectAccessFriend(tu, recordCursor);
-        if (friendAllowedBeforeFields)
+        if (friendAllowedBeforeFields && !rec.allowMarkedPrivateReflect)
         {
             rec.allowPrivateReflect = true;
             PrintCursorDebugLine("[friend kept]", recordCursor,
@@ -3747,7 +3843,10 @@ namespace
                         f.bitWidth = clang_getFieldDeclBitWidth(child);
                         f.bitOffset = clang_Cursor_getOffsetOfField(child);
                     }
-                    CollectAnnotatedPointerMetadata(child, *out, f, ctx);
+                    if (!CollectFieldAnnotationMetadata(child, *out, f, ctx))
+                    {
+                        return CXChildVisit_Continue;
+                    }
                     if (!ShouldCollectReflectedField(*out, f, ctx))
                     {
                         return CXChildVisit_Continue;
@@ -3766,7 +3865,8 @@ namespace
 
                 if (kind == CXCursor_FriendDecl)
                 {
-                    if (FriendDeclAllowsReflectAccess(payload->tu, child))
+                    if (FriendDeclAllowsReflectAccess(payload->tu, child) &&
+                        !out->allowMarkedPrivateReflect)
                     {
                         out->allowPrivateReflect = true;
                         PrintCursorDebugLine("[friend kept]", child, "owner=[" + out->qualifiedName + "] reason=friend-decl-text text=[" + ShortenForDebugLog(GetCursorSourceText(payload->tu, child)) + "]");
@@ -3823,7 +3923,8 @@ namespace
         rec.semanticParentQualifiedName = GetQualifiedName(clang_getCursorSemanticParent(cursor));
         rec.accessPathPublic = CursorAccessPathIsPublicOrTopLevel(cursor);
         rec.isStruct = true;
-        if (CursorHasReflectAccessFriend(tu, cursor))
+        rec.allowMarkedPrivateReflect = CursorHasReflectMarkedFriend(tu, cursor);
+        if (CursorHasReflectAccessFriend(tu, cursor) && !rec.allowMarkedPrivateReflect)
         {
             rec.allowPrivateReflect = true;
             PrintCursorDebugLine("[friend kept]", cursor,
@@ -3900,7 +4001,8 @@ namespace
 
                 if (kind == CXCursor_FriendDecl)
                 {
-                    if (FriendDeclAllowsReflectAccess(payload->tu, child))
+                    if (FriendDeclAllowsReflectAccess(payload->tu, child) &&
+                        !out->allowMarkedPrivateReflect)
                     {
                         out->allowPrivateReflect = true;
                         PrintCursorDebugLine("[friend kept]", child, "owner=[" + out->qualifiedName + "] reason=class-template-friend-decl text=[" + ShortenForDebugLog(GetCursorSourceText(payload->tu, child)) + "]");
@@ -4097,7 +4199,11 @@ namespace
                             f.bitWidth = clang_getFieldDeclBitWidth(child);
                             f.bitOffset = clang_Cursor_getOffsetOfField(child);
                         }
-                        CollectAnnotatedPointerMetadata(child, *out, f, payload->ctx);
+                        if (!CollectFieldAnnotationMetadata(child, *out, f, payload->ctx))
+                        {
+                            *foundBody = true;
+                            return CXChildVisit_Continue;
+                        }
                         if (!ShouldCollectReflectedField(*out, f, payload->ctx))
                         {
                             *foundBody = true;
@@ -4874,6 +4980,146 @@ namespace
         return true;
     }
 
+    bool FilesHaveIdenticalContents(const std::string& leftPath,
+                                    const std::string& rightPath)
+    {
+        std::ifstream left(leftPath.c_str(), std::ios::in | std::ios::binary);
+        std::ifstream right(rightPath.c_str(), std::ios::in | std::ios::binary);
+        if (!left || !right) return false;
+
+        left.seekg(0, std::ios::end);
+        right.seekg(0, std::ios::end);
+        const std::streamoff leftSize = left.tellg();
+        const std::streamoff rightSize = right.tellg();
+        if (leftSize < 0 || rightSize < 0 || leftSize != rightSize) return false;
+        left.seekg(0, std::ios::beg);
+        right.seekg(0, std::ios::beg);
+
+        char leftBuffer[64u * 1024u];
+        char rightBuffer[64u * 1024u];
+        while (left && right)
+        {
+            left.read(leftBuffer, static_cast<std::streamsize>(sizeof(leftBuffer)));
+            right.read(rightBuffer, static_cast<std::streamsize>(sizeof(rightBuffer)));
+            const std::streamsize leftCount = left.gcount();
+            const std::streamsize rightCount = right.gcount();
+            if (leftCount != rightCount) return false;
+            if (leftCount == 0) break;
+            if (std::memcmp(leftBuffer, rightBuffer,
+                            static_cast<std::size_t>(leftCount)) != 0) return false;
+        }
+        return left.eof() && right.eof();
+    }
+
+    bool OpenGeneratedOutputFile(const std::string& path,
+                                 std::string& temporaryPath,
+                                 std::ofstream& os,
+                                 const std::string& label)
+    {
+        temporaryPath = MakeWavePtrConfigTemporaryPath(path);
+        errno = 0;
+        os.open(temporaryPath.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!os)
+        {
+            PrintFileOpenFailure(label, temporaryPath);
+            temporaryPath.clear();
+            return false;
+        }
+        return true;
+    }
+
+    bool CommitGeneratedOutputFile(std::ofstream& os,
+                                   const std::string& temporaryPath,
+                                   const std::string& path,
+                                   const std::string& label)
+    {
+        if (!FlushAndCheckFile(os, temporaryPath, label))
+        {
+            os.close();
+            std::remove(temporaryPath.c_str());
+            return false;
+        }
+        os.close();
+        if (!os)
+        {
+            PrintFileOpenFailure(label, temporaryPath);
+            std::remove(temporaryPath.c_str());
+            return false;
+        }
+
+        if (IsExistingRegularFile(path) &&
+            FilesHaveIdenticalContents(temporaryPath, path))
+        {
+            std::remove(temporaryPath.c_str());
+            std::cout << "[generated output] unchanged: " << path << "\n";
+            return true;
+        }
+
+        PrepareOutputFileForOverwrite(path);
+#ifdef _WIN32
+        static const DWORD retryDelayMs[] = { 0, 10, 25, 50, 100, 200, 400 };
+        DWORD replaceError = ERROR_SUCCESS;
+        for (std::size_t attempt = 0;
+             attempt < sizeof(retryDelayMs) / sizeof(retryDelayMs[0]);
+             ++attempt)
+        {
+            if (retryDelayMs[attempt] != 0) Sleep(retryDelayMs[attempt]);
+            if (MoveFileExA(temporaryPath.c_str(), path.c_str(),
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            {
+                std::cout << "[generated output] updated: " << path << "\n";
+                return true;
+            }
+            replaceError = GetLastError();
+            if (!IsTransientWavePtrConfigReplaceError(replaceError)) break;
+        }
+
+        if (IsExistingRegularFile(path) &&
+            FilesHaveIdenticalContents(temporaryPath, path))
+        {
+            // Another ReflectGen process committed the same result while this
+            // process was waiting for the destination. Do not rewrite it and
+            // disturb the timestamp that downstream incremental builds observe.
+            std::remove(temporaryPath.c_str());
+            std::cout << "[generated output] synchronized unchanged: " << path << "\n";
+            return true;
+        }
+
+        // A compiler/editor may allow writes while denying replacement of the
+        // directory entry. Preserve compatibility with that common Windows
+        // sharing mode, but only after the content comparison proved a change.
+        if (CopyFileA(temporaryPath.c_str(), path.c_str(), FALSE))
+        {
+            std::remove(temporaryPath.c_str());
+            std::cout << "[generated output] updated in place: " << path << "\n";
+            return true;
+        }
+        const DWORD copyError = GetLastError();
+        std::remove(temporaryPath.c_str());
+        std::cerr << label << " replace failed: " << path
+                  << " move_win32_error=" << replaceError
+                  << " copy_win32_error=" << copyError << "\n";
+        return false;
+#else
+        int replaceError = 0;
+        for (unsigned attempt = 0; attempt != 4; ++attempt)
+        {
+            if (std::rename(temporaryPath.c_str(), path.c_str()) == 0)
+            {
+                std::cout << "[generated output] updated: " << path << "\n";
+                return true;
+            }
+            replaceError = errno;
+            if (replaceError != EINTR && replaceError != EBUSY && replaceError != EACCES) break;
+            usleep((attempt + 1) * 25000);
+        }
+        std::remove(temporaryPath.c_str());
+        std::cerr << label << " replace failed: " << path
+                  << " errno=" << replaceError << "\n";
+        return false;
+#endif
+    }
+
 
     void RunClangxxDiagnosticProbe(const Options& opt)
     {
@@ -5138,7 +5384,7 @@ namespace
         for (std::size_t i = 0; i < rec.fields.size(); ++i)
         {
             const FieldInfo& f = rec.fields[i];
-            if (!RecordAllowsAccess(rec, f.access))
+            if (!FieldAllowsAccess(rec, f))
             {
                 if (gDebugAst)
                 {
@@ -5380,6 +5626,14 @@ namespace
                 return IsFieldTopologyRelocationSafe(opt, firstField, byName, memo, active) &&
                     IsFieldTopologyRelocationSafe(opt, secondField, byName, memo, active);
             }
+            if ((templateKey == "std::bitset" || templateKey == "bitset") &&
+                arguments.size() == 1u)
+            {
+                // Bitset nodes carry one WVZ4 virtual-subtree descriptor.
+                // Build each descriptor explicitly instead of cloning only the
+                // word tracks and silently losing Viewer expansion metadata.
+                return false;
+            }
             // wave::array/WaveValue, smart pointers, and unknown wrappers own
             // element-specific state or have expansion semantics that cannot be
             // proven relocatable from the declaration alone.
@@ -5417,7 +5671,7 @@ namespace
         for (std::size_t fi = 0; safe && fi < rec.fields.size(); ++fi)
         {
             const FieldInfo& field = rec.fields[fi];
-            if (!RecordAllowsAccess(rec, field.access)) continue;
+            if (!FieldAllowsAccess(rec, field)) continue;
             safe = IsFieldTopologyRelocationSafe(opt, field, byName, memo, active);
         }
         active.erase(key);
@@ -7033,14 +7287,10 @@ namespace
         const Options& opt,
         const std::map<std::string, const RecordInfo*>* globalByName)
     {
-        PrepareOutputFileForOverwrite(opt.outputHeader);
-        errno = 0;
-        std::ofstream os(opt.outputHeader.c_str(), std::ios::binary);
-        if (!os)
-        {
-            PrintFileOpenFailure("[emit generated file error]", opt.outputHeader);
-            return false;
-        }
+        std::string temporaryPath;
+        std::ofstream os;
+        if (!OpenGeneratedOutputFile(opt.outputHeader, temporaryPath, os,
+                                     "[emit generated file error]")) return false;
 
         std::map<std::string, const RecordInfo*> byName;
         if (globalByName) byName = *globalByName;
@@ -7621,7 +7871,8 @@ namespace
         os << "#endif\n\n";
         os << "} // namespace reflect\n\n";
         os << "#endif\n";
-        return FlushAndCheckFile(os, opt.outputHeader, "[emit generated file write error]");
+        return CommitGeneratedOutputFile(os, temporaryPath, opt.outputHeader,
+                                         "[emit generated file write error]");
     }
 
     bool GenerateOneHeader(const Options& baseOpt,
@@ -7714,7 +7965,7 @@ namespace
         const CXCursor root = clang_getTranslationUnitCursor(tu);
         clang_visitChildren(root, AstVisitor, &ctx);
         PrintRecordCollectionSummary(opt, ctx);
-        if (!AnnotatedPointerMetadataIsValid(ctx))
+        if (!FieldAnnotationMetadataIsValid(ctx))
         {
             clang_disposeTranslationUnit(tu);
             clang_disposeIndex(index);
@@ -7772,14 +8023,10 @@ namespace
             return false;
         }
 
-        PrepareOutputFileForOverwrite(aggregateHeader);
-        errno = 0;
-        std::ofstream os(aggregateHeader.c_str(), std::ios::binary);
-        if (!os)
-        {
-            PrintFileOpenFailure("[aggregate header open error]", aggregateHeader);
-            return false;
-        }
+        std::string temporaryPath;
+        std::ofstream os;
+        if (!OpenGeneratedOutputFile(aggregateHeader, temporaryPath, os,
+                                     "[aggregate header open error]")) return false;
 
         const std::string guard = MakeHeaderGuard(aggregateHeader);
         os << "#ifndef " << guard << "\n";
@@ -7804,7 +8051,8 @@ namespace
         }
 
         os << "\n#endif\n";
-        return FlushAndCheckFile(os, aggregateHeader, "[aggregate header write error]");
+        return CommitGeneratedOutputFile(os, temporaryPath, aggregateHeader,
+                                         "[aggregate header write error]");
     }
 
     bool EmitEmptyGeneratedHeader(const std::string& path)
@@ -7816,17 +8064,14 @@ namespace
             return false;
         }
 
-        PrepareOutputFileForOverwrite(path);
-        errno = 0;
-        std::ofstream os(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!os)
-        {
-            PrintFileOpenFailure("[empty generated header open error]", path);
-            return false;
-        }
+        std::string temporaryPath;
+        std::ofstream os;
+        if (!OpenGeneratedOutputFile(path, temporaryPath, os,
+                                     "[empty generated header open error]")) return false;
         os << "#pragma once\n";
         os << "// WaveTrace=false: reflection intentionally omitted.\n";
-        return FlushAndCheckFile(os, path, "[empty generated header write error]");
+        return CommitGeneratedOutputFile(os, temporaryPath, path,
+                                         "[empty generated header write error]");
     }
 
     bool EmitDisabledReflectionHeaders(const Options& opt,
@@ -8317,7 +8562,7 @@ namespace
             for (std::size_t f = 0; f < rec->fields.size(); ++f)
             {
                 const FieldInfo& field = rec->fields[f];
-                if (!RecordAllowsAccess(*rec, field.access))
+                if (!FieldAllowsAccess(*rec, field))
                 {
                     if (gDebugAst)
                     {
@@ -8553,14 +8798,10 @@ namespace
             return false;
         }
 
-        PrepareOutputFileForOverwrite(path);
-        errno = 0;
-        std::ofstream os(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!os)
-        {
-            PrintFileOpenFailure("[batch temporary aggregate input open error]", path);
-            return false;
-        }
+        std::string temporaryPath;
+        std::ofstream os;
+        if (!OpenGeneratedOutputFile(path, temporaryPath, os,
+                                     "[batch temporary aggregate input open error]")) return false;
 
         os << "// Generated by ReflectGen. Do not edit.\n";
         os << "// This file is a temporary aggregate input used to parse all business headers once.\n\n";
@@ -8568,7 +8809,8 @@ namespace
         {
             os << "#include \"" << EscapeString(NormalizePathSlashes(headers[i])) << "\"\n";
         }
-        return FlushAndCheckFile(os, path, "[batch temporary aggregate input write error]");
+        return CommitGeneratedOutputFile(os, temporaryPath, path,
+                                         "[batch temporary aggregate input write error]");
     }
 
     std::string CompileShardTag(unsigned index)
@@ -8587,14 +8829,10 @@ namespace
     bool EmitCompileShardRegistryHeader(const std::string& outputDir, unsigned shardCount)
     {
         const std::string path = JoinPath(outputDir, "root_class_closure_shards_registry.h");
-        PrepareOutputFileForOverwrite(path);
-        errno = 0;
-        std::ofstream os(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!os)
-        {
-            PrintFileOpenFailure("[compile shard registry open error]", path);
-            return false;
-        }
+        std::string temporaryPath;
+        std::ofstream os;
+        if (!OpenGeneratedOutputFile(path, temporaryPath, os,
+                                     "[compile shard registry open error]")) return false;
 
         const std::string guard = MakeHeaderGuard(path);
         os << "#ifndef " << guard << "\n";
@@ -8622,7 +8860,8 @@ namespace
             os << "#include \"" << CompileShardBaseName(i) << "_reflect_auto.h\"\n";
         }
         os << "#endif\n\n#endif\n";
-        return FlushAndCheckFile(os, path, "[compile shard registry write error]");
+        return CommitGeneratedOutputFile(os, temporaryPath, path,
+                                         "[compile shard registry write error]");
     }
 
     bool EmitCompileShardTranslationUnit(const std::string& outputDir,
@@ -8632,14 +8871,10 @@ namespace
         bool disabled)
     {
         const std::string path = JoinPath(outputDir, CompileShardBaseName(shardIndex) + ".cpp");
-        PrepareOutputFileForOverwrite(path);
-        errno = 0;
-        std::ofstream os(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!os)
-        {
-            PrintFileOpenFailure("[compile shard source open error]", path);
-            return false;
-        }
+        std::string temporaryPath;
+        std::ofstream os;
+        if (!OpenGeneratedOutputFile(path, temporaryPath, os,
+                                     "[compile shard source open error]")) return false;
         os << "// Generated by ReflectGen. Do not edit.\n";
         if (!disabled)
         {
@@ -8657,7 +8892,8 @@ namespace
             os << "#endif\n";
         }
         os << "}\n";
-        return FlushAndCheckFile(os, path, "[compile shard source write error]");
+        return CommitGeneratedOutputFile(os, temporaryPath, path,
+                                         "[compile shard source write error]");
     }
 
     bool EmitDisabledCompileShardFiles(const std::string& outputDir, unsigned shardCount)
@@ -8695,7 +8931,7 @@ namespace
         const CXCursor root = clang_getTranslationUnitCursor(tu);
         clang_visitChildren(root, AstVisitor, &ctx);
         PrintRecordCollectionSummary(opt, ctx);
-        if (!AnnotatedPointerMetadataIsValid(ctx)) return false;
+        if (!FieldAnnotationMetadataIsValid(ctx)) return false;
         records.swap(ctx.records);
         return true;
     }
@@ -8900,7 +9136,8 @@ namespace
                 if ((IsRecordKind(kind) || kind == CXCursor_ClassTemplate) && clang_isCursorDefinition(child))
                 {
                     const std::string qn = GetQualifiedName(child);
-                    if (!qn.empty() && CursorHasReflectAccessFriend(p->tu, child))
+                    if (!qn.empty() && CursorHasReflectAccessFriend(p->tu, child) &&
+                        !CursorHasReflectMarkedFriend(p->tu, child))
                     {
                         p->out->insert(qn);
                         if (gDebugAst)
@@ -8979,7 +9216,8 @@ namespace
         {
             RecordInfo& rec = records[i];
             if (rec.qualifiedName.empty()) continue;
-            if (expandedFriendRecords.find(rec.qualifiedName) != expandedFriendRecords.end())
+            if (!rec.allowMarkedPrivateReflect &&
+                expandedFriendRecords.find(rec.qualifiedName) != expandedFriendRecords.end())
             {
                 if (!rec.allowPrivateReflect) ++newlyEnabled;
                 rec.allowPrivateReflect = true;

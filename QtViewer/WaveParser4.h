@@ -20,7 +20,7 @@ public:
         bool loadAllIfWindowEmpty = true;
 
         // When true, outWave.signalList contains every signal definition from
-        // NAME/NODE/SIGT even if its samples are not decoded in this call.
+        // NAME/NODI/SIGD even if its samples are not decoded in this call.
         // Unloaded signal entries have samplesLoaded=false and an empty samples vector.
         bool includeAllSignalDefinitions = false;
 
@@ -48,7 +48,7 @@ public:
         // samplesLoaded=false.
         bool loadRawSamples = true;
 
-        // WVZ4 v15 writers finalize files by writing FOOT and patching
+        // WVZ4 v17 writers finalize files by writing FOOT and patching
         // footer_offset in the header. Keep this false in viewer paths so a
         // killed direct writer cannot be mistaken for a complete waveform.
         bool allowUnfinalized = false;

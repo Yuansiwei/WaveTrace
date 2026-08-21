@@ -91,7 +91,7 @@ struct WaveDiffRegion {
 };
 
 struct WaveSignal {
-    // Stable WVZ4 v15 signal id. MainWindow uses it for on-demand loading without
+    // Stable WVZ4 v17 signal id. MainWindow uses it for on-demand loading without
     // assuming signalList index == file id.
     int signalId = -1;
     // Physical WVZ4 storage stream id. Several logical signal ids may share one
@@ -112,8 +112,18 @@ struct WaveSignal {
     bool proceduralClock = false;
     bool clockInitialValue = false;
     quint64 clockTogglePeriodTicks = 0;
+    // Viewer-only signal synthesized from a canonical std::bitset word stream.
+    // signalId is in the virtual range above the file signal table; storageId
+    // and bitOffset select the physical U64 stream stored in WVZ4.
+    bool virtualBitsetBit = false;
+    // Viewer-only leaf synthesized from an ARRY element schema. The file stores
+    // byte patches for the owning array node instead of a WDAT scalar stream.
+    bool virtualArrayLeaf = false;
+    int arrayNodeId = 0;
+    quint64 arrayByteOffset = 0;
+    int arrayByteWidth = 0;
     // True means samples already cover the whole file time range for this signal.
-    // Directory-only and partial v15 loads leave this false.
+    // Directory-only and partial v17 loads leave this false.
     bool samplesLoaded = true;
     QVector<WaveSample> samples;
     // WVZ4 on-demand display path may keep only the current raw viewport plus
@@ -131,7 +141,7 @@ struct WaveSignal {
     // Derived cache for fast navigation. Contains times where samples[i] differs from samples[i-1].
     QVector<qint64> changeTimes;
     bool changeTimesReady = false;
-    // WVZ4 v15 file-level overview data loaded from chunked LODZ streams.
+    // WVZ4 v17 file-level overview data loaded from chunked LODZ streams.
     QVector<WaveLodLevel> lodLevels;
 };
 
@@ -228,19 +238,69 @@ struct WaveTreeNode {
     bool valid = false;
 };
 
+struct WaveBitsetInfo {
+    int nodeId = 0;
+    int firstStorageId = 0;
+    int bitCount = 0;
+    int wordCount = 0;
+    int firstVirtualSignalId = 0;
+    int firstMaterializedNodeId = 0;
+    bool materialized = false;
+};
+
+enum class WaveArraySchemaKind : quint8 {
+    Object = 1,
+    Field = 2,
+    Array = 3,
+    Leaf = 4
+};
+
+struct WaveArraySchemaNode {
+    int schemaNodeId = 0;
+    int parentSchemaNodeId = 0;
+    quint32 nameToken = 0;
+    WaveArraySchemaKind kind = WaveArraySchemaKind::Field;
+    quint64 byteOffset = 0;
+    quint64 byteSize = 0;
+    quint64 elementCount = 0;
+    quint64 elementStride = 0;
+    quint8 valueType = 0;
+    int bitWidth = 0;
+    int bitOffset = 0;
+};
+
+struct WaveArrayInfo {
+    int nodeId = 0;
+    quint64 totalBytes = 0;
+    quint64 elementCount = 0;
+    quint64 elementStride = 0;
+    QVector<WaveArraySchemaNode> schema;
+    int firstVirtualSignalId = 0;
+    quint64 leafCountPerElement = 0;
+    int firstMaterializedNodeId = 0;
+    quint64 materializedElementCount = 0;
+    bool materialized = false;
+};
+
 constexpr quint8 kWaveTreeNodeKindReference = 7;
 
 struct WaveTreeInfo {
     bool valid = false;
-    // File NAME strings are stored once. Numeric v15 array segments never enter
+    // File NAME strings are stored once. Numeric v17 array segments never enter
     // this table and are formatted only when a consumer actually needs text.
     QVector<QByteArray> namesById;
     QVector<WaveTreeNode> nodesById;
     QVector<int> rootNodeIds;
     QVector<int> signalIndexToNodeId;
-    // Directory-only v15 loads build this while decoding SIGD. Values store
+    // Directory-only v17 loads build this while decoding SIGD. Values store
     // signalIndex + 1 so zero remains the missing-id sentinel used by MainWindow.
     QVector<int> signalIndexBySignalId;
+    QVector<WaveBitsetInfo> bitsets;
+    // Values store bitset index + 1; zero is the non-bitset sentinel.
+    QVector<int> bitsetIndexByNodeId;
+    QVector<WaveArrayInfo> arrays;
+    // Values store array index + 1; zero is the non-array sentinel.
+    QVector<int> arrayIndexByNodeId;
 };
 
 // A subtree-reference patch is built off the UI thread. Negative structural
@@ -498,7 +558,26 @@ inline void hydrateWaveSampleRawFields(const SignalKind kind, const int width, W
     sample.rawFieldsReady = true;
 }
 
+inline QString waveFormatBinaryValue(const quint64 value, const int width) {
+    return QStringLiteral("0b") +
+        QString::number(value & waveBitMaskForWidth(width), 2);
+}
+
+inline QString waveFormatHexValue(const quint64 value, const int width) {
+    return QStringLiteral("0x") +
+        QString::number(value & waveBitMaskForWidth(width), 16).toUpper();
+}
+
+inline QString waveTrimLeadingZeroDigits(QString digits) {
+    int firstNonZero = 0;
+    while (firstNonZero + 1 < digits.size() && digits.at(firstNonZero) == QLatin1Char('0')) {
+        ++firstNonZero;
+    }
+    return firstNonZero == 0 ? digits : digits.mid(firstNonZero);
+}
+
 inline QString waveSampleRawText(const SignalKind kind, const int width, const ValueRadix radix, const WaveSample& sample) {
+    Q_UNUSED(kind);
     // Raw-only WVZ4 samples are formatted from rawBits.  Legacy samples may not
     // have been hydrated yet; in that case preserve their original text instead
     // of accidentally formatting the default rawBits==0 value.
@@ -511,15 +590,13 @@ inline QString waveSampleRawText(const SignalKind kind, const int width, const V
 
     if (sample.isAbsent) return waveAbsentValue();
     if (sample.isZ) return QStringLiteral("Z");
-    if (kind == SignalKind::Bit) return (sample.rawBits & 1ull) ? QStringLiteral("1") : QStringLiteral("0");
-
     const int safeWidth = qMax(1, width);
     const quint64 masked = sample.rawBits & waveBitMaskForWidth(safeWidth);
     switch (radix) {
     case ValueRadix::Bin:
-        return QStringLiteral("0b") + QString::number(masked, 2).rightJustified(safeWidth, QLatin1Char('0'));
+        return waveFormatBinaryValue(masked, safeWidth);
     case ValueRadix::Hex:
-        return QStringLiteral("0x") + QString::number(masked, 16).toUpper().rightJustified(qMax(1, (safeWidth + 3) / 4), QLatin1Char('0'));
+        return waveFormatHexValue(masked, safeWidth);
     case ValueRadix::Float: {
         quint32 bits = quint32(masked & 0xffffffffull);
         float v = 0.0f;

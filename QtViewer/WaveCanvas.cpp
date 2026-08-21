@@ -1597,9 +1597,9 @@ QString WaveCanvas::formatValue(const WaveSignal& sig, const WaveSample& sample,
         const quint64 bits = rawBits;
         switch (format) {
         case ValueRadix::Bin:
-            return QString::number(bits, 2).rightJustified(qMax(1, sig.width), QLatin1Char('0'));
+            return waveFormatBinaryValue(bits, sig.width);
         case ValueRadix::Hex:
-            return QString::number(bits, 16).toUpper().rightJustified(qMax(1, (sig.width + 3) / 4), QLatin1Char('0'));
+            return waveFormatHexValue(bits, sig.width);
         case ValueRadix::Int:
             if (sig.width == 32) return QString::number(static_cast<qint32>(bits & 0xFFFFFFFFu));
             return QString::number(static_cast<qint64>(bits));
@@ -1641,25 +1641,28 @@ QString WaveCanvas::formatValue(const WaveSignal& sig, const WaveSample& sample,
     switch (format) {
     case ValueRadix::Bin:
         if (numericText && canUseRawBitsForDisplay) {
-            return QString::number(bits, 2).rightJustified(qMax(1, sig.width), QLatin1Char('0'));
+            return waveFormatBinaryValue(bits, sig.width);
         }
         if (explicitBinary) {
-            return normalized.toLower().rightJustified(qMax(1, sig.width), QLatin1Char('0'));
+            return QStringLiteral("0b") +
+                waveTrimLeadingZeroDigits(normalized.toLower());
         }
         if (hexText) {
-            return hexToBinaryText(trimmed, sig.width);
+            return QStringLiteral("0b") +
+                waveTrimLeadingZeroDigits(hexToBinaryText(trimmed, sig.width));
         }
         return normalized;
     case ValueRadix::Hex:
         if (numericText && canUseRawBitsForDisplay) {
-            return QString::number(bits, 16).toUpper().rightJustified(qMax(1, (sig.width + 3) / 4), QLatin1Char('0'));
+            return waveFormatHexValue(bits, sig.width);
         }
         if (explicitBinary) {
-            return explicitBinaryToHexText(trimmed, sig.width);
+            return QStringLiteral("0x") +
+                waveTrimLeadingZeroDigits(explicitBinaryToHexText(trimmed, sig.width));
         }
         if (hexText) {
             const QString hexDigits = normalized.toUpper();
-            return hexDigits.rightJustified(qMax(1, (sig.width + 3) / 4), QLatin1Char('0'));
+            return QStringLiteral("0x") + waveTrimLeadingZeroDigits(hexDigits);
         }
         return normalized.toUpper();
     case ValueRadix::Int: {
@@ -2141,6 +2144,9 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                         const int yBusTop = yTop + 8;
                         const int yBusBottom = yTop + m_rowHeight - 8;
                         const qreal penWidth = kWaveStrokeWidth;
+                        WaveSample implicitZeroSample;
+                        implicitZeroSample.rawBits = 0;
+                        implicitZeroSample.rawFieldsReady = true;
                         enum class DenseMiniFrameKind { Known, Z, Absent };
                         QVector<QRect> knownMiniRects;
                         QVector<QRect> zMiniRects;
@@ -2220,20 +2226,43 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                         const bool lodDenseByPixel =
                             lodVisibleCount > qMax(40, plotWidth / 3);
                         if (!lodDenseByPixel) {
-                            for (int i = firstIdx; i < lastExclusive; ++i) {
+                            WaveSample rawAnchorSample;
+                            const WaveSample* currentSample = &implicitZeroSample;
+                            int sampleIndex = lowerSampleIndexForTime(lodSamples, visibleStart);
+                            if (sampleIndex > 0) {
+                                currentSample = &lodSamples.at(sampleIndex - 1);
+                            } else if (waveSignalRawSamplesCoverRange(sig, visibleStart, visibleEnd) &&
+                                       !sig.samples.isEmpty()) {
+                                rawAnchorSample = rawValueAtTime(entry.signalIndex, visibleStart);
+                                currentSample = sampleIsAbsentState(rawAnchorSample)
+                                    ? nullptr : &rawAnchorSample;
+                            }
+                            while (sampleIndex < lodSamples.size() &&
+                                   lodSamples.at(sampleIndex).time <= visibleStart) {
+                                currentSample = &lodSamples.at(sampleIndex);
+                                ++sampleIndex;
+                            }
+
+                            qint64 cursor = visibleStart;
+                            for (int i = sampleIndex; i < lodSamples.size(); ++i) {
                                 const WaveSample& sample = lodSamples.at(i);
-                                const qint64 t0 = sample.time;
-                                const qint64 t1 = (i + 1 < lodSamples.size()) ? lodSamples.at(i + 1).time : visibleEnd;
-                                const qint64 segStart = qMax(t0, visibleStart);
-                                const qint64 segEnd = qMin(qMax(t1, t0 + 1), visibleEnd);
-                                drawBusStableSampleRange(&sample, segStart, segEnd);
+                                if (sample.time >= visibleEnd) break;
+                                if (sample.time > cursor) {
+                                    drawBusStableSampleRange(currentSample, cursor, sample.time);
+                                }
+                                currentSample = &sample;
+                                cursor = qMax(cursor, sample.time);
+                            }
+                            if (cursor < visibleEnd) {
+                                drawBusStableSampleRange(currentSample, cursor, visibleEnd);
                             }
                         } else {
                             WaveSample rawAnchorSample;
-                            const WaveSample* currentSample = nullptr;
+                            const WaveSample* currentSample = &implicitZeroSample;
                             if (waveSignalRawSamplesCoverRange(sig, visibleStart, visibleEnd) && !sig.samples.isEmpty()) {
                                 rawAnchorSample = rawValueAtTime(entry.signalIndex, visibleStart);
-                                if (!sampleIsAbsentState(rawAnchorSample)) currentSample = &rawAnchorSample;
+                                currentSample = sampleIsAbsentState(rawAnchorSample)
+                                    ? nullptr : &rawAnchorSample;
                             }
                             qint64 cursor = visibleStart;
                             for (int i = firstIdx; i < lastExclusive && cursor < visibleEnd; ++i) {

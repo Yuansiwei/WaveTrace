@@ -25,6 +25,7 @@ class QEvent;
 class QLineEdit;
 class QComboBox;
 class QCheckBox;
+class QCloseEvent;
 class QPushButton;
 class QIcon;
 class QSplitter;
@@ -63,6 +64,7 @@ public:
     void resetViewForBenchmark();
     bool benchmarkActiveViewportCoverage(int* covered, int* total) const;
     bool benchmarkValidateRawCaches(QString* error);
+    bool runViewerSessionStateRegressionForBenchmark(QString* error);
     bool runDerivedExpressionForBenchmark(const QString& expression,
                                           int widthOverride,
                                           qint64* elapsedMs,
@@ -81,6 +83,7 @@ public:
                               QString* errorMessage);
 
 protected:
+    void closeEvent(QCloseEvent* event) override;
     bool eventFilter(QObject* watched, QEvent* event) override;
     void dragEnterEvent(QDragEnterEvent* event) override;
     void dragMoveEvent(QDragMoveEvent* event) override;
@@ -88,6 +91,7 @@ protected:
 
 private:
     void openWaveFile();
+    void importSignalPathsFromTextFile();
     void compareWaveFiles();
     void zoomIn();
     void zoomOut();
@@ -142,6 +146,13 @@ private:
         QPushButton* removeButton = nullptr;
     };
 
+    struct ViewerSessionSignal {
+        QString path;
+        QString format;
+        bool selected = false;
+        bool current = false;
+    };
+
     WaveFile m_wave;
     QString m_currentWaveFilePath;
     bool m_currentWaveSupportsOnDemand = false;
@@ -158,6 +169,8 @@ private:
     QLineEdit* m_treeSearchEdit = nullptr;
     QPushButton* m_treeSearchCaseButton = nullptr;
     QPushButton* m_treeSearchRegexButton = nullptr;
+    QPushButton* m_treeSearchPrevButton = nullptr;
+    QPushButton* m_treeSearchNextButton = nullptr;
     QLineEdit* m_activeSearchEdit = nullptr;
     QLineEdit* m_jumpTimeEdit = nullptr;
     QTreeView* m_tree = nullptr;
@@ -184,6 +197,7 @@ private:
     int m_valueFindCurrentHit = -1;
     QDialog* m_signalConditionSearchDialog = nullptr;
     QCheckBox* m_signalConditionScopeCheck = nullptr;
+    QCheckBox* m_signalConditionCropTreeCheck = nullptr;
     QLineEdit* m_signalConditionNameEdit = nullptr;
     QCheckBox* m_signalConditionRegexCheck = nullptr;
     QCheckBox* m_signalConditionCaseCheck = nullptr;
@@ -220,6 +234,15 @@ private:
     quint64 m_deferredViewportApplySerial = 0;
     qint64 m_deferredViewportBucketCycles = 1;
     std::function<void()> m_deferredViewportApply;
+    QSet<QString> m_userExpandedNodePaths;
+    QVector<int> m_treeSearchMatchedNodeIds;
+    QVector<int> m_treeSearchAutoExpandedNodeIds;
+    int m_treeSearchCurrentMatch = -1;
+    bool m_treeSearchCropMode = false;
+    QVector<ViewerSessionSignal> m_pendingSessionSignals;
+    bool m_treeSearchActive = false;
+    bool m_applyingTreeExpansionState = false;
+    bool m_pendingSessionSignalRestore = false;
 
     void buildUi();
     void applyTheme();
@@ -233,6 +256,12 @@ private:
     void stopTreeWarmup();
     void prioritizeTreeReference(int nodeId);
     void resetTreeViewModel();
+    void saveViewerSessionState() const;
+    bool loadViewerSessionState();
+    void retryPendingViewerSessionRestore();
+    void restoreUserTreeExpansionState();
+    void applyTreeSearchExpansion();
+    void navigateTreeSearchMatch(int delta);
     void collectSignalIndexesFromLogicNode(int nodeId, QSet<int>& seen, QList<int>& output) const;
     QList<int> selectedActiveSignalIndexesForJump() const;
     QList<int> selectedActiveSignalIndexesForFind() const;
@@ -268,6 +297,8 @@ private:
     bool handleWaveFileDropEvent(QEvent* event);
 
     void insertSignalIntoTree(const QString& fullName, int signalIndex);
+    void materializeBitsetNode(int nodeId);
+    void materializeArrayNode(int nodeId);
     QList<int> selectedTreeSignalIndexesForViewportJump() const;
     bool selectActiveSignalByIndex(int signalIndex);
     bool canDeferSamplesWithLod(const WaveSignal& sig) const;

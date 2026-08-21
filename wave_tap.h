@@ -298,7 +298,8 @@ private:
         // almost always a bug: either reflection did not instantiate, the root
         // pointer/type is wrong, or the first lazy expansion was empty. Fail here
         // before the recorder opens an irreversible layout.
-        if (tracer_->root_watch_count() != 0u && tracer_->tracks().size() <= 1u) {
+        if (tracer_->root_watch_count() != 0u && tracer_->tracks().size() <= 1u &&
+            tracer_->compact_array_block_count() == 0u) {
             error = "WaveTap lazy topology produced no reflected tracks after add_root; ";
             error += state_summary_();
             return false;

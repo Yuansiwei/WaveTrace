@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -182,6 +183,15 @@ struct topology_type_estimate<std::array<T, N>, void> {
     static constexpr bool generated = false;
     static constexpr TopologyTypeEstimate get() noexcept {
         return detail::repeat_topology_estimate(topology_type_estimate<T>::get(), N);
+    }
+};
+
+template <std::size_t N>
+struct topology_type_estimate<std::bitset<N>, void> {
+    static constexpr bool generated = false;
+    static constexpr TopologyTypeEstimate get() noexcept {
+        return TopologyTypeEstimate(N / 64u + (N % 64u != 0u ? 1u : 0u),
+                                    true, false, false);
     }
 };
 

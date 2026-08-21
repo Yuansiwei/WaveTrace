@@ -13,6 +13,7 @@
 #include <QCoreApplication>
 #include <QDialog>
 #include <QFileDialog>
+#include <QFile>
 #include <QFileInfo>
 #include <QFrame>
 #include <QFont>
@@ -29,6 +30,7 @@
 #include <QClipboard>
 #include <QComboBox>
 #include <QCheckBox>
+#include <QCloseEvent>
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QKeyEvent>
@@ -53,6 +55,7 @@
 #include <QSpinBox>
 #include <QStringList>
 #include <QStatusBar>
+#include <QTextStream>
 #include <QTreeView>
 #include <QTreeWidget>
 #include <QAbstractItemView>
@@ -1276,6 +1279,14 @@ struct SignalLogicTree {
             if (!isValidNodeId(nodeId)) return false;
             const WaveTreeNode& node = waveTree->nodesById.at(nodeId);
             if (node.firstChild != 0) return true;
+            if (nodeId < waveTree->bitsetIndexByNodeId.size() &&
+                waveTree->bitsetIndexByNodeId.at(nodeId) > 0) {
+                return true;
+            }
+            if (nodeId < waveTree->arrayIndexByNodeId.size() &&
+                waveTree->arrayIndexByNodeId.at(nodeId) > 0) {
+                return true;
+            }
             if (node.kind != kWaveTreeNodeKindReference ||
                 node.referenceTargetId <= 0 ||
                 node.referenceTargetId >= waveTree->nodesById.size()) {
@@ -1323,6 +1334,25 @@ struct SignalLogicTree {
 
     void invalidateWaveChildList(int nodeId) {
         if (waveTree) waveChildLists.erase(nodeId);
+    }
+
+    bool isBitsetContainer(int nodeId) const {
+        return waveTree && isValidNodeId(nodeId) &&
+               nodeId < waveTree->bitsetIndexByNodeId.size() &&
+               waveTree->bitsetIndexByNodeId.at(nodeId) > 0;
+    }
+
+    bool isArrayContainer(int nodeId) const {
+        return waveTree && isValidNodeId(nodeId) &&
+               nodeId < waveTree->arrayIndexByNodeId.size() &&
+               waveTree->arrayIndexByNodeId.at(nodeId) > 0;
+    }
+
+    bool arrayHasUnmaterializedElements(int nodeId) const {
+        if (!isArrayContainer(nodeId)) return false;
+        const int encodedIndex = waveTree->arrayIndexByNodeId.at(nodeId);
+        return encodedIndex > 0 && encodedIndex <= waveTree->arrays.size() &&
+               !waveTree->arrays.at(encodedIndex - 1).materialized;
     }
 
     LogicChildList& ensureChildList(int nodeId) {
@@ -1494,6 +1524,50 @@ struct SignalLogicTree {
 
     QString fullPathForSignalIndex(int signalIndex) const {
         return fullPathForNodeId(nodeIdForSignalIndex(signalIndex));
+    }
+
+    QVector<int> materializedNodeChainForPath(const QString& path,
+                                              bool& complete,
+                                              bool& pending) const {
+        complete = false;
+        pending = false;
+        QVector<int> chain;
+        const QStringList parts = splitSearchPath(path);
+        if (parts.isEmpty()) return chain;
+
+        int current = -1;
+        for (int rootNodeId : roots) {
+            if (nodeNameEquals(rootNodeId, parts.first(), Qt::CaseSensitive)) {
+                current = rootNodeId;
+                break;
+            }
+        }
+        if (current < 0) return chain;
+        chain.push_back(current);
+
+        for (int partIndex = 1; partIndex < parts.size(); ++partIndex) {
+            int nextNode = -1;
+            const LogicChildList* list = childListForNode(current);
+            if (list) {
+                for (int childNodeId : list->children) {
+                    if (nodeNameEquals(childNodeId, parts.at(partIndex),
+                                       Qt::CaseSensitive)) {
+                        nextNode = childNodeId;
+                        break;
+                    }
+                }
+            }
+            if (nextNode < 0) {
+                pending = isPendingReference(current) || isBitsetContainer(current) ||
+                          isArrayContainer(current);
+                return chain;
+            }
+            current = nextNode;
+            chain.push_back(current);
+        }
+
+        complete = true;
+        return chain;
     }
 
     QString nodeNameString(int nodeId) const {
@@ -3216,32 +3290,76 @@ public:
     explicit SignalTreeModel(QObject* parent = nullptr)
         : QAbstractItemModel(parent) {}
 
+    void setArrayFetchCallback(std::function<void(int)> callback) {
+        m_arrayFetchCallback = std::move(callback);
+    }
+
     void setLogicTree(SignalLogicTree* tree) {
         beginResetModel();
         m_tree = tree;
         m_searchMode = false;
         m_searchNodeIds.clear();
+        m_searchHighlights.clear();
+        m_currentSearchNodeId = -1;
         clearSearchStorage();
         rebuildRowCache();
         endResetModel();
     }
 
-    void setSearchRoots(const QVector<int>& nodeIds) {
-        beginResetModel();
-        m_searchMode = true;
+    void setSearchRoots(const QVector<int>& nodeIds, bool cropTree = false) {
+        QSet<int> changed = m_searchHighlights;
         m_searchNodeIds = nodeIds;
-        clearSearchStorage();
-        rebuildSearchStorage();
-        endResetModel();
+        m_searchHighlights.clear();
+        for (int nodeId : nodeIds) {
+            if (isValidNode(nodeId)) m_searchHighlights.insert(nodeId);
+        }
+        changed.unite(m_searchHighlights);
+        if (!m_searchHighlights.contains(m_currentSearchNodeId)) {
+            m_currentSearchNodeId = -1;
+        }
+        if (cropTree) {
+            beginResetModel();
+            m_searchMode = true;
+            clearSearchStorage();
+            rebuildSearchStorage();
+            endResetModel();
+            return;
+        }
+        if (m_searchMode) {
+            beginResetModel();
+            m_searchMode = false;
+            clearSearchStorage();
+            endResetModel();
+            return;
+        }
+        emitHighlightChanges(changed);
     }
 
     void clearSearch() {
-        if (!m_searchMode) return;
-        beginResetModel();
-        m_searchMode = false;
+        if (m_searchHighlights.isEmpty() && m_currentSearchNodeId < 0 &&
+            !m_searchMode) return;
+        const QSet<int> changed = m_searchHighlights;
         m_searchNodeIds.clear();
-        clearSearchStorage();
-        endResetModel();
+        m_searchHighlights.clear();
+        m_currentSearchNodeId = -1;
+        if (m_searchMode) {
+            beginResetModel();
+            m_searchMode = false;
+            clearSearchStorage();
+            endResetModel();
+            return;
+        }
+        emitHighlightChanges(changed);
+    }
+
+    void setCurrentSearchNode(int nodeId) {
+        if (!m_searchHighlights.contains(nodeId)) nodeId = -1;
+        if (m_currentSearchNodeId == nodeId) return;
+        QSet<int> changed;
+        if (m_currentSearchNodeId >= 0) changed.insert(m_currentSearchNodeId);
+        if (nodeId >= 0) changed.insert(nodeId);
+        m_currentSearchNodeId = nodeId;
+        emitHighlightChanges(changed);
     }
 
     QModelIndex indexForNode(int nodeId, int column = 0) const {
@@ -3323,6 +3441,16 @@ public:
         return m_tree->hasChildren(parentNodeId);
     }
 
+    bool canFetchMore(const QModelIndex& parent) const override {
+        if (!parent.isValid() || !m_tree || m_searchMode || parent.column() != 0) return false;
+        return m_tree->arrayHasUnmaterializedElements(nodeIdFromIndex(parent));
+    }
+
+    void fetchMore(const QModelIndex& parent) override {
+        if (!canFetchMore(parent) || !m_arrayFetchCallback) return;
+        m_arrayFetchCallback(nodeIdFromIndex(parent));
+    }
+
     QVariant data(const QModelIndex& index, int role = Qt::DisplayRole) const override {
         if (!m_tree || !index.isValid() || index.column() != 0) return QVariant();
         const int nodeId = nodeIdFromIndex(index);
@@ -3344,11 +3472,17 @@ public:
         if (role == Qt::ToolTipRole) {
             return m_tree->fullPathForNodeId(nodeId);
         }
+        if (role == Qt::BackgroundRole) {
+            if (nodeId == m_currentSearchNodeId) return QBrush(QColor("#C97924"));
+            if (m_searchHighlights.contains(nodeId)) return QBrush(QColor("#685A2D"));
+        }
         if (role == Qt::ForegroundRole) {
+            if (m_searchHighlights.contains(nodeId)) return QBrush(QColor("#FFF4D0"));
             if (m_tree->nodeSignalIndex(nodeId) >= 0) return QBrush(QColor("#F2F4F7"));
             return QBrush(QColor("#9CC7FF"));
         }
-        if (role == Qt::FontRole && m_tree->nodeSignalIndex(nodeId) < 0) {
+        if (role == Qt::FontRole &&
+            (m_tree->nodeSignalIndex(nodeId) < 0 || m_searchHighlights.contains(nodeId))) {
             QFont font;
             font.setBold(true);
             return font;
@@ -3389,6 +3523,282 @@ public:
 
     Qt::DropActions supportedDragActions() const override {
         return Qt::CopyAction;
+    }
+
+    bool materializeBitsetChildren(WaveTreeInfo& tree,
+                                   WaveSignalList& signalDefs,
+                                   int nodeId,
+                                   QString& error) {
+        error.clear();
+        if (!m_tree || !m_tree->isBitsetContainer(nodeId) ||
+            nodeId <= 0 || nodeId >= tree.nodesById.size() ||
+            nodeId >= tree.bitsetIndexByNodeId.size()) {
+            return true;
+        }
+        const int encodedIndex = tree.bitsetIndexByNodeId.at(nodeId);
+        if (encodedIndex <= 0 || encodedIndex > tree.bitsets.size()) {
+            error = QStringLiteral("Invalid bitset node metadata");
+            return false;
+        }
+        WaveBitsetInfo& existing = tree.bitsets[encodedIndex - 1];
+        if (existing.materialized) return true;
+        const int bitCount = existing.bitCount;
+        if (bitCount <= 0 ||
+            tree.nodesById.size() > (std::numeric_limits<int>::max)() - bitCount ||
+            signalDefs.size() > std::size_t((std::numeric_limits<int>::max)() - bitCount)) {
+            error = QStringLiteral("Bitset is too large to expand in the Viewer");
+            return false;
+        }
+
+        const int firstNodeId = tree.nodesById.size();
+        const int firstSignalIndex = waveSignalCount(signalDefs);
+        const int firstSignalId = existing.firstVirtualSignalId;
+        const int firstStorageId = existing.firstStorageId;
+        if (firstSignalId <= 0 || firstStorageId <= 0 ||
+            firstSignalId > (std::numeric_limits<int>::max)() - bitCount + 1) {
+            error = QStringLiteral("Invalid bitset virtual signal range");
+            return false;
+        }
+
+        const bool resetSearch = m_searchMode;
+        const QModelIndex parentIndex = indexForNode(nodeId);
+        if (resetSearch) beginResetModel();
+        else beginInsertRows(parentIndex, 0, bitCount - 1);
+
+        tree.nodesById.reserve(firstNodeId + bitCount);
+        tree.signalIndexToNodeId.reserve(firstSignalIndex + bitCount);
+        signalDefs.reserve(std::size_t(firstSignalIndex + bitCount));
+        const int lastSignalId = firstSignalId + bitCount - 1;
+        if (tree.signalIndexBySignalId.size() <= lastSignalId) {
+            tree.signalIndexBySignalId.resize(lastSignalId + 1);
+        }
+
+        for (int bit = 0; bit < bitCount; ++bit) {
+            const int childNodeId = firstNodeId + bit;
+            const int signalIndex = firstSignalIndex + bit;
+            const int signalId = firstSignalId + bit;
+
+            WaveTreeNode child;
+            child.parentId = nodeId;
+            child.nextSibling = bit + 1 < bitCount ? childNodeId + 1 : 0;
+            child.rowInParent = bit;
+            child.signalIndex = signalIndex;
+            child.signalId = signalId;
+            child.nameToken = waveArrayIndexToken(quint32(bit));
+            child.kind = 6; // WVZ4 NodeKind::SignalLeaf
+            child.valid = true;
+            tree.nodesById.push_back(child);
+
+            WaveSignal signal;
+            signal.signalId = signalId;
+            signal.storageId = firstStorageId + bit / 64;
+            signal.bitOffset = bit % 64;
+            signal.kind = SignalKind::Bit;
+            signal.width = 1;
+            signal.defaultRadix = ValueRadix::Bin;
+            signal.currentRadix = ValueRadix::Bin;
+            signal.virtualBitsetBit = true;
+            signal.samplesLoaded = false;
+            signalDefs.push_back(std::move(signal));
+            tree.signalIndexToNodeId.push_back(childNodeId);
+            tree.signalIndexBySignalId[signalId] = signalIndex + 1;
+        }
+        tree.nodesById[nodeId].firstChild = firstNodeId;
+        WaveBitsetInfo& completed = tree.bitsets[encodedIndex - 1];
+        completed.firstMaterializedNodeId = firstNodeId;
+        completed.materialized = true;
+        m_tree->invalidateWaveChildList(nodeId);
+
+        if (resetSearch) {
+            clearSearchStorage();
+            rebuildSearchStorage();
+            endResetModel();
+        } else {
+            endInsertRows();
+            if (parentIndex.isValid()) emit dataChanged(parentIndex, parentIndex);
+        }
+        return true;
+    }
+
+    bool materializeArrayChildren(WaveTreeInfo& tree,
+                                  WaveSignalList& signalDefs,
+                                  int nodeId,
+                                  QString& error) {
+        error.clear();
+        if (!m_tree || !m_tree->isArrayContainer(nodeId) || nodeId <= 0 ||
+            nodeId >= tree.nodesById.size() || nodeId >= tree.arrayIndexByNodeId.size()) {
+            return true;
+        }
+        const int encodedIndex = tree.arrayIndexByNodeId.at(nodeId);
+        if (encodedIndex <= 0 || encodedIndex > tree.arrays.size()) {
+            error = QStringLiteral("Invalid array node metadata");
+            return false;
+        }
+        WaveArrayInfo& info = tree.arrays[encodedIndex - 1];
+        if (info.materialized) return true;
+        if (info.elementCount == 0 || info.elementCount > quint64(0x7fffffffu) ||
+            info.elementCount > quint64(std::numeric_limits<int>::max()) ||
+            info.schema.isEmpty() || info.leafCountPerElement == 0) {
+            error = QStringLiteral("Array is too large or has an invalid element schema");
+            return false;
+        }
+        const quint64 totalSignals = info.elementCount * info.leafCountPerElement;
+        if (totalSignals > quint64(std::numeric_limits<int>::max()) ||
+            info.firstVirtualSignalId <= 0 ||
+            quint64(info.firstVirtualSignalId) + totalSignals - 1 >
+                quint64(std::numeric_limits<int>::max()) ||
+            signalDefs.size() > std::size_t(std::numeric_limits<int>::max()) -
+                                    std::size_t(totalSignals)) {
+            error = QStringLiteral("Array signal range exceeds Viewer limits");
+            return false;
+        }
+
+        static const quint64 kElementBatch = 256;
+        const quint64 firstOuter = info.materializedElementCount;
+        if (firstOuter >= info.elementCount) {
+            info.materialized = true;
+            return true;
+        }
+        const quint64 batchCount = qMin(kElementBatch, info.elementCount - firstOuter);
+
+        const bool resetSearch = m_searchMode;
+        const QModelIndex parentIndex = indexForNode(nodeId);
+        if (resetSearch) beginResetModel();
+        else beginInsertRows(parentIndex, int(firstOuter), int(firstOuter + batchCount - 1));
+
+        const int firstNodeId = tree.nodesById.size();
+        int nextSignalId = 0;
+        QHash<int, int> lastChildByParent;
+        auto appendNode = [&](int parent, quint32 nameToken, quint8 kind) -> int {
+            if (tree.nodesById.size() == std::numeric_limits<int>::max()) return 0;
+            const int id = tree.nodesById.size();
+            WaveTreeNode node;
+            node.parentId = parent;
+            node.nameToken = nameToken;
+            node.kind = kind;
+            node.valid = true;
+            int row = 0;
+            int child = tree.nodesById.at(parent).firstChild;
+            if (child == 0) {
+                tree.nodesById[parent].firstChild = id;
+            } else {
+                const auto found = lastChildByParent.constFind(parent);
+                if (found != lastChildByParent.constEnd()) {
+                    child = found.value();
+                } else {
+                    while (tree.nodesById.at(child).nextSibling != 0) {
+                        child = tree.nodesById.at(child).nextSibling;
+                    }
+                }
+                tree.nodesById[child].nextSibling = id;
+                row = tree.nodesById.at(child).rowInParent + 1;
+            }
+            node.rowInParent = row;
+            tree.nodesById.push_back(node);
+            lastChildByParent.insert(parent, id);
+            return id;
+        };
+        QVector<QVector<int>> schemaChildren(info.schema.size() + 1);
+        for (int i = 0; i < info.schema.size(); ++i) {
+            const int parentSchemaNodeId = info.schema.at(i).parentSchemaNodeId;
+            if (parentSchemaNodeId >= 0 && parentSchemaNodeId < schemaChildren.size()) {
+                schemaChildren[parentSchemaNodeId].push_back(i + 1);
+            }
+        }
+        bool ok = true;
+        std::function<void(int, int, quint64)> expandSchema;
+        expandSchema = [&](int schemaNodeId, int parent, quint64 repeatedOffset) {
+            if (!ok || schemaNodeId <= 0 || schemaNodeId > info.schema.size()) { ok = false; return; }
+            const WaveArraySchemaNode schema = info.schema.at(schemaNodeId - 1);
+            if (schema.kind == WaveArraySchemaKind::Leaf) {
+                int leafNode = parent;
+                if (schema.nameToken != 0) {
+                    leafNode = appendNode(parent, schema.nameToken, 6);
+                    if (leafNode == 0) { ok = false; return; }
+                } else {
+                    tree.nodesById[leafNode].kind = 6;
+                }
+                if (nextSignalId <= 0 || nextSignalId == std::numeric_limits<int>::max()) { ok = false; return; }
+                const int signalIndex = waveSignalCount(signalDefs);
+                WaveSignal signal;
+                signal.signalId = nextSignalId++;
+                signal.storageId = -1;
+                signal.bitOffset = schema.bitOffset;
+                signal.width = qMax(1, schema.bitWidth);
+                signal.kind = signal.width == 1 ? SignalKind::Bit : SignalKind::Bus;
+                const int valueType = int(schema.valueType);
+                if (valueType == 10) signal.defaultRadix = ValueRadix::Float;
+                else if (valueType == 11) signal.defaultRadix = ValueRadix::Double;
+                else if (valueType == 2 || valueType == 4 || valueType == 6) signal.defaultRadix = ValueRadix::Int;
+                else if (valueType == 8) signal.defaultRadix = ValueRadix::Int64;
+                else if (valueType == 9) signal.defaultRadix = ValueRadix::UInt64;
+                else if (signal.width == 1) signal.defaultRadix = ValueRadix::Bin;
+                else signal.defaultRadix = ValueRadix::UInt;
+                signal.currentRadix = signal.defaultRadix;
+                signal.virtualArrayLeaf = true;
+                signal.arrayNodeId = info.nodeId;
+                signal.arrayByteOffset = repeatedOffset + schema.byteOffset;
+                signal.arrayByteWidth = int(schema.byteSize);
+                signal.samplesLoaded = false;
+                signalDefs.push_back(std::move(signal));
+                tree.nodesById[leafNode].signalIndex = signalIndex;
+                tree.nodesById[leafNode].signalId = nextSignalId - 1;
+                tree.signalIndexToNodeId.push_back(leafNode);
+                if (tree.signalIndexBySignalId.size() <= nextSignalId - 1) {
+                    tree.signalIndexBySignalId.resize(nextSignalId);
+                }
+                tree.signalIndexBySignalId[nextSignalId - 1] = signalIndex + 1;
+                return;
+            }
+
+            int container = parent;
+            if (schema.nameToken != 0) {
+                container = appendNode(parent, schema.nameToken, 3);
+                if (container == 0) { ok = false; return; }
+            }
+            const QVector<int>& children = schemaChildren.at(schemaNodeId);
+            if (schema.kind == WaveArraySchemaKind::Array) {
+                if (schema.elementCount > quint64(0x7fffffffu)) { ok = false; return; }
+                for (quint64 i = 0; i < schema.elementCount; ++i) {
+                    const int elementNode = appendNode(container, waveArrayIndexToken(quint32(i)), 4);
+                    if (elementNode == 0) { ok = false; return; }
+                    for (int childSchema : children) {
+                        expandSchema(childSchema, elementNode,
+                                     repeatedOffset + i * schema.elementStride);
+                    }
+                }
+            } else {
+                for (int childSchema : children) expandSchema(childSchema, container, repeatedOffset);
+            }
+        };
+
+        for (quint64 outer = firstOuter; outer < firstOuter + batchCount && ok; ++outer) {
+            nextSignalId = info.firstVirtualSignalId + int(outer * info.leafCountPerElement);
+            const int elementNode = appendNode(nodeId, waveArrayIndexToken(quint32(outer)), 4);
+            if (elementNode == 0) { ok = false; break; }
+            expandSchema(1, elementNode, outer * info.elementStride);
+            const int expectedNext = info.firstVirtualSignalId +
+                                     int((outer + 1) * info.leafCountPerElement);
+            if (nextSignalId != expectedNext) ok = false;
+        }
+        if (!ok) {
+            if (resetSearch) endResetModel(); else endInsertRows();
+            error = QStringLiteral("Failed to materialize the array element schema");
+            return false;
+        }
+        if (info.firstMaterializedNodeId == 0) info.firstMaterializedNodeId = firstNodeId;
+        info.materializedElementCount = firstOuter + batchCount;
+        info.materialized = info.materializedElementCount == info.elementCount;
+        m_tree->invalidateWaveChildList(nodeId);
+        if (resetSearch) {
+            clearSearchStorage();
+            rebuildSearchStorage();
+            endResetModel();
+        } else {
+            endInsertRows();
+            if (parentIndex.isValid()) emit dataChanged(parentIndex, parentIndex);
+        }
+        return true;
     }
 
     bool installReferencePatch(WaveTreeInfo& tree,
@@ -3542,6 +3952,7 @@ public:
 
 private:
     SignalLogicTree* m_tree = nullptr;
+    std::function<void(int)> m_arrayFetchCallback;
     bool m_searchMode = false;
     QVector<int> m_searchNodeIds;
     SmallVec32<int, 32> m_searchRootRows;
@@ -3549,6 +3960,20 @@ private:
     QVector<int> m_searchRowByNodeId;
     QVector<uchar> m_searchVisible;
     QVector<uchar> m_searchSubtreeComplete;
+    QSet<int> m_searchHighlights;
+    int m_currentSearchNodeId = -1;
+
+    void emitHighlightChanges(const QSet<int>& nodeIds) {
+        for (int nodeId : nodeIds) {
+            const QModelIndex changed = indexForNode(nodeId);
+            if (changed.isValid()) {
+                emit dataChanged(changed, changed,
+                                 QVector<int>() << Qt::BackgroundRole
+                                                << Qt::ForegroundRole
+                                                << Qt::FontRole);
+            }
+        }
+    }
 
     const SmallVec32<int, 32>* currentRootRows() const {
         if (!m_tree) return nullptr;
@@ -3685,7 +4110,7 @@ private:
     }
 
     void rebuildRowCache() {
-        // rowInParent is assigned once while building the immutable v15 tree.
+        // rowInParent is assigned once while building the immutable v17 tree.
     }
 
     void collectSignalIndexes(int nodeId, QSet<int>& seen, QList<int>& output) const {
@@ -5115,6 +5540,379 @@ MainWindow::~MainWindow() {
     stopTreeWarmup();
 }
 
+static QString viewerSessionSettingsApplicationName() {
+    const QString testNamespace =
+        qEnvironmentVariable("WV_VIEWER_SESSION_NAMESPACE").trimmed();
+    return testNamespace.isEmpty()
+        ? QStringLiteral("WaveViewer")
+        : QStringLiteral("WaveViewer_%1").arg(testNamespace);
+}
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+    saveViewerSessionState();
+    QMainWindow::closeEvent(event);
+}
+
+void MainWindow::saveViewerSessionState() const {
+    if (m_currentWaveFilePath.isEmpty() || !m_activeList || !m_canvas) return;
+
+    QSettings settings(QStringLiteral("WaveTrace"),
+                       viewerSessionSettingsApplicationName());
+    settings.beginGroup(QStringLiteral("viewerSessionV1"));
+    settings.remove(QString());
+    settings.setValue(QStringLiteral("valid"), true);
+    settings.setValue(QStringLiteral("sourceFile"),
+                      QFileInfo(m_currentWaveFilePath).absoluteFilePath());
+
+    QStringList expandedPaths = m_userExpandedNodePaths.values();
+    std::sort(expandedPaths.begin(), expandedPaths.end());
+    settings.setValue(QStringLiteral("expandedNodes"), expandedPaths);
+
+    const QSet<int> selectedRows = selectedTopLevelIndexes(m_activeList);
+    const int currentRow = m_activeList->currentIndex().isValid()
+        ? m_activeList->currentIndex().row()
+        : -1;
+    settings.beginWriteArray(QStringLiteral("activeSignals"));
+    for (int row = 0; row < m_activeList->topLevelItemCount(); ++row) {
+        QTreeWidgetItem* item = m_activeList->topLevelItem(row);
+        const int signalIndex = signalIndexFromActiveItem(item);
+        const QString path = signalDisplayName(signalIndex);
+        if (path.isEmpty()) continue;
+        settings.setArrayIndex(row);
+        settings.setValue(QStringLiteral("path"), path);
+        settings.setValue(QStringLiteral("format"),
+                          item->data(0, RoleCurrentFormat).toString());
+        settings.setValue(QStringLiteral("selected"), selectedRows.contains(row));
+        settings.setValue(QStringLiteral("current"), row == currentRow);
+    }
+    settings.endArray();
+
+    settings.setValue(QStringLiteral("viewStart"), m_canvas->viewStart());
+    settings.setValue(QStringLiteral("viewEnd"), m_canvas->viewEnd());
+    settings.setValue(QStringLiteral("hasCursor"), m_canvas->cursorTime() >= 0);
+    settings.setValue(QStringLiteral("cursor"), m_canvas->cursorTime());
+    settings.endGroup();
+    settings.sync();
+}
+
+bool MainWindow::loadViewerSessionState() {
+    m_userExpandedNodePaths.clear();
+    m_pendingSessionSignals.clear();
+    m_pendingSessionSignalRestore = false;
+
+    QSettings settings(QStringLiteral("WaveTrace"),
+                       viewerSessionSettingsApplicationName());
+    settings.beginGroup(QStringLiteral("viewerSessionV1"));
+    const bool valid = settings.value(QStringLiteral("valid"), false).toBool();
+    if (!valid) {
+        settings.endGroup();
+        return false;
+    }
+
+    const QStringList expandedPaths =
+        settings.value(QStringLiteral("expandedNodes")).toStringList();
+    for (const QString& path : expandedPaths) {
+        const QString trimmed = path.trimmed();
+        if (!trimmed.isEmpty()) m_userExpandedNodePaths.insert(trimmed);
+    }
+
+    const int activeCount = settings.beginReadArray(QStringLiteral("activeSignals"));
+    m_pendingSessionSignals.reserve(activeCount);
+    for (int row = 0; row < activeCount; ++row) {
+        settings.setArrayIndex(row);
+        ViewerSessionSignal signal;
+        signal.path = settings.value(QStringLiteral("path")).toString().trimmed();
+        signal.format = settings.value(QStringLiteral("format"),
+                                       QStringLiteral("bin")).toString();
+        signal.selected = settings.value(QStringLiteral("selected"), false).toBool();
+        signal.current = settings.value(QStringLiteral("current"), false).toBool();
+        if (!signal.path.isEmpty()) m_pendingSessionSignals.push_back(signal);
+    }
+    settings.endArray();
+
+    const qint64 savedViewStart =
+        settings.value(QStringLiteral("viewStart"), m_wave.meta.start).toLongLong();
+    const qint64 savedViewEnd =
+        settings.value(QStringLiteral("viewEnd"), m_wave.meta.end).toLongLong();
+    const bool hasCursor = settings.value(QStringLiteral("hasCursor"), false).toBool();
+    const qint64 savedCursor = settings.value(QStringLiteral("cursor"), -1).toLongLong();
+    settings.endGroup();
+
+    restoreUserTreeExpansionState();
+    m_pendingSessionSignalRestore = !m_pendingSessionSignals.isEmpty();
+    retryPendingViewerSessionRestore();
+
+    if (m_canvas && savedViewEnd > savedViewStart &&
+        savedViewStart >= m_wave.meta.start && savedViewEnd <= m_wave.meta.end) {
+        m_canvas->commitViewportRange(savedViewStart, savedViewEnd);
+    }
+    if (hasCursor && m_canvas &&
+        savedCursor >= m_wave.meta.start && savedCursor <= m_wave.meta.end) {
+        m_canvas->setCursorTime(savedCursor);
+    }
+    return true;
+}
+
+bool MainWindow::runViewerSessionStateRegressionForBenchmark(QString* error) {
+    if (error) error->clear();
+    if (m_currentWaveFilePath.isEmpty() || !m_tree || !m_treeModel ||
+        !m_signalTreeModel || !m_activeList || !m_canvas ||
+        m_wave.signalList.size() < 2) {
+        if (error) *error = QStringLiteral("Viewer state test prerequisites are missing");
+        return false;
+    }
+
+    SignalTreeModel* model = signalTreeModelFrom(m_treeModel);
+    const QModelIndex root = model ? model->index(0, 0) : QModelIndex();
+    if (!root.isValid() || !model->hasChildren(root)) {
+        if (error) *error = QStringLiteral("Viewer state test needs a container root");
+        return false;
+    }
+    m_tree->expand(root);
+
+    m_activeList->clear();
+    addSignalIndexesToActive(QList<int>() << 0 << 1);
+    if (m_activeList->topLevelItemCount() != 2) {
+        if (error) *error = QStringLiteral("Unable to prepare active signals");
+        return false;
+    }
+    m_activeList->topLevelItem(0)->setData(0, RoleCurrentFormat,
+                                          QStringLiteral("hex"));
+    m_activeList->topLevelItem(1)->setData(0, RoleCurrentFormat,
+                                          QStringLiteral("uint"));
+    if (QItemSelectionModel* selection = m_activeList->selectionModel()) {
+        selection->clearSelection();
+        selection->select(m_activeList->model()->index(1, 0),
+                          QItemSelectionModel::Select |
+                          QItemSelectionModel::Rows);
+        selection->setCurrentIndex(m_activeList->model()->index(1, 0),
+                                   QItemSelectionModel::NoUpdate);
+    }
+    rebuildVisibleSignals();
+
+    const qint64 fullStart = m_canvas->fullStartTime();
+    const qint64 fullEnd = m_canvas->fullEndTime();
+    const qint64 fullSpan = fullEnd - fullStart;
+    if (fullSpan < 4) {
+        if (error) *error = QStringLiteral("Viewer state test needs a wider time range");
+        return false;
+    }
+    const qint64 savedStart = fullStart + fullSpan / 4;
+    const qint64 savedEnd = fullStart + (fullSpan * 3) / 4;
+    const qint64 savedCursor = savedStart + (savedEnd - savedStart) / 2;
+    m_canvas->commitViewportRange(savedStart, savedEnd);
+    m_canvas->setCursorTime(savedCursor);
+    saveViewerSessionState();
+
+    m_applyingTreeExpansionState = true;
+    m_tree->collapseAll();
+    m_applyingTreeExpansionState = false;
+    m_userExpandedNodePaths.clear();
+    m_activeList->clear();
+    m_canvas->resetView();
+    if (!loadViewerSessionState()) {
+        if (error) *error = QStringLiteral("Saved Viewer state was not found");
+        return false;
+    }
+
+    const QSet<int> selectedRows = selectedTopLevelIndexes(m_activeList);
+    const bool ok = m_tree->isExpanded(root) &&
+        m_activeList->topLevelItemCount() == 2 &&
+        signalIndexFromActiveItem(m_activeList->topLevelItem(0)) == 0 &&
+        signalIndexFromActiveItem(m_activeList->topLevelItem(1)) == 1 &&
+        m_activeList->topLevelItem(0)->data(0, RoleCurrentFormat).toString() ==
+            QStringLiteral("hex") &&
+        m_activeList->topLevelItem(1)->data(0, RoleCurrentFormat).toString() ==
+            QStringLiteral("uint") &&
+        selectedRows == QSet<int>() << 1 &&
+        m_canvas->viewStart() == savedStart &&
+        m_canvas->viewEnd() == savedEnd &&
+        m_canvas->cursorTime() == savedCursor;
+    if (!ok && error) {
+        *error = QStringLiteral("Expanded nodes, active selection, formats, viewport, or cursor did not round-trip");
+    }
+    return ok;
+}
+
+void MainWindow::restoreUserTreeExpansionState() {
+    if (!m_tree || !m_treeModel || !m_signalTreeModel || m_treeSearchActive) return;
+    SignalTreeModel* model = signalTreeModelFrom(m_treeModel);
+    if (!model) return;
+
+    QStringList paths = m_userExpandedNodePaths.values();
+    std::sort(paths.begin(), paths.end(), [](const QString& left, const QString& right) {
+        const int leftDepth = left.count(QLatin1Char('.'));
+        const int rightDepth = right.count(QLatin1Char('.'));
+        return leftDepth == rightDepth ? left < right : leftDepth < rightDepth;
+    });
+
+    QSet<QString> stillValid;
+    m_applyingTreeExpansionState = true;
+    for (const QString& path : paths) {
+        bool complete = false;
+        bool pending = false;
+        const QVector<int> chain =
+            m_signalTreeModel->materializedNodeChainForPath(path, complete, pending);
+        if (chain.isEmpty()) continue;
+        if (complete) {
+            const QModelIndex index = model->indexForNode(chain.last());
+            if (index.isValid()) m_tree->expand(index);
+        }
+        const int deepestNode = chain.last();
+        if (m_signalTreeModel->isBitsetContainer(deepestNode)) {
+            materializeBitsetNode(deepestNode);
+        }
+        if (m_signalTreeModel->isArrayContainer(deepestNode)) {
+            materializeArrayNode(deepestNode);
+        }
+        prioritizeTreeReference(deepestNode);
+        if (complete || pending) stillValid.insert(path);
+    }
+    m_applyingTreeExpansionState = false;
+    m_userExpandedNodePaths = stillValid;
+}
+
+void MainWindow::retryPendingViewerSessionRestore() {
+    restoreUserTreeExpansionState();
+    if (!m_pendingSessionSignalRestore || !m_signalTreeModel ||
+        !m_activeList || !m_canvas) {
+        return;
+    }
+
+    QList<int> resolvedIndexes;
+    QVector<ViewerSessionSignal> resolvedSignals;
+    bool waitingForSubtree = false;
+    bool retrySoon = false;
+    for (const ViewerSessionSignal& saved : m_pendingSessionSignals) {
+        bool complete = false;
+        bool pending = false;
+        const QVector<int> chain =
+            m_signalTreeModel->materializedNodeChainForPath(saved.path,
+                                                            complete, pending);
+        if (complete && !chain.isEmpty()) {
+            const int signalIndex = m_signalTreeModel->nodeSignalIndex(chain.last());
+            if (signalIndex >= 0 && signalIndex < m_wave.signalList.size()) {
+                resolvedIndexes.push_back(signalIndex);
+                resolvedSignals.push_back(saved);
+            }
+            continue;
+        }
+        if (!pending || chain.isEmpty()) continue;
+
+        const int deepestNode = chain.last();
+        if (m_signalTreeModel->isBitsetContainer(deepestNode)) {
+            materializeBitsetNode(deepestNode);
+            retrySoon = true;
+        } else if (m_signalTreeModel->isArrayContainer(deepestNode)) {
+            materializeArrayNode(deepestNode);
+            retrySoon = true;
+        } else {
+            prioritizeTreeReference(deepestNode);
+            waitingForSubtree = true;
+        }
+    }
+
+    if (retrySoon) {
+        QTimer::singleShot(0, this, [this]() { retryPendingViewerSessionRestore(); });
+    }
+    if (waitingForSubtree || retrySoon) return;
+
+    m_pendingSessionSignalRestore = false;
+    m_activeList->clear();
+    addSignalIndexesToActive(resolvedIndexes);
+
+    int currentRow = -1;
+    QSet<int> selectedRows;
+    const int restoredCount = qMin(resolvedSignals.size(),
+                                   m_activeList->topLevelItemCount());
+    for (int row = 0; row < restoredCount; ++row) {
+        QTreeWidgetItem* item = m_activeList->topLevelItem(row);
+        item->setData(0, RoleCurrentFormat, resolvedSignals.at(row).format);
+        if (resolvedSignals.at(row).selected) selectedRows.insert(row);
+        if (resolvedSignals.at(row).current) currentRow = row;
+    }
+
+    if (QItemSelectionModel* selection = m_activeList->selectionModel()) {
+        const QSignalBlocker blocker(selection);
+        selection->clearSelection();
+        for (int row : selectedRows) {
+            const QModelIndex index = m_activeList->model()->index(row, 0);
+            selection->select(index, QItemSelectionModel::Select |
+                                     QItemSelectionModel::Rows);
+        }
+        if (currentRow >= 0 && currentRow < restoredCount) {
+            selection->setCurrentIndex(m_activeList->model()->index(currentRow, 0),
+                                       QItemSelectionModel::NoUpdate);
+        }
+    }
+    rebuildVisibleSignals();
+    refreshActiveValueLabels();
+    syncCanvasSelectionFromActiveList(m_canvas, m_activeList);
+    m_pendingSessionSignals.clear();
+}
+
+void MainWindow::applyTreeSearchExpansion() {
+    if (!m_treeSearchActive || !m_tree || !m_treeModel || !m_signalTreeModel) return;
+    SignalTreeModel* model = signalTreeModelFrom(m_treeModel);
+    if (!model) return;
+
+    m_applyingTreeExpansionState = true;
+    for (int i = m_treeSearchAutoExpandedNodeIds.size() - 1; i >= 0; --i) {
+        const int nodeId = m_treeSearchAutoExpandedNodeIds.at(i);
+        const QString path = m_signalTreeModel->fullPathForNodeId(nodeId);
+        if (m_userExpandedNodePaths.contains(path)) continue;
+        const QModelIndex index = model->indexForNode(nodeId);
+        if (index.isValid()) m_tree->collapse(index);
+    }
+    m_treeSearchAutoExpandedNodeIds.clear();
+    if (m_treeSearchCurrentMatch >= 0 &&
+        m_treeSearchCurrentMatch < m_treeSearchMatchedNodeIds.size()) {
+        const int targetNodeId =
+            m_treeSearchMatchedNodeIds.at(m_treeSearchCurrentMatch);
+        model->setCurrentSearchNode(targetNodeId);
+        QVector<int> chain;
+        int current = targetNodeId;
+        int guard = 0;
+        while (m_signalTreeModel->isValidNodeId(current) &&
+               guard++ < m_signalTreeModel->nodeCount()) {
+            chain.push_back(current);
+            current = m_signalTreeModel->nodeParent(current);
+        }
+        // Expand ancestors only.  A container that is itself the match stays
+        // closed, so navigating search results never opens its descendants.
+        for (int i = chain.size() - 1; i >= 1; --i) {
+            const QModelIndex index = model->indexForNode(chain.at(i));
+            if (index.isValid() && !m_tree->isExpanded(index)) {
+                m_tree->expand(index);
+                m_treeSearchAutoExpandedNodeIds.push_back(chain.at(i));
+            }
+        }
+        const QModelIndex target = model->indexForNode(targetNodeId);
+        if (target.isValid()) {
+            m_tree->setCurrentIndex(target);
+            m_tree->scrollTo(target, QAbstractItemView::PositionAtCenter);
+        }
+    } else {
+        model->setCurrentSearchNode(-1);
+    }
+    m_applyingTreeExpansionState = false;
+    if (m_tree->viewport()) m_tree->viewport()->update();
+}
+
+void MainWindow::navigateTreeSearchMatch(int delta) {
+    const int count = m_treeSearchMatchedNodeIds.size();
+    if (!m_treeSearchActive || count <= 0) return;
+    int next = m_treeSearchCurrentMatch;
+    if (next < 0 || next >= count) next = 0;
+    else next = (next + delta + count) % count;
+    m_treeSearchCurrentMatch = next;
+    applyTreeSearchExpansion();
+    if (m_treeSearchEdit) {
+        m_treeSearchEdit->setToolTip(QStringLiteral("Match %1 of %2")
+                                     .arg(next + 1).arg(count));
+    }
+}
+
 bool MainWindow::handleWaveFileDropEvent(QEvent* event) {
     if (!event) return false;
 
@@ -5215,11 +6013,16 @@ void MainWindow::buildUi() {
     m_treeSearchEdit->setObjectName(QStringLiteral("signalTreeSearch"));
     m_treeSearchEdit->setPlaceholderText(QString::fromUtf8("搜索层级名 / 信号名"));
     m_treeSearchEdit->setMinimumWidth(0);
+    m_treeSearchEdit->setClearButtonEnabled(true);
     auto* treeSearchRow = new QHBoxLayout();
     treeSearchRow->setSpacing(4);
     treeSearchRow->setContentsMargins(0, 0, 0, 0);
     m_treeSearchCaseButton = new QPushButton(QStringLiteral("Aa"), leftPane);
     m_treeSearchRegexButton = new QPushButton(QStringLiteral(".*"), leftPane);
+    m_treeSearchPrevButton = new QPushButton(QStringLiteral("↑"), leftPane);
+    m_treeSearchNextButton = new QPushButton(QStringLiteral("↓"), leftPane);
+    m_treeSearchPrevButton->setObjectName(QStringLiteral("signalTreeSearchPrevious"));
+    m_treeSearchNextButton->setObjectName(QStringLiteral("signalTreeSearchNext"));
     auto setupSearchOptionButton = [](QPushButton* button, const QString& tip) {
         button->setCheckable(true);
         button->setObjectName(QStringLiteral("searchOptionButton"));
@@ -5234,7 +6037,17 @@ void MainWindow::buildUi() {
     };
     setupSearchOptionButton(m_treeSearchCaseButton, QStringLiteral("Match case"));
     setupSearchOptionButton(m_treeSearchRegexButton, QStringLiteral("Use regular expression"));
+    for (QPushButton* button : {m_treeSearchPrevButton, m_treeSearchNextButton}) {
+        button->setProperty("searchNavigationButton", true);
+        button->setFixedSize(30, 30);
+        button->setFocusPolicy(Qt::NoFocus);
+        button->setEnabled(false);
+    }
+    m_treeSearchPrevButton->setToolTip(QStringLiteral("Previous search match"));
+    m_treeSearchNextButton->setToolTip(QStringLiteral("Next search match"));
     treeSearchRow->addWidget(m_treeSearchEdit, 1);
+    treeSearchRow->addWidget(m_treeSearchPrevButton);
+    treeSearchRow->addWidget(m_treeSearchNextButton);
     treeSearchRow->addWidget(m_treeSearchCaseButton);
     treeSearchRow->addWidget(m_treeSearchRegexButton);
     leftLayout->addLayout(treeSearchRow);
@@ -5246,6 +6059,8 @@ void MainWindow::buildUi() {
     });
     m_tree = signalTree;
     m_treeModel = new SignalTreeModel(m_tree);
+    signalTreeModelFrom(m_treeModel)->setArrayFetchCallback(
+        [this](int nodeId) { materializeArrayNode(nodeId); });
     m_tree->setModel(m_treeModel);
     m_tree->setItemDelegate(new ReadOnlyTextDelegate(m_tree));
     m_tree->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -5284,6 +6099,11 @@ void MainWindow::buildUi() {
     m_activeList = new ActiveSignalListWidget(middlePane);
     m_activeList->setObjectName(QStringLiteral("activeSignalList"));
     middleLayout->addWidget(m_activeList, 1);
+    auto* importSignalPathsButton = new QPushButton(
+        QStringLiteral("Import signal paths..."), middlePane);
+    importSignalPathsButton->setToolTip(
+        QStringLiteral("Read one full signal path per line from a UTF-8 text file"));
+    middleLayout->addWidget(importSignalPathsButton);
 
     auto* rightPane = new QFrame();
     rightPane->setObjectName("wavePanel");
@@ -5402,6 +6222,8 @@ void MainWindow::buildUi() {
     m_splitter->setSizes(QList<int>() << 330 << 420 << 1110);
 
     connect(btnOpen, &QPushButton::clicked, this, &MainWindow::openWaveFile);
+    connect(importSignalPathsButton, &QPushButton::clicked,
+            this, &MainWindow::importSignalPathsFromTextFile);
     connect(btnCompare, &QPushButton::clicked, this, &MainWindow::compareWaveFiles);
     connect(btnDerivedSignal, &QPushButton::clicked, this, &MainWindow::openDerivedSignalDialog);
     connect(btnZoomIn, &QPushButton::clicked, this, &MainWindow::zoomIn);
@@ -5445,7 +6267,28 @@ void MainWindow::buildUi() {
     connect(m_tree, &QTreeView::expanded, this, [this](const QModelIndex& index) {
         SignalTreeModel* model = signalTreeModelFrom(m_treeModel);
         if (!model) return;
-        prioritizeTreeReference(model->nodeIdFromIndex(index));
+        const int nodeId = model->nodeIdFromIndex(index);
+        if (!m_applyingTreeExpansionState &&
+            !(m_treeSearchActive && m_treeSearchCropMode) &&
+            m_signalTreeModel) {
+            const QString path = m_signalTreeModel->fullPathForNodeId(nodeId);
+            if (!path.isEmpty()) m_userExpandedNodePaths.insert(path);
+        }
+        materializeBitsetNode(nodeId);
+        materializeArrayNode(nodeId);
+        prioritizeTreeReference(nodeId);
+    });
+    connect(m_tree, &QTreeView::collapsed, this, [this](const QModelIndex& index) {
+        if (m_applyingTreeExpansionState ||
+            (m_treeSearchActive && m_treeSearchCropMode) ||
+            !m_signalTreeModel) {
+            return;
+        }
+        SignalTreeModel* model = signalTreeModelFrom(m_treeModel);
+        if (!model) return;
+        const int nodeId = model->nodeIdFromIndex(index);
+        const QString path = m_signalTreeModel->fullPathForNodeId(nodeId);
+        if (!path.isEmpty()) m_userExpandedNodePaths.remove(path);
     });
     connect(m_treeSearchEdit, &QLineEdit::returnPressed, this, [this]() {
         onTreeSearchTextChanged(m_treeSearchEdit ? m_treeSearchEdit->text() : QString());
@@ -5455,6 +6298,17 @@ void MainWindow::buildUi() {
     });
     connect(m_treeSearchRegexButton, &QPushButton::toggled, this, [this](bool) {
         onTreeSearchTextChanged(m_treeSearchEdit ? m_treeSearchEdit->text() : QString());
+    });
+    connect(m_treeSearchPrevButton, &QPushButton::clicked, this, [this]() {
+        navigateTreeSearchMatch(-1);
+    });
+    connect(m_treeSearchNextButton, &QPushButton::clicked, this, [this]() {
+        navigateTreeSearchMatch(1);
+    });
+    connect(m_treeSearchEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
+        if (text.trimmed().isEmpty() && m_treeSearchActive) {
+            onTreeSearchTextChanged(QString());
+        }
     });
 
     connect(m_activeSearchEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
@@ -6243,6 +7097,17 @@ void MainWindow::loadDemoWave() {
 void MainWindow::applyWave(WaveFile&& wave) {
     stopSignalConditionSearch();
     stopTreeWarmup();
+    m_treeSearchActive = false;
+    m_treeSearchCropMode = false;
+    m_treeSearchMatchedNodeIds.clear();
+    m_treeSearchAutoExpandedNodeIds.clear();
+    m_treeSearchCurrentMatch = -1;
+    m_pendingSessionSignals.clear();
+    m_pendingSessionSignalRestore = false;
+    if (m_treeSearchEdit) {
+        const QSignalBlocker blocker(m_treeSearchEdit);
+        m_treeSearchEdit->clear();
+    }
 
     const bool perf = viewerPerfLogEnabled();
     QElapsedTimer totalTimer;
@@ -6311,6 +7176,8 @@ void MainWindow::applyWave(WaveFile&& wave) {
 
     m_activeList->clear();
     m_canvas->setWave(&m_wave);
+    const bool restoredSession = !m_currentWaveFilePath.isEmpty() &&
+                                 loadViewerSessionState();
     if (perf) {
         viewerPerfLog("apply.canvas_bind", stepTimer.restart(),
                       waveSignalCount(m_wave.signalList),
@@ -6330,7 +7197,7 @@ void MainWindow::applyWave(WaveFile&& wave) {
             }
         }
     }
-    addSignalIndexesToActive(initialSignalIndexes);
+    if (!restoredSession) addSignalIndexesToActive(initialSignalIndexes);
     if (perf) {
         viewerPerfLog("apply.first_active", stepTimer.restart(),
                       waveSignalCount(m_wave.signalList),
@@ -6351,6 +7218,7 @@ void MainWindow::applyWave(WaveFile&& wave) {
                       m_activeList->topLevelItemCount());
     }
     scheduleTreeWarmup();
+    retryPendingViewerSessionRestore();
 }
 
 void MainWindow::updateMetaLabel() {
@@ -6419,6 +7287,7 @@ bool MainWindow::openWaveFilePath(const QString& path, bool showError) {
         return false;
     }
 
+    saveViewerSessionState();
     m_currentWaveFilePath = path;
     m_currentWaveSupportsOnDemand = true;
     ++m_viewportLoadSerial;
@@ -6626,6 +7495,67 @@ void MainWindow::openWaveFile() {
     openWaveFilePath(path);
 }
 
+void MainWindow::importSignalPathsFromTextFile() {
+    if (!m_signalTreeModel || !m_activeList) return;
+    const QString path = QFileDialog::getOpenFileName(
+        this,
+        QStringLiteral("Import signal paths"),
+        QString(),
+        QStringLiteral("Text files (*.txt *.list *.lst);;All files (*.*)"));
+    if (path.isEmpty()) return;
+
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QMessageBox::critical(this, QStringLiteral("Import failed"),
+                              QStringLiteral("Cannot read %1: %2")
+                                  .arg(path, file.errorString()));
+        return;
+    }
+
+    QTextStream stream(&file);
+    stream.setCodec("UTF-8");
+    QList<int> signalIndexes;
+    QStringList missingPaths;
+    QSet<QString> seenPaths;
+    int lineNumber = 0;
+    while (!stream.atEnd()) {
+        ++lineNumber;
+        const QString signalPath = stream.readLine().trimmed();
+        if (signalPath.isEmpty() || signalPath.startsWith(QLatin1Char('#'))) continue;
+        if (seenPaths.contains(signalPath)) continue;
+        seenPaths.insert(signalPath);
+
+        int signalIndex = -1;
+        int width = 1;
+        bool ambiguous = false;
+        if (m_signalTreeModel->resolveExactSignalPath(signalPath, signalIndex,
+                                                      width, ambiguous) &&
+            signalIndex >= 0 && signalIndex < m_wave.signalList.size()) {
+            signalIndexes.push_back(signalIndex);
+        } else {
+            missingPaths.push_back(QStringLiteral("line %1: %2%3")
+                .arg(lineNumber)
+                .arg(signalPath)
+                .arg(ambiguous ? QStringLiteral(" (ambiguous)") : QString()));
+        }
+    }
+
+    addSignalIndexesToActive(signalIndexes);
+    const QString summary = QStringLiteral("Imported %1 signal(s); %2 path(s) not found.")
+        .arg(signalIndexes.size()).arg(missingPaths.size());
+    statusBar()->showMessage(summary, 5000);
+    if (!missingPaths.isEmpty()) {
+        const int shown = qMin(20, missingPaths.size());
+        QString details = missingPaths.mid(0, shown).join(QLatin1Char('\n'));
+        if (missingPaths.size() > shown) {
+            details += QStringLiteral("\n... and %1 more")
+                .arg(missingPaths.size() - shown);
+        }
+        QMessageBox::warning(this, QStringLiteral("Signal import incomplete"),
+                             summary + QLatin1Char('\n') + details);
+    }
+}
+
 bool MainWindow::compareWaveFilePaths(const QString& leftPath,
                                       const QString& rightPath,
                                       bool showProgress,
@@ -6727,6 +7657,7 @@ bool MainWindow::compareWaveFilePaths(const QString& leftPath,
 
     const int comparedSignalCount =
         waveSignalCount(comparedWave.signalList);
+    saveViewerSessionState();
     m_currentWaveFilePath.clear();
     m_currentWaveSupportsOnDemand = false;
     if (m_blockCacheLoader) m_blockCacheLoader->stop();
@@ -7012,6 +7943,10 @@ void MainWindow::loadSignalConditionSearchSettings() {
         m_signalConditionScopeCheck->setChecked(
             settings.value(QStringLiteral("selectedSubtree"), false).toBool());
     }
+    if (m_signalConditionCropTreeCheck) {
+        m_signalConditionCropTreeCheck->setChecked(
+            settings.value(QStringLiteral("cropTree"), false).toBool());
+    }
     if (m_signalConditionNameEdit) {
         m_signalConditionNameEdit->setText(
             settings.value(QStringLiteral("name")).toString());
@@ -7058,6 +7993,9 @@ void MainWindow::saveSignalConditionSearchSettings() const {
     settings.setValue(QStringLiteral("selectedSubtree"),
                       m_signalConditionScopeCheck &&
                       m_signalConditionScopeCheck->isChecked());
+    settings.setValue(QStringLiteral("cropTree"),
+                      m_signalConditionCropTreeCheck &&
+                      m_signalConditionCropTreeCheck->isChecked());
     settings.setValue(QStringLiteral("name"),
                       m_signalConditionNameEdit
                           ? m_signalConditionNameEdit->text()
@@ -7110,6 +8048,15 @@ void MainWindow::openSignalConditionSearchDialog() {
         m_signalConditionScopeCheck->setToolTip(
             QStringLiteral("未勾选时查找整个待选信号树。"));
         root->addWidget(m_signalConditionScopeCheck);
+
+        m_signalConditionCropTreeCheck = new QCheckBox(
+            QStringLiteral("Crop tree to matched subtrees"),
+            m_signalConditionSearchDialog);
+        m_signalConditionCropTreeCheck->setObjectName(
+            QStringLiteral("signalConditionCropTree"));
+        m_signalConditionCropTreeCheck->setToolTip(
+            QStringLiteral("When disabled, keep the full tree and highlight matches."));
+        root->addWidget(m_signalConditionCropTreeCheck);
 
         auto* nameRow = new QHBoxLayout();
         nameRow->addWidget(new QLabel(QStringLiteral("名字"), m_signalConditionSearchDialog));
@@ -7213,10 +8160,7 @@ void MainWindow::openSignalConditionSearchDialog() {
         connect(m_signalConditionCancelButton, &QPushButton::clicked,
                 this, &MainWindow::cancelSignalConditionSearch);
         connect(clearResultsButton, &QPushButton::clicked, this, [this]() {
-            SignalTreeModel* model = m_treeModel
-                ? signalTreeModelFrom(m_treeModel)
-                : nullptr;
-            if (model) model->clearSearch();
+            showTreeSearchResults(QString());
             if (m_treeSearchEdit) {
                 const QSignalBlocker blocker(m_treeSearchEdit);
                 m_treeSearchEdit->clear();
@@ -7294,6 +8238,8 @@ void MainWindow::applySignalConditionSearchResults(
         return;
     }
 
+    if (m_treeSearchActive) showTreeSearchResults(QString());
+
     SignalTreeModel* model = m_treeModel
         ? signalTreeModelFrom(m_treeModel)
         : nullptr;
@@ -7302,33 +8248,18 @@ void MainWindow::applySignalConditionSearchResults(
             const QSignalBlocker blocker(m_treeSearchEdit);
             m_treeSearchEdit->clear();
         }
-        model->setSearchRoots(matchedNodeIds);
-
-        auto expandAncestorsTo = [this, model](int nodeId) {
-            if (!m_signalTreeModel) return;
-            QVector<int> chain;
-            int current = nodeId;
-            int guard = 0;
-            while (m_signalTreeModel->isValidNodeId(current) &&
-                   guard++ < m_signalTreeModel->nodeCount()) {
-                chain.push_back(current);
-                current = m_signalTreeModel->nodeParent(current);
-            }
-            for (int i = chain.size() - 1; i >= 1; --i) {
-                const QModelIndex index = model->indexForNode(chain.at(i));
-                if (index.isValid()) m_tree->expand(index);
-            }
-        };
-        const int expandLimit = qMin(matchedNodeIds.size(), 512);
-        for (int i = 0; i < expandLimit; ++i) {
-            expandAncestorsTo(matchedNodeIds.at(i));
-        }
-        if (!matchedNodeIds.isEmpty()) {
-            const QModelIndex first = model->indexForNode(matchedNodeIds.first());
-            if (first.isValid()) {
-                m_tree->scrollTo(first, QAbstractItemView::PositionAtTop);
-            }
-        }
+        m_treeSearchMatchedNodeIds = matchedNodeIds;
+        m_treeSearchCurrentMatch = matchedNodeIds.isEmpty() ? -1 : 0;
+        m_treeSearchActive = true;
+        m_treeSearchCropMode = m_signalConditionCropTreeCheck &&
+                               m_signalConditionCropTreeCheck->isChecked();
+        m_applyingTreeExpansionState = true;
+        model->setSearchRoots(matchedNodeIds, m_treeSearchCropMode);
+        m_applyingTreeExpansionState = false;
+        const bool canNavigate = matchedNodeIds.size() > 1;
+        if (m_treeSearchPrevButton) m_treeSearchPrevButton->setEnabled(canNavigate);
+        if (m_treeSearchNextButton) m_treeSearchNextButton->setEnabled(canNavigate);
+        applyTreeSearchExpansion();
     }
 
     QString summary = QStringLiteral(
@@ -9707,6 +10638,8 @@ void MainWindow::resetTreeViewModel() {
     if (!m_tree) return;
     if (!m_treeModel) {
         m_treeModel = new SignalTreeModel(m_tree);
+        signalTreeModelFrom(m_treeModel)->setArrayFetchCallback(
+            [this](int nodeId) { materializeArrayNode(nodeId); });
         m_tree->setModel(m_treeModel);
     }
     SignalTreeModel* model = signalTreeModelFrom(m_treeModel);
@@ -9727,6 +10660,49 @@ void MainWindow::rebuildTree() {
         m_signalTreeModel->buildFromSignalDefs(m_wave.signalList);
     }
     resetTreeViewModel();
+}
+
+void MainWindow::materializeBitsetNode(int nodeId) {
+    if (!m_signalTreeModel || !m_signalTreeModel->isBitsetContainer(nodeId)) return;
+    SignalTreeModel* model = signalTreeModelFrom(m_treeModel);
+    if (!model) return;
+    const int oldSignalCount = waveSignalCount(m_wave.signalList);
+    QString error;
+    if (!model->materializeBitsetChildren(m_wave.tree, m_wave.signalList,
+                                          nodeId, error)) {
+        QMessageBox::warning(this, QStringLiteral("Expand bitset failed"), error);
+        return;
+    }
+    const int newSignalCount = waveSignalCount(m_wave.signalList);
+    for (int signalIndex = oldSignalCount; signalIndex < newSignalCount; ++signalIndex) {
+        const int signalId = m_wave.signalList.at(signalIndex).signalId;
+        if (signalId <= 0) continue;
+        if (m_signalIndexBySignalId.size() <= signalId) {
+            m_signalIndexBySignalId.resize(signalId + 1);
+        }
+        m_signalIndexBySignalId[signalId] = signalIndex + 1;
+    }
+}
+
+void MainWindow::materializeArrayNode(int nodeId) {
+    if (!m_signalTreeModel || !m_signalTreeModel->isArrayContainer(nodeId)) return;
+    SignalTreeModel* model = signalTreeModelFrom(m_treeModel);
+    if (!model) return;
+    const int oldSignalCount = waveSignalCount(m_wave.signalList);
+    QString error;
+    if (!model->materializeArrayChildren(m_wave.tree, m_wave.signalList, nodeId, error)) {
+        QMessageBox::warning(this, QStringLiteral("Expand array failed"), error);
+        return;
+    }
+    const int newSignalCount = waveSignalCount(m_wave.signalList);
+    for (int signalIndex = oldSignalCount; signalIndex < newSignalCount; ++signalIndex) {
+        const int signalId = m_wave.signalList.at(signalIndex).signalId;
+        if (signalId <= 0) continue;
+        if (m_signalIndexBySignalId.size() <= signalId) {
+            m_signalIndexBySignalId.resize(signalId + 1);
+        }
+        m_signalIndexBySignalId[signalId] = signalIndex + 1;
+    }
 }
 
 void MainWindow::stopTreeWarmup() {
@@ -9864,6 +10840,8 @@ void MainWindow::scheduleTreeWarmup() {
                                         5000);
                                 }
                             }
+                            if (m_treeSearchActive) applyTreeSearchExpansion();
+                            else retryPendingViewerSessionRestore();
                             if (m_tree) m_tree->viewport()->update();
                         }
                         releasePendingBatch();
@@ -9943,9 +10921,31 @@ void MainWindow::showTreeSearchResults(const QString& query) {
     if (!model) return;
 
     const QString q = query.trimmed();
+    if (!q.isEmpty() && m_treeSearchActive && m_treeSearchCropMode) {
+        showTreeSearchResults(QString());
+    }
     if (q.isEmpty()) {
+        m_applyingTreeExpansionState = true;
+        if (!m_treeSearchCropMode) {
+            for (int nodeId : m_treeSearchAutoExpandedNodeIds) {
+                const QModelIndex index = model->indexForNode(nodeId);
+                if (!index.isValid() || !m_tree->isExpanded(index)) continue;
+                const QString path = m_signalTreeModel->fullPathForNodeId(nodeId);
+                if (!path.isEmpty()) m_userExpandedNodePaths.insert(path);
+            }
+        }
         model->clearSearch();
-        m_tree->collapseAll();
+        if (m_treeSearchCropMode) m_tree->collapseAll();
+        m_applyingTreeExpansionState = false;
+        const bool restorePreCropState = m_treeSearchCropMode;
+        m_treeSearchActive = false;
+        m_treeSearchCropMode = false;
+        m_treeSearchMatchedNodeIds.clear();
+        m_treeSearchAutoExpandedNodeIds.clear();
+        m_treeSearchCurrentMatch = -1;
+        if (m_treeSearchPrevButton) m_treeSearchPrevButton->setEnabled(false);
+        if (m_treeSearchNextButton) m_treeSearchNextButton->setEnabled(false);
+        if (restorePreCropState) restoreUserTreeExpansionState();
         if (m_treeSearchEdit) m_treeSearchEdit->setToolTip(QString());
         return;
     }
@@ -9964,43 +10964,33 @@ void MainWindow::showTreeSearchResults(const QString& query) {
         const QRegularExpression re(q, options);
         if (!re.isValid()) {
             model->setSearchRoots(QVector<int>());
+            m_treeSearchActive = true;
+            m_treeSearchCropMode = false;
+            m_treeSearchMatchedNodeIds.clear();
+            m_treeSearchCurrentMatch = -1;
+            if (m_treeSearchPrevButton) m_treeSearchPrevButton->setEnabled(false);
+            if (m_treeSearchNextButton) m_treeSearchNextButton->setEnabled(false);
+            applyTreeSearchExpansion();
             if (m_treeSearchEdit) m_treeSearchEdit->setToolTip(re.errorString());
             return;
         }
     }
     if (m_treeSearchEdit) m_treeSearchEdit->setToolTip(QString());
 
-    const QVector<int> matchedNodeIds = m_signalTreeModel->searchTreeQuery(q, maxResults,
-                                                                           caseSensitivity,
-                                                                           regexMode);
-    model->setSearchRoots(matchedNodeIds);
-
-    // In search mode keep the real tree skeleton.  Expand only ancestor paths
-    // needed to reveal matched nodes; do not expand every matched module subtree,
-    // otherwise a broad module-name search can expand thousands of descendants
-    // and stall the UI.  A matched module remains collapsible/expandable by the
-    // user through its +/- indicator.
-    auto expandAncestorsTo = [this, model](int nodeId) {
-        if (!m_signalTreeModel) return;
-        QVector<int> chain;
-        int cur = nodeId;
-        int guard = 0;
-        while (m_signalTreeModel->isValidNodeId(cur) && guard++ < m_signalTreeModel->nodeCount()) {
-            chain.push_back(cur);
-            cur = m_signalTreeModel->nodeParent(cur);
-        }
-        for (int i = chain.size() - 1; i >= 1; --i) {
-            const QModelIndex idx = model->indexForNode(chain.at(i));
-            if (idx.isValid()) m_tree->expand(idx);
-        }
-    };
-
-    const int expandLimit = qMin(matchedNodeIds.size(), 512);
-    for (int i = 0; i < expandLimit; ++i) expandAncestorsTo(matchedNodeIds.at(i));
-
-    if (!matchedNodeIds.isEmpty()) {
-        const QModelIndex first = model->indexForNode(matchedNodeIds.first());
-        if (first.isValid()) m_tree->scrollTo(first, QAbstractItemView::PositionAtTop);
+    m_treeSearchMatchedNodeIds = m_signalTreeModel->searchTreeQuery(
+        q, maxResults, caseSensitivity, regexMode);
+    m_treeSearchActive = true;
+    m_treeSearchCropMode = false;
+    m_treeSearchCurrentMatch = m_treeSearchMatchedNodeIds.isEmpty() ? -1 : 0;
+    model->setSearchRoots(m_treeSearchMatchedNodeIds, false);
+    const bool canNavigate = m_treeSearchMatchedNodeIds.size() > 1;
+    if (m_treeSearchPrevButton) m_treeSearchPrevButton->setEnabled(canNavigate);
+    if (m_treeSearchNextButton) m_treeSearchNextButton->setEnabled(canNavigate);
+    applyTreeSearchExpansion();
+    if (m_treeSearchEdit) {
+        m_treeSearchEdit->setToolTip(m_treeSearchMatchedNodeIds.isEmpty()
+            ? QStringLiteral("No matches")
+            : QStringLiteral("Match 1 of %1").arg(m_treeSearchMatchedNodeIds.size()));
     }
 }
 
@@ -10090,6 +11080,10 @@ bool MainWindow::ensureSignalLodLoaded(const QList<int>& signalIndexes) {
     for (int signalIndex : signalIndexes) {
         if (signalIndex < 0 || signalIndex >= m_wave.signalList.size()) continue;
         const WaveSignal& sig = m_wave.signalList.at(signalIndex);
+        // Canonical std::bitset word streams have word-level LOD summaries, which cannot
+        // represent an individual bit exactly. Virtual bits therefore use the
+        // raw on-demand path only.
+        if (sig.virtualBitsetBit) continue;
         if (signalHasLoadedLodForWindow(sig, viewStart, viewEnd, plotWidth)) continue;
         if (sig.samplesLoaded) continue;
         if (sig.signalId <= 0) continue;

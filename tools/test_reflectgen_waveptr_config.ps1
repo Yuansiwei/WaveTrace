@@ -80,6 +80,7 @@ function New-CompleteConfigText {
     $directValue = if ($DirectPtr) { "true" } else { "false" }
     return @"
 {
+  "WaveTrace": true,
   "wave_ptr_members": [
     {"class": "OldClass", "member": "old_ptr", "reflect": false},
     {"class": "Root", "member": "alias_ptr", "reflect": true},
@@ -113,6 +114,7 @@ $singleOut = Join-Path $singleRoot "generated_reflect\input_reflect.h"
 $singleConfig = Join-Path $singleRoot "wavetrace_config.json"
 
 Write-Host "[1/12] Missing entries default to true; templates and aliases are discovered"
+Write-Utf8NoBom $singleConfig '{"WaveTrace":true,"wave_ptr_members":[]}'
 $freshLog = Invoke-ReflectGen @(
     $inputHeader, "-o", $singleOut,
     "--header-include", "input.hpp",
@@ -132,9 +134,27 @@ foreach ($entry in $entries) {
 }
 $singleText = Get-Content -LiteralPath $singleOut -Raw
 foreach ($member in @("template_ptr", "enabled_ptr", "other_ptr", "direct_ptr", "alias_ptr",
-                      "annotated_ptr", "annotated_array", "annotated_shared", "annotated_weak")) {
+                      "annotated_ptr", "annotated_array", "annotated_shared", "annotated_weak", "flags",
+                      "selective_private", "traced_value", "second_traced_value")) {
     Assert-GeneratedMember $singleText $member $true
 }
+Assert-GeneratedMember $singleText "untraced_private_value" $false
+Assert-GeneratedMember $singleText "ignored_object" $false
+Assert-GeneratedMember $singleText "ignored_ptr" $false
+Assert-True (@(Find-Entry $entries "Root" "ignored_ptr").Count -eq 0) "WAVE_NO_TRACE pointer leaked into wave_ptr_members"
+
+$singleGeneratedHash = (Get-FileHash -LiteralPath $singleOut -Algorithm SHA256).Hash
+$singleGeneratedWriteTicks = (Get-Item -LiteralPath $singleOut).LastWriteTimeUtc.Ticks
+Start-Sleep -Milliseconds 1100
+$unchangedSingleLog = Invoke-ReflectGen @(
+    $inputHeader, "-o", $singleOut,
+    "--header-include", "input.hpp",
+    "--wavetrace-config", $singleConfig,
+    "--main-file-only", "--", "-x", "c++", "-std=c++14"
+)
+Assert-True ((Get-FileHash -LiteralPath $singleOut -Algorithm SHA256).Hash -eq $singleGeneratedHash) "deterministic single-header rerun changed generated content"
+Assert-True ((Get-Item -LiteralPath $singleOut).LastWriteTimeUtc.Ticks -eq $singleGeneratedWriteTicks) "deterministic single-header rerun changed generated file timestamp"
+Assert-True ($unchangedSingleLog.Contains("[generated output] unchanged:")) "deterministic single-header rerun did not report unchanged output"
 
 Write-Host "[2/12] false remains generated for runtime filtering"
 Write-Utf8NoBom $singleConfig (New-CompleteConfigText -TemplatePtr $false -DirectPtr $false)
@@ -171,11 +191,50 @@ Assert-GeneratedMember $closureText "template_ptr" $true
 Assert-GeneratedMember $closureText "direct_ptr" $true
 Assert-GeneratedMember $closureText "enabled_ptr" $true
 Assert-GeneratedMember $closureText "other_ptr" $true
+Assert-GeneratedMember $closureText "flags" $true
+Assert-GeneratedMember $closureText "selective_private" $true
+Assert-GeneratedMember $closureText "traced_value" $true
+Assert-GeneratedMember $closureText "second_traced_value" $true
+Assert-GeneratedMember $closureText "untraced_private_value" $false
+Assert-True ($closureText.Contains("obj->traced_value")) "WAVE_TRACE_PRIVATE did not emit marked private field access"
+Assert-GeneratedMember $closureText "ignored_object" $false
+Assert-GeneratedMember $closureText "ignored_ptr" $false
+Assert-True (-not $closureText.Contains("ReflectAccess<struct IgnoredOnly>")) "WAVE_NO_TRACE subtree leaked into root closure"
 Assert-True (-not $closureText.Contains("ReflectAccess<std::")) "root closure emitted ReflectAccess for a standard-library wrapper"
 Assert-True (-not $closureText.Contains("topology_type_estimate<std::")) "root closure redefined a runtime-owned std topology estimate"
 Assert-True (-not $closureText.Contains("reflected_visitor<std::")) "root closure emitted reflected_visitor for a standard-library wrapper"
 Assert-True ($closureText.Contains("ReflectAccess<struct PayloadA>")) "std wrapper traversal did not retain PayloadA"
 Assert-True ($closureText.Contains("ReflectAccess<struct PayloadB>")) "std wrapper traversal did not retain PayloadB"
+
+$batchGeneratedTimes = @{}
+Get-ChildItem -LiteralPath $batchOut -File | Where-Object { $_.Name -ne "reflectgen.log" } | ForEach-Object {
+    $batchGeneratedTimes[$_.FullName] = $_.LastWriteTimeUtc.Ticks
+}
+Start-Sleep -Milliseconds 1100
+$unchangedBatchLog = Invoke-ReflectGen @(
+    "--reflect-root-class", "Root",
+    "--batch-dir", $batchInputDir, "--no-recursive",
+    "--wavetrace-config", $singleConfig,
+    "-o", $batchOut, "--aggregate-header", "project_reflect_auto.h",
+    "--", "-x", "c++", "-std=c++14"
+)
+foreach ($generatedPath in $batchGeneratedTimes.Keys) {
+    Assert-True ((Get-Item -LiteralPath $generatedPath).LastWriteTimeUtc.Ticks -eq $batchGeneratedTimes[$generatedPath]) "deterministic batch rerun changed timestamp: $generatedPath"
+}
+Assert-True ($unchangedBatchLog.Contains("[generated output] unchanged:")) "deterministic batch rerun did not report unchanged output"
+
+$bitsetShardOut = Join-Path $BuildRoot "bitset_shards\generated_reflect"
+$bitsetShardLog = Invoke-ReflectGen @(
+    "--reflect-root-class", "BitsetOnly",
+    "--batch-dir", $batchInputDir, "--no-recursive",
+    "--compile-shards", "2",
+    "--wavetrace-config", $singleConfig,
+    "-o", $bitsetShardOut, "--aggregate-header", "project_reflect_auto.h",
+    "--", "-x", "c++", "-std=c++14"
+)
+$bitsetShardClosure = Get-Content -LiteralPath (Join-Path $bitsetShardOut "root_class_closure_reflect_auto.h") -Raw
+Assert-True ($bitsetShardClosure.Contains("ReflectAccess<struct BitsetOnly>")) "bitset-only root was not retained by sharded closure"
+Assert-True ($bitsetShardClosure.Contains("return ::reflect::TopologyTypeEstimate(1u, false, true, false);")) "bitset-only root lost its descriptor-aware topology estimate in sharded output"
 
 Write-Host "[4/12] Malformed JSON fails before replacing generated output"
 $beforeHash = (Get-FileHash -LiteralPath $singleOut -Algorithm SHA256).Hash
@@ -192,6 +251,7 @@ Assert-True ($malformedLog.Contains("invalid JSON")) "malformed JSON did not pro
 Write-Host "[5/12] Duplicate class/member entries are rejected"
 $duplicate = @"
 {
+  "WaveTrace": true,
   "wave_ptr_members": [
     {"class": "Root", "member": "direct_ptr", "reflect": true},
     {"class": "Root", "member": "direct_ptr", "reflect": false}
@@ -225,23 +285,31 @@ $cmakeArgs = @(
 Assert-True ($LASTEXITCODE -eq 0) "first CMake runner invocation failed"
 $aggregate = Join-Path $cmakeOut "project_reflect_auto.h"
 $firstTime = (Get-Item -LiteralPath $aggregate).LastWriteTimeUtc
+$firstClosureTime = (Get-Item -LiteralPath (Join-Path $cmakeOut "root_class_closure_reflect_auto.h")).LastWriteTimeUtc
+$firstLogTime = (Get-Item -LiteralPath $cmakeLog).LastWriteTimeUtc
 Start-Sleep -Milliseconds 1200
 & cmake @cmakeArgs | Out-Host
 Assert-True ($LASTEXITCODE -eq 0) "second CMake runner invocation failed"
 $settledTime = (Get-Item -LiteralPath $aggregate).LastWriteTimeUtc
-Assert-True ($settledTime -gt $firstTime) "second runner invocation did not execute ReflectGen"
+$settledLogTime = (Get-Item -LiteralPath $cmakeLog).LastWriteTimeUtc
+Assert-True ($settledLogTime -gt $firstLogTime) "second runner invocation did not execute ReflectGen"
+Assert-True ($settledTime -eq $firstTime) "second runner touched unchanged aggregate output"
 Start-Sleep -Milliseconds 1200
 & cmake @cmakeArgs | Out-Host
 Assert-True ($LASTEXITCODE -eq 0) "third CMake runner invocation failed"
 $unchangedTime = (Get-Item -LiteralPath $aggregate).LastWriteTimeUtc
-Assert-True ($unchangedTime -gt $settledTime) "third runner invocation did not execute ReflectGen"
+$unchangedLogTime = (Get-Item -LiteralPath $cmakeLog).LastWriteTimeUtc
+Assert-True ($unchangedLogTime -gt $settledLogTime) "third runner invocation did not execute ReflectGen"
+Assert-True ($unchangedTime -eq $settledTime) "third runner touched unchanged aggregate output"
+Assert-True ((Get-Item -LiteralPath (Join-Path $cmakeOut "root_class_closure_reflect_auto.h")).LastWriteTimeUtc -eq $firstClosureTime) "unchanged runner touched closure output"
 
 Start-Sleep -Milliseconds 1200
 Write-Utf8NoBom $singleConfig (New-CompleteConfigText -TemplatePtr $false -DirectPtr $true)
 & cmake @cmakeArgs | Out-Host
 Assert-True ($LASTEXITCODE -eq 0) "CMake runner failed after config change"
 $changedTime = (Get-Item -LiteralPath $aggregate).LastWriteTimeUtc
-Assert-True ($changedTime -gt $unchangedTime) "runtime-only config edit was filtered by the CMake runner"
+Assert-True ((Get-Item -LiteralPath $cmakeLog).LastWriteTimeUtc -gt $unchangedLogTime) "runtime-only config edit was filtered by the CMake runner"
+Assert-True ($changedTime -eq $unchangedTime) "runtime-only config edit touched unchanged generated output"
 $cmakeClosure = Get-Content -LiteralPath (Join-Path $cmakeOut "root_class_closure_reflect_auto.h") -Raw
 Assert-GeneratedMember $cmakeClosure "direct_ptr" $true
 Assert-GeneratedMember $cmakeClosure "template_ptr" $true
@@ -263,7 +331,7 @@ Assert-True ($configBefore -eq $configAfter) "deterministic rerun rewrote config
 Assert-True ($finalLog.Contains("unchanged:")) "deterministic rerun did not report unchanged config"
 
 Write-Host "[8/12] A changed read-only config is forcibly replaced and remains read-only"
-Write-Utf8NoBom $singleConfig '{"wave_ptr_members":[]}'
+Write-Utf8NoBom $singleConfig '{"WaveTrace":true,"wave_ptr_members":[]}'
 $configItem = Get-Item -LiteralPath $singleConfig
 $configItem.IsReadOnly = $true
 try {
@@ -283,7 +351,7 @@ finally {
 }
 
 Write-Host "[9/12] An exclusively opened config does not fail reflection or corrupt JSON"
-Write-Utf8NoBom $singleConfig '{"wave_ptr_members":[]}'
+Write-Utf8NoBom $singleConfig '{"WaveTrace":true,"wave_ptr_members":[]}'
 $lockedBefore = Get-Content -LiteralPath $singleConfig -Raw
 $lockedStream = [IO.File]::Open($singleConfig, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
 try {
@@ -340,6 +408,7 @@ Write-Host "[12/12] Invalid pointer annotations fail with field-specific diagnos
 $invalidInput = Join-Path $fixtureDir "invalid_input.fixture"
 $invalidOut = Join-Path $BuildRoot "invalid\invalid_reflect.h"
 $invalidConfig = Join-Path $BuildRoot "invalid\wavetrace_config.json"
+Write-Utf8NoBom $invalidConfig '{"WaveTrace":true,"wave_ptr_members":[]}'
 $invalidLog = Invoke-ReflectGen @(
     $invalidInput, "-o", $invalidOut,
     "--header-include", "invalid_input.fixture",

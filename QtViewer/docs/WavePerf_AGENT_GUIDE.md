@@ -15,7 +15,7 @@
 
 ## 1. 维护目标
 
-WavePerf 是 WVZ4 v15-v16 的离线 GPU 波形性能分析器。它不尝试恢复完整 C++ 对象，
+WavePerf 是 WVZ4 v17 的离线 GPU 波形性能分析器。它不尝试恢复完整 C++ 对象，
 而是从架构路径和关键字段中提取可验证事实，再递归形成：
 
 1. 每个 issue slot 的发射事实；
@@ -123,7 +123,7 @@ CBCtrl/CBData 数据通路：
 
 ### `WaveParser4.cpp/.h`
 
-WavePerf 只依赖 Viewer 的 WVZ4 v15-v16 Reader。当前相关扩展是
+WavePerf 只依赖 Viewer 的 WVZ4 v17 Reader。当前相关扩展是
 `WaveParser4Reader::loadSignals()` 的进度回调。解析器仍是唯一解码事实来源，
 不要在 WavePerf 中复制 WDAT 解码逻辑。
 
@@ -142,7 +142,7 @@ WavePerf 只依赖 Viewer 的 WVZ4 v15-v16 Reader。当前相关扩展是
 ## 3. 端到端数据流
 
 ```text
-WVZ4 v15-v16 directory
+WVZ4 v17 directory
   -> 节点名快速预筛选
   -> 完整路径正式分类
   -> 选择性能信号
@@ -929,7 +929,7 @@ JSON、HTML、自测和本文。
 
 ## 22. 已知限制
 
-1. 只支持 WVZ4 v15-v16，不保留 v13 兼容。
+1. 只支持 WVZ4 v17，不保留更早格式兼容。
 2. 当前识别指令功能类别与原始枚举，不解码完整 opcode 助记符。
 3. 局部 Eligible 缺少部分操作数、写回和最终仲裁事实。
 4. DLS-L1 多 outstanding 没有 transaction ID 时只能低置信顺序配对。

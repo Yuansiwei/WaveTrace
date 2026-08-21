@@ -63,7 +63,9 @@ public:
         // synthetic clk track, it does not change the writer time unit.
         bool emit_default_clk = true;
         std::string default_clk_name = "clk";
-        bool clk_initial_value = false;
+        // Display phase only. WaveTap sampling remains sensitive to the input
+        // SystemC clock's negedge_event().
+        bool clk_initial_value = true;
         wvz4::u64 clk_period_ticks = 10;
         // In v4 this is interpreted as simple toggle period for CLKD. Keep the
         // old field name to preserve existing config source compatibility.
@@ -213,7 +215,7 @@ public:
             error += debug_state_summary();
             return false;
         }
-        if (track_states_.empty() && !cfg_.emit_default_clk) {
+        if (track_states_.empty() && array_states_.empty() && !cfg_.emit_default_clk) {
             error = "WVZ4 recorder cannot open writer before track topology is declared; ";
             error += debug_state_summary();
             return false;
@@ -439,6 +441,82 @@ public:
             decl.path);
     }
 
+    void on_bitset_declared_fast(wave::NodeId node_id,
+                                 wave::TrackId first_storage_id,
+                                 std::uint32_t bit_count,
+                                 std::uint32_t word_count) override {
+        if (writer_opened_) {
+            set_error("WVZ4 recorder bitset declaration arrived after writer open");
+            return;
+        }
+        if (node_id == 0 || first_storage_id == 0 || bit_count == 0 || word_count == 0 ||
+            static_cast<std::uint64_t>(word_count) !=
+                (static_cast<std::uint64_t>(bit_count) + 63ull) / 64ull ||
+            node_id > static_cast<wave::NodeId>((std::numeric_limits<wvz4::u32>::max)()) ||
+            first_storage_id > static_cast<wave::TrackId>((std::numeric_limits<wvz4::u32>::max)()) ||
+            word_count > static_cast<std::uint32_t>((std::numeric_limits<wvz4::u32>::max)() - first_storage_id + 1u)) {
+            set_error("WVZ4 recorder received invalid bitset declaration");
+            return;
+        }
+        for (std::size_t i = 0; i < bitset_states_.size(); ++i) {
+            if (bitset_states_[i].node_id == static_cast<wvz4::u32>(node_id)) {
+                set_error("WVZ4 recorder received duplicate bitset node_id");
+                return;
+            }
+        }
+        BitsetState state;
+        state.node_id = static_cast<wvz4::u32>(node_id);
+        state.first_storage_track_id = first_storage_id;
+        state.bit_count = bit_count;
+        state.word_count = word_count;
+        bitset_states_.push_back(state);
+    }
+
+    void on_array_block_declared(const wave::ArrayBlockDecl& decl) override {
+        if (writer_opened_) {
+            set_error("WVZ4 recorder array declaration arrived after writer open");
+            return;
+        }
+        if (decl.node_id == 0 || decl.total_bytes == 0 ||
+            decl.element_count == 0 || decl.element_stride == 0 ||
+            decl.schema.empty() ||
+            decl.node_id > static_cast<wave::NodeId>((std::numeric_limits<wvz4::u32>::max)())) {
+            set_error("WVZ4 recorder received invalid compact array declaration");
+            return;
+        }
+        wvz4::ArrayDefinition array;
+        array.node_id = static_cast<wvz4::u32>(decl.node_id);
+        array.total_bytes = decl.total_bytes;
+        array.element_count = decl.element_count;
+        array.element_stride = decl.element_stride;
+        array.schema.reserve(decl.schema.size());
+        for (std::size_t i = 0; i < decl.schema.size(); ++i) {
+            const wave::ArraySchemaNodeDecl& src = decl.schema[i];
+            wvz4::ArraySchemaNode dst;
+            dst.schema_node_id = src.schema_node_id;
+            dst.parent_schema_node_id = src.parent_schema_node_id;
+            if (!src.name.empty() && !intern_node_name(src.name, dst.name_id)) return;
+            switch (src.kind) {
+            case wave::ArraySchemaNodeKind::Object: dst.kind = wvz4::ArraySchemaKind::Object; break;
+            case wave::ArraySchemaNodeKind::Field: dst.kind = wvz4::ArraySchemaKind::Field; break;
+            case wave::ArraySchemaNodeKind::Array: dst.kind = wvz4::ArraySchemaKind::Array; break;
+            case wave::ArraySchemaNodeKind::Leaf: dst.kind = wvz4::ArraySchemaKind::Leaf; break;
+            default:
+                set_error("WVZ4 recorder received invalid compact array schema kind");
+                return;
+            }
+            dst.byte_offset = src.byte_offset;
+            dst.byte_size = src.byte_size;
+            dst.element_count = src.element_count;
+            dst.element_stride = src.element_stride;
+            dst.value_type = map_value_type(src.value_kind, src.bit_width);
+            dst.bit_width = src.bit_width;
+            dst.bit_offset = src.bit_offset;
+            array.schema.push_back(dst);
+        }
+        array_states_.push_back(std::move(array));
+    }
+
     void on_track_declared_fast(wave::TrackId track_id,
                                 wave::TrackId storage_id,
                                 wave::NodeId node_id,
@@ -523,6 +601,24 @@ public:
         current_sample_ids_.push_back(frame_id);
     }
 
+    void on_array_patch(const wave::ArrayPatchEvent& ev) override {
+        if (!cycle_open_) {
+            set_error("WVZ4 recorder array patch arrived outside begin_cycle/end_cycle");
+            return;
+        }
+        if (ev.cycle != current_cycle_ || ev.node_id == 0 ||
+            !ev.data || ev.byte_count == 0 ||
+            ev.node_id > static_cast<wave::NodeId>((std::numeric_limits<wvz4::u32>::max)())) {
+            set_error("WVZ4 recorder received invalid compact array patch");
+            return;
+        }
+        wvz4::ArrayPatchUpdate patch;
+        patch.node_id = static_cast<wvz4::u32>(ev.node_id);
+        patch.byte_offset = ev.byte_offset;
+        patch.bytes.assign(ev.data, ev.data + ev.byte_count);
+        submission_work_.array_patches.push_back(std::move(patch));
+    }
+
 private:
     struct InternedNameState {
         wvz4::u32 offset = 0;
@@ -566,6 +662,13 @@ private:
         std::uint64_t first_signature = 0;
     };
 
+    struct BitsetState {
+        wvz4::u32 node_id = 0;
+        wave::TrackId first_storage_track_id = 0;
+        wvz4::u32 bit_count = 0;
+        wvz4::u32 word_count = 0;
+    };
+
     OpenConfig cfg_;
     bool opened_ = false;
     bool writer_opened_ = false;
@@ -587,6 +690,8 @@ private:
     std::vector<wvz4::u32> runtime_node_name_ids_;
     std::size_t numeric_array_node_count_ = 0;
     std::vector<TrackState> track_states_;     // track-id indexed
+    std::vector<BitsetState> bitset_states_;
+    std::vector<wvz4::ArrayDefinition> array_states_;
     std::vector<FrameSlot> frame_slots_;       // track-id indexed, touched slots cleared after each cycle
     std::vector<wvz4::u32> declared_node_ids_;
     std::vector<wvz4::u32> declared_track_ids_;
@@ -616,6 +721,8 @@ private:
         runtime_node_name_ids_.clear();
         numeric_array_node_count_ = 0;
         track_states_.clear();
+        bitset_states_.clear();
+        array_states_.clear();
         frame_slots_.clear();
         declared_node_ids_.clear();
         declared_track_ids_.clear();
@@ -1140,7 +1247,10 @@ private:
         // Without the synthetic clock, a layout with no reflected nodes/tracks
         // is still invalid.
         if (declared_node_ids_.empty() && !cfg_.emit_default_clk) { error = "WVZ4 layout requires at least one node"; return false; }
-        if (declared_track_ids_.empty() && !cfg_.emit_default_clk) { error = "WVZ4 layout requires at least one signal"; return false; }
+        if (declared_track_ids_.empty() && array_states_.empty() && !cfg_.emit_default_clk) {
+            error = "WVZ4 layout requires at least one signal or compact array";
+            return false;
+        }
 
         std::vector<wvz4::u32> node_ids_scratch;
         std::vector<wvz4::u32> track_ids_scratch;
@@ -1185,6 +1295,7 @@ private:
         layout.names.reserve(interned_node_names_.size() + (cfg_.emit_default_clk ? 1u : 0u));
         layout.nodes.reserve(node_ids.size() + (cfg_.emit_default_clk ? 1u : 0u));
         layout.signals.reserve(track_ids.size() + (cfg_.emit_default_clk ? 1u : 0u));
+        layout.arrays.reserve(array_states_.size());
 
         const bool use_cached_child_links = node_child_links_valid_;
         std::vector<wvz4::u32> first_child;
@@ -1310,6 +1421,44 @@ private:
             sig.radix = ts.radix;
             sig.storage_only = ts.storage_only;
             layout.signals.push_back(sig);
+        }
+        layout.bitsets.reserve(bitset_states_.size());
+        for (std::size_t i = 0; i < bitset_states_.size(); ++i) {
+            const BitsetState& state = bitset_states_[i];
+            if (state.node_id >= node_states_.size() || !node_states_[state.node_id].declared) {
+                error = "WVZ4 layout bitset references a missing node";
+                return false;
+            }
+            if (state.first_storage_track_id >= track_states_.size() ||
+                state.word_count > track_states_.size() - state.first_storage_track_id) {
+                error = "WVZ4 layout bitset storage range is missing";
+                return false;
+            }
+            for (wvz4::u32 word = 0; word < state.word_count; ++word) {
+                const TrackState& storage = track_states_[
+                    static_cast<std::size_t>(state.first_storage_track_id) + word];
+                if (!storage.declared || !storage.storage_only ||
+                    storage.value_type != wvz4::ValueType::U64 || storage.bit_width != 64u) {
+                    error = "WVZ4 layout bitset storage is not a hidden U64 track";
+                    return false;
+                }
+            }
+            wvz4::BitsetDefinition bitset;
+            bitset.node_id = state.node_id;
+            bitset.first_storage_id = static_cast<wvz4::u32>(state.first_storage_track_id) +
+                (cfg_.emit_default_clk ? 1u : 0u);
+            bitset.bit_count = state.bit_count;
+            bitset.word_count = state.word_count;
+            layout.bitsets.push_back(bitset);
+        }
+        for (std::size_t i = 0; i < array_states_.size(); ++i) {
+            const wvz4::ArrayDefinition& array = array_states_[i];
+            if (array.node_id == 0 || array.node_id >= node_states_.size() ||
+                !node_states_[array.node_id].declared || array.schema.empty()) {
+                error = "WVZ4 layout compact array references a missing node or schema";
+                return false;
+            }
+            layout.arrays.push_back(array);
         }
         name_blob_guard.commit();
         return true;

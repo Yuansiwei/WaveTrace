@@ -93,15 +93,34 @@ enum class Radix : u8 {
     Auto  = 255
 };
 
-static const u32 kCurrentFormatVersion = 16;
+static const u32 kCurrentFormatVersion = 17;
 
-bool isSupportedFormatVersion(u32 version) {
-    return version == 15 || version == kCurrentFormatVersion;
+bool isCurrentFormatVersion(u32 version) {
+    return version == kCurrentFormatVersion;
 }
-static const u8 kSignalFlagStorageOnly = 1u << 0;
-
 static const u64 kHeaderFeatureLodTables = 1ull << 6;
 static const u64 kHeaderFeatureResidualLodTables = 1ull << 7;
+static const u64 kHeaderFeatureBitsetDefinitions = 1ull << 8;
+static const u64 kHeaderFeatureArrayBlocks = 1ull << 9;
+static const u64 kKnownHeaderFeatureFlags = (1ull << 10) - 1;
+
+bool validateCurrentHeader(u32 headerSize, u64 featureFlags, QString& error) {
+    if (headerSize != 64) {
+        error = QStringLiteral("WVZ4 v17 header_size must be 64, got %1").arg(headerSize);
+        return false;
+    }
+    if ((featureFlags & ~kKnownHeaderFeatureFlags) != 0) {
+        error = QStringLiteral("WVZ4 v17 header contains unsupported feature flags: 0x%1")
+            .arg(featureFlags & ~kKnownHeaderFeatureFlags, 0, 16);
+        return false;
+    }
+    if ((featureFlags & kHeaderFeatureResidualLodTables) != 0 &&
+        (featureFlags & kHeaderFeatureLodTables) == 0) {
+        error = QStringLiteral("WVZ4 v17 residual LOD flag requires the LOD flag");
+        return false;
+    }
+    return true;
+}
 
 // Raw WDAT payload flags. These match wvz4_writer_typed.h.
 static const u64 kWdatDeltaTimes      = 1ull << 0;
@@ -123,11 +142,6 @@ enum class ValueRecordCodec : u8 {
     ByteMaskStride = 5,
     NibbleMask = 6,
     NibbleMaskStride = 7
-};
-
-struct NameRec {
-    u32 id = 0;
-    QString text;
 };
 
 struct NodeRec {
@@ -158,6 +172,38 @@ struct ClockRec {
     u64 periodTicks = 1;
 };
 
+struct BitsetRec {
+    u32 nodeId = 0;
+    u32 firstStorageId = 0;
+    u32 bitCount = 0;
+    u32 wordCount = 0;
+    u32 firstVirtualSignalId = 0;
+};
+
+struct ArraySchemaRec {
+    u32 schemaNodeId = 0;
+    u32 parentSchemaNodeId = 0;
+    u32 nameId = 0;
+    u8 kind = 0;
+    u64 byteOffset = 0;
+    u64 byteSize = 0;
+    u64 elementCount = 0;
+    u64 elementStride = 0;
+    ValueType valueType = ValueType::U64;
+    u32 bitWidth = 0;
+    u32 bitOffset = 0;
+};
+
+struct ArrayRec {
+    u32 nodeId = 0;
+    u64 totalBytes = 0;
+    u64 elementCount = 0;
+    u64 elementStride = 0;
+    QVector<ArraySchemaRec> schema;
+    u32 firstVirtualSignalId = 0;
+    u64 leafCountPerElement = 0;
+};
+
 struct BlockIndexRec {
     u64 blockId = 0;
     i64 start = 0;
@@ -184,6 +230,18 @@ struct LodChunkIndexRec {
     u64 rawSize = 0;
     Compression compression = Compression::None;
     u64 storageCount = 0;
+    u64 recordCount = 0;
+};
+
+struct ArrayDataIndexRec {
+    u32 nodeId = 0;
+    u64 pageIndex = 0;
+    i64 start = 0;
+    i64 end = 0;
+    u64 fileOffset = 0;
+    u64 fileSize = 0;
+    u64 rawSize = 0;
+    Compression compression = Compression::None;
     u64 recordCount = 0;
 };
 
@@ -567,11 +625,14 @@ bool parseNameSection(const QByteArray& payload,
         return false;
     }
 
+    namesById.clear();
+    namesById.resize(int(count) + 1);
+
     for (u64 i = 0; i < count; ++i) {
         u64 id64 = 0;
         u64 len64 = 0;
-        if (!r.readVarUInt(id64) || id64 == 0 || id64 > u64(std::numeric_limits<int>::max())) {
-            error = QStringLiteral("WVZ4 NAME: invalid name_id");
+        if (!r.readVarUInt(id64) || id64 != i + 1u) {
+            error = QStringLiteral("WVZ4 NAME: v17 requires dense ordered name_id values");
             return false;
         }
         if (!r.readVarUInt(len64) || len64 > u64(std::numeric_limits<int>::max())) {
@@ -585,11 +646,6 @@ bool parseNameSection(const QByteArray& payload,
         }
 
         const int id = int(id64);
-        if (namesById.size() <= id) namesById.resize(id + 1);
-        if (!namesById[id].isEmpty()) {
-            error = QStringLiteral("WVZ4 NAME: duplicate name_id %1").arg(id);
-            return false;
-        }
         namesById[id] = QByteArray(p, int(len64));
         if (namesById[id].isEmpty()) {
             error = QStringLiteral("WVZ4 NAME: empty name for name_id %1").arg(id);
@@ -603,72 +659,8 @@ bool parseNameSection(const QByteArray& payload,
     return true;
 }
 
-bool parseNodeReferenceSection(const QByteArray& payload,
-                               QVector<NodeRec>& nodesById,
-                               QString& error) {
-    SpanReader r(payload);
-    u64 count = 0;
-    if (!r.readVarUInt(count) || count > 100000000ull) {
-        error = QStringLiteral("WVZ4 NREF: invalid node count");
-        return false;
-    }
-    i64 previousArrayIndex = 0;
-    for (u64 i = 0; i < count; ++i) {
-        u64 id64 = 0, parent64 = 0, nameRef = 0, first64 = 0, next64 = 0;
-        u8 kind = 0;
-        if (!r.readVarUInt(id64) || id64 == 0 || id64 > u64(std::numeric_limits<int>::max()) ||
-            !r.readVarUInt(parent64) || parent64 > u64(std::numeric_limits<int>::max()) ||
-            !r.readVarUInt(nameRef) ||
-            !r.readU8(kind) ||
-            !r.readVarUInt(first64) || first64 > u64(std::numeric_limits<int>::max()) ||
-            !r.readVarUInt(next64) || next64 > u64(std::numeric_limits<int>::max())) {
-            error = QStringLiteral("WVZ4 NREF: malformed node record");
-            return false;
-        }
-        const bool isArrayIndex = (nameRef & 1u) != 0;
-        const u64 nameValue = nameRef >> 1u;
-        if ((!isArrayIndex && (nameValue == 0 || nameValue > u64(std::numeric_limits<int>::max()))) ||
-            (isArrayIndex && nameValue > (u64(std::numeric_limits<u32>::max()) * 2u + 1u))) {
-            error = QStringLiteral("WVZ4 NREF: invalid node name reference");
-            return false;
-        }
-        const int id = int(id64);
-        if (nodesById.size() <= id) nodesById.resize(id + 1);
-        if (nodesById[id].valid) {
-            error = QStringLiteral("WVZ4 NREF: duplicate node_id %1").arg(id);
-            return false;
-        }
-        NodeRec n;
-        n.id = u32(id64);
-        n.parent = u32(parent64);
-        if (isArrayIndex) {
-            const i64 delta = i64((nameValue >> 1u) ^ (u64(0) - (nameValue & 1u)));
-            const i64 indexValue = previousArrayIndex + delta;
-            if (indexValue < 0 || u64(indexValue) > u64(kWaveNameTokenValueMask)) {
-                error = QStringLiteral("WVZ4 NREF: array index delta out of range");
-                return false;
-            }
-            n.nameToken = waveArrayIndexToken(u32(indexValue));
-            previousArrayIndex = indexValue;
-        } else {
-            n.nameToken = waveNameIdToken(u32(nameValue));
-        }
-        n.kind = kind;
-        n.firstChild = u32(first64);
-        n.nextSibling = u32(next64);
-        n.valid = true;
-        nodesById[id] = n;
-    }
-    if (!r.eof()) {
-        error = QStringLiteral("WVZ4 NREF: trailing bytes after node table");
-        return false;
-    }
-    return true;
-}
-
 bool parseCompactNodeReferenceSection(const QByteArray& payload,
                                       QVector<NodeRec>& nodesById,
-                                      u32 formatVersion,
                                       QString& error) {
     SpanReader r(payload);
     u64 count = 0;
@@ -690,8 +682,7 @@ bool parseCompactNodeReferenceSection(const QByteArray& payload,
             error = QStringLiteral("WVZ4 NODI: malformed compact node record");
             return false;
         }
-        if (!isValidNodeKind(kind) ||
-            (kind == kNodeKindReference && formatVersion < 16)) {
+        if (!isValidNodeKind(kind)) {
             error = QStringLiteral("WVZ4 NODI: invalid NodeKind for node_id %1").arg(id64);
             return false;
         }
@@ -763,7 +754,6 @@ bool parseCompactNodeReferenceSection(const QByteArray& payload,
 
 bool parseCompactNodeTreeSection(const QByteArray& payload,
                                  WaveTreeInfo& tree,
-                                 u32 formatVersion,
                                  QString& error) {
     SpanReader r(payload);
     u64 count = 0;
@@ -796,8 +786,7 @@ bool parseCompactNodeTreeSection(const QByteArray& payload,
             error = QStringLiteral("WVZ4 NODI: malformed compact node record");
             return false;
         }
-        if (!isValidNodeKind(kind) ||
-            (kind == kNodeKindReference && formatVersion < 16)) {
+        if (!isValidNodeKind(kind)) {
             error = QStringLiteral("WVZ4 NODI: invalid NodeKind for node_id %1").arg(id64);
             return false;
         }
@@ -902,119 +891,6 @@ bool parseCompactNodeTreeSection(const QByteArray& payload,
         return false;
     }
     tree.valid = true;
-    return true;
-}
-
-bool parseSignalSection(const QByteArray& payload,
-                        QVector<SigRec>& sigs,
-                        QString& error) {
-    SpanReader r(payload);
-    u64 count = 0;
-    if (!r.readVarUInt(count)) {
-        error = QStringLiteral("WVZ4 SIGT: missing count");
-        return false;
-    }
-    if (count > 100000000ull) {
-        error = QStringLiteral("WVZ4 SIGT: unreasonable signal count");
-        return false;
-    }
-
-    sigs.clear();
-    sigs.reserve(int(qMin<u64>(count, u64(std::numeric_limits<int>::max()))));
-
-    // signal_id is generated densely by the WVZ4 writer.  Do not use QSet here:
-    // this function is executed on every on-demand signal load, and the hash table
-    // showed up as a visible hot path for large SignalTable sections.
-    QVector<uchar> seenSignalIds;
-    QSet<int> sparseSeenSignalIds;
-    for (u64 i = 0; i < count; ++i) {
-        u64 sid64 = 0, storage64 = 0, node64 = 0, width64 = 0, bitOffset64 = 0;
-        u8 type = 0, radix = 0, flags = 0;
-        if (!r.readVarUInt(sid64) || sid64 == 0 || sid64 > u64(std::numeric_limits<int>::max())) {
-            error = QStringLiteral("WVZ4 SIGT: malformed signal record");
-            return false;
-        }
-        if (!r.readVarUInt(storage64) || storage64 == 0 || storage64 > u64(std::numeric_limits<int>::max())) {
-            error = QStringLiteral("WVZ4 SIGT: malformed storage_id for signal_id %1").arg(int(sid64));
-            return false;
-        }
-        if (!r.readVarUInt(node64) || node64 > u64(std::numeric_limits<int>::max()) ||
-            !r.readU8(type) ||
-            !r.readVarUInt(width64) || width64 == 0 || width64 > 64 ||
-            !r.readU8(radix)) {
-            error = QStringLiteral("WVZ4 SIGT: malformed signal record");
-            return false;
-        }
-        if (!r.readVarUInt(bitOffset64) || bitOffset64 > 63 ||
-            !r.readU8(flags) ||
-            (flags & ~kSignalFlagStorageOnly) != 0) {
-            error = QStringLiteral("WVZ4 SIGT: malformed range flags for signal_id %1").arg(int(sid64));
-            return false;
-        }
-        const bool storageOnly = (flags & kSignalFlagStorageOnly) != 0;
-        if (storageOnly) {
-            if (node64 != 0 || storage64 != sid64 || bitOffset64 != 0) {
-                error = QStringLiteral("WVZ4 SIGT: malformed storage-only signal_id %1").arg(int(sid64));
-                return false;
-            }
-        } else if (node64 == 0) {
-            error = QStringLiteral("WVZ4 SIGT: signal_id %1 has missing node_id").arg(int(sid64));
-            return false;
-        }
-
-        const int sid = int(sid64);
-        if (sid <= 100000000) {
-            if (seenSignalIds.size() <= sid) seenSignalIds.resize(sid + 1);
-            if (seenSignalIds.at(sid)) {
-                error = QStringLiteral("WVZ4 SIGT: duplicate signal_id %1").arg(sid);
-                return false;
-            }
-            seenSignalIds[sid] = 1;
-        } else {
-            // Pathological sparse signal_id values are valid u32 values, but do not
-            // allocate a giant direct table for them.
-            if (sparseSeenSignalIds.contains(sid)) {
-                error = QStringLiteral("WVZ4 SIGT: duplicate signal_id %1").arg(sid);
-                return false;
-            }
-            sparseSeenSignalIds.insert(sid);
-        }
-
-        int typeBytes = 0;
-        if (!valueTypeByteWidth(ValueType(type), typeBytes)) {
-            error = QStringLiteral("WVZ4 SIGT: invalid ValueType for signal_id %1").arg(int(sid64));
-            return false;
-        }
-        if (!isValidRadix(Radix(radix))) {
-            error = QStringLiteral("WVZ4 SIGT: invalid Radix for signal_id %1").arg(int(sid64));
-            return false;
-        }
-        if (width64 > u64(typeBytes * 8)) {
-            error = QStringLiteral("WVZ4 SIGT: bit_width exceeds ValueType capacity for signal_id %1").arg(int(sid64));
-            return false;
-        }
-        if (bitOffset64 + width64 > 64) {
-            error = QStringLiteral("WVZ4 SIGT: bit range exceeds 64 bits for signal_id %1").arg(int(sid64));
-            return false;
-        }
-        SigRec s;
-        s.signalId = u32(sid64);
-        s.storageId = u32(storage64);
-        s.nodeId = u32(node64);
-        s.type = ValueType(type);
-        s.bitWidth = u32(width64);
-        s.bitOffset = u32(bitOffset64);
-        s.radix = Radix(radix);
-        s.storageOnly = storageOnly;
-        sigs.push_back(s);
-    }
-
-    // Writer already serializes SIGT in signal_id order.  Sorting again is not
-    // required for decoding and hurts on-demand load latency on very large files.
-    if (!r.eof()) {
-        error = QStringLiteral("WVZ4 SIGT: trailing bytes after signal table");
-        return false;
-    }
     return true;
 }
 
@@ -1154,6 +1030,101 @@ bool parseClockSection(const QByteArray& payload,
     return true;
 }
 
+bool parseBitsetSection(const QByteArray& payload,
+                        QVector<BitsetRec>& bitsets,
+                        QString& error) {
+    SpanReader r(payload);
+    u64 count = 0;
+    if (!r.readVarUInt(count)) {
+        error = QStringLiteral("WVZ4 BSET: missing count");
+        return false;
+    }
+    if (count > 100000000ull || count > u64(std::numeric_limits<int>::max())) {
+        error = QStringLiteral("WVZ4 BSET: unreasonable bitset count");
+        return false;
+    }
+
+    bitsets.clear();
+    bitsets.reserve(int(count));
+    for (u64 i = 0; i < count; ++i) {
+        u64 nodeId = 0, firstStorageId = 0, bitCount = 0, wordCount = 0;
+        if (!r.readVarUInt(nodeId) || nodeId == 0 || nodeId > u64(std::numeric_limits<u32>::max()) ||
+            !r.readVarUInt(firstStorageId) || firstStorageId == 0 || firstStorageId > u64(std::numeric_limits<u32>::max()) ||
+            !r.readVarUInt(bitCount) || bitCount == 0 || bitCount > u64(std::numeric_limits<u32>::max()) ||
+            !r.readVarUInt(wordCount) || wordCount == 0 || wordCount > u64(std::numeric_limits<u32>::max())) {
+            error = QStringLiteral("WVZ4 BSET: malformed bitset record");
+            return false;
+        }
+        BitsetRec rec;
+        rec.nodeId = u32(nodeId);
+        rec.firstStorageId = u32(firstStorageId);
+        rec.bitCount = u32(bitCount);
+        rec.wordCount = u32(wordCount);
+        bitsets.push_back(rec);
+    }
+    if (!r.eof()) {
+        error = QStringLiteral("WVZ4 BSET: trailing bytes after bitset table");
+        return false;
+    }
+    return true;
+}
+
+bool parseArraySection(const QByteArray& payload,
+                       QVector<ArrayRec>& arrays,
+                       QString& error) {
+    SpanReader r(payload);
+    u64 count = 0;
+    if (!r.readVarUInt(count) || count > u64(std::numeric_limits<int>::max())) {
+        error = QStringLiteral("WVZ4 ARRY: invalid array count");
+        return false;
+    }
+    arrays.clear();
+    arrays.reserve(int(count));
+    for (u64 i = 0; i < count; ++i) {
+        ArrayRec array;
+        u64 nodeId = 0, schemaCount = 0;
+        if (!r.readVarUInt(nodeId) || nodeId == 0 || nodeId > u64(std::numeric_limits<u32>::max()) ||
+            !r.readVarUInt(array.totalBytes) || !r.readVarUInt(array.elementCount) ||
+            !r.readVarUInt(array.elementStride) || !r.readVarUInt(schemaCount) ||
+            schemaCount == 0 || schemaCount > u64(std::numeric_limits<int>::max())) {
+            error = QStringLiteral("WVZ4 ARRY: malformed array definition");
+            return false;
+        }
+        array.nodeId = u32(nodeId);
+        array.schema.reserve(int(schemaCount));
+        for (u64 j = 0; j < schemaCount; ++j) {
+            ArraySchemaRec sn;
+            u64 id = 0, parent = 0, name = 0, width = 0, bitOffset = 0;
+            u8 kind = 0, valueType = 0;
+            if (!r.readVarUInt(id) || id > u64(std::numeric_limits<u32>::max()) ||
+                !r.readVarUInt(parent) || parent > u64(std::numeric_limits<u32>::max()) ||
+                !r.readVarUInt(name) || name > u64(std::numeric_limits<u32>::max()) ||
+                !r.readU8(kind) || !r.readVarUInt(sn.byteOffset) ||
+                !r.readVarUInt(sn.byteSize) || !r.readVarUInt(sn.elementCount) ||
+                !r.readVarUInt(sn.elementStride) || !r.readU8(valueType) ||
+                !r.readVarUInt(width) || width > u64(std::numeric_limits<u32>::max()) ||
+                !r.readVarUInt(bitOffset) || bitOffset > u64(std::numeric_limits<u32>::max())) {
+                error = QStringLiteral("WVZ4 ARRY: malformed element schema");
+                return false;
+            }
+            sn.schemaNodeId = u32(id);
+            sn.parentSchemaNodeId = u32(parent);
+            sn.nameId = u32(name);
+            sn.kind = kind;
+            sn.valueType = ValueType(valueType);
+            sn.bitWidth = u32(width);
+            sn.bitOffset = u32(bitOffset);
+            array.schema.push_back(sn);
+        }
+        arrays.push_back(std::move(array));
+    }
+    if (!r.eof()) {
+        error = QStringLiteral("WVZ4 ARRY: trailing bytes");
+        return false;
+    }
+    return true;
+}
+
 bool readFooterScalarBits(SpanReader& r, int byteWidth, quint64& out) {
     const char* valueBytes = nullptr;
     if (byteWidth <= 0 || byteWidth > 8 || !r.readBytes(valueBytes, byteWidth)) return false;
@@ -1234,6 +1205,7 @@ bool parseFooterSection(const QByteArray& payload,
                         QVector<QVector<int>>& blockIndexesByChunk,
                         QVector<QVector<WaveLodLevel>>& lodLevelsByStorageId,
                         QVector<LodChunkIndexRec>& lodChunkIndex,
+                        QVector<ArrayDataIndexRec>& arrayDataIndex,
                         QString& error) {
     Q_UNUSED(byteWidthByStorageId);
     Q_UNUSED(boolStorageByStorageId);
@@ -1252,6 +1224,7 @@ bool parseFooterSection(const QByteArray& payload,
     blockIndexesByChunk.clear();
     lodLevelsByStorageId.clear();
     lodChunkIndex.clear();
+    arrayDataIndex.clear();
     blocks.reserve(int(qMin<u64>(count, u64(std::numeric_limits<int>::max()))));
     for (u64 i = 0; i < count; ++i) {
         u64 blockId = 0, fileOffset = 0, fileSize = 0, rawSize = 0;
@@ -1452,8 +1425,32 @@ bool parseFooterSection(const QByteArray& payload,
                 rec.recordCount = chunkRecordCount;
                 lodChunkIndex.push_back(rec);
             }
+            u64 arrayChunkCount = 0;
+            if (!r.readVarUInt(arrayChunkCount) || arrayChunkCount > 100000000ull) {
+                error = QStringLiteral("WVZ4 FOOT: invalid ADAT index count");
+                return false;
+            }
+            arrayDataIndex.reserve(int(qMin<u64>(arrayChunkCount, u64(std::numeric_limits<int>::max()))));
+            for (u64 i = 0; i < arrayChunkCount; ++i) {
+                ArrayDataIndexRec rec; u64 nodeId = 0; u8 comp = 0;
+                if (!r.readVarUInt(nodeId) || nodeId == 0 || nodeId > u64(std::numeric_limits<u32>::max()) ||
+                    !r.readVarUInt(rec.pageIndex) || !r.readI64(rec.start) || !r.readI64(rec.end) ||
+                    !r.readVarUInt(rec.fileOffset) || !r.readVarUInt(rec.fileSize) ||
+                    !r.readVarUInt(rec.rawSize) || !r.readU8(comp) ||
+                    !r.readVarUInt(rec.recordCount)) {
+                    error = QStringLiteral("WVZ4 FOOT: malformed ADAT index record");
+                    return false;
+                }
+                rec.nodeId = u32(nodeId);
+                rec.compression = Compression(comp);
+                if (rec.end <= rec.start || !isValidCompression(rec.compression) || rec.recordCount == 0) {
+                    error = QStringLiteral("WVZ4 FOOT: invalid ADAT index record");
+                    return false;
+                }
+                arrayDataIndex.push_back(rec);
+            }
             if (!r.eof()) {
-                error = QStringLiteral("WVZ4 FOOT: trailing bytes after LODZ chunk index");
+                error = QStringLiteral("WVZ4 FOOT: trailing bytes after ADAT index");
                 return false;
             }
             return true;
@@ -1693,21 +1690,21 @@ bool validateNodeAndSignalLayout(const QVector<NodeRec>& nodesById,
     for (const SigRec& s : sigs) {
         if (s.storageOnly) continue;
         if (s.nodeId == 0 || s.nodeId >= u32(nodesById.size()) || !nodesById.at(int(s.nodeId)).valid) {
-            error = QStringLiteral("WVZ4 SIGT references missing node_id %1").arg(int(s.nodeId));
+            error = QStringLiteral("WVZ4 SIGD references missing node_id %1").arg(int(s.nodeId));
             return false;
         }
         const int nodeId = int(s.nodeId);
         const NodeRec& leaf = nodesById.at(nodeId);
         if (leaf.kind != kNodeKindSignalLeaf) {
-            error = QStringLiteral("WVZ4 SIGT node_id %1 is not a SignalLeaf").arg(nodeId);
+            error = QStringLiteral("WVZ4 SIGD node_id %1 is not a SignalLeaf").arg(nodeId);
             return false;
         }
         if (leaf.firstChild != 0) {
-            error = QStringLiteral("WVZ4 SIGT node_id %1 must be a leaf node").arg(nodeId);
+            error = QStringLiteral("WVZ4 SIGD node_id %1 must be a leaf node").arg(nodeId);
             return false;
         }
         if (seenSignalNodes.at(nodeId)) {
-            error = QStringLiteral("WVZ4 SIGT has multiple signals bound to node_id %1").arg(nodeId);
+            error = QStringLiteral("WVZ4 SIGD has multiple signals bound to node_id %1").arg(nodeId);
             return false;
         }
         seenSignalNodes[nodeId] = 1;
@@ -1770,7 +1767,7 @@ bool buildWaveTreeInfo(const QVector<NodeRec>& nodesById,
         if (signalIndex < 0) continue;
 
         if (s.nodeId >= u32(outTree.nodesById.size()) || !outTree.nodesById[int(s.nodeId)].valid) {
-            error = QStringLiteral("WVZ4 SIGT references missing node_id %1").arg(int(s.nodeId));
+            error = QStringLiteral("WVZ4 SIGD references missing node_id %1").arg(int(s.nodeId));
             return false;
         }
 
@@ -2071,6 +2068,336 @@ bool finalizeCompactDirectorySignals(const QVector<SigRec>& sigs,
     return true;
 }
 
+bool finalizeBitsetDefinitions(QVector<BitsetRec>& bitsets,
+                               const QVector<SigRec>& sigs,
+                               WaveTreeInfo& tree,
+                               QString& error) {
+    tree.bitsets.clear();
+    tree.bitsetIndexByNodeId.clear();
+    if (bitsets.isEmpty()) return true;
+    if (!tree.valid || tree.nodesById.isEmpty()) {
+        error = QStringLiteral("WVZ4 BSET: NODI must precede the bitset table");
+        return false;
+    }
+
+    tree.bitsetIndexByNodeId.resize(tree.nodesById.size());
+    std::fill(tree.bitsetIndexByNodeId.begin(), tree.bitsetIndexByNodeId.end(), 0);
+    u64 nextVirtualSignalId = u64(sigs.size()) + 1ull;
+    tree.bitsets.reserve(bitsets.size());
+    for (int i = 0; i < bitsets.size(); ++i) {
+        BitsetRec& rec = bitsets[i];
+        const u64 expectedWords = (u64(rec.bitCount) + 63ull) / 64ull;
+        if (rec.wordCount != expectedWords ||
+            rec.nodeId >= u32(tree.nodesById.size()) ||
+            rec.firstStorageId > u32(sigs.size()) ||
+            u64(rec.firstStorageId) + u64(rec.wordCount) - 1ull > u64(sigs.size())) {
+            error = QStringLiteral("WVZ4 BSET: invalid node/storage range");
+            return false;
+        }
+        const WaveTreeNode& node = tree.nodesById.at(int(rec.nodeId));
+        if (!node.valid || node.kind == kNodeKindSignalLeaf || node.firstChild != 0 ||
+            tree.bitsetIndexByNodeId.at(int(rec.nodeId)) != 0) {
+            error = QStringLiteral("WVZ4 BSET: node_id %1 is not an empty unique container")
+                        .arg(int(rec.nodeId));
+            return false;
+        }
+        for (u32 word = 0; word < rec.wordCount; ++word) {
+            const u32 storageId = rec.firstStorageId + word;
+            const SigRec& storage = sigs.at(int(storageId - 1u));
+            if (storage.signalId != storageId || storage.storageId != storageId ||
+                !storage.storageOnly || storage.nodeId != 0 ||
+                storage.type != ValueType::U64 || storage.bitWidth != 64 ||
+                storage.bitOffset != 0) {
+                error = QStringLiteral("WVZ4 BSET: storage_id %1 is not a hidden U64 stream")
+                            .arg(int(storageId));
+                return false;
+            }
+        }
+        if (nextVirtualSignalId + u64(rec.bitCount) - 1ull >
+            u64(std::numeric_limits<int>::max())) {
+            error = QStringLiteral("WVZ4 BSET: virtual signal id range exceeds Viewer limits");
+            return false;
+        }
+        rec.firstVirtualSignalId = u32(nextVirtualSignalId);
+        WaveBitsetInfo info;
+        info.nodeId = int(rec.nodeId);
+        info.firstStorageId = int(rec.firstStorageId);
+        info.bitCount = int(rec.bitCount);
+        info.wordCount = int(rec.wordCount);
+        info.firstVirtualSignalId = int(rec.firstVirtualSignalId);
+        tree.bitsetIndexByNodeId[int(rec.nodeId)] = tree.bitsets.size() + 1;
+        tree.bitsets.push_back(info);
+        nextVirtualSignalId += u64(rec.bitCount);
+    }
+    return true;
+}
+
+bool finalizeArrayDefinitions(QVector<ArrayRec>& arrays,
+                              const QVector<SigRec>& sigs,
+                              const QVector<BitsetRec>& bitsets,
+                              WaveTreeInfo& tree,
+                              QString& error) {
+    tree.arrays.clear();
+    tree.arrayIndexByNodeId.clear();
+    if (arrays.isEmpty()) return true;
+    if (!tree.valid || tree.nodesById.isEmpty()) {
+        error = QStringLiteral("WVZ4 ARRY: NODI must precede the array table");
+        return false;
+    }
+    tree.arrayIndexByNodeId.resize(tree.nodesById.size());
+    std::fill(tree.arrayIndexByNodeId.begin(), tree.arrayIndexByNodeId.end(), 0);
+    u64 nextVirtualSignalId = u64(sigs.size()) + 1ull;
+    for (const BitsetRec& bitset : bitsets) {
+        nextVirtualSignalId = qMax(nextVirtualSignalId,
+            u64(bitset.firstVirtualSignalId) + u64(bitset.bitCount));
+    }
+
+    for (int ai = 0; ai < arrays.size(); ++ai) {
+        ArrayRec& array = arrays[ai];
+        if (array.nodeId >= u32(tree.nodesById.size()) || array.totalBytes == 0 ||
+            array.elementCount == 0 || array.elementStride == 0 ||
+            array.elementCount > (std::numeric_limits<u64>::max)() / array.elementStride ||
+            array.elementCount * array.elementStride != array.totalBytes ||
+            tree.arrayIndexByNodeId.at(int(array.nodeId)) != 0) {
+            error = QStringLiteral("WVZ4 ARRY: invalid or duplicate array node");
+            return false;
+        }
+        const WaveTreeNode& owner = tree.nodesById.at(int(array.nodeId));
+        if (!owner.valid || owner.kind == kNodeKindSignalLeaf || owner.firstChild != 0) {
+            error = QStringLiteral("WVZ4 ARRY: node_id %1 is not an empty container").arg(array.nodeId);
+            return false;
+        }
+        QVector<u64> logicalLeafCounts(array.schema.size(), 0);
+        int rootCount = 0;
+        for (int si = array.schema.size() - 1; si >= 0; --si) {
+            const ArraySchemaRec& sn = array.schema.at(si);
+            if (sn.schemaNodeId != u32(si + 1) ||
+                (sn.parentSchemaNodeId != 0 && sn.parentSchemaNodeId >= sn.schemaNodeId) ||
+                sn.nameId >= u32(tree.namesById.size()) ||
+                sn.byteOffset > array.elementStride ||
+                sn.byteSize > array.elementStride - sn.byteOffset ||
+                sn.kind < 1 || sn.kind > 4) {
+                error = QStringLiteral("WVZ4 ARRY: invalid schema node in array %1").arg(array.nodeId);
+                return false;
+            }
+            u64 count = 0;
+            if (sn.kind == 4) {
+                int byteWidth = 0;
+                if (!valueTypeByteWidth(sn.valueType, byteWidth) || sn.bitWidth == 0 ||
+                    sn.bitWidth > u32(byteWidth * 8) ||
+                    sn.byteSize == 0 || sn.byteSize > 8 ||
+                    u64(sn.bitOffset) + u64(sn.bitWidth) > sn.byteSize * 8ull) {
+                    error = QStringLiteral("WVZ4 ARRY: invalid leaf schema in array %1").arg(array.nodeId);
+                    return false;
+                }
+                count = 1;
+            } else {
+                for (int child = si + 1; child < array.schema.size(); ++child) {
+                    if (array.schema.at(child).parentSchemaNodeId == sn.schemaNodeId) {
+                        if (count > (std::numeric_limits<u64>::max)() - logicalLeafCounts.at(child)) {
+                            error = QStringLiteral("WVZ4 ARRY: schema leaf count overflow");
+                            return false;
+                        }
+                        count += logicalLeafCounts.at(child);
+                    }
+                }
+                if (sn.kind == 3) {
+                    if (sn.elementCount == 0 || sn.elementStride == 0 || count == 0 ||
+                        sn.elementCount > (std::numeric_limits<u64>::max)() / sn.elementStride ||
+                        sn.elementCount * sn.elementStride > sn.byteSize ||
+                        sn.elementCount > (std::numeric_limits<u64>::max)() / count) {
+                        error = QStringLiteral("WVZ4 ARRY: invalid nested array schema");
+                        return false;
+                    }
+                    count *= sn.elementCount;
+                }
+            }
+            logicalLeafCounts[si] = count;
+            if (sn.parentSchemaNodeId == 0) ++rootCount;
+        }
+        if (rootCount != 1 || logicalLeafCounts.first() == 0 ||
+            array.schema.first().parentSchemaNodeId != 0 ||
+            array.elementCount > (std::numeric_limits<u64>::max)() / logicalLeafCounts.first()) {
+            error = QStringLiteral("WVZ4 ARRY: invalid root element schema");
+            return false;
+        }
+        std::function<bool(u32, u64)> validateLeafRanges;
+        validateLeafRanges = [&](u32 schemaNodeId, u64 repeatedOffset) -> bool {
+            const ArraySchemaRec& sn = array.schema.at(int(schemaNodeId - 1u));
+            if (sn.kind == 4) {
+                return repeatedOffset <= array.elementStride &&
+                       sn.byteOffset <= array.elementStride - repeatedOffset &&
+                       sn.byteSize <= array.elementStride - repeatedOffset - sn.byteOffset;
+            }
+            u64 childRepeatedOffset = repeatedOffset;
+            if (sn.kind == 3) {
+                const u64 lastRepeat = (sn.elementCount - 1) * sn.elementStride;
+                if (childRepeatedOffset > array.elementStride ||
+                    lastRepeat > array.elementStride - childRepeatedOffset) return false;
+                childRepeatedOffset += lastRepeat;
+            }
+            for (const ArraySchemaRec& child : array.schema) {
+                if (child.parentSchemaNodeId == schemaNodeId &&
+                    !validateLeafRanges(child.schemaNodeId, childRepeatedOffset)) return false;
+            }
+            return true;
+        };
+        if (!validateLeafRanges(1, 0)) {
+            error = QStringLiteral("WVZ4 ARRY: nested leaf range exceeds element storage");
+            return false;
+        }
+        array.leafCountPerElement = logicalLeafCounts.first();
+        const u64 totalSignals = array.elementCount * array.leafCountPerElement;
+        if (nextVirtualSignalId + totalSignals > u64(std::numeric_limits<int>::max()) + 1ull) {
+            error = QStringLiteral("WVZ4 ARRY: virtual signal id range exceeds Viewer limits");
+            return false;
+        }
+        array.firstVirtualSignalId = u32(nextVirtualSignalId);
+
+        WaveArrayInfo info;
+        info.nodeId = int(array.nodeId);
+        info.totalBytes = array.totalBytes;
+        info.elementCount = array.elementCount;
+        info.elementStride = array.elementStride;
+        info.firstVirtualSignalId = int(array.firstVirtualSignalId);
+        info.leafCountPerElement = array.leafCountPerElement;
+        info.schema.reserve(array.schema.size());
+        for (const ArraySchemaRec& src : array.schema) {
+            WaveArraySchemaNode dst;
+            dst.schemaNodeId = int(src.schemaNodeId);
+            dst.parentSchemaNodeId = int(src.parentSchemaNodeId);
+            dst.nameToken = src.nameId;
+            dst.kind = WaveArraySchemaKind(src.kind);
+            dst.byteOffset = src.byteOffset;
+            dst.byteSize = src.byteSize;
+            dst.elementCount = src.elementCount;
+            dst.elementStride = src.elementStride;
+            dst.valueType = quint8(src.valueType);
+            dst.bitWidth = int(src.bitWidth);
+            dst.bitOffset = int(src.bitOffset);
+            info.schema.push_back(dst);
+        }
+        tree.arrayIndexByNodeId[int(array.nodeId)] = tree.arrays.size() + 1;
+        tree.arrays.push_back(std::move(info));
+        nextVirtualSignalId += totalSignals;
+    }
+    return true;
+}
+
+struct VirtualArraySignalRec {
+    SigRec signal;
+    u32 arrayNodeId = 0;
+    u64 byteOffset = 0;
+    u32 byteWidth = 0;
+};
+
+bool locateArrayLeafOrdinal(const ArrayRec& array,
+                            u32 schemaNodeId,
+                            u64 ordinal,
+                            u64 repeatedOffset,
+                            VirtualArraySignalRec& result) {
+    if (schemaNodeId == 0 || schemaNodeId > u32(array.schema.size())) return false;
+    const ArraySchemaRec& node = array.schema.at(int(schemaNodeId - 1u));
+    if (node.kind == 4) {
+        if (ordinal != 0 || node.byteSize > u64(std::numeric_limits<u32>::max())) return false;
+        result.signal.type = node.valueType;
+        result.signal.bitWidth = node.bitWidth;
+        result.signal.bitOffset = node.bitOffset;
+        result.byteOffset += node.byteOffset + repeatedOffset;
+        result.byteWidth = u32(node.byteSize);
+        return true;
+    }
+    QVector<u32> children;
+    for (const ArraySchemaRec& candidate : array.schema) {
+        if (candidate.parentSchemaNodeId == schemaNodeId) children.push_back(candidate.schemaNodeId);
+    }
+    auto subtreeCount = [&](u32 root, const auto& self) -> u64 {
+        const ArraySchemaRec& current = array.schema.at(int(root - 1u));
+        if (current.kind == 4) return 1;
+        u64 count = 0;
+        for (const ArraySchemaRec& candidate : array.schema) {
+            if (candidate.parentSchemaNodeId == root) count += self(candidate.schemaNodeId, self);
+        }
+        return current.kind == 3 ? count * current.elementCount : count;
+    };
+    if (node.kind == 3) {
+        u64 perElement = 0;
+        for (u32 child : children) perElement += subtreeCount(child, subtreeCount);
+        if (perElement == 0) return false;
+        const u64 index = ordinal / perElement;
+        if (index >= node.elementCount) return false;
+        ordinal %= perElement;
+        repeatedOffset += index * node.elementStride;
+    }
+    for (u32 child : children) {
+        const u64 childCount = subtreeCount(child, subtreeCount);
+        if (ordinal < childCount) {
+            return locateArrayLeafOrdinal(array, child, ordinal, repeatedOffset, result);
+        }
+        ordinal -= childCount;
+    }
+    return false;
+}
+
+bool virtualArraySignalRec(const QVector<ArrayRec>& arrays,
+                           int signalId,
+                           VirtualArraySignalRec& result) {
+    if (signalId <= 0) return false;
+    const u64 sid = u64(signalId);
+    for (const ArrayRec& array : arrays) {
+        const u64 totalSignals = array.elementCount * array.leafCountPerElement;
+        if (sid < array.firstVirtualSignalId || sid >= u64(array.firstVirtualSignalId) + totalSignals) continue;
+        const u64 linear = sid - array.firstVirtualSignalId;
+        const u64 outerIndex = linear / array.leafCountPerElement;
+        const u64 ordinal = linear % array.leafCountPerElement;
+        result = VirtualArraySignalRec();
+        result.signal.signalId = u32(signalId);
+        result.signal.radix = Radix::Auto;
+        result.arrayNodeId = array.nodeId;
+        result.byteOffset = outerIndex * array.elementStride;
+        if (!locateArrayLeafOrdinal(array, 1u, ordinal, 0, result)) return false;
+        return true;
+    }
+    return false;
+}
+
+bool virtualBitsetSignalRec(const QVector<BitsetRec>& bitsets,
+                            int signalId,
+                            SigRec& result) {
+    if (signalId <= 0) return false;
+    const u64 sid = u64(signalId);
+    for (const BitsetRec& bitset : bitsets) {
+        const u64 first = bitset.firstVirtualSignalId;
+        const u64 end = first + u64(bitset.bitCount);
+        if (sid < first || sid >= end) continue;
+        const u32 bit = u32(sid - first);
+        result = SigRec();
+        result.signalId = u32(signalId);
+        result.storageId = bitset.firstStorageId + bit / 64u;
+        result.type = ValueType::Bool;
+        result.bitWidth = 1;
+        result.bitOffset = bit % 64u;
+        result.radix = Radix::Bin;
+        result.storageOnly = false;
+        return true;
+    }
+    return false;
+}
+
+bool signalRecForId(const QVector<SigRec>& sigs,
+                    const QVector<BitsetRec>& bitsets,
+                    int signalId,
+                    SigRec& result,
+                    bool& virtualBit) {
+    virtualBit = false;
+    if (signalId > 0 && signalId <= sigs.size()) {
+        result = sigs.at(signalId - 1);
+        return result.signalId == u32(signalId);
+    }
+    virtualBit = virtualBitsetSignalRec(bitsets, signalId, result);
+    return virtualBit;
+}
+
 bool buildStorageMapsForSignals(const QVector<SigRec>& sigs,
                                 QVector<int>& byteWidthByStorageId,
                                 QVector<int>& boolStorageByStorageId,
@@ -2094,14 +2421,14 @@ bool buildStorageMapsForSignals(const QVector<SigRec>& sigs,
         const SigRec& s = sigs.at(i);
         int bytes = 0;
         if (!valueTypeByteWidth(s.type, bytes)) {
-            error = QStringLiteral("WVZ4 SIGT has invalid ValueType for signal_id %1").arg(int(s.signalId));
+            error = QStringLiteral("WVZ4 SIGD has invalid ValueType for signal_id %1").arg(int(s.signalId));
             return false;
         }
         const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
         storageIdBySignalId[int(s.signalId)] = storageId;
         const int oldBytes = directIntMapValue(byteWidthByStorageId, storageId, -1);
         if ((s.storageOnly || storageId == int(s.signalId)) && oldBytes > 0 && oldBytes != bytes) {
-            error = QStringLiteral("WVZ4 SIGT storage_id %1 has incompatible logical aliases").arg(storageId);
+            error = QStringLiteral("WVZ4 SIGD storage_id %1 has incompatible logical aliases").arg(storageId);
             return false;
         }
         if (s.storageOnly || storageId == int(s.signalId) || oldBytes <= 0) {
@@ -2116,12 +2443,12 @@ bool buildStorageMapsForSignals(const QVector<SigRec>& sigs,
         const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
         const int storageBytes = directIntMapValue(byteWidthByStorageId, storageId, -1);
         if (storageBytes <= 0) {
-            error = QStringLiteral("WVZ4 SIGT signal_id %1 references missing storage_id %2")
+            error = QStringLiteral("WVZ4 SIGD signal_id %1 references missing storage_id %2")
                 .arg(int(s.signalId)).arg(storageId);
             return false;
         }
         if (s.bitOffset + s.bitWidth > u32(storageBytes * 8)) {
-            error = QStringLiteral("WVZ4 SIGT signal_id %1 bit range exceeds storage_id %2 capacity")
+            error = QStringLiteral("WVZ4 SIGD signal_id %1 bit range exceeds storage_id %2 capacity")
                 .arg(int(s.signalId)).arg(storageId);
             return false;
         }
@@ -2153,6 +2480,15 @@ void expandTimeRangeFromFooterBlocks(const QVector<BlockIndexRec>& footerBlocks,
     }
 }
 
+void expandTimeRangeFromArrayDataIndex(const QVector<ArrayDataIndexRec>& index,
+                                       qint64& minTime,
+                                       qint64& maxTime) {
+    for (const ArrayDataIndexRec& rec : index) {
+        minTime = qMin(minTime, rec.start);
+        maxTime = qMax(maxTime, rec.end);
+    }
+}
+
 
 quint64 readScalarBitsLE(const char* p, int n) {
     quint64 v = 0;
@@ -2177,15 +2513,69 @@ void appendCompactedSample(QVector<WaveSample>& rows, WaveSample&& sample) {
     rows.push_back(std::move(sample));
 }
 
+bool appendBudgetedCompactedSample(QVector<WaveSample>& rows,
+                                   WaveSample&& sample,
+                                   QString& error) {
+    const bool addsRow = rows.isEmpty() ||
+                         (rows.last().time != sample.time &&
+                          !waveSamplesEquivalent(rows.last(), sample));
+    if (addsRow && gDecodedSampleLimit != 0 &&
+        gDecodedSampleCount >= gDecodedSampleLimit) {
+        error = QStringLiteral("WVZ4 decoded sample budget exceeded (%1)")
+                    .arg(gDecodedSampleLimit);
+        return false;
+    }
+    const int before = rows.size();
+    appendCompactedSample(rows, std::move(sample));
+    if (rows.size() > before) ++gDecodedSampleCount;
+    return true;
+}
+
+bool validateArrayDataIndex(const QVector<ArrayDataIndexRec>& index,
+                            const QVector<ArrayRec>& arrays,
+                            quint64 fileSize,
+                            QString& error) {
+    static const u64 kArrayPageBytes = 64ull * 1024ull;
+    QHash<u32, u64> totalBytesByNodeId;
+    for (const ArrayRec& array : arrays) totalBytesByNodeId.insert(array.nodeId, array.totalBytes);
+
+    i64 previousCycle = (std::numeric_limits<i64>::min)();
+    for (const ArrayDataIndexRec& rec : index) {
+        const auto found = totalBytesByNodeId.constFind(rec.nodeId);
+        if (found == totalBytesByNodeId.constEnd() || found.value() == 0) {
+            error = QStringLiteral("WVZ4 FOOT ADAT references an unknown array node");
+            return false;
+        }
+        if (rec.start < previousCycle || rec.start == (std::numeric_limits<i64>::max)() ||
+            rec.end != rec.start + 1) {
+            error = QStringLiteral("WVZ4 FOOT ADAT cycle index is not ordered or exact");
+            return false;
+        }
+        previousCycle = rec.start;
+        if (rec.pageIndex > (found.value() - 1) / kArrayPageBytes) {
+            error = QStringLiteral("WVZ4 FOOT ADAT page exceeds array storage");
+            return false;
+        }
+        if (rec.fileSize < 12 || rec.fileOffset > fileSize ||
+            rec.fileSize > fileSize - rec.fileOffset) {
+            error = QStringLiteral("WVZ4 FOOT ADAT file range exceeds file size");
+            return false;
+        }
+    }
+    return true;
+}
+
 struct RawLeftAnchorState {
     QVector<WaveSample> samples;
     QVector<quint8> valid;
     QVector<quint8> emitted;
+    bool deferEmission = false;
 
     void reset(int count) {
         samples.resize(count);
         valid.fill(0, count);
         emitted.fill(0, count);
+        deferEmission = false;
     }
 };
 
@@ -2352,11 +2742,14 @@ bool emitLeftAnchorIfNeeded(int outputIndex,
                             QVector<QVector<WaveSample>>& samplesByOutputIndex,
                             bool compactSamples,
                             RawLeftAnchorState* leftAnchors,
-                            QString& error) {
+                            QString& error,
+                            qint64 anchorTime = std::numeric_limits<qint64>::min()) {
     if (!leftAnchors) return true;
+    if (leftAnchors->deferEmission) return true;
     if (outputIndex < 0 || outputIndex >= leftAnchors->valid.size()) return true;
     if (!leftAnchors->valid.at(outputIndex) || leftAnchors->emitted.at(outputIndex)) return true;
     WaveSample anchor = leftAnchors->samples.at(outputIndex);
+    if (anchorTime != std::numeric_limits<qint64>::min()) anchor.time = anchorTime;
     leftAnchors->emitted[outputIndex] = 1;
     return appendDecodedSampleObject(outputIndex, std::move(anchor), outputSignals,
                                      samplesByOutputIndex, compactSamples, error, false);
@@ -2403,7 +2796,7 @@ bool appendImplicitZeroSamplesForSelectedSignals(const QSet<int>& selectedIds,
     for (int outputIndex = 0; outputIndex < outputSignals.size(); ++outputIndex) {
         const WaveSignal& sig = outputSignals.at(outputIndex);
         if (!allSelected && !selectedIds.contains(sig.signalId)) continue;
-        if (sig.proceduralClock) continue;
+        if (sig.proceduralClock || sig.virtualArrayLeaf) continue;
         if (outputIndex < 0 || outputIndex >= samplesByOutputIndex.size()) continue;
 
         WaveSample sample;
@@ -2590,7 +2983,7 @@ bool appendDecodedRecordValue(const QVector<int>& outputIndexes,
     for (int i = 0; i < outputIndexes.size(); ++i) {
         const int outputIndex = outputIndexes.at(i);
         if (!emitLeftAnchorIfNeeded(outputIndex, outputSignals, samplesByOutputIndex,
-                                    compactSamples, leftAnchors, error)) {
+                                    compactSamples, leftAnchors, error, windowStart)) {
             return false;
         }
     }
@@ -2912,7 +3305,7 @@ bool decodeRawWaveTile(const QByteArray& rawPayload,
     if (!validateRawBlockHeader(blockId, blockStart, blockEnd, expectedBlockId, expectedStart, expectedEnd, error)) return false;
 
     if ((flags & kWdatSignalChunkTile) == 0) {
-        error = QStringLiteral("WVZ4 v15 WDAT tile is missing the signal-chunk flag");
+        error = QStringLiteral("WVZ4 v17 WDAT tile is missing the signal-chunk flag");
         return false;
     }
 
@@ -3614,7 +4007,7 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
         for (int outputIndex = 0;
              outputIndex < waveSignalCount(outputSignals); ++outputIndex) {
             if (!emitLeftAnchorIfNeeded(outputIndex, outputSignals, samplesByOutputIndex,
-                                        true, &leftAnchors, error)) {
+                                        true, &leftAnchors, error, windowStart)) {
                 return false;
             }
         }
@@ -3659,6 +4052,7 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
 
             ParallelWdatWorkerResult& local = workerResults[std::size_t(workerIndex)];
             DecodedSampleBudgetScope localBudget(0);
+            local.leftAnchors.deferEmission = true;
             QString localError;
             const int begin = (selectedBlockIndexes.size() * workerIndex) / workerCount;
             const int end = (selectedBlockIndexes.size() * (workerIndex + 1)) / workerCount;
@@ -3715,17 +4109,6 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
                     completedBlocks.fetch_add(1, std::memory_order_acq_rel) + 1;
                 if (completed == totalBlocks) progressCondition.notify_one();
             }
-            for (int outputIndex = 0; outputIndex < outputSignals.size(); ++outputIndex) {
-                if (!emitLeftAnchorIfNeeded(outputIndex,
-                                            outputSignals,
-                                            local.samplesByOutputIndex,
-                                            true,
-                                            &local.leftAnchors,
-                                            localError)) {
-                    setError(localError);
-                    return;
-                }
-            }
         });
     }
 
@@ -3758,6 +4141,26 @@ bool decodeWdatSectionsFromFooterIndexParallel(const QString& filePath,
     }
     if (progress && lastReportedBlocks != totalBlocks) {
         progress(totalBlocks, totalBlocks);
+    }
+
+    RawLeftAnchorState mergedLeftAnchors;
+    mergedLeftAnchors.reset(waveSignalCount(outputSignals));
+    for (const ParallelWdatWorkerResult& result : workerResults) {
+        for (int outputIndex = 0; outputIndex < result.leftAnchors.valid.size(); ++outputIndex) {
+            if (!result.leftAnchors.valid.at(outputIndex)) continue;
+            if (!mergedLeftAnchors.valid.at(outputIndex) ||
+                result.leftAnchors.samples.at(outputIndex).time >
+                    mergedLeftAnchors.samples.at(outputIndex).time) {
+                mergedLeftAnchors.samples[outputIndex] = result.leftAnchors.samples.at(outputIndex);
+                mergedLeftAnchors.valid[outputIndex] = 1;
+            }
+        }
+    }
+    for (int outputIndex = 0; outputIndex < outputSignals.size(); ++outputIndex) {
+        if (!emitLeftAnchorIfNeeded(outputIndex, outputSignals, samplesByOutputIndex,
+                                    true, &mergedLeftAnchors, error, windowStart)) {
+            return false;
+        }
     }
 
     quint64 decodedSamples = 0;
@@ -4535,6 +4938,163 @@ bool decodeRawWdatPayloadForCompare(const QByteArray& payload,
     return error.isEmpty();
 }
 
+bool decodeSelectedArraySignals(const QString& filePath,
+                                const QVector<ArrayDataIndexRec>& index,
+                                WaveSignalList& outputSignals,
+                                QVector<QVector<WaveSample>>& samplesByOutputIndex,
+                                qint64 timeStart,
+                                qint64 timeEnd,
+                                QString& error) {
+    static const u64 kArrayPageBytes = 64ull * 1024ull;
+    QVector<int> selected;
+    for (int i = 0; i < outputSignals.size(); ++i) {
+        if (outputSignals.at(i).virtualArrayLeaf) selected.push_back(i);
+    }
+    if (selected.isEmpty()) return true;
+
+    struct State {
+        QByteArray bytes;
+        QByteArray known;
+        bool anchorEmitted = false;
+    };
+    QVector<State> states(waveSignalCount(outputSignals));
+    for (int output : selected) {
+        const int width = outputSignals.at(output).arrayByteWidth;
+        if (width <= 0 || width > 8) {
+            error = QStringLiteral("WVZ4 ARRY leaf width is invalid");
+            return false;
+        }
+        states[output].bytes.fill(char(0), width);
+        states[output].known.fill(char(0), width);
+    }
+
+    QFile file(filePath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        error = QStringLiteral("Cannot reopen WVZ4 array data: %1").arg(filePath);
+        return false;
+    }
+    int cursor = 0;
+    while (cursor < index.size()) {
+        const qint64 cycle = index.at(cursor).start;
+        int endCursor = cursor + 1;
+        while (endCursor < index.size() && index.at(endCursor).start == cycle) ++endCursor;
+        if (timeEnd >= timeStart && cycle >= timeEnd) break;
+
+        if (timeEnd >= timeStart && cycle >= timeStart) {
+            for (int output : selected) {
+                State& state = states[output];
+                if (state.anchorEmitted || state.known.contains(char(0))) continue;
+                WaveSample anchor = makeDecodedSample(output, state.bytes.constData(), state.bytes.size(),
+                                                      timeStart, outputSignals);
+                if (!appendBudgetedCompactedSample(samplesByOutputIndex[output],
+                                                   std::move(anchor), error)) return false;
+                state.anchorEmitted = true;
+            }
+        }
+
+        for (int ii = cursor; ii < endCursor; ++ii) {
+            const ArrayDataIndexRec& rec = index.at(ii);
+            bool needed = false;
+            for (int output : selected) {
+                const WaveSignal& sig = outputSignals.at(output);
+                if (sig.arrayNodeId != int(rec.nodeId)) continue;
+                const u64 firstPage = sig.arrayByteOffset / kArrayPageBytes;
+                const u64 lastPage = (sig.arrayByteOffset + u64(sig.arrayByteWidth) - 1ull) / kArrayPageBytes;
+                if (rec.pageIndex >= firstPage && rec.pageIndex <= lastPage) { needed = true; break; }
+            }
+            if (!needed) continue;
+            if (rec.fileOffset > u64(file.size()) || rec.fileSize > u64(file.size()) - rec.fileOffset ||
+                rec.fileOffset > u64(std::numeric_limits<qint64>::max()) ||
+                !file.seek(qint64(rec.fileOffset))) {
+                error = QStringLiteral("WVZ4 FOOT ADAT range is invalid");
+                return false;
+            }
+            SectionHeader sh;
+            if (!readSectionHeader(file, sh, error) || sh.tag != "ADAT" || sh.size + 12ull != rec.fileSize) {
+                if (error.isEmpty()) error = QStringLiteral("WVZ4 FOOT ADAT index does not point to ADAT");
+                return false;
+            }
+            QByteArray payload;
+            if (!readSectionPayload(file, sh, payload, error)) return false;
+            SpanReader outer(payload);
+            u64 nodeId = 0, pageIndex = 0, rawSize = 0, encodedSize = 0;
+            i64 start = 0, end = 0; u8 comp = 0; const char* encoded = nullptr;
+            if (!outer.readVarUInt(nodeId) || !outer.readVarUInt(pageIndex) ||
+                !outer.readI64(start) || !outer.readI64(end) || !outer.readU8(comp) ||
+                !outer.readVarUInt(rawSize) || !outer.readVarUInt(encodedSize) ||
+                encodedSize > u64(std::numeric_limits<int>::max()) ||
+                !outer.readBytes(encoded, int(encodedSize)) || !outer.eof() ||
+                nodeId != rec.nodeId || pageIndex != rec.pageIndex || start != rec.start ||
+                end != rec.end || Compression(comp) != rec.compression || rawSize != rec.rawSize) {
+                error = QStringLiteral("WVZ4 ADAT header/index mismatch");
+                return false;
+            }
+            const QByteArray encodedBytes = QByteArray::fromRawData(encoded, int(encodedSize));
+            QByteArray raw = decompressBlockPayload(encodedBytes, Compression(comp), rawSize, error);
+            if (!error.isEmpty()) return false;
+            SpanReader records(raw);
+            u64 recordCount = 0;
+            if (!records.readVarUInt(recordCount) || recordCount != rec.recordCount) {
+                error = QStringLiteral("WVZ4 ADAT record count mismatch");
+                return false;
+            }
+            for (u64 ri = 0; ri < recordCount; ++ri) {
+                u64 pageOffset = 0, size = 0; const char* bytes = nullptr;
+                if (!records.readVarUInt(pageOffset) || !records.readVarUInt(size) ||
+                    pageOffset >= kArrayPageBytes || size == 0 ||
+                    size > kArrayPageBytes - pageOffset || size > u64(std::numeric_limits<int>::max()) ||
+                    !records.readBytes(bytes, int(size))) {
+                    error = QStringLiteral("WVZ4 ADAT fragment is malformed");
+                    return false;
+                }
+                const u64 fragmentStart = rec.pageIndex * kArrayPageBytes + pageOffset;
+                const u64 fragmentEnd = fragmentStart + size;
+                for (int output : selected) {
+                    const WaveSignal& sig = outputSignals.at(output);
+                    if (sig.arrayNodeId != int(rec.nodeId)) continue;
+                    const u64 leafStart = sig.arrayByteOffset;
+                    const u64 leafEnd = leafStart + u64(sig.arrayByteWidth);
+                    const u64 overlapStart = qMax(fragmentStart, leafStart);
+                    const u64 overlapEnd = qMin(fragmentEnd, leafEnd);
+                    if (overlapEnd <= overlapStart) continue;
+                    const int dst = int(overlapStart - leafStart);
+                    const int src = int(overlapStart - fragmentStart);
+                    const int count = int(overlapEnd - overlapStart);
+                    std::memcpy(states[output].bytes.data() + dst, bytes + src, size_t(count));
+                    std::memset(states[output].known.data() + dst, 1, size_t(count));
+                }
+            }
+            if (!records.eof()) {
+                error = QStringLiteral("WVZ4 ADAT payload has trailing bytes");
+                return false;
+            }
+        }
+
+        for (int output : selected) {
+            State& state = states[output];
+            if (state.known.contains(char(0))) continue;
+            QVector<WaveSample>& samples = samplesByOutputIndex[output];
+            if (timeEnd >= timeStart && cycle < timeStart) continue;
+            WaveSample sample = makeDecodedSample(output, state.bytes.constData(), state.bytes.size(),
+                                                  cycle, outputSignals);
+            if (!appendBudgetedCompactedSample(samples, std::move(sample), error)) return false;
+            state.anchorEmitted = true;
+        }
+        cursor = endCursor;
+    }
+    if (timeEnd >= timeStart) {
+        for (int output : selected) {
+            State& state = states[output];
+            if (state.anchorEmitted || state.known.contains(char(0))) continue;
+            WaveSample sample = makeDecodedSample(output, state.bytes.constData(), state.bytes.size(),
+                                                  timeStart, outputSignals);
+            if (!appendBudgetedCompactedSample(samplesByOutputIndex[output],
+                                               std::move(sample), error)) return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 bool buildWaveSubtreeReferencePatch(
@@ -4563,10 +5123,13 @@ struct WaveParser4Reader::Impl {
 
     QVector<SigRec> sigs;
     QVector<ClockRec> clocks;
+    QVector<BitsetRec> bitsets;
+    QVector<ArrayRec> arrays;
     QVector<BlockIndexRec> footerBlocks;
     QVector<QVector<int>> footerBlockIndexesByChunk;
     QVector<QVector<WaveLodLevel>> footerLodLevelsByStorageId;
     QVector<LodChunkIndexRec> footerLodChunkIndex;
+    QVector<ArrayDataIndexRec> footerArrayDataIndex;
     QVector<int> byteWidthByStorageId;
     QVector<int> boolStorageByStorageId;
 
@@ -4619,18 +5182,13 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
     next->footerOffset = readU64LE(header.constData() + 24);
     next->signalsPerChunk = readU64LE(header.constData() + 32);
     next->headerFeatureFlags = readU64LE(header.constData() + 40);
+    if (!isCurrentFormatVersion(version)) {
+        error = QStringLiteral("Unsupported WVZ4 version: %1 (this Viewer supports v17 only)").arg(version);
+        return false;
+    }
+    if (!validateCurrentHeader(next->headerSize, next->headerFeatureFlags, error)) return false;
     next->residualLodTables =
-        ((next->headerFeatureFlags & kHeaderFeatureResidualLodTables) != 0) &&
-        ((next->headerFeatureFlags & kHeaderFeatureLodTables) != 0);
-
-    if (!isSupportedFormatVersion(version)) {
-        error = QStringLiteral("Unsupported WVZ4 version: %1 (this Viewer supports v15-v16)").arg(version);
-        return false;
-    }
-    if (next->headerSize < 64 || quint64(next->headerSize) > quint64(file.size())) {
-        error = QStringLiteral("Invalid WVZ4 header_size: %1").arg(next->headerSize);
-        return false;
-    }
+        (next->headerFeatureFlags & kHeaderFeatureResidualLodTables) != 0;
     if (next->footerOffset != 0 && next->footerOffset > quint64(file.size())) {
         error = QStringLiteral("WVZ4 footer_offset exceeds file size");
         return false;
@@ -4644,8 +5202,11 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
         return false;
     }
 
+    bool haveNameLayout = false;
     bool haveNodeLayout = false;
     bool haveSignalLayout = false;
+    bool haveBitsetLayout = false;
+    bool haveArrayLayout = false;
     bool haveFooter = false;
     while (!file.atEnd()) {
         SectionHeader sh;
@@ -4654,7 +5215,7 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
             return false;
         }
 
-        if (sh.tag == "WDAT") {
+        if (sh.tag == "WDAT" || sh.tag == "ADAT") {
             if (next->footerOffset != 0) {
                 if (!haveSignalLayout) {
                     error = QStringLiteral("WVZ4 missing SIGD section before WDAT");
@@ -4683,6 +5244,7 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
                                         next->footerBlockIndexesByChunk,
                                         next->footerLodLevelsByStorageId,
                                         next->footerLodChunkIndex,
+                                        next->footerArrayDataIndex,
                                         error)) {
                     return false;
                 }
@@ -4699,18 +5261,28 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
         if (!readSectionPayload(file, sh, payload, error)) return false;
 
         if (sh.tag == "NAME") {
+            if (haveNameLayout) {
+                error = QStringLiteral("WVZ4 contains duplicate NAME layout sections");
+                return false;
+            }
             if (!parseNameSection(payload, next->directoryWave.tree.namesById, error)) return false;
+            haveNameLayout = true;
         } else if (sh.tag == "NAMZ") {
+            if (haveNameLayout) {
+                error = QStringLiteral("WVZ4 contains duplicate NAME layout sections");
+                return false;
+            }
             const QByteArray raw = decodeCompressedLayoutPayload(payload, "NAMZ", error);
             if (!error.isEmpty()) return false;
             if (!parseNameSection(raw, next->directoryWave.tree.namesById, error)) return false;
+            haveNameLayout = true;
         } else if (sh.tag == "NODI") {
             if (haveNodeLayout) {
                 error = QStringLiteral("WVZ4 contains duplicate NODI layout sections");
                 return false;
             }
             if (!parseCompactNodeTreeSection(
-                    payload, next->directoryWave.tree, version, error)) {
+                    payload, next->directoryWave.tree, error)) {
                 return false;
             }
             haveNodeLayout = true;
@@ -4722,7 +5294,7 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
                 return false;
             }
             if (!parseCompactNodeTreeSection(
-                    raw, next->directoryWave.tree, version, error)) {
+                    raw, next->directoryWave.tree, error)) {
                 return false;
             }
             haveNodeLayout = true;
@@ -4754,16 +5326,42 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
                                                  next->boolStorageByStorageId,
                                                  error)) return false;
             haveSignalLayout = true;
-        } else if (sh.tag == "NREF" || sh.tag == "NRFZ" ||
-                   sh.tag == "SIGT" || sh.tag == "SIGZ") {
-            error = QStringLiteral("WVZ4 v15-v16 Viewer requires compact NODI/SIGD layout sections");
-            return false;
         } else if (sh.tag == "CLKD") {
             if (!parseClockSection(payload, next->clocks, error)) return false;
         } else if (sh.tag == "CLKZ") {
             const QByteArray raw = decodeCompressedLayoutPayload(payload, "CLKZ", error);
             if (!error.isEmpty()) return false;
             if (!parseClockSection(raw, next->clocks, error)) return false;
+        } else if (sh.tag == "BSET") {
+            if (haveBitsetLayout) {
+                error = QStringLiteral("WVZ4 contains duplicate BSET layout sections");
+                return false;
+            }
+            if (!parseBitsetSection(payload, next->bitsets, error)) return false;
+            haveBitsetLayout = true;
+        } else if (sh.tag == "BSZ2") {
+            if (haveBitsetLayout) {
+                error = QStringLiteral("WVZ4 contains duplicate BSET layout sections");
+                return false;
+            }
+            const QByteArray raw = decodeCompressedLayoutPayload(payload, "BSZ2", error);
+            if (!error.isEmpty()) return false;
+            if (!parseBitsetSection(raw, next->bitsets, error)) return false;
+            haveBitsetLayout = true;
+        } else if (sh.tag == "ARRY") {
+            if (haveArrayLayout || !parseArraySection(payload, next->arrays, error)) {
+                if (error.isEmpty()) error = QStringLiteral("WVZ4 contains duplicate ARRY layout sections");
+                return false;
+            }
+            haveArrayLayout = true;
+        } else if (sh.tag == "ARZ2") {
+            if (haveArrayLayout) {
+                error = QStringLiteral("WVZ4 contains duplicate ARRY layout sections");
+                return false;
+            }
+            const QByteArray raw = decodeCompressedLayoutPayload(payload, "ARZ2", error);
+            if (!error.isEmpty() || !parseArraySection(raw, next->arrays, error)) return false;
+            haveArrayLayout = true;
         } else if (sh.tag == "FOOT") {
             const qint64 footerSectionOffset = sh.payloadOffset - 12;
             if (next->footerOffset != 0 && footerSectionOffset >= 0 &&
@@ -4782,6 +5380,7 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
                                     next->footerBlockIndexesByChunk,
                                     next->footerLodLevelsByStorageId,
                                     next->footerLodChunkIndex,
+                                    next->footerArrayDataIndex,
                                     error)) {
                 return false;
             }
@@ -4797,7 +5396,7 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
         error = QStringLiteral("WVZ4 indexed reader did not find FOOT");
         return false;
     }
-    if (next->directoryWave.tree.namesById.isEmpty()) {
+    if (!haveNameLayout || next->directoryWave.tree.namesById.isEmpty()) {
         error = QStringLiteral("WVZ4 missing NAME section");
         return false;
     }
@@ -4805,8 +5404,36 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
         error = QStringLiteral("WVZ4 missing NODI section");
         return false;
     }
-    if (!haveSignalLayout || next->sigs.isEmpty()) {
-        error = QStringLiteral("WVZ4 missing SIGD section or signal table is empty");
+    if (!haveSignalLayout || (next->sigs.isEmpty() && next->arrays.isEmpty())) {
+        error = QStringLiteral("WVZ4 missing SIGD section or contains no signals/arrays");
+        return false;
+    }
+    const bool headerHasBitsets =
+        (next->headerFeatureFlags & kHeaderFeatureBitsetDefinitions) != 0;
+    if (headerHasBitsets != haveBitsetLayout) {
+        error = headerHasBitsets
+            ? QStringLiteral("WVZ4 header declares bitsets but BSET is missing")
+            : QStringLiteral("WVZ4 BSET section is present without its header feature flag");
+        return false;
+    }
+    const bool headerHasArrays =
+        (next->headerFeatureFlags & kHeaderFeatureArrayBlocks) != 0;
+    if (headerHasArrays != haveArrayLayout) {
+        error = headerHasArrays
+            ? QStringLiteral("WVZ4 header declares arrays but ARRY is missing")
+            : QStringLiteral("WVZ4 ARRY section is present without its header feature flag");
+        return false;
+    }
+    if (!finalizeBitsetDefinitions(next->bitsets, next->sigs,
+                                   next->directoryWave.tree, error)) {
+        return false;
+    }
+    if (!finalizeArrayDefinitions(next->arrays, next->sigs, next->bitsets,
+                                  next->directoryWave.tree, error)) {
+        return false;
+    }
+    if (!validateArrayDataIndex(next->footerArrayDataIndex, next->arrays,
+                                quint64(file.size()), error)) {
         return false;
     }
     QVector<int> directoryOutputIndexBySignalId =
@@ -4825,6 +5452,7 @@ bool WaveParser4Reader::open(const QString& filePath, QString& error, bool allow
     qint64 minTime = std::numeric_limits<qint64>::max();
     qint64 maxTime = 0;
     expandTimeRangeFromFooterBlocks(next->footerBlocks, minTime, maxTime);
+    expandTimeRangeFromArrayDataIndex(next->footerArrayDataIndex, minTime, maxTime);
     next->directoryWave.meta.title = QFileInfo(filePath).completeBaseName();
     next->directoryWave.meta.timescale = QStringLiteral("cycle");
     next->directoryWave.meta.start = (minTime == std::numeric_limits<qint64>::max()) ? 0 : minTime;
@@ -4858,9 +5486,13 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
     emittedSignalIds.reserve(signalIds.size() * 2 + 1);
     const QSet<int> clockSignalIds = proceduralClockSignalIds(d->clocks);
     for (int sid : signalIds) {
-        if (sid <= 0 || sid > d->sigs.size()) continue;
-        const SigRec& s = d->sigs.at(sid - 1);
-        if (s.signalId != u32(sid)) continue;
+        SigRec s;
+        bool virtualBit = false;
+        if (!signalRecForId(d->sigs, d->bitsets, sid, s, virtualBit)) {
+            VirtualArraySignalRec arraySignal;
+            if (virtualArraySignalRec(d->arrays, sid, arraySignal)) continue;
+            continue;
+        }
         if (clockSignalIds.contains(sid)) continue;
         const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
         if (storageId > 0) selectedStorageIds.insert(storageId);
@@ -4873,15 +5505,28 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
     outputIndexBySignalId.reserve(signalIds.size() * 2 + 1);
     outputIndexesByStorageId.reserve(signalIds.size() * 2 + 1);
     for (int sid : signalIds) {
-        if (sid <= 0 || sid > d->sigs.size() || emittedSignalIds.contains(sid)) continue;
-        const SigRec& s = d->sigs.at(sid - 1);
-        if (s.signalId != u32(sid)) continue;
+        if (emittedSignalIds.contains(sid)) continue;
+        SigRec s;
+        bool virtualBit = false;
+        VirtualArraySignalRec arraySignal;
+        const bool virtualArray = virtualArraySignalRec(d->arrays, sid, arraySignal);
+        if (!signalRecForId(d->sigs, d->bitsets, sid, s, virtualBit) && !virtualArray) continue;
+        if (virtualArray) s = arraySignal.signal;
         if (!isVisibleSignalRec(s)) continue;
         emittedSignalIds.insert(sid);
         const int idx = waveSignalCount(outputSignals);
-        outputSignals.push_back(makeWaveSignalFromRec(s, true));
+        WaveSignal output = makeWaveSignalFromRec(s, true);
+        output.virtualBitsetBit = virtualBit;
+        if (virtualArray) {
+            output.storageId = -1;
+            output.virtualArrayLeaf = true;
+            output.arrayNodeId = int(arraySignal.arrayNodeId);
+            output.arrayByteOffset = arraySignal.byteOffset;
+            output.arrayByteWidth = int(arraySignal.byteWidth);
+        }
+        outputSignals.push_back(std::move(output));
         outputIndexBySignalId.insert(int(s.signalId), idx);
-        if (!clockSignalIds.contains(sid)) {
+        if (!virtualArray && !clockSignalIds.contains(sid)) {
             const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
             outputIndexesByStorageId[storageId].push_back(idx);
         }
@@ -4901,8 +5546,11 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
 
     DecodedSampleBudgetScope decodedSampleBudget(maxDecodedSamples);
     const QSet<int> noFilteredSignalIds;
+    const qint64 implicitZeroTime = timeEnd >= timeStart
+        ? timeStart
+        : d->directoryWave.meta.start;
     if (!appendImplicitZeroSamplesForSelectedSignals(noFilteredSignalIds, true,
-                                                     d->directoryWave.meta.start,
+                                                     implicitZeroTime,
                                                      outputSignals, samplesByOutputIndex,
                                                      minTime, maxTime, error)) {
         return false;
@@ -4929,6 +5577,23 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
             return false;
         }
     }
+    // Parallel WDAT workers intentionally decode without touching the
+    // thread-local budget counter.  Rebase it to the compacted rows merged
+    // above so following ADAT decoding shares the same caller-visible limit.
+    gDecodedSampleCount = 0;
+    for (const QVector<WaveSample>& rows : samplesByOutputIndex) {
+        gDecodedSampleCount += static_cast<quint64>(rows.size());
+        if (gDecodedSampleLimit != 0 && gDecodedSampleCount > gDecodedSampleLimit) {
+            error = QStringLiteral("WVZ4 decoded sample budget exceeded (%1)")
+                        .arg(gDecodedSampleLimit);
+            return false;
+        }
+    }
+    if (!decodeSelectedArraySignals(d->filePath, d->footerArrayDataIndex,
+                                    outputSignals, samplesByOutputIndex,
+                                    timeStart, timeEnd, error)) {
+        return false;
+    }
 
     if (d->residualLodTables && !selectedStorageIds.isEmpty()) {
         QVector<QVector<WaveLodLevel>> residualLodLevelsByStorageId = d->footerLodLevelsByStorageId;
@@ -4944,6 +5609,7 @@ bool WaveParser4Reader::loadSignals(const QVector<int>& signalIds,
     }
 
     expandTimeRangeFromFooterBlocks(d->footerBlocks, minTime, maxTime);
+    expandTimeRangeFromArrayDataIndex(d->footerArrayDataIndex, minTime, maxTime);
 
     for (int i = 0; i < outputSignals.size(); ++i) {
         outputSignals[i].samples = std::move(samplesByOutputIndex[i]);
@@ -5349,17 +6015,21 @@ bool WaveParser4Reader::loadSignalLodImpl(const QVector<int>& signalIds,
     outputSignals.reserve(std::size_t(signalIds.size()) + 256u);
     outputIndexBySignalId.reserve(signalIds.size());
     for (int sid : signalIds) {
-        if (sid <= 0 || sid > d->sigs.size() || emittedSignalIds.contains(sid)) continue;
-        const SigRec& s = d->sigs.at(sid - 1);
-        if (s.signalId != u32(sid) || !isVisibleSignalRec(s)) continue;
+        if (emittedSignalIds.contains(sid)) continue;
+        SigRec s;
+        bool virtualBit = false;
+        if (!signalRecForId(d->sigs, d->bitsets, sid, s, virtualBit) ||
+            !isVisibleSignalRec(s)) continue;
         emittedSignalIds.insert(sid);
-        if (!clockSignalIds.contains(sid)) {
+        if (!virtualBit && !clockSignalIds.contains(sid)) {
             const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
             if (storageId > 0) selectedStorageIds.insert(storageId);
         }
         directIntMapSet(
             outputIndexBySignalId, sid, waveSignalCount(outputSignals));
-        outputSignals.push_back(makeWaveSignalFromRec(s, false));
+        WaveSignal output = makeWaveSignalFromRec(s, false);
+        output.virtualBitsetBit = virtualBit;
+        outputSignals.push_back(std::move(output));
     }
     if (!applyProceduralClockDefinitions(d->clocks,
                                          outputIndexBySignalId,
@@ -5675,23 +6345,19 @@ bool WaveParser4::loadFromFile(const QString& filePath,
     const u64 headerSignalsPerChunk = readU64LE(header.constData() + 32);
     const u64 headerFeatureFlags = readU64LE(header.constData() + 40);
     const bool residualLodTables =
-        ((headerFeatureFlags & kHeaderFeatureResidualLodTables) != 0) &&
-        ((headerFeatureFlags & kHeaderFeatureLodTables) != 0);
+        (headerFeatureFlags & kHeaderFeatureResidualLodTables) != 0;
     Q_UNUSED(blockSpan);
 
-    // On-demand WVZ4 sample load only needs SIGT plus WDAT. NAME/NAMZ and the
-    // v15-v16 NREF/NODI node layouts are skipped instead of reparsed on every click,
+    // On-demand WVZ4 sample load only needs SIGD plus WDAT. NAME/NAMZ and NODI
+    // are skipped instead of reparsed on every click,
     // which made selecting a signal appear stuck on large metadata-heavy files.
     const bool sampleOnlyLoad = !options.includeAllSignalDefinitions && !options.signalIds.isEmpty();
 
-    if (!isSupportedFormatVersion(version)) {
-        error = QStringLiteral("不支持的 WVZ4 版本：%1（此 Viewer 支持 v15-v16）").arg(version);
+    if (!isCurrentFormatVersion(version)) {
+        error = QStringLiteral("不支持的 WVZ4 版本：%1（此 Viewer 仅支持 v17）").arg(version);
         return false;
     }
-    if (headerSize < 64 || headerSize > u32(file.size())) {
-        error = QStringLiteral("WVZ4 header_size 无效：%1").arg(headerSize);
-        return false;
-    }
+    if (!validateCurrentHeader(headerSize, headerFeatureFlags, error)) return false;
     if (footerOffset != 0 && footerOffset > u64(file.size())) {
         error = QStringLiteral("WVZ4 footer_offset 超出文件大小");
         return false;
@@ -5700,6 +6366,61 @@ bool WaveParser4::loadFromFile(const QString& filePath,
         error = QStringLiteral("WVZ4 file is not finalized: missing FOOT/footer_offset. "
                                "Wait for the writer helper to finalize the file; if direct writing was killed, rerun the capture.");
         return false;
+    }
+
+    // ARRY is intentionally directory-lazy. Keep the all-in-one API usable by
+    // delegating v17 array files to the indexed Reader instead of
+    // linearly scanning every ADAT page or eagerly expanding every array leaf.
+    if ((headerFeatureFlags & kHeaderFeatureArrayBlocks) != 0) {
+        file.close();
+        WaveParser4Reader reader;
+        if (!reader.open(filePath, error, options.allowUnfinalized)) return false;
+        WaveFile directory = reader.takeDirectoryWave();
+        QVector<int> ids = options.signalIds;
+        if (ids.isEmpty()) {
+            int limit = options.autoLoadFirstSignalCount;
+            if (limit < 0 && options.loadAllIfWindowEmpty) {
+                limit = waveSignalCount(directory.signalList);
+            }
+            for (int i = 0; i < waveSignalCount(directory.signalList) && i < limit; ++i) {
+                ids.push_back(directory.signalList.at(i).signalId);
+            }
+        }
+
+        WaveFile selected;
+        if (!ids.isEmpty() &&
+            !reader.loadSignals(ids, selected, error, options.maxDecodedSamples,
+                                options.timeStart, options.timeEnd)) {
+            return false;
+        }
+        if (!options.loadRawSamples) {
+            for (WaveSignal& signal : selected.signalList) {
+                signal.samples.clear();
+                signal.samplesLoaded = false;
+            }
+        }
+        if (!options.includeAllSignalDefinitions) {
+            outWave = std::move(selected);
+            if (ids.isEmpty()) outWave.meta = directory.meta;
+            return true;
+        }
+
+        QHash<int, int> outputIndexById;
+        outputIndexById.reserve(waveSignalCount(directory.signalList) * 2 + 1);
+        for (int i = 0; i < waveSignalCount(directory.signalList); ++i) {
+            outputIndexById.insert(directory.signalList.at(i).signalId, i);
+        }
+        for (WaveSignal& signal : selected.signalList) {
+            const auto found = outputIndexById.constFind(signal.signalId);
+            if (found == outputIndexById.constEnd()) {
+                outputIndexById.insert(signal.signalId, waveSignalCount(directory.signalList));
+                directory.signalList.push_back(std::move(signal));
+            } else {
+                directory.signalList[found.value()] = std::move(signal);
+            }
+        }
+        outWave = std::move(directory);
+        return true;
     }
     if (!file.seek(qint64(headerSize))) {
         error = QStringLiteral("WVZ4 seek 到 header_size 失败");
@@ -5710,10 +6431,12 @@ bool WaveParser4::loadFromFile(const QString& filePath,
     QVector<NodeRec> nodesById;
     QVector<SigRec> sigs;
     QVector<ClockRec> clocks;
+    QVector<BitsetRec> bitsets;
     QVector<BlockIndexRec> footerBlocks;
     QVector<QVector<int>> footerBlockIndexesByChunk;
     QVector<QVector<WaveLodLevel>> footerLodLevelsByStorageId;
     QVector<LodChunkIndexRec> footerLodChunkIndex;
+    QVector<ArrayDataIndexRec> footerArrayDataIndex;
 
     QSet<int> selectedIds;
     QSet<int> selectedStorageIds;
@@ -5731,6 +6454,10 @@ bool WaveParser4::loadFromFile(const QString& filePath,
     bool allSelectedStorageIds = false;
     bool allLodSelectedStorageIds = false;
     bool implicitZeroSamplesNeedFooterRebase = false;
+    bool haveNameLayout = false;
+    bool haveNodeLayout = false;
+    bool haveSignalLayout = false;
+    bool haveBitsetLayout = false;
 
     qint64 minTime = std::numeric_limits<qint64>::max();
     qint64 maxTime = 0;
@@ -5758,7 +6485,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
         for (int i = 0; i < rawLeftAnchors.valid.size(); ++i) {
             if (!rawLeftAnchors.valid.at(i) || rawLeftAnchors.emitted.at(i)) continue;
             if (!emitLeftAnchorIfNeeded(i, outputSignals, samplesByOutputIndex,
-                                        true, &rawLeftAnchors, error)) {
+                                        true, &rawLeftAnchors, error, options.timeStart)) {
                 return false;
             }
         }
@@ -5767,6 +6494,15 @@ bool WaveParser4::loadFromFile(const QString& filePath,
 
     auto initializeOutput = [&]() -> bool {
         if (outputInitialized) return true;
+
+        const bool headerHasBitsets =
+            (headerFeatureFlags & kHeaderFeatureBitsetDefinitions) != 0;
+        if (headerHasBitsets != haveBitsetLayout) {
+            error = headerHasBitsets
+                ? QStringLiteral("WVZ4 header declares bitsets but BSET is missing")
+                : QStringLiteral("WVZ4 BSET section is present without its header feature flag");
+            return false;
+        }
 
         if (!sampleOnlyLoad) {
             if (namesById.isEmpty()) {
@@ -5779,7 +6515,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
             }
         }
         if (sigs.isEmpty()) {
-            error = QStringLiteral("WVZ4 缺少 SIGT section 或信号为空");
+            error = QStringLiteral("WVZ4 缺少 SIGD section 或信号为空");
             return false;
         }
         if (!sampleOnlyLoad && !validateNodeAndSignalLayout(nodesById, namesById, sigs, error)) {
@@ -5824,14 +6560,14 @@ bool WaveParser4::loadFromFile(const QString& filePath,
             const SigRec& s = sigs.at(i);
             int bytes = 0;
             if (!valueTypeByteWidth(s.type, bytes)) {
-                error = QStringLiteral("WVZ4 SIGT has invalid ValueType for signal_id %1").arg(int(s.signalId));
+                error = QStringLiteral("WVZ4 SIGD has invalid ValueType for signal_id %1").arg(int(s.signalId));
                 return false;
             }
             const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
             directIntMapSet(storageIdBySignalId, int(s.signalId), storageId);
             const int oldBytes = directIntMapValue(byteWidthByStorageId, storageId, -1);
             if ((s.storageOnly || storageId == int(s.signalId)) && oldBytes > 0 && oldBytes != bytes) {
-                error = QStringLiteral("WVZ4 SIGT storage_id %1 has incompatible logical aliases").arg(storageId);
+                error = QStringLiteral("WVZ4 SIGD storage_id %1 has incompatible logical aliases").arg(storageId);
                 return false;
             }
             if (s.storageOnly || storageId == int(s.signalId) || oldBytes <= 0) {
@@ -5845,12 +6581,12 @@ bool WaveParser4::loadFromFile(const QString& filePath,
             const int storageId = int(s.storageId != 0 ? s.storageId : s.signalId);
             const int storageBytes = directIntMapValue(byteWidthByStorageId, storageId, -1);
             if (storageBytes <= 0) {
-                error = QStringLiteral("WVZ4 SIGT signal_id %1 references missing storage_id %2")
+                error = QStringLiteral("WVZ4 SIGD signal_id %1 references missing storage_id %2")
                     .arg(int(s.signalId)).arg(storageId);
                 return false;
             }
             if (s.bitOffset + s.bitWidth > u32(storageBytes * 8)) {
-                error = QStringLiteral("WVZ4 SIGT signal_id %1 bit range exceeds storage_id %2 capacity")
+                error = QStringLiteral("WVZ4 SIGD signal_id %1 bit range exceeds storage_id %2 capacity")
                     .arg(int(s.signalId)).arg(storageId);
                 return false;
             }
@@ -5905,7 +6641,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
                 const SigRec& s = sigs.at(i);
                 if (!isVisibleSignal(s)) continue;
                 if (s.nodeId >= u32(nodesById.size()) || !nodesById[int(s.nodeId)].valid) {
-                    error = QStringLiteral("WVZ4 SIGT references missing node_id %1").arg(int(s.nodeId));
+                    error = QStringLiteral("WVZ4 SIGD references missing node_id %1").arg(int(s.nodeId));
                     return false;
                 }
                 const int idx = waveSignalCount(outputSignals);
@@ -5951,7 +6687,9 @@ bool WaveParser4::loadFromFile(const QString& filePath,
 
         if (options.loadRawSamples) {
             qint64 implicitZeroTime = 0;
-            if (!footerBlocks.isEmpty()) {
+            if (windowedRawLoad()) {
+                implicitZeroTime = options.timeStart;
+            } else if (!footerBlocks.isEmpty()) {
                 implicitZeroTime = footerBlocks.first().start;
                 for (int i = 1; i < footerBlocks.size(); ++i) {
                     implicitZeroTime = qMin(implicitZeroTime, footerBlocks.at(i).start);
@@ -5976,13 +6714,14 @@ bool WaveParser4::loadFromFile(const QString& filePath,
                 return false;
             }
             if (!materializeSubtreeReferences(outWave.tree, error)) return false;
+            if (!finalizeBitsetDefinitions(bitsets, sigs, outWave.tree, error)) return false;
         }
 
         outputInitialized = true;
         return true;
     };
 
-    // Parse layout sections first; WDAT is streamed and decoded as soon as SIGT
+    // Parse layout sections first; WDAT is streamed and decoded as soon as SIGD
     // has initialized the selected signal set, so large WVZ4 files are not copied
     // into a pending payload list.
     while (!file.atEnd()) {
@@ -6019,7 +6758,8 @@ bool WaveParser4::loadFromFile(const QString& filePath,
                 if (!readSectionPayload(file, footerHeader, footerPayload, error)) return false;
                 if (!parseFooterSection(footerPayload, byteWidthByStorageId, boolStorageByStorageId,
                                         footerBlocks, footerBlockIndexesByChunk,
-                                        footerLodLevelsByStorageId, footerLodChunkIndex, error)) return false;
+                                        footerLodLevelsByStorageId, footerLodChunkIndex,
+                                        footerArrayDataIndex, error)) return false;
                 const u64 fileSize64 = u64(file.size());
                 for (int i = 0; i < footerBlocks.size(); ++i) {
                     const BlockIndexRec& b = footerBlocks.at(i);
@@ -6048,7 +6788,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
         }
 
         if (sampleOnlyLoad &&
-            (sh.tag == "NAME" || sh.tag == "NAMZ" || sh.tag == "NREF" || sh.tag == "NRFZ" ||
+            (sh.tag == "NAME" || sh.tag == "NAMZ" ||
              sh.tag == "NODI" || sh.tag == "NIZ2")) {
             if (!skipSectionPayload(file, sh, error)) return false;
             continue;
@@ -6058,47 +6798,81 @@ bool WaveParser4::loadFromFile(const QString& filePath,
         if (!readSectionPayload(file, sh, payload, error)) return false;
 
         if (sh.tag == "NAME") {
+            if (haveNameLayout) {
+                error = QStringLiteral("WVZ4 contains duplicate NAME layout sections");
+                return false;
+            }
             if (!parseNameSection(payload, namesById, error)) return false;
+            haveNameLayout = true;
         } else if (sh.tag == "NAMZ") {
+            if (haveNameLayout) {
+                error = QStringLiteral("WVZ4 contains duplicate NAME layout sections");
+                return false;
+            }
             const QByteArray raw = decodeCompressedLayoutPayload(payload, "NAMZ", error);
             if (!error.isEmpty()) return false;
             if (!parseNameSection(raw, namesById, error)) return false;
-        } else if (sh.tag == "NREF") {
-            if (!parseNodeReferenceSection(payload, nodesById, error)) return false;
-        } else if (sh.tag == "NRFZ") {
-            const QByteArray raw = decodeCompressedLayoutPayload(payload, "NRFZ", error);
-            if (!error.isEmpty()) return false;
-            if (!parseNodeReferenceSection(raw, nodesById, error)) return false;
+            haveNameLayout = true;
         } else if (sh.tag == "NODI") {
-            if (!parseCompactNodeReferenceSection(
-                    payload, nodesById, version, error)) {
+            if (haveNodeLayout) {
+                error = QStringLiteral("WVZ4 contains duplicate NODI layout sections");
                 return false;
             }
+            if (!parseCompactNodeReferenceSection(
+                    payload, nodesById, error)) {
+                return false;
+            }
+            haveNodeLayout = true;
         } else if (sh.tag == "NIZ2") {
+            if (haveNodeLayout) {
+                error = QStringLiteral("WVZ4 contains duplicate NODI layout sections");
+                return false;
+            }
             const QByteArray raw = decodeCompressedLayoutPayload(payload, "NIZ2", error);
             if (!error.isEmpty()) return false;
             if (!parseCompactNodeReferenceSection(
-                    raw, nodesById, version, error)) {
+                    raw, nodesById, error)) {
                 return false;
             }
-        } else if (sh.tag == "SIGT") {
-            if (!parseSignalSection(payload, sigs, error)) return false;
-        } else if (sh.tag == "SIGZ") {
-            const QByteArray raw = decodeCompressedLayoutPayload(payload, "SIGZ", error);
-            if (!error.isEmpty()) return false;
-            if (!parseSignalSection(raw, sigs, error)) return false;
+            haveNodeLayout = true;
         } else if (sh.tag == "SIGD") {
+            if (haveSignalLayout) {
+                error = QStringLiteral("WVZ4 contains duplicate SIGD layout sections");
+                return false;
+            }
             if (!parseCompactSignalSection(payload, sigs, error)) return false;
+            haveSignalLayout = true;
         } else if (sh.tag == "SGZ2") {
+            if (haveSignalLayout) {
+                error = QStringLiteral("WVZ4 contains duplicate SIGD layout sections");
+                return false;
+            }
             const QByteArray raw = decodeCompressedLayoutPayload(payload, "SGZ2", error);
             if (!error.isEmpty()) return false;
             if (!parseCompactSignalSection(raw, sigs, error)) return false;
+            haveSignalLayout = true;
         } else if (sh.tag == "CLKD") {
             if (!parseClockSection(payload, clocks, error)) return false;
         } else if (sh.tag == "CLKZ") {
             const QByteArray raw = decodeCompressedLayoutPayload(payload, "CLKZ", error);
             if (!error.isEmpty()) return false;
             if (!parseClockSection(raw, clocks, error)) return false;
+        } else if (sh.tag == "BSET") {
+            if (haveBitsetLayout) {
+                error = QStringLiteral("WVZ4 contains duplicate BSET layout sections");
+                return false;
+            }
+            if (!parseBitsetSection(payload, bitsets, error)) return false;
+            haveBitsetLayout = true;
+        } else if (sh.tag == "BSZ2") {
+            if (haveBitsetLayout) {
+                error = QStringLiteral("WVZ4 contains duplicate BSET layout sections");
+                return false;
+            }
+            const QByteArray raw = decodeCompressedLayoutPayload(payload, "BSZ2", error);
+            if (!error.isEmpty()) return false;
+            if (!parseBitsetSection(raw, bitsets, error)) return false;
+            haveBitsetLayout = true;
         } else if (sh.tag == "FOOT") {
             const qint64 footerSectionOffset = sh.payloadOffset - 12;
             if (footerOffset != 0 && footerSectionOffset >= 0 && u64(footerSectionOffset) != footerOffset) {
@@ -6107,7 +6881,8 @@ bool WaveParser4::loadFromFile(const QString& filePath,
             }
             if (!parseFooterSection(payload, byteWidthByStorageId, boolStorageByStorageId,
                                     footerBlocks, footerBlockIndexesByChunk,
-                                    footerLodLevelsByStorageId, footerLodChunkIndex, error)) return false;
+                                    footerLodLevelsByStorageId, footerLodChunkIndex,
+                                    footerArrayDataIndex, error)) return false;
             const u64 fileSize64 = u64(file.size());
             for (int i = 0; i < footerBlocks.size(); ++i) {
                 const BlockIndexRec& b = footerBlocks.at(i);
@@ -6169,7 +6944,7 @@ bool WaveParser4::loadFromFile(const QString& filePath,
         maxTime = qMax(maxTime, b.end);
     }
 
-    if (implicitZeroSamplesNeedFooterRebase && !footerBlocks.isEmpty()) {
+    if (implicitZeroSamplesNeedFooterRebase && !windowedRawLoad() && !footerBlocks.isEmpty()) {
         qint64 footerStart = footerBlocks.first().start;
         for (int i = 1; i < footerBlocks.size(); ++i) {
             footerStart = qMin(footerStart, footerBlocks.at(i).start);

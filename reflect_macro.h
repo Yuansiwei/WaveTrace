@@ -523,6 +523,15 @@ struct wave_array_traits<array<T, N> > {
 #ifndef WAVE_PTR_ARRAY
 #define WAVE_PTR_ARRAY(count)
 #endif
+#ifndef WAVE_NO_TRACE
+#define WAVE_NO_TRACE
+#endif
+#ifndef WAVE_REFLECT_MARKED_FRIEND
+#define WAVE_REFLECT_MARKED_FRIEND
+#endif
+#ifndef WAVE_TRACE_PRIVATE
+#define WAVE_TRACE_PRIVATE
+#endif
 
 #else
 
@@ -2180,8 +2189,15 @@ struct tuple_element<I, ::wave::array<T, N> > {
     using wave_reflect_friend_marker_do_not_use = ::wave::ReflectFriendMarker;
 #endif
 
-// Keyword-like pointer annotations.  Clang retains the payload for ReflectGen;
-// MSVC/GCC see an ordinary pointer/smart-pointer declaration with no ABI change.
+// Kept for source compatibility. New code only needs WAVE_TRACE_PRIVATE on
+// each private/protected member that should be reflected.
+#ifndef WAVE_REFLECT_MARKED_FRIEND
+#define WAVE_REFLECT_MARKED_FRIEND \
+    template <typename WaveReflectAccessT> friend struct ::wave::ReflectAccess;
+#endif
+
+// Keyword-like reflection annotations. Clang retains the payload for ReflectGen;
+// MSVC/GCC see an ordinary declaration with no ABI change.
 #if defined(__clang__)
 #define WAVE_DETAIL_POINTER_ANNOTATE_(payload) __attribute__((annotate(payload)))
 #else
@@ -2194,6 +2210,19 @@ struct tuple_element<I, ::wave::array<T, N> > {
 
 #ifndef WAVE_PTR_ARRAY
 #define WAVE_PTR_ARRAY(count) WAVE_DETAIL_POINTER_ANNOTATE_("wavetrace.ptr_array:" #count)
+#endif
+
+// Omit the marked data member and its complete subtree from reflection.
+#ifndef WAVE_NO_TRACE
+#define WAVE_NO_TRACE WAVE_DETAIL_POINTER_ANNOTATE_("wavetrace.no_trace")
+#endif
+
+// Opt one private/protected member into reflection and grant ReflectGen the
+// required class access. No separate class-level macro is needed.
+#ifndef WAVE_TRACE_PRIVATE
+#define WAVE_TRACE_PRIVATE \
+    WAVE_REFLECT_MARKED_FRIEND \
+    WAVE_DETAIL_POINTER_ANNOTATE_("wavetrace.private_trace")
 #endif
 
 #if defined(REFLECT_MACRO_RESTORE_MAX_MACRO_)

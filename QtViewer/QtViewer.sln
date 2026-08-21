@@ -12,6 +12,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_wvz4_dirty_peek_dynam
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "WavePerf", "WavePerf.vcxproj", "{47A4EF8C-D282-42A6-B29D-B7EB7BE4780E}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "WaveFifoPerf", "WaveFifoPerf.vcxproj", "{D7F05464-764F-4F2D-AC0A-5063631E8E41}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -38,6 +40,10 @@ Global
 		{47A4EF8C-D282-42A6-B29D-B7EB7BE4780E}.Debug|x64.Build.0 = Debug|x64
 		{47A4EF8C-D282-42A6-B29D-B7EB7BE4780E}.Release|x64.ActiveCfg = Release|x64
 		{47A4EF8C-D282-42A6-B29D-B7EB7BE4780E}.Release|x64.Build.0 = Release|x64
+		{D7F05464-764F-4F2D-AC0A-5063631E8E41}.Debug|x64.ActiveCfg = Debug|x64
+		{D7F05464-764F-4F2D-AC0A-5063631E8E41}.Debug|x64.Build.0 = Debug|x64
+		{D7F05464-764F-4F2D-AC0A-5063631E8E41}.Release|x64.ActiveCfg = Release|x64
+		{D7F05464-764F-4F2D-AC0A-5063631E8E41}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
