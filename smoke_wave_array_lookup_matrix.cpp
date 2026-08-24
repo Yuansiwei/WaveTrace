@@ -3,8 +3,8 @@
 #include <array>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
-#include <map>
 #include <string>
 #include <thread>
 
@@ -66,26 +66,49 @@ static void init_top(MatrixTop& top) {
     }
 }
 
-static std::map<std::string, wave::TrackId> build_track_index(const wave::InMemoryWaveSink& sink) {
-    std::map<std::string, wave::TrackId> out;
-    for (std::size_t i = 0; i < sink.declarations.size(); ++i) {
-        out[sink.declarations[i].path] = sink.declarations[i].track_id;
+static const wave::ArrayBlockDecl* find_block(const wave::InMemoryWaveSink& sink,
+                                              std::uint64_t count,
+                                              std::uint64_t stride) {
+    for (std::size_t i = 0; i < sink.array_block_declarations.size(); ++i) {
+        const wave::ArrayBlockDecl& decl = sink.array_block_declarations[i];
+        if (decl.element_count == count && decl.element_stride == stride) return &decl;
     }
-    return out;
+    return NULL;
 }
 
-static bool has_event(const wave::InMemoryWaveSink& sink,
-                      const std::map<std::string, wave::TrackId>& index,
-                      const char* path,
-                      wave::Cycle cycle,
-                      std::uint64_t value) {
-    std::map<std::string, wave::TrackId>::const_iterator it = index.find(path);
-    if (it == index.end()) return false;
-    for (std::size_t i = 0; i < sink.events.size(); ++i) {
-        const wave::TrackEvent& ev = sink.events[i];
-        if (ev.track_id == it->second && ev.cycle == cycle && ev.has_u64 && ev.u64_value == value) return true;
+static bool patch_value_at(const wave::InMemoryWaveSink& sink,
+                           wave::NodeId node_id,
+                           wave::Cycle cycle,
+                           std::uint64_t byte_offset,
+                           std::uint32_t expected) {
+    unsigned char bytes[sizeof(expected)] = {};
+    for (std::size_t byte = 0; byte < sizeof(expected); ++byte) {
+        const std::uint64_t target = byte_offset + byte;
+        bool found = false;
+        for (std::size_t i = sink.array_patches.size(); i != 0; --i) {
+            const wave::InMemoryWaveSink::OwnedArrayPatch& patch = sink.array_patches[i - 1u];
+            if (patch.node_id != node_id || patch.cycle > cycle || target < patch.byte_offset) continue;
+            const std::uint64_t local = target - patch.byte_offset;
+            if (local >= patch.data.size()) continue;
+            bytes[byte] = patch.data[static_cast<std::size_t>(local)];
+            found = true;
+            break;
+        }
+        if (!found) return false;
     }
-    return false;
+    std::uint32_t actual = 0;
+    std::memcpy(&actual, bytes, sizeof(actual));
+    return actual == expected;
+}
+
+static void dump_patches(const wave::InMemoryWaveSink& sink) {
+    for (std::size_t i = 0; i < sink.array_patches.size(); ++i) {
+        const wave::InMemoryWaveSink::OwnedArrayPatch& patch = sink.array_patches[i];
+        std::cerr << "patch[" << i << "] node=" << patch.node_id
+                  << " cycle=" << patch.cycle
+                  << " offset=" << patch.byte_offset
+                  << " bytes=" << patch.data.size() << "\n";
+    }
 }
 
 static bool error_log_exists() {
@@ -123,18 +146,23 @@ int main() {
     wave::Tracer tracer(sink, opt);
     tracer.add_root("top", &top);
     tracer.sample(0);
-    const std::map<std::string, wave::TrackId> index = build_track_index(sink);
-
-    if (index.find("top.scalars.[3]") == index.end()) return fail("missing top.scalars.[3]");
-    if (index.find("top.slots.[2].c") == index.end()) return fail("missing top.slots.[2].c");
-    if (index.find("top.nested.[1].[2]") == index.end()) return fail("missing top.nested.[1].[2]");
+    const wave::ArrayBlockDecl* scalars = find_block(sink, 8u, sizeof(std::uint32_t));
+    const wave::ArrayBlockDecl* slots = find_block(sink, 8u, sizeof(MatrixSlot));
+    const wave::ArrayBlockDecl* nested = find_block(sink, 3u, sizeof(wave::array<std::uint32_t, 4>));
+    if (!sink.declarations.empty() || sink.array_block_declarations.size() != 3u ||
+        !scalars || !slots || !nested) {
+        return fail("compact lookup matrix declaration mismatch");
+    }
 
     // Same-thread slice lookup through operator[].
     top.scalars[3] = 303u;
     top.slots[2].c = 202u;
     tracer.sample(1);
-    if (!has_event(sink, index, "top.scalars.[3]", 1, 303u)) return fail("same-thread scalar slice missing");
-    if (!has_event(sink, index, "top.slots.[2].c", 1, 202u)) return fail("same-thread struct slice missing");
+    if (!patch_value_at(sink, scalars->node_id, 1, 3u * sizeof(std::uint32_t), 303u)) {
+        dump_patches(sink);
+        return fail("same-thread scalar slice missing");
+    }
+    if (!patch_value_at(sink, slots->node_id, 1, 2u * sizeof(MatrixSlot) + offsetof(MatrixSlot, c), 202u)) return fail("same-thread struct slice missing");
 
     // Same-thread registered bulk lookups: data(), fill(), std::array assignment, operator&().
     std::uint32_t* scalar_data = top.scalars.data();
@@ -144,8 +172,8 @@ int main() {
     top.scalars = replacement;
     (void)&top.slots;
     tracer.sample(2);
-    if (!has_event(sink, index, "top.scalars.[5]", 2, 16u)) return fail("same-thread bulk assignment missing");
-    if (!has_event(sink, index, "top.nested.[1].[2]", 2, 900u)) return fail("same-thread nested bulk fill missing");
+    if (!patch_value_at(sink, scalars->node_id, 2, 5u * sizeof(std::uint32_t), 16u)) return fail("same-thread bulk assignment missing");
+    if (!patch_value_at(sink, nested->node_id, 2, sizeof(wave::array<std::uint32_t, 4>) + 2u * sizeof(std::uint32_t), 900u)) return fail("same-thread nested bulk fill missing");
 
     // Cross-thread no-TLS path: active-tracer explicit bulk/slice maps must resolve owner without overlap scanning.
     std::thread worker([&top]() {
@@ -157,13 +185,13 @@ int main() {
     });
     worker.join();
     tracer.sample(3);
-    if (!has_event(sink, index, "top.scalars.[6]", 3, 606u)) return fail("cross-thread scalar slice missing");
-    if (!has_event(sink, index, "top.slots.[4].b", 3, 404u)) return fail("cross-thread struct slice missing");
-    if (!has_event(sink, index, "top.slots.[6].d", 3, 604u)) return fail("cross-thread bulk data missing");
-    if (!has_event(sink, index, "top.nested.[2].[3]", 3, 2303u)) return fail("cross-thread nested bulk data missing");
+    if (!patch_value_at(sink, scalars->node_id, 3, 6u * sizeof(std::uint32_t), 606u)) return fail("cross-thread scalar slice missing");
+    if (!patch_value_at(sink, slots->node_id, 3, 4u * sizeof(MatrixSlot) + offsetof(MatrixSlot, b), 404u)) return fail("cross-thread struct slice missing");
+    if (!patch_value_at(sink, slots->node_id, 3, 6u * sizeof(MatrixSlot) + offsetof(MatrixSlot, d), 604u)) return fail("cross-thread bulk data missing");
+    if (!patch_value_at(sink, nested->node_id, 3, 2u * sizeof(wave::array<std::uint32_t, 4>) + 3u * sizeof(std::uint32_t), 2303u)) return fail("cross-thread nested bulk data missing");
 
     if (error_log_exists()) return fail("wave_runtime_error.log was produced on registered lookup matrix");
-    std::cout << "wave_array_lookup_matrix_ok tracks=" << sink.declarations.size()
-              << " events=" << sink.events.size() << "\n";
+    std::cout << "wave_array_lookup_matrix_ok arrays=" << sink.array_block_declarations.size()
+              << " patches=" << sink.array_patches.size() << "\n";
     return 0;
 }

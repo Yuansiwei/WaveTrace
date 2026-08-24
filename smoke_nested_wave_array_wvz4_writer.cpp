@@ -38,6 +38,65 @@ struct ArrayOnlyTop {
     wave::array<std::uint64_t, 8193> values;
 };
 
+struct BoolStorageLeaf {
+    std::uint8_t status = 0;
+    std::uint32_t inline_value = 9u;
+    const std::uint32_t* pointer;
+    std::shared_ptr<std::uint32_t> smart_pointer;
+    const std::uint32_t& reference;
+
+    BoolStorageLeaf() : pointer(&inline_value), reference(inline_value) {}
+};
+
+struct BoolStorageArrayCell {
+    BoolStorageLeaf direct;
+    wave::array<BoolStorageLeaf, 2> children;
+};
+
+struct BoolStorageArrayTop {
+    wave::array<wave::array<BoolStorageArrayCell, 2>, 2> cells;
+};
+
+struct UnreflectedPayload {
+    std::uint32_t value = 0;
+};
+
+struct AllSkippedLeaf {
+    std::uint32_t inline_value = 1u;
+    std::uint32_t* raw_pointer;
+    std::uint32_t* annotated_pointer;
+    std::uint32_t& reference;
+    std::unique_ptr<std::uint32_t> unique_pointer;
+    std::shared_ptr<std::uint32_t> shared_pointer;
+    std::weak_ptr<std::uint32_t> weak_pointer;
+    std::vector<std::uint32_t> dynamic_values;
+    std::string text;
+    std::array<std::uint32_t, 2> std_array;
+    UnreflectedPayload unreflected;
+
+    AllSkippedLeaf()
+        : raw_pointer(&inline_value),
+          annotated_pointer(&inline_value),
+          reference(inline_value),
+          unique_pointer(new std::uint32_t(2u)),
+          shared_pointer(new std::uint32_t(3u)),
+          weak_pointer(shared_pointer),
+          dynamic_values(3u, 4u),
+          text("skip"),
+          std_array{{5u, 6u}} {}
+};
+
+struct AllSkippedNested {
+    AllSkippedLeaf direct;
+    wave::array<AllSkippedLeaf, 2> children;
+};
+
+struct MixedSchemaLeaf {
+    std::uint32_t visible = 7u;
+    AllSkippedLeaf skipped_object;
+    wave::array<AllSkippedLeaf, 2> skipped_array;
+};
+
 namespace reflect {
 template<> struct is_reflected<ArrayMemberCell> : std::true_type {};
 template<> struct reflected_visitor<ArrayMemberCell> {
@@ -71,6 +130,70 @@ template<> struct reflected_visitor<ArrayOnlyTop> {
     template<class P, class V, class G>
     static void visit(const ArrayOnlyTop* obj, P&& on_ptr, V&&, G&&) {
         on_ptr("values", std::addressof(obj->values));
+    }
+};
+template<> struct is_reflected<BoolStorageLeaf> : std::true_type {};
+template<> struct reflected_visitor<BoolStorageLeaf> {
+    template<class P, class V, class G>
+    static void visit(const BoolStorageLeaf* obj, P&& on_ptr, V&&, G&&) {
+        on_ptr("status", wave::as_bool_storage_ptr(std::addressof(obj->status)));
+        on_ptr("pointer", std::addressof(obj->pointer),
+               wave::detail::PointerOrReferenceFieldTag());
+        on_ptr("smart_pointer", std::addressof(obj->smart_pointer));
+        on_ptr("reference", std::addressof(obj->reference),
+               wave::detail::PointerOrReferenceFieldTag());
+    }
+};
+template<> struct is_reflected<BoolStorageArrayCell> : std::true_type {};
+template<> struct reflected_visitor<BoolStorageArrayCell> {
+    template<class P, class V, class G>
+    static void visit(const BoolStorageArrayCell* obj, P&& on_ptr, V&&, G&&) {
+        on_ptr("direct", std::addressof(obj->direct));
+        on_ptr("children", std::addressof(obj->children));
+    }
+};
+template<> struct is_reflected<BoolStorageArrayTop> : std::true_type {};
+template<> struct reflected_visitor<BoolStorageArrayTop> {
+    template<class P, class V, class G>
+    static void visit(const BoolStorageArrayTop* obj, P&& on_ptr, V&&, G&&) {
+        on_ptr("cells", std::addressof(obj->cells));
+    }
+};
+template<> struct is_reflected<AllSkippedLeaf> : std::true_type {};
+template<> struct reflected_visitor<AllSkippedLeaf> {
+    template<class P, class V, class G>
+    static void visit(const AllSkippedLeaf* obj, P&& on_ptr, V&&, G&&) {
+        on_ptr("raw_pointer", std::addressof(obj->raw_pointer),
+               wave::detail::PointerOrReferenceFieldTag());
+        wave::detail::invoke_annotated_ptr_visitor(
+            on_ptr, "annotated_pointer", obj->annotated_pointer, 1u,
+            wave::detail::AnnotatedPointerMemberKey("AllSkippedLeaf", "annotated_pointer"));
+        on_ptr("reference", std::addressof(obj->reference),
+               wave::detail::PointerOrReferenceFieldTag());
+        on_ptr("unique_pointer", std::addressof(obj->unique_pointer));
+        on_ptr("shared_pointer", std::addressof(obj->shared_pointer));
+        on_ptr("weak_pointer", std::addressof(obj->weak_pointer));
+        on_ptr("dynamic_values", std::addressof(obj->dynamic_values));
+        on_ptr("text", std::addressof(obj->text));
+        on_ptr("std_array", std::addressof(obj->std_array));
+        on_ptr("unreflected", std::addressof(obj->unreflected));
+    }
+};
+template<> struct is_reflected<AllSkippedNested> : std::true_type {};
+template<> struct reflected_visitor<AllSkippedNested> {
+    template<class P, class V, class G>
+    static void visit(const AllSkippedNested* obj, P&& on_ptr, V&&, G&&) {
+        on_ptr("direct", std::addressof(obj->direct));
+        on_ptr("children", std::addressof(obj->children));
+    }
+};
+template<> struct is_reflected<MixedSchemaLeaf> : std::true_type {};
+template<> struct reflected_visitor<MixedSchemaLeaf> {
+    template<class P, class V, class G>
+    static void visit(const MixedSchemaLeaf* obj, P&& on_ptr, V&&, G&&) {
+        on_ptr("visible", std::addressof(obj->visible));
+        on_ptr("skipped_object", std::addressof(obj->skipped_object));
+        on_ptr("skipped_array", std::addressof(obj->skipped_array));
     }
 };
 }
@@ -109,6 +232,74 @@ public:
 static int fail(const std::string& msg) {
     std::cerr << msg << "\n";
     return 1;
+}
+
+static int verifyBoolStorageCompactArray() {
+    BoolStorageArrayTop top;
+    wave::InMemoryWaveSink sink;
+    wave::Tracer tracer(sink);
+    tracer.add_root("bool_storage_top", &top);
+    tracer.prepare_topology();
+    if (tracer.compact_array_block_count() != 1u ||
+        sink.array_block_declarations.size() != 1u) {
+        return fail("bool-storage compact array registration mismatch");
+    }
+    const std::vector<wave::ArraySchemaNodeDecl>& schema =
+        sink.array_block_declarations[0].schema;
+    std::size_t bool_leaf_count = 0;
+    std::size_t array_node_count = 0;
+    for (std::size_t i = 0; i < schema.size(); ++i) {
+        if (schema[i].kind == wave::ArraySchemaNodeKind::Array) ++array_node_count;
+        if (schema[i].name == "status" &&
+            schema[i].kind == wave::ArraySchemaNodeKind::Leaf &&
+            schema[i].value_kind == wave::ValueKind::Bool &&
+            schema[i].bit_width == 1u && schema[i].byte_size == 1u) {
+            ++bool_leaf_count;
+        }
+    }
+    if (bool_leaf_count != 2u || array_node_count != 2u) {
+        return fail("nested bool-storage compact schema mismatch");
+    }
+
+    wave::array<const std::uint32_t*, 2> pointers;
+    wave::InMemoryWaveSink pointer_sink;
+    wave::Tracer pointer_tracer(pointer_sink);
+    pointer_tracer.add_root("pointer_only", &pointers);
+    pointer_tracer.prepare_topology();
+    if (pointer_tracer.compact_array_block_count() != 0u ||
+        !pointer_sink.array_block_declarations.empty()) {
+        return fail("pointer-only wave::array was not skipped");
+    }
+
+    wave::array<AllSkippedNested, 4> all_skipped;
+    wave::InMemoryWaveSink all_skipped_sink;
+    wave::Tracer all_skipped_tracer(all_skipped_sink);
+    all_skipped_tracer.add_root("all_skipped", &all_skipped);
+    all_skipped_tracer.prepare_topology();
+    if (all_skipped_tracer.compact_array_block_count() != 0u ||
+        !all_skipped_sink.array_block_declarations.empty()) {
+        return fail("all-skipped nested wave::array produced a compact declaration");
+    }
+
+    wave::array<MixedSchemaLeaf, 8> mixed;
+    wave::InMemoryWaveSink mixed_sink;
+    wave::Tracer mixed_tracer(mixed_sink);
+    mixed_tracer.add_root("mixed", &mixed);
+    mixed_tracer.prepare_topology();
+    if (mixed_tracer.compact_array_block_count() != 1u ||
+        mixed_sink.array_block_declarations.size() != 1u) {
+        return fail("mixed supported/unsupported wave::array registration mismatch");
+    }
+    const std::vector<wave::ArraySchemaNodeDecl>& mixed_schema =
+        mixed_sink.array_block_declarations[0].schema;
+    if (mixed_schema.size() != 2u ||
+        mixed_schema[0].kind != wave::ArraySchemaNodeKind::Object ||
+        mixed_schema[1].kind != wave::ArraySchemaNodeKind::Leaf ||
+        mixed_schema[1].name != "visible" ||
+        mixed_schema[1].parent_schema_node_id != mixed_schema[0].schema_node_id) {
+        return fail("unsupported members left nodes in mixed compact schema");
+    }
+    return 0;
 }
 
 struct StressKey {
@@ -406,6 +597,8 @@ int main(int argc, char** argv) {
     static_assert(sizeof(CrossPageCell) == 10, "cross-page test requires packed layout");
     static_assert(offsetof(CrossPageCell, value) == 2, "cross-page leaf offset changed");
     static const std::size_t kCrossPageIndex = 6553;
+    const int bool_storage_result = verifyBoolStorageCompactArray();
+    if (bool_storage_result != 0) return bool_storage_result;
     const std::string out_path =
         (argc >= 2 && argv[1] && argv[1][0] != '\0')
             ? argv[1]

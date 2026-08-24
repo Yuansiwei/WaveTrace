@@ -73,6 +73,8 @@ struct Root {
     std::bitset<130> flags;
     std::shared_ptr<PayloadA> shared_payload;
     std::unique_ptr<PayloadB> unique_payload;
+    PayloadA* ordinary_raw_ptr;
+    PayloadA& ordinary_reference;
     WAVE_PTR PayloadA* direct_ptr;
     WAVE_PTR AliasPtr alias_ptr;
     std::size_t annotated_count;

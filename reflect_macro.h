@@ -786,6 +786,7 @@ inline BoolStoragePtr<T> as_bool_storage_ptr(const T* p) noexcept {
 namespace detail {
 
 struct UnionFieldTag {};
+struct PointerOrReferenceFieldTag {};
 
 struct GeneratedMemberId {
     GeneratedMemberId() : class_id(NULL), member_id(kInvalidIndex) {}
@@ -1588,6 +1589,7 @@ void invoke_annotated_ptr_visitor_impl(Visitor&& visitor,
     invoke_ptr_visitor(std::forward<Visitor>(visitor),
                        name,
                        std::addressof(view),
+                       PointerOrReferenceFieldTag(),
                        std::forward<Meta>(meta)...);
 }
 
@@ -1633,6 +1635,7 @@ void invoke_annotated_weak_ptr_visitor(Visitor&& visitor,
     invoke_ptr_visitor(std::forward<Visitor>(visitor),
                        name,
                        std::addressof(view),
+                       PointerOrReferenceFieldTag(),
                        std::forward<Meta>(meta)...);
 }
 

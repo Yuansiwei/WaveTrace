@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -274,6 +275,31 @@ static bool has_bool_event(const wave::InMemoryWaveSink& sink,
     return false;
 }
 
+static bool patch_u32_at(const wave::InMemoryWaveSink& sink,
+                         wave::NodeId node_id,
+                         wave::Cycle cycle,
+                         std::uint64_t byte_offset,
+                         std::uint32_t expected) {
+    unsigned char bytes[sizeof(expected)] = {};
+    for (std::size_t byte = 0; byte < sizeof(expected); ++byte) {
+        const std::uint64_t target = byte_offset + byte;
+        bool found = false;
+        for (std::size_t i = sink.array_patches.size(); i != 0; --i) {
+            const wave::InMemoryWaveSink::OwnedArrayPatch& patch = sink.array_patches[i - 1u];
+            if (patch.node_id != node_id || patch.cycle > cycle || target < patch.byte_offset) continue;
+            const std::uint64_t local = target - patch.byte_offset;
+            if (local >= patch.data.size()) continue;
+            bytes[byte] = patch.data[static_cast<std::size_t>(local)];
+            found = true;
+            break;
+        }
+        if (!found) return false;
+    }
+    std::uint32_t actual = 0;
+    std::memcpy(&actual, bytes, sizeof(actual));
+    return actual == expected;
+}
+
 static int fail(const char* msg) {
     std::cerr << msg << "\n";
     return 1;
@@ -309,8 +335,6 @@ int main() {
         "top.peek.count",
         "top.port.count",
         "top.dirty_counter",
-        "top.slots.[0].count",
-        "top.slots.[1].tag",
         "top.flag_bool"
     };
     for (std::size_t i = 0; i < sizeof(required_paths) / sizeof(required_paths[0]); ++i) {
@@ -325,6 +349,13 @@ int main() {
     if (has_decl(index, "top.plain_ptr.value")) {
         return fail("unmarked plain pointer was expanded");
     }
+    if (sink.array_block_declarations.size() != 1u ||
+        sink.array_block_declarations[0].element_count != top.slots.size() ||
+        sink.array_block_declarations[0].element_stride != sizeof(ArraySlot) ||
+        sink.array_block_declarations[0].schema.size() != 3u) {
+        return fail("wave::array compact declaration mismatch");
+    }
+    const wave::NodeId slots_node_id = sink.array_block_declarations[0].node_id;
 
     if (!has_u64_event(sink, index, "top.friend_box.secret", 0, 7)) return fail("private friend value missing");
     if (!has_u64_event(sink, index, "top.direct_raw.value", 0, 10)) return fail("direct raw pointer value missing");
@@ -367,7 +398,10 @@ int main() {
     if (!has_u64_event(sink, index, "top.peek.count", 3, 111)) return fail("dirty peek update missing");
     if (!has_u64_event(sink, index, "top.port.count", 3, 112)) return fail("dirty port update missing");
     if (!has_u64_event(sink, index, "top.dirty_counter", 3, 77)) return fail("WaveValue dirty update missing");
-    if (!has_u64_event(sink, index, "top.slots.[2].count", 3, 55)) return fail("wave::array dirty update missing");
+    if (!patch_u32_at(sink, slots_node_id, 3,
+                      2u * sizeof(ArraySlot) + offsetof(ArraySlot, count), 55u)) {
+        return fail("wave::array dirty patch missing");
+    }
     if (!has_bool_event(sink, index, "top.flag_bool", 3, true)) return fail("bool storage update missing");
     if (!has_u64_event(sink, index, "top.direct_raw.value", 3, 99)) return fail("direct pointer update missing");
     if (!has_u64_event(sink, index, "top.wave_raw_array.[1].value", 3, 88)) return fail("annotated raw pointer array update missing");

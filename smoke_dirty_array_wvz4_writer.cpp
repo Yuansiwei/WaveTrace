@@ -5,6 +5,7 @@
 #include <iostream>
 #include <set>
 #include <string>
+#include <vector>
 
 struct DirtyArrayWvz4Slot {
     std::uint32_t f0;
@@ -65,6 +66,12 @@ template<> struct reflected_visitor<DirtyArrayWvz4Top> {
 class DirtyArrayPathRecorder : public PathStableWvz4Recorder {
 public:
     std::set<std::string> declared_paths;
+    std::vector<wave::ArrayBlockDecl> arrays;
+
+    void on_array_block_declared(const wave::ArrayBlockDecl& decl) override {
+        arrays.push_back(decl);
+        PathStableWvz4Recorder::on_array_block_declared(decl);
+    }
 
     void on_track_declared_fast(wave::TrackId track_id,
                                 wave::TrackId storage_id,
@@ -155,11 +162,11 @@ int main(int argc, char** argv) {
 
     if (!tap.sample_one_cycle()) return fail("cycle0 sample failed: " + tap.last_error());
 
-    if (recorder.declared_paths.find("top.slots.[7].f3") == recorder.declared_paths.end()) {
-        return fail("missing declared path top.slots.[7].f3");
-    }
-    if (recorder.declared_paths.find("top.slots.[9].f4") == recorder.declared_paths.end()) {
-        return fail("missing declared path top.slots.[9].f4");
+    if (!recorder.declared_paths.empty() || recorder.arrays.size() != 1u ||
+        recorder.arrays[0].element_count != top.slots.size() ||
+        recorder.arrays[0].element_stride != sizeof(DirtyArrayWvz4Slot) ||
+        recorder.arrays[0].schema.size() != 17u) {
+        return fail("dirty array did not use the expected compact declaration");
     }
 
     top.slots[7].f3 = 0x12345678u;
@@ -177,7 +184,7 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "dirty_array_wvz4_writer_ok file=" << out_path
-              << " tracks=" << recorder.declared_paths.size()
+              << " tracks=0 arrays=" << recorder.arrays.size()
               << " cycles=4\n";
     return 0;
 }

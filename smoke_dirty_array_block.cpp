@@ -3,7 +3,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <iostream>
-#include <map>
+#include <cstring>
 #include <string>
 
 struct DirtyArrayBlockSlot {
@@ -85,29 +85,18 @@ static void init_top(DirtyArrayBlockTop& top) {
     }
 }
 
-static std::map<std::string, wave::TrackId> build_track_index(const wave::InMemoryWaveSink& sink) {
-    std::map<std::string, wave::TrackId> out;
-    for (std::size_t i = 0; i < sink.declarations.size(); ++i) {
-        out[sink.declarations[i].path] = sink.declarations[i].track_id;
-    }
-    return out;
-}
-
-static std::size_t event_count_for(const wave::InMemoryWaveSink& sink, wave::TrackId id) {
-    std::size_t count = 0;
-    for (std::size_t i = 0; i < sink.events.size(); ++i) {
-        if (sink.events[i].track_id == id) ++count;
-    }
-    return count;
-}
-
-static bool has_u64_event(const wave::InMemoryWaveSink& sink,
-                          wave::TrackId id,
-                          wave::Cycle cycle,
-                          std::uint64_t value) {
-    for (std::size_t i = 0; i < sink.events.size(); ++i) {
-        const wave::TrackEvent& ev = sink.events[i];
-        if (ev.track_id == id && ev.cycle == cycle && ev.has_u64 && ev.u64_value == value) return true;
+static bool patch_value_at(const wave::InMemoryWaveSink& sink,
+                           wave::Cycle cycle,
+                           std::uint64_t byte_offset,
+                           std::uint32_t expected) {
+    for (std::size_t i = sink.array_patches.size(); i != 0; --i) {
+        const wave::InMemoryWaveSink::OwnedArrayPatch& patch = sink.array_patches[i - 1u];
+        if (patch.cycle > cycle || byte_offset < patch.byte_offset) continue;
+        const std::uint64_t local = byte_offset - patch.byte_offset;
+        if (local + sizeof(expected) > patch.data.size()) continue;
+        std::uint32_t actual = 0;
+        std::memcpy(&actual, patch.data.data() + static_cast<std::size_t>(local), sizeof(actual));
+        return actual == expected;
     }
     return false;
 }
@@ -138,31 +127,40 @@ int main(int argc, char** argv) {
     tracer.add_root("top", &top);
     tracer.sample(0);
 
-    const std::map<std::string, wave::TrackId> index = build_track_index(sink);
-    const auto f3_it = index.find("top.slots.[7].f3");
-    const auto f4_it = index.find("top.slots.[9].f4");
-    if (f3_it == index.end()) return fail("missing top.slots.[7].f3");
-    if (f4_it == index.end()) return fail("missing top.slots.[9].f4");
+    if (!sink.declarations.empty() || sink.array_block_declarations.size() != 1u) {
+        return fail("wave::array did not use one compact block");
+    }
+    const wave::ArrayBlockDecl& decl = sink.array_block_declarations[0];
+    if (decl.element_count != top.slots.size() ||
+        decl.element_stride != sizeof(DirtyArrayBlockSlot) ||
+        decl.schema.size() != 17u) {
+        return fail("compact array declaration shape mismatch");
+    }
+    const std::uint64_t f3_offset = 7u * sizeof(DirtyArrayBlockSlot) + offsetof(DirtyArrayBlockSlot, f3);
+    const std::uint64_t f4_offset = 9u * sizeof(DirtyArrayBlockSlot) + offsetof(DirtyArrayBlockSlot, f4);
+    if (!patch_value_at(sink, 0, f3_offset, 7003u) ||
+        !patch_value_at(sink, 0, f4_offset, 9004u)) {
+        return fail("initial compact array patch missing");
+    }
 
-    const std::size_t after_initial = sink.events.size();
+    const std::size_t after_initial = sink.array_patches.size();
     top.slots[7].f3 = 0x12345678u;
     tracer.sample(1);
-    const std::size_t after_one_dirty = sink.events.size();
-    if (after_one_dirty != after_initial + 1u) return fail("single element dirty emitted unexpected event count");
-    if (!has_u64_event(sink, f3_it->second, 1, 0x12345678u)) return fail("single element dirty value missing");
+    const std::size_t after_one_dirty = sink.array_patches.size();
+    if (after_one_dirty <= after_initial) return fail("single element dirty emitted no patch");
+    if (!patch_value_at(sink, 1, f3_offset, 0x12345678u)) return fail("single element dirty value missing");
 
     tracer.sample(2);
-    if (sink.events.size() != after_one_dirty) return fail("no-dirty cycle emitted dirty array events");
+    if (sink.array_patches.size() != after_one_dirty) return fail("no-dirty cycle emitted compact array patches");
 
     DirtyArrayBlockSlot* raw = top.slots.data();
     raw[9].f4 = 0x87654321u;
     (void)top.slots.data();
     tracer.sample(3);
-    if (!has_u64_event(sink, f4_it->second, 3, 0x87654321u)) return fail("bulk data dirty value missing");
-    if (event_count_for(sink, f4_it->second) != 2u) return fail("bulk data dirty duplicated same track");
+    if (!patch_value_at(sink, 3, f4_offset, 0x87654321u)) return fail("bulk data dirty value missing");
 
     std::cout << "dirty array block smoke passed: threads=" << requested_threads
-              << " tracks=" << sink.declarations.size()
-              << " events=" << sink.events.size() << "\n";
+              << " arrays=" << sink.array_block_declarations.size()
+              << " patches=" << sink.array_patches.size() << "\n";
     return 0;
 }

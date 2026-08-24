@@ -80,6 +80,9 @@ $single = Join-Path $BuildRoot "single\input_reflect.h"
 $singleArgs = @($input, "-o", $single, "--header-include", "input.hpp",
     "--wavetrace-config", $config, "--main-file-only", "--", "-x", "c++", "-std=c++14")
 Invoke-ReflectGen $singleArgs | Out-Null
+$singleText = Get-Content -LiteralPath $single -Raw
+Assert-True ($singleText -match 'ordinary_raw_ptr.*PointerOrReferenceFieldTag') "ordinary raw pointer was not tagged"
+Assert-True ($singleText -match 'ordinary_reference.*PointerOrReferenceFieldTag') "ordinary reference was not tagged"
 $singleSnapshot = Snapshot-GeneratedFiles (Split-Path -Parent $single)
 Start-Sleep -Milliseconds 1100
 $singleLog = Invoke-ReflectGen $singleArgs

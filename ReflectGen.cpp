@@ -97,6 +97,7 @@ namespace
         // relative to that union, not to the containing class.
         std::string unionBaseAccessPath;
         bool unionBaseIsSelf = false;
+        bool rawPointerOrReference = false;
         AnnotatedPointerKind annotatedPointerKind = AnnotatedPointerKind::None;
         std::string annotatedPointerCountExpr;
         bool annotatedPointerTargetArray = false;
@@ -349,6 +350,7 @@ namespace
         std::string unionBaseMutExpr;
         bool unionBaseIsSelf = false;
         bool exprIsPointerAlready = false;
+        bool rawPointerOrReference = false;
         bool asBoolStorage = false;
         AnnotatedPointerKind annotatedPointerKind = AnnotatedPointerKind::None;
         std::string annotatedPointerCountExpr;
@@ -2955,6 +2957,14 @@ namespace
         return CursorAccessPathIsReflectAccessible(tu, cursor);
     }
 
+    bool IsRawPointerOrReferenceType(CXType type)
+    {
+        const CXTypeKind kind = clang_getCanonicalType(type).kind;
+        return kind == CXType_Pointer ||
+               kind == CXType_LValueReference ||
+               kind == CXType_RValueReference;
+    }
+
 
     CXType StripTypeForAccessPathCheck(CXType type)
     {
@@ -3622,6 +3632,7 @@ namespace
                 f.typeName = ToStdString(clang_getTypeSpelling(fieldType));
                 f.canonicalTypeName = ToStdString(clang_getTypeSpelling(clang_getCanonicalType(fieldType)));
                 f.declQualifiedName = GetTypeDeclarationQualifiedName(fieldType);
+                f.rawPointerOrReference = IsRawPointerOrReferenceType(fieldType);
                 if (ShouldSkipFieldType(f.typeName))
                 {
                     if (ctx) ++ctx->fieldsSkippedSystemC;
@@ -3795,6 +3806,7 @@ namespace
                     f.typeName = ToStdString(clang_getTypeSpelling(fieldType));
                     f.canonicalTypeName = ToStdString(clang_getTypeSpelling(clang_getCanonicalType(fieldType)));
                     f.declQualifiedName = GetTypeDeclarationQualifiedName(fieldType);
+                    f.rawPointerOrReference = IsRawPointerOrReferenceType(fieldType);
                     if (ShouldSkipFieldType(f.typeName))
                     {
                         if (ctx) ++ctx->fieldsSkippedSystemC;
@@ -4151,6 +4163,7 @@ namespace
                         f.typeName = ToStdString(clang_getTypeSpelling(fieldType));
                         f.canonicalTypeName = ToStdString(clang_getTypeSpelling(clang_getCanonicalType(fieldType)));
                         f.declQualifiedName = GetTypeDeclarationQualifiedName(fieldType);
+                        f.rawPointerOrReference = IsRawPointerOrReferenceType(fieldType);
                         if (ShouldSkipFieldType(f.typeName))
                         {
                             if (payload->ctx) ++payload->ctx->fieldsSkippedSystemC;
@@ -5406,6 +5419,7 @@ namespace
             m.unionStorageBytes = f.unionStorageBytes;
             m.unionBaseIsSelf = f.unionBaseIsSelf;
             m.exprIsPointerAlready = false;
+            m.rawPointerOrReference = f.rawPointerOrReference;
             m.asBoolStorage = !f.isBitField && IsBoolStorageTypedefSpelling(opt, f.typeName);
             m.annotatedPointerKind = f.annotatedPointerKind;
             m.annotatedPointerCountExpr = f.annotatedPointerCountExpr;
@@ -7512,6 +7526,10 @@ namespace
                             os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.constExpr << "), ::wave::detail::UnionFieldTag(), sizeof(Self), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                         }
                     }
+                    else if (m.rawPointerOrReference)
+                    {
+                        os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.constExpr << "), ::wave::detail::PointerOrReferenceFieldTag(), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                    }
                     else if (m.exprIsPointerAlready)
                     {
                         os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.constExpr << ", ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
@@ -7603,6 +7621,10 @@ namespace
                         {
                             os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.mutExpr << "), ::wave::detail::UnionFieldTag(), sizeof(Self), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                         }
+                    }
+                    else if (m.rawPointerOrReference)
+                    {
+                        os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.mutExpr << "), ::wave::detail::PointerOrReferenceFieldTag(), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
                     else if (m.exprIsPointerAlready)
                     {

@@ -14778,6 +14778,19 @@ private:
         return static_cast<long long>(second);
     }
 
+    static bool pointer_or_reference_field_tag_present_() { return false; }
+
+    template <typename... Rest>
+    static bool pointer_or_reference_field_tag_present_(
+        detail::PointerOrReferenceFieldTag, Rest...) {
+        return true;
+    }
+
+    template <typename First, typename... Rest>
+    static bool pointer_or_reference_field_tag_present_(First, Rest... rest) {
+        return pointer_or_reference_field_tag_present_(rest...);
+    }
+
     static std::size_t union_field_storage_bytes_or_zero() { return 0; }
 
     template <typename SizeT, typename... Rest>
@@ -15426,13 +15439,10 @@ private:
         const unsigned char* block_base;
         std::size_t element_bytes;
         std::vector<ArraySchemaNodeDecl> nodes;
-        bool expandable_reference;
-        bool unsupported;
 
         CompactArraySchemaBuild(const void* base, std::size_t bytes)
             : block_base(static_cast<const unsigned char*>(base)),
-              element_bytes(bytes),
-              expandable_reference(false), unsupported(false) {}
+              element_bytes(bytes) {}
     };
 
     std::uint32_t append_compact_array_schema_node_(
@@ -15444,17 +15454,12 @@ private:
         std::size_t byte_size) {
         if (!address || !build.block_base ||
             build.nodes.size() >= static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())) {
-            build.unsupported = true;
             return 0;
         }
         const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(build.block_base);
         const std::uintptr_t value = reinterpret_cast<std::uintptr_t>(address);
         if (value < base || byte_size > build.element_bytes ||
             value - base > build.element_bytes - byte_size) {
-            // A reflected reference is visited as the address of its referent.
-            // It therefore falls outside the element's own storage and must use
-            // topology expansion instead of being serialized as inline bytes.
-            build.expandable_reference = true;
             return 0;
         }
         ArraySchemaNodeDecl node;
@@ -15466,6 +15471,23 @@ private:
         node.byte_size = static_cast<std::uint64_t>(byte_size);
         build.nodes.push_back(node);
         return node.schema_node_id;
+    }
+
+    template <typename T>
+    bool collect_compact_array_schema_value_(CompactArraySchemaBuild& build,
+                                             std::uint32_t parent,
+                                             const char* name,
+                                             ::wave::BoolStoragePtr<T> ptr) {
+        // Keep the physical storage byte in the compact block while exposing
+        // the generated U01-style member as a one-bit logical Bool.
+        typedef typename detail::remove_cvref<T>::type RawT;
+        const std::uint32_t id = append_compact_array_schema_node_(
+            build, parent, name, ArraySchemaNodeKind::Leaf, ptr.ptr, sizeof(RawT));
+        if (id == 0) return false;
+        ArraySchemaNodeDecl& node = build.nodes[id - 1u];
+        node.value_kind = ValueKind::Bool;
+        node.bit_width = 1u;
+        return true;
     }
 
     template <typename T>
@@ -15498,6 +15520,7 @@ private:
         typedef typename detail::remove_cvref<T>::type CleanT;
         typedef typename wave_array_traits<CleanT>::element_type ElemT;
         const std::size_t count = wave_array_traits<CleanT>::size;
+        const std::size_t node_count = build.nodes.size();
         const std::uint32_t id = append_compact_array_schema_node_(
             build, parent, name, ArraySchemaNodeKind::Array, ptr, sizeof(CleanT));
         if (id == 0) return false;
@@ -15505,11 +15528,15 @@ private:
         node.element_count = static_cast<std::uint64_t>(count);
         node.element_stride = static_cast<std::uint64_t>(sizeof(ElemT));
         if (count == 0) {
-            build.unsupported = true;
+            build.nodes.resize(node_count);
             return false;
         }
         const ElemT* first = std::addressof((*ptr)[0]);
-        return collect_compact_array_schema_value_<ElemT>(build, id, NULL, first);
+        if (!collect_compact_array_schema_value_<ElemT>(build, id, NULL, first)) {
+            build.nodes.resize(node_count);
+            return false;
+        }
+        return true;
     }
 
     template <typename T>
@@ -15519,6 +15546,7 @@ private:
                                         const char* name,
                                         const T* ptr) {
         typedef typename detail::remove_cvref<T>::type CleanT;
+        const std::size_t node_count = build.nodes.size();
         const std::uint32_t id = append_compact_array_schema_node_(
             build,
             parent,
@@ -15527,41 +15555,24 @@ private:
             ptr,
             sizeof(CleanT));
         if (id == 0) return false;
-        bool ok = true;
         detail::call_reflected_visit<CleanT>(
             ptr,
-            [this, &build, id, &ok](const char* child_name, auto child_field_ptr, auto...) {
-                typedef typename std::remove_pointer<decltype(child_field_ptr)>::type RawFieldT;
-                typedef typename detail::remove_cvref<RawFieldT>::type FieldT;
-                const bool pointer_like =
-                    std::is_pointer<FieldT>::value ||
-                    detail::is_unique_ptr_scalar<FieldT>::value ||
-                    detail::is_unique_ptr_array<FieldT>::value ||
-                    detail::is_shared_ptr<FieldT>::value ||
-                    detail::is_weak_ptr<FieldT>::value;
-                if (pointer_like) {
-                    build.expandable_reference = true;
-                    ok = false;
-                    return;
-                }
-                if (!collect_compact_array_schema_value_<FieldT>(
+            [this, &build, id](const char* child_name, auto child_field_ptr, auto... meta) {
+                if (pointer_or_reference_field_tag_present_(meta...)) return;
+                const std::size_t child_node_count = build.nodes.size();
+                if (!collect_compact_array_schema_value_(
                         build, id, child_name, child_field_ptr)) {
-                    ok = false;
+                    build.nodes.resize(child_node_count);
                 }
             },
-            [&build, &ok](const char*, const auto&) {
-                build.unsupported = true;
-                ok = false;
-            },
-            [this, &build, id, ptr, &ok](const char* child_name, auto getter, auto... meta) {
+            [](const char*, const auto&) {},
+            [this, &build, id, ptr](const char* child_name, auto getter, auto... meta) {
                 typedef typename detail::remove_cvref<decltype(getter(ptr))>::type GetterT;
                 const std::uint32_t width = getter_bit_width_or_zero(meta...);
                 const long long bit_offset = getter_bit_offset_or_negative(meta...);
                 if (!detail::is_leaf_scalar<GetterT>::value ||
                     detail::is_std_string<GetterT>::value ||
                     width == 0 || bit_offset < 0) {
-                    build.unsupported = true;
-                    ok = false;
                     return;
                 }
                 const std::size_t byte_offset = static_cast<std::size_t>(bit_offset / 8);
@@ -15571,21 +15582,23 @@ private:
                     reinterpret_cast<const unsigned char*>(ptr) + byte_offset;
                 const std::uint32_t leaf_id = append_compact_array_schema_node_(
                     build, id, child_name, ArraySchemaNodeKind::Leaf, address, byte_count);
-                if (leaf_id == 0) {
-                    ok = false;
-                    return;
-                }
+                if (leaf_id == 0) return;
                 ArraySchemaNodeDecl& node = build.nodes[leaf_id - 1u];
                 node.value_kind = detail::classify_value_kind<GetterT>();
                 node.bit_width = width;
                 node.bit_offset = static_cast<std::uint32_t>(local_bit_offset);
             });
-        return ok;
+        if (build.nodes.size() == node_count + 1u) {
+            build.nodes.resize(node_count);
+            return false;
+        }
+        return true;
     }
 
     template <typename T>
     typename std::enable_if<
-        !detail::is_leaf_scalar<typename detail::remove_cvref<T>::type>::value &&
+        (!detail::is_leaf_scalar<typename detail::remove_cvref<T>::type>::value ||
+         detail::is_std_string<typename detail::remove_cvref<T>::type>::value) &&
         !detail::is_wave_array<typename detail::remove_cvref<T>::type>::value &&
         !reflect::is_reflected<typename detail::remove_cvref<T>::type>::value,
         bool>::type
@@ -15593,118 +15606,8 @@ private:
                                         std::uint32_t,
                                         const char*,
                                         const T*) {
-        typedef typename detail::remove_cvref<T>::type CleanT;
-        build.expandable_reference =
-            std::is_pointer<CleanT>::value ||
-            detail::is_unique_ptr_scalar<CleanT>::value ||
-            detail::is_unique_ptr_array<CleanT>::value ||
-            detail::is_shared_ptr<CleanT>::value ||
-            detail::is_weak_ptr<CleanT>::value;
-        if (!build.expandable_reference) build.unsupported = true;
+        (void)build;
         return false;
-    }
-
-    template <typename ArrT>
-    typename std::enable_if<detail::is_wave_array<ArrT>::value, NodeId>::type
-    expand_wave_array_field_legacy_(const std::string& path, NodeId parent_id, const ArrT* ptr) {
-        if (!ptr) return 0;
-        const std::size_t logical_count = wave_array_traits<ArrT>::size;
-        const std::size_t traced_count = traced_array_element_count_(logical_count);
-        std::string annotated_array_path;
-        const std::string& array_path =
-            make_array_container_path_(path, logical_count, annotated_array_path);
-        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
-        const NodeId node_id = create_node(parent_id, array_path, NodeKind::Aggregate, 0);
-        if (node_id == 0) {
-            rollback_topology_to(cp);
-            return 0;
-        }
-        typedef typename wave_array_traits<ArrT>::element_type ElemT;
-        // A first-element-only array is sampled as an ordinary leaf/subtree.
-        // Registering the full dirty range would make writes to intentionally
-        // untracked elements schedule work for topology that does not exist.
-        const bool capture_wave_array =
-            options_.enable_wave_array_dirty && !options_.trace_array_first_element_only;
-        const std::uint32_t prev_capture_depth = active_dirty_wave_array_capture_depth_;
-        DirtyWaveArrayBlockCursor array_begin;
-        if (capture_wave_array) {
-            if (prev_capture_depth == 0) {
-                reserve_dirty_wave_array_scalar_layout_<ArrT>();
-            }
-            ++active_dirty_wave_array_capture_depth_;
-            array_begin = dirty_wave_array_current_block_cursor_();
-        }
-
-        const std::size_t chunk_max_bytes = options_.wave_array_dirty_chunk_max_bytes != 0
-            ? options_.wave_array_dirty_chunk_max_bytes
-            : sizeof(ElemT);
-        const std::size_t chunk_element_capacity = (std::max<std::size_t>)(
-            static_cast<std::size_t>(1), chunk_max_bytes / sizeof(ElemT));
-        std::size_t chunk_first_index = 0;
-        DirtyWaveArrayBlockCursor chunk_begin = array_begin;
-
-        for (std::size_t i = 0; i < traced_count; ++i) {
-            const std::string child_path = make_index_child_path_(array_path, i);
-            TopologyCheckpoint elem_cp = make_topology_checkpoint(node_id);
-            const ElemT* elem = std::addressof((*ptr)[i]);
-            const NodeId child_node = expand_member_clean_dispatch<ElemT>(
-                child_path,
-                node_id,
-                elem);
-            if (child_node == 0) {
-                rollback_topology_to(elem_cp);
-            }
-            if (capture_wave_array) {
-                const std::size_t chunk_element_count = i + 1u - chunk_first_index;
-                if (chunk_element_count >= chunk_element_capacity ||
-                    i + 1u == traced_count) {
-                    const DirtyWaveArrayBlockCursor chunk_end = dirty_wave_array_current_block_cursor_();
-                    if (dirty_wave_array_cursor_less_(chunk_begin, chunk_end)) {
-                        const ElemT* first_chunk_elem = std::addressof((*ptr)[chunk_first_index]);
-                        const WaveArrayBulkMarkKey chunk_key(
-                            static_cast<const void*>(first_chunk_elem),
-                            reflect::type_tag_of<ElemT>(),
-                            sizeof(ElemT),
-                            chunk_element_count);
-                        (void)register_dirty_wave_array_element_chunk_(
-                            chunk_key, chunk_begin, chunk_end);
-                    }
-                    chunk_first_index = i + 1u;
-                    chunk_begin = chunk_end;
-                }
-            }
-        }
-
-        DirtyWaveArrayBlockCursor array_end;
-        if (capture_wave_array) {
-            array_end = dirty_wave_array_current_block_cursor_();
-            active_dirty_wave_array_capture_depth_ = prev_capture_depth;
-            if (prev_capture_depth == 0) {
-                close_dirty_wave_array_open_block_();
-            }
-        }
-        const NodeId kept = keep_node_or_rollback(cp, node_id);
-        if (kept != 0 && capture_wave_array && logical_count != 0) {
-            const ElemT* first_elem = std::addressof((*ptr)[0]);
-            const WaveArrayBulkMarkKey bulk_key(
-                static_cast<const void*>(first_elem),
-                reflect::type_tag_of<ElemT>(),
-                sizeof(ElemT),
-                logical_count);
-            const std::uint32_t bulk_range_id =
-                register_dirty_wave_array_slice_(DirtyWaveArraySliceKey(), &bulk_key, array_begin, array_end);
-            if (bulk_range_id == kInvalidIndex || bulk_range_id >= dirty_wave_array_bulk_ranges_.size()) {
-                fail_dirty_wave_array_bulk_notify_("bulk range cursor registration failed during topology expansion",
-                                                   static_cast<const void*>(first_elem),
-                                                   reflect::type_tag_of<ElemT>(),
-                                                   sizeof(ElemT),
-                                                   logical_count);
-            }
-            dirty_wave_array_memory_blocks_valid_ = true;
-            dirty_wave_array_memory_blocks_complete_ = true;
-        }
-        active_dirty_wave_array_capture_depth_ = prev_capture_depth;
-        return kept;
     }
 
     template <typename ArrT>
@@ -15718,17 +15621,7 @@ private:
         }
         const ElemT* first = std::addressof((*ptr)[0]);
         CompactArraySchemaBuild schema(first, sizeof(ElemT));
-        const bool schema_ok = collect_compact_array_schema_value_<ElemT>(
-            schema, 0, NULL, first);
-        if (!schema_ok) {
-            if (schema.expandable_reference && !schema.unsupported) {
-                // Arrays whose element topology contains an expanding pointer or
-                // reference are outside compact-array semantics by definition.
-                return expand_wave_array_field_legacy_<ArrT>(path, parent_id, ptr);
-            }
-            throw std::logic_error(
-                "WaveTrace compact wave::array schema contains an unsupported non-pointer member");
-        }
+        if (!collect_compact_array_schema_value_<ElemT>(schema, 0, NULL, first)) return 0;
         if (!options_.enable_wave_array_dirty) {
             throw std::logic_error(
                 "WaveTrace compact wave::array requires active wave::array dirty reporting");

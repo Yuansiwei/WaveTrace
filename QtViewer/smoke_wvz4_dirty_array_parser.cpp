@@ -1,37 +1,13 @@
 #include "WaveParser4.h"
 
 #include <QCoreApplication>
-#include <QStringList>
 
 #include <cstdint>
 #include <iostream>
 
-static QString fullPathForSignal(const WaveFile& wave, int signalIndex) {
-    if (signalIndex < 0 || signalIndex >= wave.signalList.size()) return QString();
-    if (!wave.tree.valid ||
-        signalIndex >= wave.tree.signalIndexToNodeId.size() ||
-        wave.tree.signalIndexToNodeId.at(signalIndex) <= 0) {
-        return wave.signalList.at(signalIndex).name;
-    }
-
-    QStringList parts;
-    int nodeId = wave.tree.signalIndexToNodeId.at(signalIndex);
-    int guard = 0;
-    while (nodeId > 0 &&
-           nodeId < wave.tree.nodesById.size() &&
-           wave.tree.nodesById.at(nodeId).valid &&
-           guard < wave.tree.nodesById.size()) {
-        const WaveTreeNode& node = wave.tree.nodesById.at(nodeId);
-        parts.prepend(waveTreeNodeSegmentName(wave.tree, nodeId));
-        nodeId = node.parentId;
-        ++guard;
-    }
-    return parts.join(QStringLiteral("."));
-}
-
-static int findSignalByPath(const WaveFile& wave, const QString& path) {
-    for (int i = 0; i < wave.signalList.size(); ++i) {
-        if (fullPathForSignal(wave, i) == path) return i;
+static int findSignalById(const WaveFile& wave, int signalId) {
+    for (int i = 0; i < static_cast<int>(wave.signalList.size()); ++i) {
+        if (wave.signalList.at(i).signalId == signalId) return i;
     }
     return -1;
 }
@@ -84,24 +60,35 @@ int main(int argc, char** argv) {
         return fail(QStringLiteral("usage: smoke_wvz4_dirty_array_parser <dirty_array.wvz4>"));
     }
 
-    WaveParser4::LoadOptions options;
-    options.includeAllSignalDefinitions = true;
-    options.loadRawSamples = true;
-    options.autoLoadFirstSignalCount = -1;
-    options.maxDecodedSamples = 1000000;
-
-    WaveFile wave;
+    WaveParser4Reader reader;
     QString error;
-    if (!WaveParser4::loadFromFile(QString::fromLocal8Bit(argv[1]), wave, error, options)) {
-        return fail(QStringLiteral("loadFromFile failed: ") + error);
+    if (!reader.open(QString::fromLocal8Bit(argv[1]), error)) {
+        return fail(QStringLiteral("reader.open failed: ") + error);
+    }
+    const WaveFile& directory = reader.directoryWave();
+    if (directory.tree.arrays.size() != 1 || !directory.signalList.empty()) {
+        return fail(QStringLiteral("dirty array was not retained as one lazy compact block"));
+    }
+    const WaveArrayInfo& array = directory.tree.arrays.at(0);
+    if (array.elementCount != 128 || array.elementStride != 64 ||
+        array.leafCountPerElement != 16 || array.schema.size() != 17) {
+        return fail(QStringLiteral("dirty array compact schema mismatch"));
+    }
+    QVector<int> ids;
+    ids << array.firstVirtualSignalId + 7 * 16 + 3
+        << array.firstVirtualSignalId + 9 * 16 + 4
+        << array.firstVirtualSignalId + 7 * 16 + 4;
+    WaveFile wave;
+    if (!reader.loadSignals(ids, wave, error, 1000000)) {
+        return fail(QStringLiteral("loadSignals failed: ") + error);
     }
 
-    const int f3Index = findSignalByPath(wave, QStringLiteral("top.slots.[7].f3"));
-    const int f4Index = findSignalByPath(wave, QStringLiteral("top.slots.[9].f4"));
-    const int stableIndex = findSignalByPath(wave, QStringLiteral("top.slots.[7].f4"));
-    if (f3Index < 0) return fail(QStringLiteral("missing path top.slots.[7].f3"));
-    if (f4Index < 0) return fail(QStringLiteral("missing path top.slots.[9].f4"));
-    if (stableIndex < 0) return fail(QStringLiteral("missing path top.slots.[7].f4"));
+    const int f3Index = findSignalById(wave, ids.at(0));
+    const int f4Index = findSignalById(wave, ids.at(1));
+    const int stableIndex = findSignalById(wave, ids.at(2));
+    if (f3Index < 0) return fail(QStringLiteral("missing virtual signal top.slots.[7].f3"));
+    if (f4Index < 0) return fail(QStringLiteral("missing virtual signal top.slots.[9].f4"));
+    if (stableIndex < 0) return fail(QStringLiteral("missing virtual signal top.slots.[7].f4"));
 
     const WaveSignal& f3 = wave.signalList.at(f3Index);
     const WaveSignal& f4 = wave.signalList.at(f4Index);
