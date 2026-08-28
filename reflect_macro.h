@@ -168,11 +168,12 @@ struct WaveDirtyHook {
 
     void* tracer;
     uint32_type group_id;
+    uint32_type binding_id;
     MarkFn mark_fn;
 
-    WaveDirtyHook() noexcept : tracer(nullptr), group_id(~uint32_type(0)), mark_fn(nullptr) {}
-    WaveDirtyHook(const WaveDirtyHook&) noexcept : tracer(nullptr), group_id(~uint32_type(0)), mark_fn(nullptr) {}
-    WaveDirtyHook(WaveDirtyHook&&) noexcept : tracer(nullptr), group_id(~uint32_type(0)), mark_fn(nullptr) {}
+    WaveDirtyHook() noexcept : tracer(nullptr), group_id(~uint32_type(0)), binding_id(~uint32_type(0)), mark_fn(nullptr) {}
+    WaveDirtyHook(const WaveDirtyHook&) noexcept : tracer(nullptr), group_id(~uint32_type(0)), binding_id(~uint32_type(0)), mark_fn(nullptr) {}
+    WaveDirtyHook(WaveDirtyHook&&) noexcept : tracer(nullptr), group_id(~uint32_type(0)), binding_id(~uint32_type(0)), mark_fn(nullptr) {}
 
     WaveDirtyHook& operator=(const WaveDirtyHook&) noexcept { clear(); return *this; }
     WaveDirtyHook& operator=(WaveDirtyHook&&) noexcept { clear(); return *this; }
@@ -180,19 +181,28 @@ struct WaveDirtyHook {
     void clear() noexcept {
         tracer = nullptr;
         group_id = ~uint32_type(0);
+        binding_id = ~uint32_type(0);
         mark_fn = nullptr;
     }
 
     void bind(void* owner, uint32_type id, MarkFn fn) noexcept {
         tracer = owner;
         group_id = id;
+        binding_id = id;
+        mark_fn = fn;
+    }
+
+    void bind(void* owner, uint32_type id, uint32_type opaque_binding_id, MarkFn fn) noexcept {
+        tracer = owner;
+        group_id = id;
+        binding_id = opaque_binding_id;
         mark_fn = fn;
     }
 
     void mark_dirty() const noexcept {
         // Preserve harmless user-supplied hook behavior while WaveTrace itself
         // remains absent in Linux API-only builds.
-        if (tracer && mark_fn && group_id != ~uint32_type(0)) mark_fn(tracer, group_id);
+        if (tracer && mark_fn && binding_id != ~uint32_type(0)) mark_fn(tracer, binding_id);
     }
 };
 
@@ -247,6 +257,12 @@ public:
 
 template <typename T>
 struct BoolStoragePtr { const T* ptr; };
+
+// Generated-member metadata for value sources whose terminal object uses
+// one-byte logical-bool storage (for example sc_port<...U01...>).  This tag
+// carries source spelling that C++ typedef canonicalization would otherwise
+// erase before the runtime sees the returned pointer.
+struct BoolLeafSourceTag {};
 
 template <typename T>
 inline BoolStoragePtr<T> as_bool_storage_ptr(const T* ptr) noexcept {
@@ -569,6 +585,19 @@ struct wave_array_traits<array<T, N> > {
 #include <unordered_set>
 #include <utility>
 
+#if defined(__has_include)
+#if __has_include("wavetrace_enabled.h")
+#include "wavetrace_enabled.h"
+#define WAVE_DETAIL_ENABLED_HEADER_FOUND_ 1
+#endif
+#endif
+#ifndef WAVE_DETAIL_ENABLED_HEADER_FOUND_
+#define WAVE_DETAIL_ENABLED_HEADER_FOUND_ 0
+#endif
+#ifndef WAVETRACE_GENERATED_ENABLED
+#define WAVETRACE_GENERATED_ENABLED 0
+#endif
+
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -595,7 +624,11 @@ inline const void* type_tag_of() {
 namespace wave {
 
 class Tracer;
+#if WAVE_DETAIL_ENABLED_HEADER_FOUND_ == 1 && WAVETRACE_GENERATED_ENABLED == 1
 template <typename T, std::size_t N> class array;
+#else
+template <typename T, std::size_t N> using array = std::array<T, N>;
+#endif
 typedef std::uint64_t NodeId;
 typedef NodeId (*DynamicExpandFn)(Tracer&, const std::string&, NodeId, const void*);
 typedef bool (*DynamicExpandArrayFn)(Tracer&, NodeId, const void*, std::size_t);
@@ -627,11 +660,12 @@ struct WaveDirtyHook {
 
     void* tracer;
     std::uint32_t group_id;
+    std::uint32_t binding_id;
     MarkFn mark_fn;
 
-    WaveDirtyHook() noexcept : tracer(NULL), group_id(kInvalidIndex), mark_fn(NULL) {}
-    WaveDirtyHook(const WaveDirtyHook&) noexcept : tracer(NULL), group_id(kInvalidIndex), mark_fn(NULL) {}
-    WaveDirtyHook(WaveDirtyHook&&) noexcept : tracer(NULL), group_id(kInvalidIndex), mark_fn(NULL) {}
+    WaveDirtyHook() noexcept : tracer(NULL), group_id(kInvalidIndex), binding_id(kInvalidIndex), mark_fn(NULL) {}
+    WaveDirtyHook(const WaveDirtyHook&) noexcept : tracer(NULL), group_id(kInvalidIndex), binding_id(kInvalidIndex), mark_fn(NULL) {}
+    WaveDirtyHook(WaveDirtyHook&&) noexcept : tracer(NULL), group_id(kInvalidIndex), binding_id(kInvalidIndex), mark_fn(NULL) {}
 
     WaveDirtyHook& operator=(const WaveDirtyHook&) noexcept {
         clear();
@@ -646,18 +680,28 @@ struct WaveDirtyHook {
     void clear() noexcept {
         tracer = NULL;
         group_id = kInvalidIndex;
+        binding_id = kInvalidIndex;
         mark_fn = NULL;
     }
 
     void bind(void* t, std::uint32_t gid, MarkFn fn) noexcept {
         tracer = t;
         group_id = gid;
+        binding_id = gid;
+        mark_fn = fn;
+    }
+
+    void bind(void* t, std::uint32_t gid, std::uint32_t opaque_binding_id,
+              MarkFn fn) noexcept {
+        tracer = t;
+        group_id = gid;
+        binding_id = opaque_binding_id;
         mark_fn = fn;
     }
 
     void mark_dirty() const noexcept {
-        if (tracer && mark_fn && group_id != kInvalidIndex) {
-            mark_fn(tracer, group_id);
+        if (tracer && mark_fn && binding_id != kInvalidIndex) {
+            mark_fn(tracer, binding_id);
         }
     }
 };
@@ -776,6 +820,12 @@ template <typename T>
 struct BoolStoragePtr {
     const T* ptr;
 };
+
+// Generated-member metadata for value sources whose terminal object uses
+// one-byte logical-bool storage (for example sc_port<...U01...>).  Unlike
+// BoolStoragePtr this decorates the source member, not the returned leaf
+// address; Tracer propagates it only to that source's terminal scalar.
+struct BoolLeafSourceTag {};
 
 template <typename T>
 inline BoolStoragePtr<T> as_bool_storage_ptr(const T* p) noexcept {
@@ -1491,12 +1541,14 @@ struct annotated_pointer_storage_array_traits<std::array<StorageT, N> > {
         N * annotated_pointer_storage_array_traits<StorageT>::slot_count;
 };
 
+#if WAVE_DETAIL_ENABLED_HEADER_FOUND_ == 1 && WAVETRACE_GENERATED_ENABLED == 1
 template <typename StorageT, std::size_t N>
 struct annotated_pointer_storage_array_traits< ::wave::array<StorageT, N> > {
     typedef typename annotated_pointer_storage_array_traits<StorageT>::element_type element_type;
     static constexpr std::size_t slot_count =
         N * annotated_pointer_storage_array_traits<StorageT>::slot_count;
 };
+#endif
 
 template <typename StorageT>
 struct annotated_weak_pointer_storage_array_traits {
@@ -1518,12 +1570,14 @@ struct annotated_weak_pointer_storage_array_traits<std::array<StorageT, N> > {
         N * annotated_weak_pointer_storage_array_traits<StorageT>::slot_count;
 };
 
+#if WAVE_DETAIL_ENABLED_HEADER_FOUND_ == 1 && WAVETRACE_GENERATED_ENABLED == 1
 template <typename StorageT, std::size_t N>
 struct annotated_weak_pointer_storage_array_traits< ::wave::array<StorageT, N> > {
     typedef typename annotated_weak_pointer_storage_array_traits<StorageT>::element_type element_type;
     static constexpr std::size_t slot_count =
         N * annotated_weak_pointer_storage_array_traits<StorageT>::slot_count;
 };
+#endif
 
 template <typename StorageT>
 struct is_annotated_pointer_storage_array : std::false_type {};
@@ -1534,8 +1588,10 @@ struct is_annotated_pointer_storage_array<StorageT[N]> : std::true_type {};
 template <typename StorageT, std::size_t N>
 struct is_annotated_pointer_storage_array<std::array<StorageT, N> > : std::true_type {};
 
+#if WAVE_DETAIL_ENABLED_HEADER_FOUND_ == 1 && WAVETRACE_GENERATED_ENABLED == 1
 template <typename StorageT, std::size_t N>
 struct is_annotated_pointer_storage_array< ::wave::array<StorageT, N> > : std::true_type {};
+#endif
 
 template <typename CountT>
 std::size_t normalize_annotated_pointer_count_impl(CountT count, std::true_type) noexcept {
@@ -1740,6 +1796,7 @@ struct AnnotatedPointerStorageArrayVisitor<std::array<StorageT, N> > {
     }
 };
 
+#if WAVE_DETAIL_ENABLED_HEADER_FOUND_ == 1 && WAVETRACE_GENERATED_ENABLED == 1
 template <typename StorageT, std::size_t N>
 struct AnnotatedPointerStorageArrayVisitor< ::wave::array<StorageT, N> > {
     template <typename Visitor, typename CountT>
@@ -1762,6 +1819,7 @@ struct AnnotatedPointerStorageArrayVisitor< ::wave::array<StorageT, N> > {
         }
     }
 };
+#endif
 
 template <typename StorageT>
 struct AnnotatedWeakPointerStorageArrayVisitor {
@@ -1812,6 +1870,7 @@ struct AnnotatedWeakPointerStorageArrayVisitor<std::array<StorageT, N> > {
     }
 };
 
+#if WAVE_DETAIL_ENABLED_HEADER_FOUND_ == 1 && WAVETRACE_GENERATED_ENABLED == 1
 template <typename StorageT, std::size_t N>
 struct AnnotatedWeakPointerStorageArrayVisitor< ::wave::array<StorageT, N> > {
     template <typename Visitor>
@@ -1830,6 +1889,7 @@ struct AnnotatedWeakPointerStorageArrayVisitor< ::wave::array<StorageT, N> > {
         }
     }
 };
+#endif
 
 template <typename Visitor, typename StorageT, typename CountT, typename... Meta>
 void invoke_annotated_ptr_storage_array_visitor_impl(Visitor&& visitor,
@@ -1929,10 +1989,9 @@ struct wave_ptr_traits<detail::AnnotatedWeakPtrView<T> > {
     }
 };
 
-template <typename T, std::size_t N> class array;
-
 template <typename T> struct wave_array_traits;
 
+#if WAVE_DETAIL_ENABLED_HEADER_FOUND_ == 1 && WAVETRACE_GENERATED_ENABLED == 1
 // wave::array<T,N> is a size-preserving wrapper around std::array<T,N>.
 // It deliberately exposes mutation only through non-const operator[] so the
 // tracer can mark the accessed element dirty.  The object stores no tracer id
@@ -2170,9 +2229,11 @@ struct wave_array_traits<array<T, N> > {
 
 static_assert(sizeof(array<std::uint32_t, 4>) == sizeof(std::array<std::uint32_t, 4>), "wave::array size mismatch");
 static_assert(alignof(array<std::uint32_t, 4>) == alignof(std::array<std::uint32_t, 4>), "wave::array align mismatch");
+#endif
 
 } // namespace wave
 
+#if WAVE_DETAIL_ENABLED_HEADER_FOUND_ == 1 && WAVETRACE_GENERATED_ENABLED == 1
 namespace std {
 
 template <typename T, std::size_t N>
@@ -2185,6 +2246,7 @@ struct tuple_element<I, ::wave::array<T, N> > {
 };
 
 } // namespace std
+#endif
 
 #ifndef WAVE_REFLECT_FRIEND
 #define WAVE_REFLECT_FRIEND \

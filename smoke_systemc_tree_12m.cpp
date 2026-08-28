@@ -225,10 +225,10 @@ int sc_main(int argc, char* argv[]) {
     if (sample_one) {
         sc_core::sc_clock clk("clk", sc_core::sc_time(1, sc_core::SC_NS));
         wave::WaveTap tap("wave_tap", tracer, recorder, clk);
-        sc_core::sc_start(sc_core::SC_ZERO_TIME);
+        tap.sample_one_cycle();
         if (!tap.last_error().empty()) error = tap.last_error();
         if (error.empty() && tap.next_cycle() != static_cast<wave::Cycle>(1)) {
-            error = "WaveTap start_of_simulation sample count mismatch";
+            error = "WaveTap manual sample count mismatch";
         }
     } else {
         tracer.prepare_topology(0);

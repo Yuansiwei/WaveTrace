@@ -1263,7 +1263,11 @@ QVector<int> WaveCanvas::collectSampleIndicesForWindow(const WaveSignal& sig, in
 
 
 void WaveCanvas::zoomByFactor(double factor) {
-    const qint64 center = (m_cursorTime >= 0) ? m_cursorTime : ((m_viewStart + m_viewEnd) / 2);
+    const bool cursorVisible =
+        m_cursorTime >= m_viewStart && m_cursorTime <= m_viewEnd;
+    const qint64 center = cursorVisible
+        ? m_cursorTime
+        : ((m_viewStart + m_viewEnd) / 2);
     zoomAt(center, factor, true);
 }
 
@@ -3029,7 +3033,6 @@ void WaveCanvas::mouseReleaseEvent(QMouseEvent* event) {
             if (ne > fullEnd()) ne = fullEnd();
             if (ne - ns < m_minWindow) ns = qMax(fullStart(), ne - m_minWindow);
             Q_EMIT viewportRangeSelected(ns, ne);
-            m_cursorTime = ns + (ne - ns) / 2;
         }
         else {
             m_cursorTime = snapCursorClickTime(t1);
@@ -3037,10 +3040,10 @@ void WaveCanvas::mouseReleaseEvent(QMouseEvent* event) {
                 m_selectedEntryIndex = m_pendingClickRow;
                 Q_EMIT entryClicked(m_pendingClickRow, m_pendingClickCtrlHeld);
             }
+            Q_EMIT cursorMoved(m_cursorTime);
         }
         m_pendingClickRow = -1;
         m_pendingClickCtrlHeld = false;
-        Q_EMIT cursorMoved(m_cursorTime);
         update();
         event->accept();
         return;
@@ -3073,7 +3076,11 @@ void WaveCanvas::leaveEvent(QEvent* event) {
 }
 
 void WaveCanvas::wheelEvent(QWheelEvent* event) {
-    const qint64 zoomCenter = xToTime(wheelEventXCompat(event));
+    const bool cursorVisible =
+        m_cursorTime >= m_viewStart && m_cursorTime <= m_viewEnd;
+    const qint64 zoomCenter = cursorVisible
+        ? m_cursorTime
+        : xToTime(wheelEventXCompat(event));
     zoomAt(zoomCenter, event->angleDelta().y() > 0 ? 0.85 : 1.15, true);
     event->accept();
 }

@@ -13,10 +13,10 @@ wave::Tracer tracer(recorder, opt);
 wave::WaveTap tap("wave_tap", tracer, recorder, clk);
 ```
 
-When SystemC is available, `WaveTap` derives from `sc_module`. It samples once
-from `start_of_simulation()` before timed simulation starts, then automatically
-samples on every falling edge of the registered `sc_clock`. WaveTap owns the
-internal cycle counter. `SystemCStartSampler` no longer exists.
+When SystemC is available, `WaveTap` derives from `sc_module` and automatically
+samples on every falling edge of the registered `sc_clock`. It does not sample
+from `start_of_simulation()`. WaveTap owns the internal cycle counter.
+`SystemCStartSampler` no longer exists.
 
 ## Minimal usage
 
@@ -87,8 +87,8 @@ and avoids two competing WaveTap modes.
 
 ## Automatic sampling
 
-`WaveTap` performs one frame in `start_of_simulation()` and one on every clock
-falling edge, using its internal monotonically increasing cycle counter:
+`WaveTap` performs one frame on every clock falling edge, using its internal
+monotonically increasing cycle counter:
 
 ```cpp
 recorder.begin_cycle(cycle);
@@ -97,7 +97,7 @@ recorder.end_cycle(cycle, error);
 ++internal_cycle;
 ```
 
-On the initial sample, if topology has not already been prepared, `WaveTap` lazily
+On the first falling-edge sample, if topology has not already been prepared, `WaveTap` lazily
 expands the topology and opens the WVZ4 writer layout before the cycle frame
 begins.  User code does not call `prepare_topology()`.
 

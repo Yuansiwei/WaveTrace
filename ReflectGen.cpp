@@ -352,6 +352,7 @@ namespace
         bool exprIsPointerAlready = false;
         bool rawPointerOrReference = false;
         bool asBoolStorage = false;
+        bool boolLeafSource = false;
         AnnotatedPointerKind annotatedPointerKind = AnnotatedPointerKind::None;
         std::string annotatedPointerCountExpr;
         bool annotatedPointerTargetArray = false;
@@ -373,6 +374,13 @@ namespace
     std::string ToStdString(CXString s);
 
     std::string EscapeString(const std::string& s);
+
+    bool ExtractTemplateArguments(const std::string& typeName,
+                                  std::string* templateName,
+                                  std::vector<std::string>* arguments);
+
+    bool IsBoolLeafSourceTypeSpelling(const Options& opt,
+                                      const std::string& typeName);
 
     std::string BuildAnnotatedPointerCountExpression(const EmittedMember& member,
                                                      const std::string& objectExpr);
@@ -1739,6 +1747,10 @@ namespace
         bool includeWaveRuntime);
 
     bool EmitEmptyGeneratedHeader(const std::string& path);
+
+    std::string WaveTraceGeneratedOutputDirectory(const Options& opt);
+
+    bool EmitWaveTraceEnabledHeader(const Options& opt, bool enabled);
 
     bool EmitDisabledReflectionHeaders(const Options& opt,
         const WavePtrReflectionConfig& config);
@@ -3415,6 +3427,7 @@ namespace
         return key == "sc_core::sc_in" ||
             key == "sc_core::sc_out" ||
             key == "sc_core::sc_inout" ||
+            key == "sc_core::sc_port" ||
             key == "sc_core::sc_signal" ||
             key == "sc_core::sc_buffer" ||
             key == "sc_core::sc_vector" ||
@@ -5421,6 +5434,8 @@ namespace
             m.exprIsPointerAlready = false;
             m.rawPointerOrReference = f.rawPointerOrReference;
             m.asBoolStorage = !f.isBitField && IsBoolStorageTypedefSpelling(opt, f.typeName);
+            m.boolLeafSource = !f.isBitField &&
+                IsBoolLeafSourceTypeSpelling(opt, f.typeName);
             m.annotatedPointerKind = f.annotatedPointerKind;
             m.annotatedPointerCountExpr = f.annotatedPointerCountExpr;
             m.annotatedPointerTargetArray = f.annotatedPointerTargetArray;
@@ -5534,6 +5549,67 @@ namespace
         if (!Trim(typeName.substr(close + 1)).empty()) return false;
         *templateName = Trim(typeName.substr(0, open));
         return !arguments->empty();
+    }
+
+    std::string UnqualifiedTemplateName(std::string name)
+    {
+        name = Trim(name);
+        if (name.compare(0, 2, "::") == 0) name = name.substr(2);
+        const std::size_t scope = name.rfind("::");
+        if (scope != std::string::npos) name = name.substr(scope + 2);
+        return Trim(name);
+    }
+
+    bool ContainsBoolStorageTemplateArgument(const Options& opt,
+                                             const std::string& typeName)
+    {
+        if (IsBoolStorageTypedefSpelling(opt, typeName)) return true;
+
+        std::string templateName;
+        std::vector<std::string> arguments;
+        if (!ExtractTemplateArguments(Trim(typeName), &templateName, &arguments)) {
+            return false;
+        }
+        for (std::size_t i = 0; i < arguments.size(); ++i) {
+            if (ContainsBoolStorageTemplateArgument(opt, arguments[i])) return true;
+        }
+        return false;
+    }
+
+    bool IsBoolLeafSourceTypeSpelling(const Options& opt,
+                                      const std::string& typeName)
+    {
+        std::string templateName;
+        std::vector<std::string> arguments;
+        if (!ExtractTemplateArguments(Trim(typeName), &templateName, &arguments)) {
+            return false;
+        }
+
+        const std::string leafName = UnqualifiedTemplateName(templateName);
+        static const char* const kValueSourceTemplates[] = {
+            "sc_port", "sc_in", "sc_out", "sc_inout", "sc_signal", "sc_buffer",
+            "vsipIN", "vsipOUT", "vsipINOUT",
+            "vsiiIN", "vsiiOUT", "vsiiINOUT"
+        };
+        bool recognizedSource = false;
+        for (std::size_t i = 0;
+             i < sizeof(kValueSourceTemplates) / sizeof(kValueSourceTemplates[0]);
+             ++i) {
+            if (leafName == kValueSourceTemplates[i]) {
+                recognizedSource = true;
+                break;
+            }
+        }
+        if (!recognizedSource) return false;
+
+        // Preserve only an explicit typedef spelling found below a recognized
+        // value-source wrapper.  Canonical spellings are deliberately not used:
+        // U01 and unsigned char are identical after canonicalization, and marking
+        // the latter globally would corrupt genuine 8-bit ports.
+        for (std::size_t i = 0; i < arguments.size(); ++i) {
+            if (ContainsBoolStorageTemplateArgument(opt, arguments[i])) return true;
+        }
+        return false;
     }
 
     std::string NormalizeScalarTypeSpelling(std::string typeName)
@@ -7532,11 +7608,15 @@ namespace
                     }
                     else if (m.exprIsPointerAlready)
                     {
-                        os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.constExpr << ", ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                        os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.constExpr << ", ";
+                        if (m.boolLeafSource) os << "::wave::BoolLeafSourceTag(), ";
+                        os << "::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
                     else
                     {
-                        os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.constExpr << "), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                        os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.constExpr << "), ";
+                        if (m.boolLeafSource) os << "::wave::BoolLeafSourceTag(), ";
+                        os << "::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
                 }
             }
@@ -7628,11 +7708,15 @@ namespace
                     }
                     else if (m.exprIsPointerAlready)
                     {
-                        os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.mutExpr << ", ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                        os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", " << m.mutExpr << ", ";
+                        if (m.boolLeafSource) os << "::wave::BoolLeafSourceTag(), ";
+                        os << "::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
                     else
                     {
-                        os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.mutExpr << "), ::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
+                        os << "        ::wave::detail::invoke_ptr_visitor(on_ptr, \"" << EscapeString(m.displayName) << "\", std::addressof(" << m.mutExpr << "), ";
+                        if (m.boolLeafSource) os << "::wave::BoolLeafSourceTag(), ";
+                        os << "::wave::detail::GeneratedMemberId(generated_class_id(), " << i << "u));\n";
                     }
                 }
             }
@@ -8094,6 +8178,35 @@ namespace
         os << "// WaveTrace=false: reflection intentionally omitted.\n";
         return CommitGeneratedOutputFile(os, temporaryPath, path,
                                          "[empty generated header write error]");
+    }
+
+    std::string WaveTraceGeneratedOutputDirectory(const Options& opt)
+    {
+        std::string output = NormalizePathSlashes(
+            ExpandEnvironmentVariablesInPath(StripOuterQuotes(opt.outputHeader)));
+        if (!IsAbsolutePath(output)) output = MakeAbsoluteLexicalPath(output);
+        output = NormalizePathSlashes(CollapseDotDotPath(output));
+        return opt.batchMode ? output : DirectoryName(output);
+    }
+
+    bool EmitWaveTraceEnabledHeader(const Options& opt, bool enabled)
+    {
+        const std::string outputDir = WaveTraceGeneratedOutputDirectory(opt);
+        if (!outputDir.empty() && !MakeDirectoryRecursive(outputDir))
+        {
+            PrintDirectoryCreateFailure("[WaveTrace enabled header]", outputDir);
+            return false;
+        }
+
+        const std::string path = JoinPath(outputDir, "wavetrace_enabled.h");
+        std::string temporaryPath;
+        std::ofstream os;
+        if (!OpenGeneratedOutputFile(path, temporaryPath, os,
+                                     "[WaveTrace enabled header open error]")) return false;
+        os << "#pragma once\n";
+        os << "#define WAVETRACE_GENERATED_ENABLED " << (enabled ? 1 : 0) << "\n";
+        return CommitGeneratedOutputFile(os, temporaryPath, path,
+                                         "[WaveTrace enabled header write error]");
     }
 
     bool EmitDisabledReflectionHeaders(const Options& opt,
@@ -10884,12 +10997,15 @@ int main(int argc, char** argv)
     if (!LoadWavePtrReflectionConfig(opt, wavePtrConfig)) return 2;
     opt.wavePtrConfig = &wavePtrConfig;
 
+    if (!EmitWaveTraceEnabledHeader(opt, wavePtrConfig.waveTrace)) return 3;
+
     if (!wavePtrConfig.waveTrace)
     {
         return EmitDisabledReflectionHeaders(opt, wavePtrConfig) ? 0 : 3;
     }
 
     if (!ApplyVcxprojSettings(opt)) return 2;
+    AddUniqueArg(opt.clangArgs, "-I" + WaveTraceGeneratedOutputDirectory(opt));
 
     if (opt.batchMode)
     {

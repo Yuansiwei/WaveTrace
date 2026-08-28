@@ -102,14 +102,14 @@ int run_model(GpuState& gpu) {
 2. `recorder.open()`。
 3. 构造 `Tracer`，调用 `tracer.add_root()`。
 4. 用模块名、`Tracer`、recorder 和业务 `sc_clock` 构造 `WaveTap`。
-5. 启动 SystemC；`WaveTap` 在仿真开始前采一次初始态，之后在每个时钟下降沿自动采样。
+5. 启动 SystemC；`WaveTap` 从第一个时钟下降沿开始自动采样，不采仿真启动初始态。
 6. 正常结束时调用 `recorder.close()`。
 
 业务代码不再需要逐周期调用采样接口。不要自行组合 `prepare_topology()`、`begin_cycle()`、`sample()` 和 `end_cycle()`，也不要手工传 cycle。
 
 ## 3. 周期与稳定拓扑
 
-`start_of_simulation()` 中的初始采样会延迟完成：
+第一个时钟下降沿的采样会延迟完成：
 
 1. 展开所有 root，建立节点、逻辑信号和物理 storage。
 2. 冻结稳定拓扑，建立 flat、dirty 和 memory-block 索引。
@@ -390,7 +390,7 @@ helper 只保证已完整接收的 cycle frame 可恢复。业务进程或 helpe
 
 ## 11. SystemC
 
-包含 SystemC 时，`WaveTap` 本身就是 `sc_module`。构造函数接收一个 `sc_clock`，在 `start_of_simulation()` 自动采初始态，并通过静态敏感表在每个 `negedge_event()` 自动采样。下降沿进程使用 `dont_initialize()`，不会和启动采样重复。旧的 `SystemCStartSampler` 已删除。
+包含 SystemC 时，`WaveTap` 本身就是 `sc_module`。构造函数接收一个 `sc_clock`，通过静态敏感表在每个 `negedge_event()` 自动采样；`start_of_simulation()` 不采样。下降沿进程使用 `dont_initialize()`。旧的 `SystemCStartSampler` 已删除。
 
 若调度中有多个写线程或 process，仍需确保所有相关更新在下降沿之前完成。不要把 `WaveTap` 当作异步观察器。
 

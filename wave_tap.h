@@ -18,11 +18,7 @@
 // Business code does NOT pass a cycle number and does NOT call
 // prepare_topology(). The first falling-edge/manual sample lazily freezes the
 // topology, builds dirty lookup tables, opens the WVZ4 writer layout, and then
-// records cycle 0.
-//
-// WaveTap also samples once in start_of_simulation(). The falling-edge process
-// uses dont_initialize(), so the initial callback and the first clock edge are
-// two explicit, non-overlapping samples.
+// records cycle 0. There is no start_of_simulation sample.
 
 #if defined(min)
 #pragma push_macro("min")
@@ -120,8 +116,8 @@ public:
     }
 
     // Samples exactly one stable business cycle and then advances the internal
-    // cycle counter. SystemC builds call this automatically before simulation
-    // and on each registered clock falling edge. Worker threads must already
+    // cycle counter. SystemC builds call this automatically on each registered
+    // clock falling edge. Worker threads must already
     // be at a barrier/join point before a sample; this method is not a
     // concurrent snapshot mechanism.
     //
@@ -144,13 +140,6 @@ public:
             return false;
         }
     }
-
-#if defined(WAVE_TAP_HAS_SYSTEMC_)
-    void start_of_simulation() noexcept override {
-        if (!automatic_sampling_required_()) return;
-        run_automatic_sample_("start_of_simulation");
-    }
-#endif
 
     Cycle next_cycle() const noexcept { return next_cycle_; }
 

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -84,6 +85,11 @@ struct ParallelAliasRoot {
         : slots(values), count(size) {}
 };
 
+struct SharedHookDistinctRoot {
+    ParallelAliasDynamic first;
+    ParallelAliasDynamic second;
+};
+
 } // namespace
 
 namespace reflect {
@@ -122,6 +128,15 @@ template<> struct reflected_visitor<ParallelAliasRoot> {
     static void visit(const ParallelAliasRoot* object, P&& on_ptr, V&&, G&&) {
         wave::detail::invoke_annotated_ptr_visitor(
             on_ptr, "slots", object->slots, object->count);
+    }
+};
+
+template<> struct is_reflected<SharedHookDistinctRoot> : std::true_type {};
+template<> struct reflected_visitor<SharedHookDistinctRoot> {
+    template<class P, class V, class G>
+    static void visit(const SharedHookDistinctRoot* object, P&& on_ptr, V&&, G&&) {
+        on_ptr("first", &object->first);
+        on_ptr("second", &object->second);
     }
 };
 
@@ -240,6 +255,35 @@ int main(int argc, char** argv) {
     }
 
     {
+        Payload firstPayload = {21u, true};
+        Payload secondPayload = {22u, false};
+        wave::WaveDirtyHook sharedHook;
+        SharedHookDistinctRoot sharedRoot;
+        sharedRoot.first.payload = &firstPayload;
+        sharedRoot.first.sharedHook = &sharedHook;
+        sharedRoot.second.payload = &secondPayload;
+        sharedRoot.second.sharedHook = &sharedHook;
+
+        wave::InMemoryWaveSink sink;
+        wave::Tracer tracer(sink, options);
+        tracer.add_root("sharedHookDistinct", &sharedRoot);
+        tracer.prepare_topology(0);
+        tracer.sample(0);
+
+        const std::size_t initialEventCount = sink.events.size();
+        firstPayload.count = 31u;
+        secondPayload.count = 32u;
+        sharedHook.mark_dirty();
+        tracer.sample(1);
+        if (sink.events.size() != initialEventCount + 2u) {
+            std::cerr << "one dirty hook did not fan out to both distinct returned objects"
+                      << " initial=" << initialEventCount
+                      << " final=" << sink.events.size() << "\n";
+            return 1;
+        }
+    }
+
+    {
         Payload badPayload = {1u, true};
         Payload badPeekPayload = {2u, false};
         Root badRoot(&badPayload, &badPeekPayload);
@@ -257,6 +301,50 @@ int main(int argc, char** argv) {
         badRoot.second.hook.clear();
         if (!rejected) {
             std::cerr << "corrupt hook group id was silently accepted\n";
+            return 1;
+        }
+    }
+
+    {
+        std::vector<Payload> distinctPayloads(64u);
+        wave::WaveDirtyHook sharedHook;
+        std::vector<ParallelAliasSlot> slots(64u);
+        for (std::size_t i = 0; i < slots.size(); ++i) {
+            distinctPayloads[i].count = static_cast<std::uint32_t>(1000u + i);
+            distinctPayloads[i].valid = (i & 1u) != 0u;
+            slots[i].target.payload = &distinctPayloads[i];
+            slots[i].target.sharedHook = &sharedHook;
+        }
+        ParallelAliasRoot aliasRoot(&slots[0], slots.size());
+        wave::BuildOptions parallelOptions = options;
+        parallelOptions.emit_track_decl_path = false;
+        parallelOptions.enable_parallel_topology_expansion = true;
+        parallelOptions.topology_expansion_threads = 8u;
+        parallelOptions.parallel_topology_min_elements = 2u;
+        parallelOptions.parallel_topology_min_work_items_per_element = 0u;
+        parallelOptions.parallel_topology_batch_elements = slots.size();
+
+        wave::InMemoryWaveSink sink;
+        wave::Tracer tracer(sink, parallelOptions);
+        tracer.add_root("parallelSharedHookDistinct", &aliasRoot);
+        tracer.prepare_topology(0);
+        tracer.sample(0);
+        const std::size_t initialEventCount = sink.events.size();
+        std::vector<std::thread> writers;
+        for (std::size_t worker = 0; worker < 8u; ++worker) {
+            writers.push_back(std::thread([&, worker]() {
+                for (std::size_t i = worker; i < distinctPayloads.size(); i += 8u) {
+                    ++distinctPayloads[i].count;
+                }
+                sharedHook.mark_dirty();
+            }));
+        }
+        for (std::size_t i = 0; i < writers.size(); ++i) writers[i].join();
+        tracer.sample(1);
+        if (sink.events.size() != initialEventCount + distinctPayloads.size()) {
+            std::cerr << "parallel shared dirty hook did not fan out to every object"
+                      << " initial=" << initialEventCount
+                      << " final=" << sink.events.size() << "\n";
             return 1;
         }
     }

@@ -237,28 +237,25 @@ static int fail(const std::string& msg) {
 static int verifyBoolStorageCompactArray() {
     BoolStorageArrayTop top;
     wave::InMemoryWaveSink sink;
-    wave::Tracer tracer(sink);
+    wave::BuildOptions options;
+    options.emit_track_decl_path = true;
+    wave::Tracer tracer(sink, options);
     tracer.add_root("bool_storage_top", &top);
     tracer.prepare_topology();
-    if (tracer.compact_array_block_count() != 1u ||
-        sink.array_block_declarations.size() != 1u) {
-        return fail("bool-storage compact array registration mismatch");
+    if (tracer.compact_array_block_count() != 0u ||
+        !sink.array_block_declarations.empty()) {
+        return fail("array with external-address members must not use a partial compact schema");
     }
-    const std::vector<wave::ArraySchemaNodeDecl>& schema =
-        sink.array_block_declarations[0].schema;
-    std::size_t bool_leaf_count = 0;
-    std::size_t array_node_count = 0;
-    for (std::size_t i = 0; i < schema.size(); ++i) {
-        if (schema[i].kind == wave::ArraySchemaNodeKind::Array) ++array_node_count;
-        if (schema[i].name == "status" &&
-            schema[i].kind == wave::ArraySchemaNodeKind::Leaf &&
-            schema[i].value_kind == wave::ValueKind::Bool &&
-            schema[i].bit_width == 1u && schema[i].byte_size == 1u) {
-            ++bool_leaf_count;
+    bool saw_nested_bool = false;
+    for (std::size_t i = 0; i < sink.declarations.size(); ++i) {
+        if (sink.declarations[i].path ==
+            "bool_storage_top.cells.[1].[1].children.[1].status") {
+            saw_nested_bool = sink.declarations[i].kind == wave::ValueKind::Bool &&
+                sink.declarations[i].bit_width == 1u;
         }
     }
-    if (bool_leaf_count != 2u || array_node_count != 2u) {
-        return fail("nested bool-storage compact schema mismatch");
+    if (!saw_nested_bool) {
+        return fail("recursive wave::array fallback lost nested bool storage");
     }
 
     wave::array<const std::uint32_t*, 2> pointers;
@@ -283,21 +280,23 @@ static int verifyBoolStorageCompactArray() {
 
     wave::array<MixedSchemaLeaf, 8> mixed;
     wave::InMemoryWaveSink mixed_sink;
-    wave::Tracer mixed_tracer(mixed_sink);
+    wave::BuildOptions mixed_options;
+    mixed_options.emit_track_decl_path = true;
+    wave::Tracer mixed_tracer(mixed_sink, mixed_options);
     mixed_tracer.add_root("mixed", &mixed);
     mixed_tracer.prepare_topology();
-    if (mixed_tracer.compact_array_block_count() != 1u ||
-        mixed_sink.array_block_declarations.size() != 1u) {
-        return fail("mixed supported/unsupported wave::array registration mismatch");
+    if (mixed_tracer.compact_array_block_count() != 0u ||
+        !mixed_sink.array_block_declarations.empty()) {
+        return fail("mixed supported/unsupported wave::array used a partial compact schema");
     }
-    const std::vector<wave::ArraySchemaNodeDecl>& mixed_schema =
-        mixed_sink.array_block_declarations[0].schema;
-    if (mixed_schema.size() != 2u ||
-        mixed_schema[0].kind != wave::ArraySchemaNodeKind::Object ||
-        mixed_schema[1].kind != wave::ArraySchemaNodeKind::Leaf ||
-        mixed_schema[1].name != "visible" ||
-        mixed_schema[1].parent_schema_node_id != mixed_schema[0].schema_node_id) {
-        return fail("unsupported members left nodes in mixed compact schema");
+    bool saw_last_visible = false;
+    for (std::size_t i = 0; i < mixed_sink.declarations.size(); ++i) {
+        if (mixed_sink.declarations[i].path == "mixed.[7].visible") {
+            saw_last_visible = true;
+        }
+    }
+    if (!saw_last_visible) {
+        return fail("recursive mixed wave::array fallback lost supported members");
     }
     return 0;
 }

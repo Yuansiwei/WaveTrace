@@ -214,6 +214,7 @@ struct topology_type_estimate< ::wave::WaveValue<T>, void> {
     }
 };
 
+#if WAVE_DETAIL_ENABLED_HEADER_FOUND_ == 1 && WAVETRACE_GENERATED_ENABLED == 1
 template <typename T, std::size_t N>
 struct topology_type_estimate< ::wave::array<T, N>, void> {
     static constexpr bool generated = false;
@@ -226,6 +227,7 @@ struct topology_type_estimate< ::wave::array<T, N>, void> {
             false);
     }
 };
+#endif
 
 template <typename T>
 struct topology_type_estimate<T*, void> {

@@ -30,7 +30,7 @@ WaveTracer/wavetrace_config.json
 
 | 字段 | 类型 | 含义 |
 | --- | --- | --- |
-| `WaveTrace` | `true` / `false` | 波形反射与采样总开关。改为 `true` 后需要重新构建 `cmodel`；改为 `false` 只需重启业务程序，不需要重新构建。 |
+| `WaveTrace` | `true` / `false` | 波形反射与采样总开关。修改后需要重新构建 `cmodel`，由 ReflectGen 生成对应的反射代码和 `wave::array` 编译模式。 |
 | `WaveTraceFileName` | 字符串 | 输出 `.wvz4` 文件名或路径。集成构建中以该字段为准；相对路径相对于业务程序的运行目录。空字符串按 `wave.wvz4` 处理。 |
 | `WaveTraceStart` | 非负整数、数字字符串、`""` 或 `null` | 开始采样的业务 Cycle，包含该 Cycle。空值表示 `0`。 |
 | `WaveTraceEnd` | 非负整数、数字字符串、`""` 或 `null` | 结束采样的业务 Cycle，包含该 Cycle。空值表示无限大，文件最终结束位置取程序实际运行终点。 |
@@ -89,8 +89,8 @@ WaveTracer/wavetrace_config.json
 
 关闭后：
 
-- 改为 `false` 后只需重新启动业务程序，不需要重新构建。
-- 之后改回 `true` 时需要重新构建 `cmodel`，让 ReflectGen 生成并编译完整反射代码。
+- 改为 `false` 后需要重新构建 `cmodel`。ReflectGen 会生成值为 `0` 的模式头，使 `wave::array<T,N>` 直接成为 `std::array<T,N>` 别名。
+- 之后改回 `true` 也需要重新构建 `cmodel`，让 ReflectGen 生成并编译完整反射代码。
 - 不展开拓扑、不采样、不生成 `.wvz4` 文件。
 - `WaveTap` 仍会在启动阶段和每个时钟下降沿推进 Cycle，但采样路径是成功空操作。
 - 开启 Cycle 进度输出后显示 `[sim] cycle=...`，不会显示 `[wave]`。
@@ -100,20 +100,23 @@ Cycle 进度输出使用现有运行时选项：
 ```cpp
 wave::BuildOptions options;
 options.print_cycle_progress = true;
-options.print_cycle_progress_period = 10; // 每 10 个业务 Cycle 输出一次
+options.print_cycle_progress_period = 100; // 每 100 个业务 Cycle 更新一次
 ```
+
+也可不改业务代码，在启动程序前设置环境变量 `SHOW_MODEL_CYCLE=1`。
+这种方式默认每 100 个业务 Cycle 更新一次控制台窗口标题；设为 `0`
+或不设置时不会通过环境变量开启。
 
 ### 修改配置后的操作
 
-修改 JSON 后是否需要重新构建，取决于 `WaveTrace` 总开关：
+修改 JSON 后的操作如下：
 
 - 配置在进程内首次读取后会缓存，运行中修改文件不会热加载。
-- 将 `WaveTrace` 改为 `true` 后，需要重新构建 `cmodel`；构建过程会运行 ReflectGen，并把完整反射代码编译进程序。
-- 将 `WaveTrace` 改为 `false` 后，不需要重新构建，退出并重新启动业务程序即可关闭波形。
+- `WaveTrace` 在 `true` 和 `false` 之间切换后都需要重新构建 `cmodel`；构建过程会运行 ReflectGen，并更新 `wavetrace_enabled.h`。
 - 文件名、采样区间、层级以及 `wave_ptr_members[].reflect` 仍由新进程直接读取，修改这些选项不需要重新构建。
 - `wave_ptr_members[].reflect=false` 会在首次拓扑展开时跳过该指针成员；改回 `true` 并重启程序即可恢复。
 
-除将 `WaveTrace` 改为 `true` 外，以下 C++ 代码变化也需要重新构建：
+除切换 `WaveTrace` 外，以下 C++ 代码变化也需要重新构建：
 
 - 新增、删除或改名 `WAVE_PTR` / `WAVE_PTR_ARRAY` 业务成员属于 C++ 代码变化，需要重新构建。
 
@@ -326,7 +329,7 @@ private:
 
 重新启用时改回 `true` 并重新启动业务程序。
 
-`wave_ptr_members[].reflect` 是运行期选项，修改它不需要重新构建。需要注意，`WaveTrace` 总开关的规则不同：改为 `true` 后必须重新构建 `cmodel`，改为 `false` 则不需要重新构建。
+`wave_ptr_members[].reflect` 是运行期选项，修改它不需要重新构建。需要注意，`WaveTrace` 总开关会改变反射代码及 `wave::array` 类型，在 `true` 和 `false` 之间切换后都必须重新构建 `cmodel`。
 
 #### 接入顺序检查
 
@@ -353,7 +356,7 @@ private:
 
 普通小数组、每个 Cycle 都整体重写的数组，或根本不需要进入波形的缓冲区，继续使用 C 数组或 `std::array`，不要机械替换。
 
-`wave::array<T, N>` 是固定长度数组，尺寸和对齐与 `std::array<T, N>` 相同，不在对象中增加 tracer id 或其他实例数据。它的作用是在业务代码通过元素写入口访问数组时，让 WaveTrace 知道本 Cycle 需要检查哪个元素。
+`WaveTrace=true` 时，`wave::array<T, N>` 是带主动上报的固定长度数组，尺寸和对齐与 `std::array<T, N>` 相同，不在对象中增加 tracer id 或其他实例数据。`WaveTrace=false` 时，ReflectGen 生成的模式头会使 `wave::array<T,N>` 直接成为 `std::array<T,N>` 别名，没有主动上报逻辑。
 
 #### module 示例
 

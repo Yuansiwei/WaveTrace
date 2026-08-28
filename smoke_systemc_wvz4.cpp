@@ -280,9 +280,9 @@ struct SystemCWaveStopper : sc_core::sc_module {
                 sc_core::sc_stop();
                 return;
             }
-            if (tap.next_cycle() != static_cast<wave::Cycle>(i + 2)) {
+            if (tap.next_cycle() != static_cast<wave::Cycle>(i + 1)) {
                 if (error) {
-                    *error = "WaveTap did not sample exactly once at start and once on the falling edge";
+                    *error = "WaveTap did not sample exactly once on the falling edge";
                 }
                 sc_core::sc_stop();
                 return;

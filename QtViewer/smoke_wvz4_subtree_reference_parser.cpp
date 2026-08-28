@@ -105,6 +105,39 @@ int main(int argc, char** argv) {
         indexedPeekSecondCountBeforeLoad != 0) {
         return fail(QStringLiteral("indexed Viewer path eagerly materialized a shared subtree"));
     }
+    if (waveTreeSearchPathEndNodeFrom(
+            indexedTree, indexedSecond,
+            QStringList{QStringLiteral("second"), QStringLiteral("count")},
+            0, Qt::CaseInsensitive) != indexedSecond ||
+        waveTreeSearchPathEndNodeFrom(
+            indexedTree, indexedFirst,
+            QStringList{QStringLiteral("first"), QStringLiteral("count")},
+            0, Qt::CaseInsensitive) != indexedFirstCount) {
+        return fail(QStringLiteral(
+            "Viewer search lost reference mount identity or canonical path"));
+    }
+
+    // Model the scalar SystemC-port case: the port node is a reference mounted
+    // directly on the channel's bool leaf.  It must keep the port name/path,
+    // while exposing the referenced leaf's signal to the Viewer immediately.
+    WaveTreeNode scalarPortReference;
+    scalarPortReference.valid = true;
+    scalarPortReference.kind = kWaveTreeNodeKindReference;
+    scalarPortReference.referenceTargetId = indexedFirstCount;
+    scalarPortReference.nameToken = indexedSecond > 0
+        ? indexedTree.nodesById.at(indexedSecond).nameToken : 0;
+    indexedTree.nodesById.push_back(scalarPortReference);
+    const int scalarPortNodeId = indexedTree.nodesById.size() - 1;
+    if (waveTreeEffectiveSignalIndex(indexedTree, scalarPortNodeId) !=
+            indexedTree.nodesById.at(indexedFirstCount).signalIndex ||
+        waveTreeEffectiveSignalId(indexedTree, scalarPortNodeId) !=
+            indexedTree.nodesById.at(indexedFirstCount).signalId ||
+        waveTreeNodeSegmentName(indexedTree, scalarPortNodeId) !=
+            waveTreeNodeSegmentName(indexedTree, indexedSecond) ||
+        indexedTree.nodesById.at(scalarPortNodeId).referenceTargetId !=
+            indexedFirstCount) {
+        return fail(QStringLiteral("scalar leaf reference lost port identity or channel signal"));
+    }
 
     WaveSubtreeReferencePatch dynamicPatch;
     WaveSubtreeReferencePatch peekPatch;

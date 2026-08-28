@@ -441,6 +441,18 @@ public:
             decl.path);
     }
 
+    void on_bitset_declarations_begin_fast(std::size_t count) override {
+        if (writer_opened_) {
+            set_error("WVZ4 recorder bitset declarations arrived after writer open");
+            return;
+        }
+        if (count > bitset_states_.max_size()) {
+            set_error("WVZ4 recorder bitset declaration count exceeds capacity");
+            return;
+        }
+        bitset_states_.reserve(count);
+    }
+
     void on_bitset_declared_fast(wave::NodeId node_id,
                                  wave::TrackId first_storage_id,
                                  std::uint32_t bit_count,
@@ -458,17 +470,29 @@ public:
             set_error("WVZ4 recorder received invalid bitset declaration");
             return;
         }
-        for (std::size_t i = 0; i < bitset_states_.size(); ++i) {
-            if (bitset_states_[i].node_id == static_cast<wvz4::u32>(node_id)) {
-                set_error("WVZ4 recorder received duplicate bitset node_id");
-                return;
-            }
-        }
         BitsetState state;
         state.node_id = static_cast<wvz4::u32>(node_id);
         state.first_storage_track_id = first_storage_id;
         state.bit_count = bit_count;
         state.word_count = word_count;
+
+        // Tracer exports bitsets in increasing node-id order. Keep that common
+        // path O(1); the former full-vector duplicate scan made N declarations
+        // O(N^2). Direct/custom sinks may still submit out of order, so retain
+        // strict duplicate validation with a binary search and sorted insert.
+        if (!bitset_states_.empty() && state.node_id <= bitset_states_.back().node_id) {
+            std::vector<BitsetState>::iterator pos = std::lower_bound(
+                bitset_states_.begin(), bitset_states_.end(), state.node_id,
+                [](const BitsetState& existing, wvz4::u32 id) {
+                    return existing.node_id < id;
+                });
+            if (pos != bitset_states_.end() && pos->node_id == state.node_id) {
+                set_error("WVZ4 recorder received duplicate bitset node_id");
+                return;
+            }
+            bitset_states_.insert(pos, state);
+            return;
+        }
         bitset_states_.push_back(state);
     }
 

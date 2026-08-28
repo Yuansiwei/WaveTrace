@@ -44,6 +44,10 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_complex_class_wvz4_wr
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_lod_residual_benchmark", "smoke_lod_residual_benchmark.vcxproj", "{A36E519B-235E-42D8-A904-33765E8E7C82}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "bench_wave_array_complex", "bench_wave_array_complex.vcxproj", "{9D2CB99D-23B2-46DB-B9E0-F07BBC73D9B2}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "smoke_bitset_recorder_scale", "smoke_bitset_recorder_scale.vcxproj", "{5EAE9F1B-4CE6-4133-AD77-364A06AC2D9C}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -134,6 +138,14 @@ Global
 		{A36E519B-235E-42D8-A904-33765E8E7C82}.Debug|x64.Build.0 = Debug|x64
 		{A36E519B-235E-42D8-A904-33765E8E7C82}.Release|x64.ActiveCfg = Release|x64
 		{A36E519B-235E-42D8-A904-33765E8E7C82}.Release|x64.Build.0 = Release|x64
+		{9D2CB99D-23B2-46DB-B9E0-F07BBC73D9B2}.Debug|x64.ActiveCfg = Debug|x64
+		{9D2CB99D-23B2-46DB-B9E0-F07BBC73D9B2}.Debug|x64.Build.0 = Debug|x64
+		{9D2CB99D-23B2-46DB-B9E0-F07BBC73D9B2}.Release|x64.ActiveCfg = Release|x64
+		{9D2CB99D-23B2-46DB-B9E0-F07BBC73D9B2}.Release|x64.Build.0 = Release|x64
+		{5EAE9F1B-4CE6-4133-AD77-364A06AC2D9C}.Debug|x64.ActiveCfg = Debug|x64
+		{5EAE9F1B-4CE6-4133-AD77-364A06AC2D9C}.Debug|x64.Build.0 = Debug|x64
+		{5EAE9F1B-4CE6-4133-AD77-364A06AC2D9C}.Release|x64.ActiveCfg = Release|x64
+		{5EAE9F1B-4CE6-4133-AD77-364A06AC2D9C}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

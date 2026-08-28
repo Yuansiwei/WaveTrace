@@ -62,9 +62,12 @@ public:
                                   qint64 rangeEnd = 0);
     void selectViewportRangeForBenchmark(qint64 start, qint64 end);
     void resetViewForBenchmark();
+    void openSignalConditionSearchDialogForBenchmark();
     bool benchmarkActiveViewportCoverage(int* covered, int* total) const;
     bool benchmarkValidateRawCaches(QString* error);
     bool runViewerSessionStateRegressionForBenchmark(QString* error);
+    bool runTreeSearchStateRegressionForBenchmark(QString* error);
+    bool runCompareActivationOrderRegressionForBenchmark(QString* error);
     bool runDerivedExpressionForBenchmark(const QString& expression,
                                           int widthOverride,
                                           qint64* elapsedMs,
@@ -76,7 +79,9 @@ public:
                               bool showMessages = true,
                               QString* errorMessage = nullptr,
                               qint64* elapsedMs = nullptr,
-                              int* resultSignalCount = nullptr);
+                              int* resultSignalCount = nullptr,
+                              bool eventTimesOnly = false,
+                              const QString& expectedSamePeerPath = QString());
     QJsonValue handleAgentRpc(const QString& method,
                               const QJsonObject& params,
                               int* errorCode,
@@ -171,6 +176,7 @@ private:
     QPushButton* m_treeSearchRegexButton = nullptr;
     QPushButton* m_treeSearchPrevButton = nullptr;
     QPushButton* m_treeSearchNextButton = nullptr;
+    QPushButton* m_treeSearchRestoreButton = nullptr;
     QLineEdit* m_activeSearchEdit = nullptr;
     QLineEdit* m_jumpTimeEdit = nullptr;
     QTreeView* m_tree = nullptr;
@@ -207,6 +213,8 @@ private:
     QLabel* m_signalConditionStatusLabel = nullptr;
     QPushButton* m_signalConditionSearchButton = nullptr;
     QPushButton* m_signalConditionCancelButton = nullptr;
+    QPushButton* m_signalConditionPrevButton = nullptr;
+    QPushButton* m_signalConditionNextButton = nullptr;
     QVector<SignalConditionValueRow> m_signalConditionValueRows;
     std::thread m_signalConditionSearchThread;
     std::shared_ptr<std::atomic_bool> m_signalConditionSearchCancel;
@@ -239,6 +247,15 @@ private:
     QVector<int> m_treeSearchAutoExpandedNodeIds;
     int m_treeSearchCurrentMatch = -1;
     bool m_treeSearchCropMode = false;
+    bool m_treeSearchSnapshotValid = false;
+    QSet<QString> m_treeSearchSavedExpandedNodePaths;
+    QVector<int> m_treeSearchSavedSelectedNodeIds;
+    int m_treeSearchSavedCurrentNodeId = -1;
+    int m_treeSearchSavedVerticalScroll = 0;
+    int m_treeSearchSavedHorizontalScroll = 0;
+    int m_treeSearchSavedTopNodeId = -1;
+    int m_treeSearchSavedTopNodeOffset = 0;
+    quint64 m_treeSearchRestoreGeneration = 0;
     QVector<ViewerSessionSignal> m_pendingSessionSignals;
     bool m_treeSearchActive = false;
     bool m_applyingTreeExpansionState = false;
@@ -260,6 +277,8 @@ private:
     bool loadViewerSessionState();
     void retryPendingViewerSessionRestore();
     void restoreUserTreeExpansionState();
+    void captureTreeSearchState();
+    void restoreTreeSearchState();
     void applyTreeSearchExpansion();
     void navigateTreeSearchMatch(int delta);
     void collectSignalIndexesFromLogicNode(int nodeId, QSet<int>& seen, QList<int>& output) const;
@@ -276,13 +295,15 @@ private:
     void loadSignalConditionSearchSettings();
     void saveSignalConditionSearchSettings() const;
     void stopSignalConditionSearch();
+    void supersedeSignalConditionSearch();
     void applySignalConditionSearchResults(const QVector<int>& matchedNodeIds,
                                            qint64 examinedSignals,
                                            qint64 nameCandidates,
                                            qint64 elapsedMs,
                                            bool truncated,
                                            const QString& error);
-    void showTreeSearchResults(const QString& query);
+    void showTreeSearchResults(const QString& query,
+                               bool preserveSnapshot = false);
     void rebuildActiveListRows();
     void rebuildVisibleSignals();
     void syncActiveScrollToCanvas();
@@ -322,6 +343,7 @@ private:
 
     void addSignalToActive(int signalIndex);
     void addSignalIndexesToActive(const QList<int>& signalIndexes);
+    void sortActiveSignalsByFirstDifference();
     void removeActiveItem(QTreeWidgetItem* item);
     void removeActiveRows(const QList<int>& rows);
     int signalIndexFromActiveItem(QTreeWidgetItem* item) const;

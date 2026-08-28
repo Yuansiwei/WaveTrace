@@ -24,6 +24,7 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPen>
@@ -38,6 +39,7 @@
 #include <QTimer>
 #include <QTreeView>
 #include <QTreeWidget>
+#include <QWheelEvent>
 #include <QtGlobal>
 
 #include <memory>
@@ -669,6 +671,16 @@ static QImage renderCanvasImage(WaveCanvas& canvas) {
 }
 
 static int runBitStateRenderRegression(QApplication& app, const QStringList& args) {
+    if (waveFormatBinaryValue(0, 1) != QStringLiteral("0") ||
+        waveFormatBinaryValue(1, 1) != QStringLiteral("1") ||
+        waveFormatHexValue(0, 1) != QStringLiteral("0") ||
+        waveFormatHexValue(1, 1) != QStringLiteral("1") ||
+        waveFormatBinaryValue(2, 2) != QStringLiteral("0b10") ||
+        waveFormatHexValue(2, 2) != QStringLiteral("0x2")) {
+        QTextStream(stderr) << "single-bit value formatting regression\n";
+        return 6;
+    }
+
     auto makeSample = [](qint64 time, quint64 value) {
         WaveSample sample;
         sample.time = time;
@@ -1629,6 +1641,38 @@ static int runZoomBoundaryBenchmark(QApplication& app, const QStringList& args) 
     if (!canvas) return 4;
     processEventsFor(app, 250);
 
+    const qint64 cursorAnchor =
+        canvas->viewStart() +
+        static_cast<qint64>(std::llround(
+            double(canvas->viewEnd() - canvas->viewStart()) * 0.37));
+    canvas->setCursorTime(cursorAnchor);
+    const auto cursorPixel = [canvas, cursorAnchor]() {
+        const double viewSpan = qMax<qint64>(
+            1, canvas->viewEnd() - canvas->viewStart());
+        return 10.0 +
+               double(cursorAnchor - canvas->viewStart()) / viewSpan *
+                   double(qMax(1, canvas->width() - 20));
+    };
+    const double cursorPixelBeforeZoom = cursorPixel();
+    const QPoint wheelPosition(canvas->width() - 40, canvas->height() / 2);
+    QWheelEvent wheelEvent(
+        QPointF(wheelPosition),
+        QPointF(canvas->mapToGlobal(wheelPosition)),
+        QPoint(), QPoint(0, 120), Qt::NoButton, Qt::NoModifier,
+        Qt::NoScrollPhase, false);
+    QApplication::sendEvent(canvas, &wheelEvent);
+    processEventsFor(app, 180);
+    const double cursorPixelDrift =
+        qAbs(cursorPixel() - cursorPixelBeforeZoom);
+    const double cursorPixelTolerance =
+        1.0 + double(qMax(1, canvas->width() - 20)) /
+                  (2.0 * double(qMax<qint64>(
+                      1, canvas->viewEnd() - canvas->viewStart())));
+    const bool cursorAnchoredZoom =
+        cursorPixelDrift <= cursorPixelTolerance;
+    canvas->resetView();
+    processEventsFor(app, 20);
+
     auto countWavePixels = [canvas]() -> qint64 {
         QImage image(canvas->size(), QImage::Format_ARGB32);
         image.fill(Qt::black);
@@ -1738,8 +1782,15 @@ static int runZoomBoundaryBenchmark(QApplication& app, const QStringList& args) 
         << ",covered_signals," << coveredSignals << ",total_signals," << totalSignals
         << ",blank_wave_steps," << blankWaveSteps
         << ",raw_cache_correct," << (rawCacheOk ? 1 : 0)
-        << ",raw_cache_error," << csvField(rawValidationError) << '\n';
-    return (coverageOk && rawCacheOk && blankWaveSteps == 0) ? 0 : 6;
+        << ",raw_cache_error," << csvField(rawValidationError)
+        << ",cursor_anchor_pixel_drift,"
+        << QString::number(cursorPixelDrift, 'f', 3)
+        << ",cursor_anchor_pixel_tolerance,"
+        << QString::number(cursorPixelTolerance, 'f', 3)
+        << ",cursor_anchored_zoom," << (cursorAnchoredZoom ? 1 : 0)
+        << '\n';
+    return (coverageOk && rawCacheOk && blankWaveSteps == 0 &&
+            cursorAnchoredZoom) ? 0 : 6;
 }
 
 static int runRangeSelectionBenchmark(QApplication& app, const QStringList& args) {
@@ -2123,12 +2174,7 @@ static int runSignalConditionSearchBenchmark(QApplication& app,
             QItemSelectionModel::Rows);
         tree->setCurrentIndex(scopedIndex);
     }
-    tree->setFocus(Qt::OtherFocusReason);
-    processEventsFor(app, 20);
-    QKeyEvent press(QEvent::KeyPress, Qt::Key_F, Qt::ControlModifier);
-    QKeyEvent release(QEvent::KeyRelease, Qt::Key_F, Qt::ControlModifier);
-    QApplication::sendEvent(tree, &press);
-    QApplication::sendEvent(tree, &release);
+    window.openSignalConditionSearchDialogForBenchmark();
     processEventsFor(app, 30);
 
     QDialog* dialog =
@@ -2153,11 +2199,16 @@ static int runSignalConditionSearchBenchmark(QApplication& app,
         window.findChild<QPushButton*>(QStringLiteral("signalConditionSearch"));
     QPushButton* cancel =
         window.findChild<QPushButton*>(QStringLiteral("signalConditionCancel"));
+    QPushButton* previous =
+        window.findChild<QPushButton*>(QStringLiteral("signalConditionPrevious"));
+    QPushButton* next =
+        window.findChild<QPushButton*>(QStringLiteral("signalConditionNext"));
     QLabel* status =
         window.findChild<QLabel*>(QStringLiteral("signalConditionStatus"));
     if (!dialog || !nameEdit || !scopeCheck || !cropTreeCheck ||
         !regexCheck || !caseCheck ||
-        !changeMin || !changeMax || !addValue || !search || !cancel || !status) {
+        !changeMin || !changeMax || !addValue || !search || !cancel ||
+        !previous || !next || !status) {
         return 5;
     }
 
@@ -2193,7 +2244,12 @@ static int runSignalConditionSearchBenchmark(QApplication& app,
 
     QElapsedTimer wallTimer;
     wallTimer.start();
-    search->click();
+    changeMax->setFocus(Qt::OtherFocusReason);
+    QMetaObject::invokeMethod(changeMax, "returnPressed", Qt::DirectConnection);
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+    const bool enterStartedSearch =
+        !search->isEnabled() ||
+        status->text().startsWith(QStringLiteral("完成："));
     while (!search->isEnabled() && wallTimer.elapsed() < 120000) {
         QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
         QThread::msleep(1);
@@ -2212,6 +2268,19 @@ static int runSignalConditionSearchBenchmark(QApplication& app,
         matchCountPattern.match(statusText);
     const int matchedSignals =
         countMatch.hasMatch() ? countMatch.captured(1).toInt() : -1;
+    const QModelIndex firstMatch = tree->currentIndex();
+    const int selectedTargets = tree->selectionModel()
+        ? tree->selectionModel()->selectedRows().size()
+        : 0;
+    const bool selectedFirst64 =
+        selectedTargets == qMin(64, qMax(0, matchedSignals));
+    bool advancedNavigationChangedTarget = matchedSignals <= 1;
+    if (matchedSignals > 1 && previous->isEnabled() && next->isEnabled()) {
+        next->click();
+        processEventsFor(app, 20);
+        advancedNavigationChangedTarget =
+            tree->currentIndex().isValid() && tree->currentIndex() != firstMatch;
+    }
 
     const QAbstractItemModel* model = tree->model();
     struct PendingIndex {
@@ -2269,10 +2338,16 @@ static int runSignalConditionSearchBenchmark(QApplication& app,
         << ",post_warmup_max_tree_depth," << postWarmupMaxDepth
         << ",empty_search_stayed_filtered,"
         << (emptySearchStayedFiltered ? 1 : 0)
+        << ",enter_started_search," << (enterStartedSearch ? 1 : 0)
+        << ",selected_targets," << selectedTargets
+        << ",selected_first_64," << (selectedFirst64 ? 1 : 0)
+        << ",advanced_navigation_changed_target,"
+        << (advancedNavigationChangedTarget ? 1 : 0)
         << ",status," << csvField(statusText) << '\n';
     out.flush();
     return (statusText.startsWith(QStringLiteral("完成：")) &&
-            emptySearchStayedFiltered)
+            emptySearchStayedFiltered && enterStartedSearch &&
+            selectedFirst64 && advancedNavigationChangedTarget)
         ? 0
         : 7;
 }
@@ -2362,22 +2437,45 @@ static int runTreeReferenceSearchBenchmark(QApplication& app,
         window.findChild<QPushButton*>(QStringLiteral("signalTreeSearchPrevious"));
     QPushButton* next =
         window.findChild<QPushButton*>(QStringLiteral("signalTreeSearchNext"));
-    if (!tree || !search || !previous || !next || !tree->model()) return 4;
+    QPushButton* restore =
+        window.findChild<QPushButton*>(QStringLiteral("signalTreeSearchRestore"));
+    if (!tree || !search || !previous || !next || !restore || !tree->model()) return 4;
 
     const int fullTopLevelRows = tree->model()->rowCount();
+    const QModelIndex preSearchIndex = tree->model()->index(0, 0);
+    if (tree->selectionModel() && preSearchIndex.isValid()) {
+        tree->selectionModel()->select(preSearchIndex,
+            QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+        tree->selectionModel()->setCurrentIndex(preSearchIndex,
+                                                QItemSelectionModel::NoUpdate);
+    }
 
     search->setText(args.at(3));
     QMetaObject::invokeMethod(search, "returnPressed", Qt::DirectConnection);
     processEventsFor(app, settleMs);
     const bool queryRetained = search->text() == args.at(3);
     const int searchedTopLevelRows = tree->model()->rowCount();
-    const QModelIndex firstMatch = tree->currentIndex();
+    const QString firstMatchStatus = search->toolTip();
+    const bool searchReportedMatch =
+        firstMatchStatus.startsWith(QStringLiteral("Match 1 of "));
+    const QModelIndex openedMatch = tree->currentIndex();
+    const int selectedTargets = tree->selectionModel()
+        ? tree->selectionModel()->selectedRows().size()
+        : 0;
+    const bool selectedFirstTargets = selectedTargets > 0 && selectedTargets <= 64;
+    if (openedMatch.isValid()) tree->expand(openedMatch);
+    if (tree->selectionModel() && preSearchIndex.isValid()) {
+        tree->selectionModel()->setCurrentIndex(preSearchIndex,
+                                                QItemSelectionModel::NoUpdate);
+    }
+    processEventsFor(app, settleMs);
+    const bool openingNodeKeptUserCurrent =
+        tree->currentIndex() == preSearchIndex;
     bool navigationChangedTarget = true;
     if (next->isEnabled()) {
         next->click();
         processEventsFor(app, 20);
-        navigationChangedTarget = tree->currentIndex().isValid() &&
-                                  tree->currentIndex() != firstMatch;
+        navigationChangedTarget = search->toolTip() != firstMatchStatus;
     }
 
     const QAbstractItemModel* model = tree->model();
@@ -2404,9 +2502,13 @@ static int runTreeReferenceSearchBenchmark(QApplication& app,
         }
     }
 
-    search->clear();
+    restore->click();
     processEventsFor(app, 20);
     const int cancelledTopLevelRows = tree->model()->rowCount();
+    const bool restoredPreSearchSelection = tree->selectionModel() &&
+        tree->selectionModel()->selectedRows().size() == 1 &&
+        tree->selectionModel()->selectedRows().first() == preSearchIndex &&
+        tree->selectionModel()->currentIndex() == preSearchIndex;
 
     QTextStream out(stdout);
     out << "tree_reference_search,query," << csvField(args.at(3))
@@ -2418,15 +2520,91 @@ static int runTreeReferenceSearchBenchmark(QApplication& app,
         << ",searched_top_level_rows," << searchedTopLevelRows
         << ",cancelled_top_level_rows," << cancelledTopLevelRows
         << ",navigation_changed_target," << (navigationChangedTarget ? 1 : 0)
+        << ",selected_targets," << selectedTargets
+        << ",selected_first_targets," << (selectedFirstTargets ? 1 : 0)
+        << ",opening_node_kept_user_current,"
+        << (openingNodeKeptUserCurrent ? 1 : 0)
+        << ",restored_pre_search_selection," << (restoredPreSearchSelection ? 1 : 0)
+        << ",search_reported_match," << (searchReportedMatch ? 1 : 0)
         << '\n';
     out.flush();
     return visibleNodes > 0 && visibleNodes < traversalLimit &&
                    queryRetained &&
                    searchedTopLevelRows == fullTopLevelRows &&
                    cancelledTopLevelRows == fullTopLevelRows &&
-                   navigationChangedTarget
+                   navigationChangedTarget && selectedFirstTargets &&
+                   openingNodeKeptUserCurrent &&
+                   restoredPreSearchSelection &&
+                   searchReportedMatch
         ? 0
         : 5;
+}
+
+class RangeCursorRegressionCanvas : public WaveCanvas {
+public:
+    using WaveCanvas::mouseMoveEvent;
+    using WaveCanvas::mousePressEvent;
+    using WaveCanvas::mouseReleaseEvent;
+};
+
+static int runRangeSelectionCursorRegression(QApplication& app) {
+    WaveFile wave;
+    wave.meta.start = 0;
+    wave.meta.end = 1000;
+
+    RangeCursorRegressionCanvas canvas;
+    canvas.resize(1000, 320);
+    canvas.setWave(&wave);
+    canvas.show();
+    app.processEvents();
+
+    const qint64 originalCursor = 250;
+    if (!canvas.setCursorTime(originalCursor)) return 3;
+
+    int cursorSignals = 0;
+    int rangeSignals = 0;
+    QObject::connect(&canvas, &WaveCanvas::cursorMoved,
+                     [&](qint64) { ++cursorSignals; });
+    QObject::connect(&canvas, &WaveCanvas::viewportRangeSelected,
+                     [&](qint64, qint64) { ++rangeSignals; });
+
+    const QPointF dragStart(180.0, 12.0);
+    const QPointF dragEnd(760.0, 12.0);
+    QMouseEvent press(QEvent::MouseButtonPress, dragStart,
+                      Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QMouseEvent move(QEvent::MouseMove, dragEnd,
+                     Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+    QMouseEvent release(QEvent::MouseButtonRelease, dragEnd,
+                        Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+    canvas.mousePressEvent(&press);
+    canvas.mouseMoveEvent(&move);
+    canvas.mouseReleaseEvent(&release);
+    app.processEvents();
+
+    const bool rangeKeptCursor =
+        canvas.cursorTime() == originalCursor &&
+        cursorSignals == 0 && rangeSignals == 1;
+
+    const QPointF clickPos(620.0, 12.0);
+    QMouseEvent clickPress(QEvent::MouseButtonPress, clickPos,
+                           Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QMouseEvent clickRelease(QEvent::MouseButtonRelease, clickPos,
+                             Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+    canvas.mousePressEvent(&clickPress);
+    canvas.mouseReleaseEvent(&clickRelease);
+    app.processEvents();
+
+    const bool clickStillMovesCursor =
+        canvas.cursorTime() != originalCursor && cursorSignals == 1;
+
+    QTextStream out(stdout);
+    out << "range_cursor_regression,range_kept_cursor,"
+        << (rangeKeptCursor ? 1 : 0)
+        << ",click_moved_cursor," << (clickStillMovesCursor ? 1 : 0)
+        << ",cursor_signals," << cursorSignals
+        << ",range_signals," << rangeSignals << '\n';
+    out.flush();
+    return (rangeKeptCursor && clickStillMovesCursor) ? 0 : 5;
 }
 
 static int runViewerSessionStateRegression(QApplication& app,
@@ -2443,6 +2621,38 @@ static int runViewerSessionStateRegression(QApplication& app,
     out << "viewer_session_state,ok," << (ok ? 1 : 0);
     if (!error.isEmpty()) out << ",error," << csvField(error);
     out << '\n';
+    out.flush();
+    return ok ? 0 : 5;
+}
+
+static int runTreeSearchStateRegression(QApplication& app,
+                                        const QStringList& args) {
+    MainWindow window;
+    window.resize(1100, 700);
+    window.show();
+    if (args.size() >= 3 && !window.openWaveFilePath(args.at(2), false)) {
+        return 3;
+    }
+    processEventsFor(app, 50);
+    QString error;
+    const bool ok = window.runTreeSearchStateRegressionForBenchmark(&error);
+    QTextStream out(stdout);
+    out << "tree_search_state_restore," << (ok ? "ok" : "failed")
+        << ",error," << csvField(error) << '\n';
+    out.flush();
+    return ok ? 0 : 5;
+}
+
+static int runCompareActivationOrderRegression(QApplication& app) {
+    MainWindow window;
+    window.resize(1100, 700);
+    window.show();
+    processEventsFor(app, 20);
+    QString error;
+    const bool ok = window.runCompareActivationOrderRegressionForBenchmark(&error);
+    QTextStream out(stdout);
+    out << "compare_activation_order," << (ok ? "ok" : "failed")
+        << ",error," << csvField(error) << '\n';
     out.flush();
     return ok ? 0 : 5;
 }
@@ -2477,6 +2687,10 @@ int main(int argc, char *argv[]) {
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--range-selection-benchmark")) {
         return runRangeSelectionBenchmark(a, args);
     }
+    if (args.size() >= 2 &&
+        args.at(1) == QStringLiteral("--range-selection-cursor-regression")) {
+        return runRangeSelectionCursorRegression(a);
+    }
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--global-return-benchmark")) {
         return runGlobalReturnBenchmark(a, args);
     }
@@ -2505,9 +2719,18 @@ int main(int argc, char *argv[]) {
         args.at(1) == QStringLiteral("--viewer-session-state-regression")) {
         return runViewerSessionStateRegression(a, args);
     }
+    if (args.size() >= 2 &&
+        args.at(1) == QStringLiteral("--tree-search-state-regression")) {
+        return runTreeSearchStateRegression(a, args);
+    }
 
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--value-find-benchmark")) {
         return runValueFindBenchmark(args);
+    }
+
+    if (args.size() >= 2 &&
+        args.at(1) == QStringLiteral("--compare-activation-order-regression")) {
+        return runCompareActivationOrderRegression(a);
     }
 
     if (args.size() >= 2 && args.at(1) == QStringLiteral("--render-benchmark")) {
@@ -2553,9 +2776,19 @@ int main(int argc, char *argv[]) {
         QString error;
         qint64 elapsedMs = 0;
         int resultSignals = 0;
+        const bool eventTimesOnly = args.contains(QStringLiteral("--events-only"));
+        QString expectedSamePeerPath;
+        const int baselinePeerOption = args.indexOf(QStringLiteral("--baseline-peer"));
+        if (baselinePeerOption >= 0 && baselinePeerOption + 1 < args.size()) {
+            expectedSamePeerPath = args.at(baselinePeerOption + 1);
+        }
         const bool ok = w.compareWaveFilePaths(args.at(2), args.at(3),
                                                false, false,
-                                               &error, &elapsedMs, &resultSignals);
+                                               &error, &elapsedMs, &resultSignals,
+                                               eventTimesOnly,
+                                               expectedSamePeerPath);
+        const QTreeWidget* activeList =
+            w.findChild<QTreeWidget*>(QStringLiteral("activeSignalList"));
         const bool noDifference =
             error.startsWith(QStringLiteral("No matching-path signal differs")) ||
             error.startsWith(QStringLiteral("No signal differences"));
@@ -2563,6 +2796,8 @@ int main(int argc, char *argv[]) {
         out << "ok," << ((ok || noDifference) ? 1 : 0) << "\n";
         out << "elapsed_ms," << elapsedMs << "\n";
         out << "result_signals," << resultSignals << "\n";
+        out << "active_signals,"
+            << (activeList ? activeList->topLevelItemCount() : -1) << "\n";
         if (noDifference) out << "note," << error << "\n";
         else if (!ok) out << "error," << error << "\n";
         return (ok || noDifference) ? 0 : 7;

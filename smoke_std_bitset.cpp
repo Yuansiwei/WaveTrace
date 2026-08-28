@@ -138,7 +138,8 @@ int run_dirty_wave_array_case() {
     tracer.add_root("top", &root);
     tracer.prepare_topology(0);
     tracer.sample(0);
-    if (sink.bitset_declarations.size() != 2u) {
+    if (!sink.array_block_declarations.empty() ||
+        sink.bitset_declarations.size() != 2u) {
         return fail("wave::array bitsets lost virtual-subtree metadata");
     }
     const wave::TrackId secondWord = sink.bitset_declarations[1].first_storage_id + 1u;

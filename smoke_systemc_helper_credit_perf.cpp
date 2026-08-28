@@ -129,7 +129,7 @@ struct CreditPerfSampler : sc_core::sc_module {
                     sc_core::sc_stop();
                     return;
                 }
-                if (tap->next_cycle() != static_cast<wave::Cycle>(i + 2u)) {
+                if (tap->next_cycle() != static_cast<wave::Cycle>(i + 1u)) {
                     if (error) *error = "WaveTap automatic sample count mismatch";
                     sc_core::sc_stop();
                     return;

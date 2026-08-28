@@ -2,6 +2,7 @@
 
 #include <QByteArray>
 #include <QString>
+#include <QStringList>
 #include <QVector>
 #include <QtGlobal>
 
@@ -352,6 +353,84 @@ inline QString waveTreeNodeSegmentName(const WaveTreeInfo& tree, int nodeId) {
     return waveTreeNameTokenText(tree, node.nameToken);
 }
 
+// A subtree reference keeps its own tree identity (name, parent and path), but
+// a reference mounted directly on a signal leaf must behave like that leaf in
+// the Viewer.  Resolve only the signal identity here; callers must continue to
+// use the original node id for presentation and navigation.
+inline int waveTreeEffectiveSignalNodeId(const WaveTreeInfo& tree, int nodeId) {
+    int current = nodeId;
+    int guard = 0;
+    while (current > 0 && current < tree.nodesById.size() &&
+           guard++ < tree.nodesById.size()) {
+        const WaveTreeNode& node = tree.nodesById.at(current);
+        if (!node.valid) return 0;
+        if (node.signalIndex >= 0) return current;
+        if (node.kind != kWaveTreeNodeKindReference ||
+            node.referenceTargetId <= 0 ||
+            node.referenceTargetId >= tree.nodesById.size()) {
+            return 0;
+        }
+        current = node.referenceTargetId;
+    }
+    return 0;
+}
+
+inline int waveTreeEffectiveSignalIndex(const WaveTreeInfo& tree, int nodeId) {
+    const int signalNodeId = waveTreeEffectiveSignalNodeId(tree, nodeId);
+    return signalNodeId > 0 ? tree.nodesById.at(signalNodeId).signalIndex : -1;
+}
+
+inline int waveTreeEffectiveSignalId(const WaveTreeInfo& tree, int nodeId) {
+    const int signalNodeId = waveTreeEffectiveSignalNodeId(tree, nodeId);
+    return signalNodeId > 0 ? tree.nodesById.at(signalNodeId).signalId : -1;
+}
+
+inline int waveTreeSearchPathEndNodeFrom(
+        const WaveTreeInfo& tree, int nodeId, const QStringList& parts,
+        int partIndex, Qt::CaseSensitivity caseSensitivity,
+        int referenceMountNodeId = 0) {
+    if (nodeId <= 0 || nodeId >= tree.nodesById.size() ||
+        partIndex < 0 || partIndex >= parts.size()) {
+        return 0;
+    }
+    const WaveTreeNode& node = tree.nodesById.at(nodeId);
+    if (!node.valid || QString::compare(
+            waveTreeNameTokenText(tree, node.nameToken), parts.at(partIndex),
+            caseSensitivity) != 0) {
+        return 0;
+    }
+    if (partIndex == parts.size() - 1) {
+        return referenceMountNodeId > 0 ? referenceMountNodeId : nodeId;
+    }
+
+    int childSourceId = nodeId;
+    int resultNodeId = referenceMountNodeId;
+    int referenceGuard = 0;
+    while (childSourceId > 0 && childSourceId < tree.nodesById.size() &&
+           tree.nodesById.at(childSourceId).valid &&
+           tree.nodesById.at(childSourceId).firstChild == 0 &&
+           tree.nodesById.at(childSourceId).kind == kWaveTreeNodeKindReference &&
+           ++referenceGuard < tree.nodesById.size()) {
+        if (resultNodeId <= 0) resultNodeId = childSourceId;
+        childSourceId = tree.nodesById.at(childSourceId).referenceTargetId;
+    }
+    if (childSourceId <= 0 || childSourceId >= tree.nodesById.size() ||
+        !tree.nodesById.at(childSourceId).valid) {
+        return 0;
+    }
+
+    int childGuard = 0;
+    for (int childId = tree.nodesById.at(childSourceId).firstChild;
+         childId != 0 && childGuard++ < tree.nodesById.size();
+         childId = tree.nodesById.at(childId).nextSibling) {
+        const int result = waveTreeSearchPathEndNodeFrom(
+            tree, childId, parts, partIndex + 1, caseSensitivity,
+            resultNodeId);
+        if (result > 0) return result;
+    }
+    return 0;
+}
+
 inline QString waveSignalSegmentName(const WaveFile& wave, int signalIndex) {
     if (signalIndex < 0 || signalIndex >= wave.signalList.size()) return QString();
     if (wave.tree.valid && signalIndex < wave.tree.signalIndexToNodeId.size()) {
@@ -559,13 +638,15 @@ inline void hydrateWaveSampleRawFields(const SignalKind kind, const int width, W
 }
 
 inline QString waveFormatBinaryValue(const quint64 value, const int width) {
-    return QStringLiteral("0b") +
-        QString::number(value & waveBitMaskForWidth(width), 2);
+    const quint64 masked = value & waveBitMaskForWidth(width);
+    if (width <= 1) return QString::number(masked);
+    return QStringLiteral("0b") + QString::number(masked, 2);
 }
 
 inline QString waveFormatHexValue(const quint64 value, const int width) {
-    return QStringLiteral("0x") +
-        QString::number(value & waveBitMaskForWidth(width), 16).toUpper();
+    const quint64 masked = value & waveBitMaskForWidth(width);
+    if (width <= 1) return QString::number(masked);
+    return QStringLiteral("0x") + QString::number(masked, 16).toUpper();
 }
 
 inline QString waveTrimLeadingZeroDigits(QString digits) {

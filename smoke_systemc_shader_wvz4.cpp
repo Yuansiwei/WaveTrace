@@ -243,7 +243,7 @@ struct ShaderWaveSampler : sc_core::sc_module {
                 sc_core::sc_stop();
                 return;
             }
-            if (tap.next_cycle() != static_cast<wave::Cycle>(i + 2)) {
+            if (tap.next_cycle() != static_cast<wave::Cycle>(i + 1)) {
                 if (error) *error = "WaveTap automatic sample count mismatch";
                 sc_core::sc_stop();
                 return;

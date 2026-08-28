@@ -255,13 +255,18 @@ int run_full_mode() {
     tracer.sample(0);
 
     const TraceIndex index = build_index(sink);
-    if (sink.declarations.size() != 24u) {
-        return fail("full mode must retain all 24 scalar leaves", sink);
+    // Full wave::array mode uses one compact block; ordinary C/std arrays and
+    // pointer arrays still contribute 19 scalar tracks.
+    if (sink.declarations.size() != 19u ||
+        sink.array_block_declarations.size() != 1u ||
+        sink.array_block_declarations[0].element_count != 5u ||
+        sink.array_block_declarations[0].element_stride != sizeof(ArrayFirstLeaf) ||
+        sink.array_patches.empty()) {
+        return fail("full mode compact wave::array topology mismatch", sink);
     }
     const char* required[] = {
         "top.c_values.[2]",
         "top.std_values.[3]",
-        "top.wave_values.[4].value",
         "top.nested.[1].[2]",
         "top.pointer_values.[5].value"
     };

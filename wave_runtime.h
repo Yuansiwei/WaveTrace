@@ -394,6 +394,7 @@ public:
         on_node_declared_fast(node_id, parent_id, name, kind);
     }
     virtual void on_subtree_reference_declared(NodeId, NodeId) {}
+    virtual void on_bitset_declarations_begin_fast(std::size_t) {}
     virtual void on_bitset_declared_fast(NodeId,
                                          TrackId,
                                          std::uint32_t,
@@ -449,6 +450,10 @@ public:
 
     virtual void on_subtree_reference_declared(NodeId node_id, NodeId target_node_id) {
         subtree_references.push_back(std::make_pair(node_id, target_node_id));
+    }
+
+    virtual void on_bitset_declarations_begin_fast(std::size_t count) {
+        bitset_declarations.reserve(count);
     }
 
     virtual void on_bitset_declared_fast(NodeId node_id,
@@ -590,11 +595,12 @@ struct BuildOptions {
     // Append progress to the existing console-window title.  This is
     // intentionally independent of debug_log and never writes progress bytes
     // to stdout/stderr.
-    // Off by default. Set print_cycle_progress=false to disable. The period is
+    // Off by default. Set print_cycle_progress=true or set the environment
+    // variable SHOW_MODEL_CYCLE=1 to enable. The period is
     // an optional caller-controlled cycle interval; there is no wall-clock rate
     // limiter around SetConsoleTitleA.
     bool print_cycle_progress = false;
-    Cycle print_cycle_progress_period = 1;
+    Cycle print_cycle_progress_period = 100;
 
     // Diagnostic logging for runtime tree construction and invalidation.
     // Keep disabled in long production runs. Enable temporarily when checking why
@@ -2125,10 +2131,12 @@ struct dynamic_registration_walk_impl<std::array<T, N>, RegistrationPolicy> {
     static void run() { register_dynamic_types_in<T, RegistrationPolicy>(); }
 };
 
+#if WAVE_DETAIL_ENABLED_HEADER_FOUND_ == 1 && WAVETRACE_GENERATED_ENABLED == 1
 template <typename T, std::size_t N, typename RegistrationPolicy>
 struct dynamic_registration_walk_impl< ::wave::array<T, N>, RegistrationPolicy> {
     static void run() { register_dynamic_types_in<T, RegistrationPolicy>(); }
 };
+#endif
 
 template <typename A, typename B, typename RegistrationPolicy>
 struct dynamic_registration_walk_impl<std::pair<A, B>, RegistrationPolicy> {
@@ -2497,6 +2505,11 @@ class Tracer {
             if (config.wave_trace_array_first_only) {
                 options_.trace_array_first_element_only = true;
             }
+        }
+        if (!options_.print_cycle_progress) {
+            const char* const show_cycle = std::getenv("SHOW_MODEL_CYCLE");
+            options_.print_cycle_progress =
+                show_cycle != NULL && show_cycle[0] != '\0' && std::strcmp(show_cycle, "0") != 0;
         }
         // Resolve std::bitset ABI support before any root can be expanded or
         // sampled. Unsupported layouts are reported and skipped explicitly.
@@ -2969,6 +2982,8 @@ public:
         append_vector_memory_row_(os, "dirty_peek_memory_shadow_bytes", dirty_peek_memory_shadow_bytes_, total);
         append_vector_memory_row_(os, "dirty_peek_work_items", dirty_peek_work_items_, total);
         append_vector_memory_row_(os, "dirty_peek_rebalanced_work_items", dirty_peek_rebalanced_work_items_, total);
+        append_vector_memory_row_(os, "dirty_peek_hook_bindings", dirty_peek_hook_bindings_, total);
+        append_vector_memory_row_(os, "bound_dirty_hooks", bound_dirty_hooks_, total);
 
         append_hash_memory_row_(os, "dirty_wave_value_group_by_key", dirty_wave_value_group_by_key_, total);
         append_vector_memory_row_(os, "dirty_wave_value_groups", dirty_wave_value_groups_, total);
@@ -3019,9 +3034,9 @@ public:
         dump_leaf_distribution_by_depth_impl_(fp, top_n, dirty_safe_only);
     }
 
-    static void wave_dirty_hook_mark_bridge_(void* tracer, std::uint32_t group_id) noexcept {
+    static void wave_dirty_hook_mark_bridge_(void* tracer, std::uint32_t binding_id) noexcept {
         if (tracer) {
-            static_cast<Tracer*>(tracer)->mark_dirty_peek_group(group_id);
+            static_cast<Tracer*>(tracer)->mark_dirty_peek_hook_binding_(binding_id);
         }
     }
 
@@ -3326,6 +3341,17 @@ public:
         tls.local_epoch[group_id] = dirty_epoch_;
         if (tls.dirty_count < tls.dirty_ids.size()) {
             tls.dirty_ids[tls.dirty_count++] = group_id;
+        }
+    }
+
+    void mark_dirty_peek_hook_binding_(std::uint32_t binding_id) noexcept {
+        std::size_t remaining = dirty_peek_hook_bindings_.size();
+        while (binding_id != kInvalidIndex &&
+               binding_id < dirty_peek_hook_bindings_.size() && remaining-- != 0u) {
+            const DirtyPeekHookBinding& binding =
+                dirty_peek_hook_bindings_[binding_id];
+            mark_dirty_peek_group(binding.group_id);
+            binding_id = binding.previous_binding_id;
         }
     }
 
@@ -3812,6 +3838,7 @@ private:
     std::size_t node_name_hot_cache_next_ = 0;
     std::uint64_t generated_name_owner_id_;
     std::uint32_t active_generated_member_name_id_;
+    bool active_bool_leaf_source_ = false;
     std::deque<std::string> node_debug_paths_;
     std::vector<TrackDesc> tracks_;
     std::vector<BitsetDesc> bitsets_;
@@ -3959,6 +3986,21 @@ private:
               memory_begin(), memory_end(), dirty_safe(false), memory_cursor_valid(false) {}
     };
 
+    // Hooks belong to sources/containers, groups belong to concrete returned
+    // objects. A FIFO/queue source can therefore use one hook for several
+    // object groups as its current slot changes. Each hook keeps an immutable
+    // reverse chain of bindings; no address hash and no polling fallback are
+    // needed on the write-side hot path.
+    struct DirtyPeekHookBinding {
+        std::uint32_t group_id;
+        std::uint32_t previous_binding_id;
+
+        DirtyPeekHookBinding()
+            : group_id(kInvalidIndex), previous_binding_id(kInvalidIndex) {}
+        DirtyPeekHookBinding(std::uint32_t group, std::uint32_t previous)
+            : group_id(group), previous_binding_id(previous) {}
+    };
+
     struct DirtyPeekRange {
         std::uint32_t group_id;
         std::uint32_t leaf_begin;
@@ -4058,6 +4100,7 @@ private:
     bool dirty_peek_memory_blocks_complete_ = false;
     std::uint32_t dirty_peek_memory_sample_epoch_ = 1;
     std::vector<WaveDirtyHook*> bound_dirty_hooks_;
+    std::vector<DirtyPeekHookBinding> dirty_peek_hook_bindings_;
     std::vector<std::uint32_t> pending_dirty_hook_group_ids_;
     std::vector<std::uint32_t> global_dirty_group_ids_;
     std::vector<std::uint32_t> retired_dirty_group_ids_;
@@ -9976,6 +10019,7 @@ private:
         std::uint32_t active_dirty_wave_array_capture_depth;
         std::uint32_t active_dirty_wave_array_open_block_id;
         std::size_t bound_dirty_hooks_size;
+        std::size_t dirty_peek_hook_bindings_size;
         std::size_t pending_dirty_hook_group_ids_size;
         NodeId parent_id;
         std::uint32_t parent_first_child;
@@ -10042,6 +10086,7 @@ private:
         cp.active_dirty_wave_array_capture_depth = active_dirty_wave_array_capture_depth_;
         cp.active_dirty_wave_array_open_block_id = active_dirty_wave_array_open_block_id_;
         cp.bound_dirty_hooks_size = bound_dirty_hooks_.size();
+        cp.dirty_peek_hook_bindings_size = dirty_peek_hook_bindings_.size();
         cp.pending_dirty_hook_group_ids_size =
             pending_dirty_hook_group_ids_.size();
         cp.parent_id = parent_id;
@@ -10327,11 +10372,44 @@ private:
         parallel_track_ids_.resize(cp.parallel_track_ids_size);
         while (bound_dirty_hooks_.size() > cp.bound_dirty_hooks_size) {
             WaveDirtyHook* hook = bound_dirty_hooks_.back();
-            if (!isolated_topology_fragment_ &&
-                hook && hook->tracer == this) {
-                hook->clear();
+            if (!isolated_topology_fragment_) {
+                if (dirty_peek_hook_bindings_.size() <=
+                    cp.dirty_peek_hook_bindings_size) {
+                    throw std::logic_error(
+                        "WaveTrace dirty-peek hook rollback lost its binding record");
+                }
+                const std::uint32_t binding_id = static_cast<std::uint32_t>(
+                    dirty_peek_hook_bindings_.size() - 1u);
+                const DirtyPeekHookBinding& binding =
+                    dirty_peek_hook_bindings_.back();
+                if (!hook || hook->tracer != this ||
+                    hook->binding_id != binding_id) {
+                    throw std::logic_error(
+                        "WaveTrace dirty-peek hook rollback order is inconsistent");
+                }
+                if (binding.previous_binding_id == kInvalidIndex) {
+                    hook->clear();
+                } else {
+                    if (binding.previous_binding_id >=
+                            dirty_peek_hook_bindings_.size() - 1u ||
+                        binding.previous_binding_id >= bound_dirty_hooks_.size() ||
+                        bound_dirty_hooks_[binding.previous_binding_id] != hook) {
+                        throw std::logic_error(
+                            "WaveTrace dirty-peek hook rollback chain is corrupt");
+                    }
+                    hook->bind(this, hook->group_id,
+                               binding.previous_binding_id,
+                               &Tracer::wave_dirty_hook_mark_bridge_);
+                }
+                dirty_peek_hook_bindings_.pop_back();
             }
             bound_dirty_hooks_.pop_back();
+        }
+        if (!isolated_topology_fragment_ &&
+            dirty_peek_hook_bindings_.size() !=
+                cp.dirty_peek_hook_bindings_size) {
+            throw std::logic_error(
+                "WaveTrace dirty-peek hook rollback left orphan bindings");
         }
         pending_dirty_hook_group_ids_.resize(
             cp.pending_dirty_hook_group_ids_size);
@@ -11372,6 +11450,7 @@ private:
             }
             ++exported_count;
         }
+        sink_.on_bitset_declarations_begin_fast(bitsets_.size());
         for (std::size_t i = 0; i < bitsets_.size(); ++i) {
             const BitsetDesc& bitset = bitsets_[i];
             sink_.on_bitset_declared_fast(bitset.node_id,
@@ -11711,6 +11790,48 @@ private:
         }
     }
 
+    void validate_dirty_peek_hook_binding_(const WaveDirtyHook& hook) const {
+        if (hook.binding_id == kInvalidIndex ||
+            hook.binding_id >= dirty_peek_hook_bindings_.size()) {
+            throw std::logic_error(
+                "WaveTrace dirty-peek hook contains an out-of-range binding id");
+        }
+        if (hook.binding_id >= bound_dirty_hooks_.size() ||
+            bound_dirty_hooks_[hook.binding_id] != &hook) {
+            throw std::logic_error(
+                "WaveTrace dirty-peek hook binding belongs to a different hook");
+        }
+        if (hook.group_id == kInvalidIndex ||
+            hook.group_id >= dirty_peek_groups_.size()) {
+            throw std::logic_error(
+                "WaveTrace dirty-peek hook contains an out-of-range primary group id");
+        }
+        std::uint32_t cursor = hook.binding_id;
+        std::size_t remaining = dirty_peek_hook_bindings_.size();
+        std::uint32_t oldest_group = kInvalidIndex;
+        while (cursor != kInvalidIndex && remaining-- != 0u) {
+            if (cursor >= dirty_peek_hook_bindings_.size()) {
+                throw std::logic_error(
+                    "WaveTrace dirty-peek hook binding chain is out of range");
+            }
+            const DirtyPeekHookBinding& binding =
+                dirty_peek_hook_bindings_[cursor];
+            if (cursor >= bound_dirty_hooks_.size() ||
+                bound_dirty_hooks_[cursor] != &hook ||
+                binding.group_id == kInvalidIndex ||
+                binding.group_id >= dirty_peek_groups_.size()) {
+                throw std::logic_error(
+                    "WaveTrace dirty-peek hook binding chain is corrupt");
+            }
+            oldest_group = binding.group_id;
+            cursor = binding.previous_binding_id;
+        }
+        if (cursor != kInvalidIndex || oldest_group != hook.group_id) {
+            throw std::logic_error(
+                "WaveTrace dirty-peek hook primary group does not match its binding chain");
+        }
+    }
+
     std::uint32_t get_or_create_dirty_peek_group(ObjectEntry* object,
                                                  WaveDirtyHook* hook,
                                                  const void* address,
@@ -11723,17 +11844,15 @@ private:
         }
 
         const DirtyPeekGroupKey key(address, type_tag, byte_width);
-        std::uint32_t hook_group_id = kInvalidIndex;
         if (!isolated_topology_fragment_ && hook && hook->tracer == this) {
-            if (hook->group_id == kInvalidIndex ||
-                hook->mark_fn != &Tracer::wave_dirty_hook_mark_bridge_) {
+            if (hook->mark_fn != &Tracer::wave_dirty_hook_mark_bridge_) {
                 throw std::logic_error(
                     "WaveTrace dirty-peek hook is partially or incorrectly bound to this tracer");
             }
-            hook_group_id = hook->group_id;
-            validate_dirty_peek_group_binding_(hook_group_id, *object, key, "hook");
+            validate_dirty_peek_hook_binding_(*hook);
         } else if (!isolated_topology_fragment_ && hook && hook->tracer == NULL &&
-                   (hook->group_id != kInvalidIndex || hook->mark_fn != NULL)) {
+                   (hook->group_id != kInvalidIndex ||
+                    hook->binding_id != kInvalidIndex || hook->mark_fn != NULL)) {
             throw std::logic_error(
                 "WaveTrace dirty-peek hook has an inconsistent unbound state");
         } else if (!isolated_topology_fragment_ && hook &&
@@ -11746,16 +11865,6 @@ private:
         if (object_group_id != kInvalidIndex) {
             validate_dirty_peek_group_binding_(
                 object_group_id, *object, key, "object");
-        }
-        if (hook_group_id != kInvalidIndex &&
-            object_group_id != kInvalidIndex &&
-            hook_group_id != object_group_id) {
-            throw std::logic_error(
-                "WaveTrace dirty-peek hook and object contain different group ids");
-        }
-        if (hook_group_id != kInvalidIndex) {
-            object->dirty_peek_group_id = hook_group_id;
-            return hook_group_id;
         }
         if (object_group_id != kInvalidIndex) return object_group_id;
 
@@ -11775,6 +11884,7 @@ private:
     void clear_bound_dirty_hooks() noexcept {
         if (isolated_topology_fragment_) {
             bound_dirty_hooks_.clear();
+            dirty_peek_hook_bindings_.clear();
             pending_dirty_hook_group_ids_.clear();
             return;
         }
@@ -11783,6 +11893,7 @@ private:
             if (hook && hook->tracer == this) hook->clear();
         }
         bound_dirty_hooks_.clear();
+        dirty_peek_hook_bindings_.clear();
         pending_dirty_hook_group_ids_.clear();
     }
 
@@ -11811,19 +11922,42 @@ private:
             }
             return;
         }
-        if (hook->tracer == this && hook->group_id == group_id) {
+        if (hook->tracer == this) {
             if (hook->mark_fn != &Tracer::wave_dirty_hook_mark_bridge_) {
                 throw std::logic_error(
                     "WaveTrace dirty-peek hook uses the wrong mark callback");
             }
+            validate_dirty_peek_hook_binding_(*hook);
+            std::uint32_t cursor = hook->binding_id;
+            std::size_t remaining = dirty_peek_hook_bindings_.size();
+            while (cursor != kInvalidIndex && remaining-- != 0u) {
+                const DirtyPeekHookBinding& binding =
+                    dirty_peek_hook_bindings_[cursor];
+                if (binding.group_id == group_id) return;
+                cursor = binding.previous_binding_id;
+            }
+            if (cursor != kInvalidIndex) {
+                throw std::logic_error(
+                    "WaveTrace dirty-peek hook binding chain contains a cycle");
+            }
+            const std::uint32_t binding_id = static_cast<std::uint32_t>(
+                dirty_peek_hook_bindings_.size());
+            dirty_peek_hook_bindings_.push_back(
+                DirtyPeekHookBinding(group_id, hook->binding_id));
+            try {
+                bound_dirty_hooks_.push_back(hook);
+            } catch (...) {
+                dirty_peek_hook_bindings_.pop_back();
+                throw;
+            }
+            hook->bind(this, hook->group_id, binding_id,
+                       &Tracer::wave_dirty_hook_mark_bridge_);
+            dirty_peek_initial_sample_done_ = false;
             return;
         }
-        if (hook->tracer == this) {
-            throw std::logic_error(
-                "WaveTrace dirty-peek hook is already bound to a different group");
-        }
         if (hook->tracer == NULL &&
-            (hook->group_id != kInvalidIndex || hook->mark_fn != NULL)) {
+            (hook->group_id != kInvalidIndex ||
+             hook->binding_id != kInvalidIndex || hook->mark_fn != NULL)) {
             throw std::logic_error(
                 "WaveTrace dirty-peek hook has an inconsistent unbound state");
         }
@@ -11831,8 +11965,18 @@ private:
             throw std::logic_error(
                 "WaveTrace dirty-peek hook is already bound to another tracer");
         }
-        bound_dirty_hooks_.push_back(hook);
-        hook->bind(this, group_id, &Tracer::wave_dirty_hook_mark_bridge_);
+        const std::uint32_t binding_id = static_cast<std::uint32_t>(
+            dirty_peek_hook_bindings_.size());
+        dirty_peek_hook_bindings_.push_back(
+            DirtyPeekHookBinding(group_id, kInvalidIndex));
+        try {
+            bound_dirty_hooks_.push_back(hook);
+        } catch (...) {
+            dirty_peek_hook_bindings_.pop_back();
+            throw;
+        }
+        hook->bind(this, group_id, binding_id,
+                   &Tracer::wave_dirty_hook_mark_bridge_);
         dirty_peek_initial_sample_done_ = false;
     }
 
@@ -13625,6 +13769,7 @@ private:
         reserve_parallel_batch_vector_(dirty_peek_memory_byte_to_storage_refs_, add_dirty_peek_byte_map);
         reserve_parallel_batch_vector_(dirty_peek_memory_shadow_bytes_, add_dirty_peek_shadow);
         reserve_parallel_batch_vector_(bound_dirty_hooks_, add_dirty_peek_groups);
+        reserve_parallel_batch_vector_(dirty_peek_hook_bindings_, add_dirty_peek_groups);
         reserve_parallel_batch_vector_(dirty_wave_value_groups_, add_dirty_wave_value_groups);
         reserve_parallel_batch_vector_(dirty_wave_value_ranges_, add_dirty_wave_value_ranges);
         reserve_parallel_batch_vector_(dirty_wave_value_leaves_, add_dirty_wave_value_leaves);
@@ -14128,6 +14273,30 @@ private:
         }
     }
 
+    static const void* bool_leaf_source_type_tag_() {
+        static const char tag = 0;
+        return &tag;
+    }
+
+    static void require_one_byte_bool_leaf_source_(const std::string& path,
+                                                   std::size_t byte_width) {
+        if (byte_width == 1u) return;
+        throw std::logic_error(
+            std::string("WaveTrace BoolLeafSourceTag requires exactly one byte: path=") +
+            path + " byte_width=" + detail::to_string_unsigned(byte_width));
+    }
+
+    static NodeId dynamic_expand_bool_leaf_source_bridge_(Tracer& tracer,
+                                                           const std::string& path,
+                                                           NodeId parent_id,
+                                                           const void* object_ptr) {
+        return tracer.add_bool_storage_signal<unsigned char>(
+            path,
+            parent_id,
+            ::wave::as_bool_storage_ptr(
+                static_cast<const unsigned char*>(object_ptr)));
+    }
+
     template <typename HookReader>
     NodeId add_runtime_typed_trace_object_(const std::string& path,
                                            NodeId parent_id,
@@ -14150,10 +14319,13 @@ private:
             return 0;
         }
 
-        DynamicExpandFn fn = find_dynamic_expander(type_tag);
-        if (!fn) {
-            fn = fallback_expander;
-        }
+        const bool bool_leaf_source = active_bool_leaf_source_;
+        if (bool_leaf_source) require_one_byte_bool_leaf_source_(path, byte_width);
+
+        DynamicExpandFn fn = bool_leaf_source
+            ? &Tracer::dynamic_expand_bool_leaf_source_bridge_
+            : find_dynamic_expander(type_tag);
+        if (!fn && !bool_leaf_source) fn = fallback_expander;
         if (!fn) {
             if (options_.debug_log) {
                 debug_log_msg(std::string(source_label ? source_label : "runtime source") +
@@ -14166,8 +14338,10 @@ private:
         }
 
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
+        const void* const semantic_type_tag =
+            bool_leaf_source ? bool_leaf_source_type_tag_() : type_tag;
         const ObjectId runtime_object_id =
-            ensure_object(ObjectKey(object_ptr, type_tag), path);
+            ensure_object(ObjectKey(object_ptr, semantic_type_tag), path);
         ObjectEntry* runtime_object = id_lookup(objects_, runtime_object_id);
         if (!runtime_object) {
             rollback_topology_to(cp);
@@ -14192,7 +14366,7 @@ private:
                     if (!dirty_hook) dirty_hook = hook_reader();
                     const std::uint32_t alias_group_id =
                         get_or_create_dirty_peek_group(
-                            runtime_object, dirty_hook, object_ptr, type_tag, byte_width);
+                            runtime_object, dirty_hook, object_ptr, semantic_type_tag, byte_width);
                     if (alias_group_id != kInvalidIndex) {
                         bind_dirty_hook_to_group(dirty_hook, alias_group_id);
                     }
@@ -14205,7 +14379,7 @@ private:
         const std::uint32_t group_id =
             capture_dirty_group
                 ? get_or_create_dirty_peek_group(
-                      runtime_object, dirty_hook, object_ptr, type_tag, byte_width)
+                      runtime_object, dirty_hook, object_ptr, semantic_type_tag, byte_width)
                 : kInvalidIndex;
 
         const std::uint32_t previous_group = active_dirty_peek_group_id_;
@@ -14384,8 +14558,13 @@ private:
 
         TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
         typedef typename detail::remove_cvref<V>::type CleanV;
+        const bool bool_leaf_source = active_bool_leaf_source_;
+        if (bool_leaf_source)
+            require_one_byte_bool_leaf_source_(path, sizeof(CleanV));
         const void* const value_address = detail::pointer_address(p);
-        const void* const value_type_tag = reflect::type_tag_of<CleanV>();
+        const void* const value_type_tag = bool_leaf_source
+            ? bool_leaf_source_type_tag_()
+            : reflect::type_tag_of<CleanV>();
         const ObjectId value_object_id =
             ensure_object(ObjectKey(value_address, value_type_tag), path);
         ObjectEntry* const value_object =
@@ -14424,8 +14603,14 @@ private:
             active_dirty_peek_group_id_ = group_id;
             active_dirty_peek_range_id_ = kInvalidIndex;
         }
-        const NodeId result = expand_member_clean_dispatch<V>(
-            path, parent_id, static_cast<const V*>(p));
+        const NodeId result = bool_leaf_source
+            ? add_bool_storage_signal<unsigned char>(
+                  path,
+                  parent_id,
+                  ::wave::as_bool_storage_ptr(
+                      reinterpret_cast<const unsigned char*>(p)))
+            : expand_member_clean_dispatch<V>(
+                  path, parent_id, static_cast<const V*>(p));
         DirtyPeekBlockCursor memory_end;
         std::uint32_t leaf_count = 0;
         if (group_id != kInvalidIndex) {
@@ -14831,6 +15016,18 @@ private:
         return generated_member_or_invalid(rest...);
     }
 
+    static bool bool_leaf_source_tag_present_() { return false; }
+
+    template <typename... Rest>
+    static bool bool_leaf_source_tag_present_(::wave::BoolLeafSourceTag, Rest...) {
+        return true;
+    }
+
+    template <typename First, typename... Rest>
+    static bool bool_leaf_source_tag_present_(First, Rest... rest) {
+        return bool_leaf_source_tag_present_(rest...);
+    }
+
     class ScopedGeneratedMemberNameId {
     public:
         ScopedGeneratedMemberNameId(Tracer* tracer, std::uint32_t name_id)
@@ -14845,6 +15042,22 @@ private:
     private:
         Tracer* tracer_;
         std::uint32_t previous_;
+    };
+
+    class ScopedBoolLeafSource {
+    public:
+        ScopedBoolLeafSource(Tracer* tracer, bool enabled)
+            : tracer_(tracer), previous_(tracer ? tracer->active_bool_leaf_source_ : false) {
+            if (tracer_ && enabled) tracer_->active_bool_leaf_source_ = true;
+        }
+
+        ~ScopedBoolLeafSource() {
+            if (tracer_) tracer_->active_bool_leaf_source_ = previous_;
+        }
+
+    private:
+        Tracer* tracer_;
+        bool previous_;
     };
 
     class ScopedObjectArrayRange {
@@ -15546,6 +15759,14 @@ private:
                                         const char* name,
                                         const T* ptr) {
         typedef typename detail::remove_cvref<T>::type CleanT;
+        // These types have runtime semantics that an inline byte schema cannot
+        // represent.  In particular, flattening their reflected data members
+        // would bypass Peek/Dynamic dispatch and lose their hooks/references.
+        if (detail::is_peek_trace_source<CleanT>::value ||
+            detail::is_dynamic_trace_target<CleanT>::value ||
+            detail::is_wave_ptr<CleanT>::value) {
+            return false;
+        }
         const std::size_t node_count = build.nodes.size();
         const std::uint32_t id = append_compact_array_schema_node_(
             build,
@@ -15555,14 +15776,16 @@ private:
             ptr,
             sizeof(CleanT));
         if (id == 0) return false;
+        bool complete = true;
         detail::call_reflected_visit<CleanT>(
             ptr,
-            [this, &build, id](const char* child_name, auto child_field_ptr, auto... meta) {
+            [this, &build, id, &complete](const char* child_name, auto child_field_ptr, auto... meta) {
                 if (pointer_or_reference_field_tag_present_(meta...)) return;
                 const std::size_t child_node_count = build.nodes.size();
                 if (!collect_compact_array_schema_value_(
                         build, id, child_name, child_field_ptr)) {
                     build.nodes.resize(child_node_count);
+                    complete = false;
                 }
             },
             [](const char*, const auto&) {},
@@ -15588,7 +15811,10 @@ private:
                 node.bit_width = width;
                 node.bit_offset = static_cast<std::uint32_t>(local_bit_offset);
             });
-        if (build.nodes.size() == node_count + 1u) {
+        // Compact array schemas are atomic: a partial schema would make the
+        // omitted member disappear from both topology and sampling.  Reject it
+        // so the caller can use the full recursive wave::array path instead.
+        if (!complete || build.nodes.size() == node_count + 1u) {
             build.nodes.resize(node_count);
             return false;
         }
@@ -15612,19 +15838,130 @@ private:
 
     template <typename ArrT>
     typename std::enable_if<detail::is_wave_array<ArrT>::value, NodeId>::type
+    expand_wave_array_field_recursive_impl_(const std::string& path,
+                                            NodeId parent_id,
+                                            const ArrT* ptr) {
+        if (!ptr) return 0;
+        const std::size_t logical_count = wave_array_traits<ArrT>::size;
+        const std::size_t traced_count = traced_array_element_count_(logical_count);
+        std::string annotated_array_path;
+        const std::string& array_path =
+            make_array_container_path_(path, logical_count, annotated_array_path);
+        TopologyCheckpoint cp = make_topology_checkpoint(parent_id);
+        const NodeId node_id = create_node(parent_id, array_path, NodeKind::Aggregate, 0);
+        if (node_id == 0) {
+            rollback_topology_to(cp);
+            return 0;
+        }
+        typedef typename wave_array_traits<ArrT>::element_type ElemT;
+        // First-element-only mode intentionally has no mapping for the omitted
+        // elements, so registering the full dirty range would be incorrect.
+        const bool capture_wave_array =
+            options_.enable_wave_array_dirty &&
+            !options_.trace_array_first_element_only;
+        const std::uint32_t previous_capture_depth =
+            active_dirty_wave_array_capture_depth_;
+        DirtyWaveArrayBlockCursor array_begin;
+        if (capture_wave_array) {
+            if (previous_capture_depth == 0) {
+                reserve_dirty_wave_array_scalar_layout_<ArrT>();
+            }
+            ++active_dirty_wave_array_capture_depth_;
+            array_begin = dirty_wave_array_current_block_cursor_();
+        }
+
+        const std::size_t chunk_max_bytes =
+            options_.wave_array_dirty_chunk_max_bytes != 0
+                ? options_.wave_array_dirty_chunk_max_bytes
+                : sizeof(ElemT);
+        const std::size_t chunk_element_capacity = (std::max<std::size_t>)(
+            static_cast<std::size_t>(1), chunk_max_bytes / sizeof(ElemT));
+        std::size_t chunk_first_index = 0;
+        DirtyWaveArrayBlockCursor chunk_begin = array_begin;
+
+        for (std::size_t i = 0; i < traced_count; ++i) {
+            const std::string child_path = make_index_child_path_(array_path, i);
+            TopologyCheckpoint element_checkpoint =
+                make_topology_checkpoint(node_id);
+            const ElemT* element = std::addressof((*ptr)[i]);
+            const NodeId child_node = expand_member_clean_dispatch<ElemT>(
+                child_path, node_id, element);
+            if (child_node == 0) rollback_topology_to(element_checkpoint);
+
+            if (capture_wave_array) {
+                const std::size_t chunk_element_count =
+                    i + 1u - chunk_first_index;
+                if (chunk_element_count >= chunk_element_capacity ||
+                    i + 1u == traced_count) {
+                    const DirtyWaveArrayBlockCursor chunk_end =
+                        dirty_wave_array_current_block_cursor_();
+                    if (dirty_wave_array_cursor_less_(chunk_begin, chunk_end)) {
+                        const ElemT* first_chunk_element =
+                            std::addressof((*ptr)[chunk_first_index]);
+                        const WaveArrayBulkMarkKey chunk_key(
+                            static_cast<const void*>(first_chunk_element),
+                            reflect::type_tag_of<ElemT>(), sizeof(ElemT),
+                            chunk_element_count);
+                        (void)register_dirty_wave_array_element_chunk_(
+                            chunk_key, chunk_begin, chunk_end);
+                    }
+                    chunk_first_index = i + 1u;
+                    chunk_begin = chunk_end;
+                }
+            }
+        }
+
+        DirtyWaveArrayBlockCursor array_end;
+        if (capture_wave_array) {
+            array_end = dirty_wave_array_current_block_cursor_();
+            active_dirty_wave_array_capture_depth_ = previous_capture_depth;
+            if (previous_capture_depth == 0) {
+                close_dirty_wave_array_open_block_();
+            }
+        }
+        const NodeId kept = keep_node_or_rollback(cp, node_id);
+        if (kept != 0 && capture_wave_array && logical_count != 0) {
+            const ElemT* first_element = std::addressof((*ptr)[0]);
+            const WaveArrayBulkMarkKey bulk_key(
+                static_cast<const void*>(first_element),
+                reflect::type_tag_of<ElemT>(), sizeof(ElemT), logical_count);
+            const std::uint32_t bulk_range_id = register_dirty_wave_array_slice_(
+                DirtyWaveArraySliceKey(), &bulk_key, array_begin, array_end);
+            if (bulk_range_id == kInvalidIndex ||
+                bulk_range_id >= dirty_wave_array_bulk_ranges_.size()) {
+                fail_dirty_wave_array_bulk_notify_(
+                    "recursive bulk range registration failed during topology expansion",
+                    static_cast<const void*>(first_element),
+                    reflect::type_tag_of<ElemT>(), sizeof(ElemT), logical_count);
+            }
+            dirty_wave_array_memory_blocks_valid_ = true;
+            dirty_wave_array_memory_blocks_complete_ = true;
+        }
+        active_dirty_wave_array_capture_depth_ = previous_capture_depth;
+        return kept;
+    }
+
+    template <typename ArrT>
+    typename std::enable_if<detail::is_wave_array<ArrT>::value, NodeId>::type
     expand_wave_array_field_impl(const std::string& path, NodeId parent_id, const ArrT* ptr) {
         if (!ptr) return 0;
         typedef typename wave_array_traits<ArrT>::element_type ElemT;
         const std::size_t count = wave_array_traits<ArrT>::size;
-        if (count == 0 || count > (std::numeric_limits<std::size_t>::max)() / sizeof(ElemT)) {
-            throw std::logic_error("WaveTrace compact wave::array requires a non-empty bounded array");
+        if (count == 0 ||
+            options_.trace_array_first_element_only ||
+            !options_.enable_wave_array_dirty) {
+            return expand_wave_array_field_recursive_impl_<ArrT>(
+                path, parent_id, ptr);
+        }
+        if (count > (std::numeric_limits<std::size_t>::max)() / sizeof(ElemT)) {
+            throw std::logic_error("WaveTrace wave::array size overflows address space");
         }
         const ElemT* first = std::addressof((*ptr)[0]);
         CompactArraySchemaBuild schema(first, sizeof(ElemT));
-        if (!collect_compact_array_schema_value_<ElemT>(schema, 0, NULL, first)) return 0;
-        if (!options_.enable_wave_array_dirty) {
-            throw std::logic_error(
-                "WaveTrace compact wave::array requires active wave::array dirty reporting");
+        if (!collect_compact_array_schema_value_<ElemT>(
+                schema, 0, NULL, first)) {
+            return expand_wave_array_field_recursive_impl_<ArrT>(
+                path, parent_id, ptr);
         }
 
         const std::size_t total_bytes = count * sizeof(ElemT);
@@ -16137,6 +16474,14 @@ private:
         // becomes a scalar_ptr_track, and reflected/container V is recursively
         // expanded.
         const V& ref = ptr->read();
+        if (active_bool_leaf_source_) {
+            require_one_byte_bool_leaf_source_(path, sizeof(V));
+            return add_bool_storage_signal<unsigned char>(
+                path,
+                parent_id,
+                ::wave::as_bool_storage_ptr(
+                    reinterpret_cast<const unsigned char*>(std::addressof(ref))));
+        }
         return expand_member_clean_dispatch<V>(path, parent_id, std::addressof(ref));
     }
 
@@ -16424,6 +16769,8 @@ private:
                             ? generated_name_base + member.member_id
                             : kInvalidIndex;
                     ScopedGeneratedMemberNameId generated_name_scope(this, generated_name_id);
+                    ScopedBoolLeafSource bool_leaf_source_scope(
+                        this, bool_leaf_source_tag_present_(meta...));
                     expand_reflected_child_ptr_with_union_meta_named_(name, node_id, child_field_ptr, ptr, union_bytes, union_base);
                 }),
                 [this, node_id](const char* name, const auto&) {
@@ -16471,6 +16818,8 @@ private:
                 if (union_bytes != 0 && !options_.enable_union_fields) return;
                 const std::string child_path = make_child_path_(path, name);
                 const void* union_base = union_field_base_or_null(meta...);
+                ScopedBoolLeafSource bool_leaf_source_scope(
+                    this, bool_leaf_source_tag_present_(meta...));
                 expand_reflected_child_ptr_with_union_meta_(child_path, node_id, child_field_ptr, ptr, union_bytes, union_base);
             }),
             [this, &path, node_id](const char* name, const auto&) {
@@ -16617,6 +16966,8 @@ private:
             dirty_wave_value_ranges_.size() != before.dirty_wave_value_ranges_size ||
             dirty_wave_value_leaves_.size() != before.dirty_wave_value_leaves_size ||
             bound_dirty_hooks_.size() != before.bound_dirty_hooks_size ||
+            dirty_peek_hook_bindings_.size() !=
+                before.dirty_peek_hook_bindings_size ||
             pending_dirty_hook_group_ids_.size() !=
                 before.pending_dirty_hook_group_ids_size ||
             track_paths_.size() != before.track_paths_size) {
