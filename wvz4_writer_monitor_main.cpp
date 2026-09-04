@@ -1,6 +1,8 @@
 #include "wvz4_writer_typed.h"
 
+#include <exception>
 #include <iostream>
+#include <new>
 #include <string>
 
 namespace {
@@ -40,12 +42,16 @@ int main(int argc, char** argv) {
     std::string pipe_name;
     std::string parent_pid_text;
     std::string output_path;
+    std::string ipc_version_text;
+    std::string log_path;
     if (!arg_value(argc, argv, "--pipe", pipe_name) ||
         !arg_value(argc, argv, "--parent-pid", parent_pid_text) ||
         !arg_value(argc, argv, "--out", output_path)) {
         std::cerr << "Missing required writer-helper arguments\n";
         return 2;
     }
+    arg_value(argc, argv, "--ipc-version", ipc_version_text);
+    arg_value(argc, argv, "--log", log_path);
 
     char* end = nullptr;
     const unsigned long parent_pid = std::strtoul(parent_pid_text.c_str(), &end, 10);
@@ -53,9 +59,33 @@ int main(int argc, char** argv) {
         std::cerr << "Invalid --parent-pid value\n";
         return 2;
     }
+    if (!ipc_version_text.empty()) {
+        end = nullptr;
+        const unsigned long ipc_version = std::strtoul(ipc_version_text.c_str(), &end, 10);
+        if (end == ipc_version_text.c_str() || *end != '\0' ||
+            ipc_version != static_cast<unsigned long>(wvz4::kWriterProcessProtocolVersion)) {
+            std::string error = "WVZ4 writer helper IPC protocol mismatch";
+            wvz4::detail::writer_process_diag_log(log_path, error);
+            std::cerr << error << "\n";
+            return 2;
+        }
+    } else {
+        wvz4::detail::writer_process_diag_log(log_path, "WVZ4 writer helper started without --ipc-version");
+    }
 
     std::string error;
-    if (!wvz4::WriterProcessServer::run(pipe_name, output_path, parent_pid, error)) {
+    bool ok = false;
+    try {
+        ok = wvz4::WriterProcessServer::run(pipe_name, output_path, parent_pid, log_path, error);
+    } catch (const std::bad_alloc&) {
+        error = "WVZ4 writer helper failed: std::bad_alloc";
+    } catch (const std::exception& e) {
+        error = std::string("WVZ4 writer helper failed with exception: ") + e.what();
+    } catch (...) {
+        error = "WVZ4 writer helper failed with unknown exception";
+    }
+    if (!ok) {
+        wvz4::detail::writer_process_diag_log(log_path, error);
         std::cerr << "WVZ4 writer helper failed: " << error << "\n";
         return 1;
     }

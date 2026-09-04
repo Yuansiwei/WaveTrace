@@ -1,6 +1,5 @@
 #include <winres.h>
 
-// Optional executable icon. Keep disabled when app.ico is not packaged.
-// IDI_APP_ICON ICON "app.ico"
+IDI_APP_ICON ICON "app.ico"
 
 // The Visual Studio project merges app.manifest during linking.

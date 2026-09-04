@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <MAJORCOMP Condition="'$(OVERRIDE_MAJORCOMP)'!='true'">d3d</MAJORCOMP>
+    <MINORCOMP Condition="'$(OVERRIDE_MINORCOMP)'!='true'">d3d9</MINORCOMP>
+    <TARGETNAME Condition="'$(OVERRIDE_TARGETNAME)'!='true'">d3dref9</TARGETNAME>
+    <TARGETPATH Condition="'$(OVERRIDE_TARGETPATH)'!='true'">obj</TARGETPATH>
+    <TARGETTYPE Condition="'$(OVERRIDE_TARGETTYPE)'!='true'">DYNLINK</TARGETTYPE>
+    <DLLDEF Condition="'$(OVERRIDE_DLLDEF)'!='true'">..\d3dref.def</DLLDEF>
+    <SYNCHRONIZE_DRAIN Condition="'$(OVERRIDE_SYNCHRONIZE_DRAIN)'!='true'">1</SYNCHRONIZE_DRAIN>
+    <INCLUDES Condition="'$(OVERRIDE_INCLUDES)'!='true'">$(DXROOT)\inc;$(INCLUDES)</INCLUDES>
+  </PropertyGroup>
+  <Choose>
+    <When Condition="'$(BUILD_MSREF)'!=''">
+      <PropertyGroup>
+        <REFLIBPATH Condition="'$(OVERRIDE_REFLIBPATH)'!='true'">$(SDK_LIB_PATH)</REFLIBPATH>
+        <DDRAWLIB Condition="'$(OVERRIDE_DDRAWLIB)'!='true'">ddrawp</DDRAWLIB>
+      </PropertyGroup>
+    </When>
+    <Otherwise>
+      <PropertyGroup>
+        <REFLIBPATH Condition="'$(OVERRIDE_REFLIBPATH)'!='true'">$(DDK_LIB_PATH)</REFLIBPATH>
+        <DDRAWLIB Condition="'$(OVERRIDE_DDRAWLIB)'!='true'">ddraw</DDRAWLIB>
+      </PropertyGroup>
+    </Otherwise>
+  </Choose>
+  <PropertyGroup>
+    <TARGETLIBS Condition="'$(OVERRIDE_TARGETLIBS)'!='true'">$(REFLIBPATH)\user32.lib            $(REFLIBPATH)\advapi32.lib          $(REFLIBPATH)\uuid.lib              $(REFLIBPATH)\rpcrt4.lib             $(REFLIBPATH)\winmm.lib              $(REFLIBPATH)\kernel32.lib</TARGETLIBS>
+    <LINKLIBS Condition="'$(OVERRIDE_LINKLIBS)'!='true'">..\..\drv\$(PLAT_DIR)\$(_OBJ_DIR)\*\refdrv.lib             ..\..\common\$(PLAT_DIR)\$(_OBJ_DIR)\*\refcomm.lib           ..\..\rast\$(PLAT_DIR)\$(_OBJ_DIR)\*\refrast.lib           ..\..\tnl\$(PLAT_DIR)\$(_OBJ_DIR)\*\reftnl.lib             ..\..\hop\$(PLAT_DIR)\$(_OBJ_DIR)\*\refhop.lib</LINKLIBS>
+    <DLLENTRY Condition="'$(OVERRIDE_DLLENTRY)'!='true'">_DllMainCRTStartup</DLLENTRY>
+    <SOURCES Condition="'$(OVERRIDE_SOURCES)'!='true'">..\d3dref.rc</SOURCES>
+  </PropertyGroup>
+</Project>

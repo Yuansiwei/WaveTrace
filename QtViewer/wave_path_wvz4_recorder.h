@@ -62,7 +62,9 @@ public:
         // synthetic clk track, it does not change the writer time unit.
         bool emit_default_clk = true;
         std::string default_clk_name = "clk";
-        bool clk_initial_value = false;
+        // Display phase only. WaveTap sampling remains sensitive to the input
+        // SystemC clock's negedge_event().
+        bool clk_initial_value = true;
         wvz4::u64 clk_period_ticks = 10;
         // In v4 this is interpreted as simple toggle period for CLKD. Keep the
         // old field name to preserve existing config source compatibility.
@@ -177,9 +179,13 @@ public:
         }
         wvz4::Layout layout;
         if (!build_layout(layout, error)) return false;
+        wvz4::WriterOptions writer_options = cfg_.options;
+        // Keep LOD10/100/1000 expressed in business cycles even though the
+        // underlying writer timestamps are scaled clock ticks.
+        writer_options.lod_bucket_cycle_scale = cfg_.clk_period_ticks;
         if (!process_writer_.open(cfg_.file_path,
                                   layout,
-                                  cfg_.options,
+                                  writer_options,
                                   error,
                                   std::string(),
                                   cfg_.writer_process_connect_timeout_ms)) return false;
@@ -282,6 +288,25 @@ public:
         declared_node_ids_.push_back(st.node_id);
     }
 
+    void on_subtree_reference_declared(wave::NodeId node_id,
+                                       wave::NodeId target_node_id) override {
+        if (writer_opened_ || node_id == 0 || target_node_id == 0 ||
+            target_node_id >= node_id ||
+            node_id >= node_states_.size() ||
+            target_node_id >= node_states_.size() ||
+            !node_states_[static_cast<std::size_t>(node_id)].declared ||
+            !node_states_[static_cast<std::size_t>(target_node_id)].declared) {
+            set_error("WVZ4 recorder received invalid subtree reference");
+            return;
+        }
+        NodeState& st = node_states_[static_cast<std::size_t>(node_id)];
+        if (st.kind != wvz4::NodeKind::Reference) {
+            set_error("WVZ4 recorder subtree reference mount is not a Reference node");
+            return;
+        }
+        st.reference_target_id = static_cast<wvz4::u32>(target_node_id);
+    }
+
     void on_track_declared(const wave::TrackDecl& decl) override {
         if (writer_opened_) {
             set_error("WVZ4 recorder on_track_declared failed: topology changed after writer open");
@@ -357,6 +382,7 @@ private:
         wvz4::u32 parent_id = 0;
         std::string name;
         wvz4::NodeKind kind = wvz4::NodeKind::Object;
+        wvz4::u32 reference_target_id = 0;
     };
 
     struct TrackState {
@@ -519,6 +545,7 @@ private:
         case wave::NodeKind::PointerLink: return wvz4::NodeKind::Field;
         case wave::NodeKind::ValueSource: return wvz4::NodeKind::Object;
         case wave::NodeKind::Aggregate: return wvz4::NodeKind::Object;
+        case wave::NodeKind::Reference: return wvz4::NodeKind::Reference;
         case wave::NodeKind::Unsupported: return wvz4::NodeKind::Object;
         default: return wvz4::NodeKind::Object;
         }
@@ -706,6 +733,7 @@ private:
             rec.kind = ns.kind;
             if (!children[nid].empty()) rec.first_child = children[nid][0];
             rec.next_sibling = 0;
+            rec.reference_target_id = ns.reference_target_id;
             if (ns.parent_id != 0) {
                 const std::vector<wvz4::u32>& siblings = children[ns.parent_id];
                 for (std::size_t k = 0; k + 1 < siblings.size(); ++k) {

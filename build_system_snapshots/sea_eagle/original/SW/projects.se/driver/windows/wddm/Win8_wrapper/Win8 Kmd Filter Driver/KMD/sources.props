@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <TARGETNAME>KmdFltr</TARGETNAME>
+    <TARGETTYPE>MINIPORT</TARGETTYPE>
+    <USE_MAPSYM>1</USE_MAPSYM>
+    <BUFFER_OVERFLOW_CHECKS>1</BUFFER_OVERFLOW_CHECKS>
+    <BROWSERFILE>$(TARGETNAME).bsc -n</BROWSERFILE>
+    <TARGETLIBS>$(DDK_LIB_PATH)\displib.lib               $(DDK_LIB_PATH)\libcntpr.lib               $(DDK_LIB_PATH)\ntoskrnl.lib               $(DDK_LIB_PATH)\hal.lib</TARGETLIBS>
+  </PropertyGroup>
+  <Choose>
+    <When Condition="!('$(MSC_WARNING_LEVEL)'!='')">
+      <PropertyGroup>
+        <MSC_WARNING_LEVEL>/W3 /WX</MSC_WARNING_LEVEL>
+      </PropertyGroup>
+    </When>
+  </Choose>
+  <Choose>
+    <When Condition="('$(DDKBUILDENV)'=='fre') Or ('$(DDKBUILDENV)'=='free')">
+      <PropertyGroup>
+        <MSC_OPTIMIZATION>$(MSC_OPTIMIZATION) /Ob2</MSC_OPTIMIZATION>
+      </PropertyGroup>
+    </When>
+  </Choose>
+  <PropertyGroup>
+    <USER_C_FLAGS>$(USER_C_FLAGS) /nologo</USER_C_FLAGS>
+    <LINKER_FLAGS>$(LINKER_FLAGS) /nologo</LINKER_FLAGS>
+    <C_DEFINES>$(C_DEFINES) /DLONGHORN=1</C_DEFINES>
+    <INCLUDES>$(DDK_INC_PATH);                                                 $(WDM_INC_PATH)</INCLUDES>
+    <SOURCES></SOURCES>
+    <PRECOMPILED_CXX>1</PRECOMPILED_CXX>
+    <PRECOMPILED_INCLUDE />
+    <PRECOMPILED_OBJ />
+    <PRECOMPILED_TARGET />
+  </PropertyGroup>
+</Project>

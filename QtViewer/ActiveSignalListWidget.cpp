@@ -530,19 +530,21 @@ void ActiveSignalListWidget::mouseDoubleClickEvent(QMouseEvent* event) {
 }
 
 void ActiveSignalListWidget::copySelectedTextToClipboard() const {
+    QModelIndexList picked =
+        selectionModel() ? selectionModel()->selectedRows(0) : QModelIndexList();
+    if (picked.isEmpty() && currentIndex().isValid()) picked.push_back(currentIndex());
+    std::sort(picked.begin(), picked.end(),
+              [](const QModelIndex& a, const QModelIndex& b) {
+                  return a.row() < b.row();
+              });
+
     QStringList lines;
-    QList<QTreeWidgetItem*> picked = selectedItems();
-    if (picked.isEmpty() && currentItem()) picked.push_back(currentItem());
-
-    // Keep copied rows in visual order rather than selection order.
-    std::sort(picked.begin(), picked.end(), [this](QTreeWidgetItem* a, QTreeWidgetItem* b) {
-        return indexOfTopLevelItem(a) < indexOfTopLevelItem(b);
-    });
-    picked.erase(std::unique(picked.begin(), picked.end()), picked.end());
-
-    for (QTreeWidgetItem* item : picked) {
-        if (!item) continue;
-        lines << (item->text(0) + QStringLiteral("\t") + item->text(1));
+    lines.reserve(picked.size());
+    for (const QModelIndex& index : picked) {
+        if (!index.isValid()) continue;
+        lines << (index.data(Qt::DisplayRole).toString() +
+                  QStringLiteral("\t") +
+                  index.sibling(index.row(), 1).data(Qt::DisplayRole).toString());
     }
     if (!lines.isEmpty() && QApplication::clipboard()) {
         QApplication::clipboard()->setText(lines.join(QStringLiteral("\n")));

@@ -677,6 +677,7 @@ private:
 仿真侧：
 
 ```cpp
+#include <systemc>
 #include "wave_tap.h"
 #include "wave_path_wvz4_recorder.h"
 
@@ -699,15 +700,9 @@ opt.enable_parallel_sampling = true;
 wave::Tracer tracer(recorder, opt);
 tracer.add_root("top", &top);
 
-wave::WaveTap tap(tracer, recorder);
-
-for (wave::Cycle c = 0; c < max_cycle; ++c) {
-    run_one_cycle(c);
-    if (!tap.sample_one_cycle()) {
-        error = tap.last_error();
-        break;
-    }
-}
+sc_core::sc_clock clk("clk", sc_core::sc_time(1, sc_core::SC_NS));
+wave::WaveTap tap("wave_tap", tracer, recorder, clk);
+sc_core::sc_start();
 
 recorder.close(error);
 ```

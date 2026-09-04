@@ -4,6 +4,8 @@
 
 #include <QString>
 #include <QVector>
+#include <atomic>
+#include <functional>
 #include <limits>
 #include <memory>
 
@@ -18,7 +20,7 @@ public:
         bool loadAllIfWindowEmpty = true;
 
         // When true, outWave.signalList contains every signal definition from
-        // NAME/NODE/SIGT even if its samples are not decoded in this call.
+        // NAME/NODI/SIGD even if its samples are not decoded in this call.
         // Unloaded signal entries have samplesLoaded=false and an empty samples vector.
         bool includeAllSignalDefinitions = false;
 
@@ -46,7 +48,7 @@ public:
         // samplesLoaded=false.
         bool loadRawSamples = true;
 
-        // New WVZ4 writer versions finalize files by writing FOOT and patching
+        // WVZ4 v17 writers finalize files by writing FOOT and patching
         // footer_offset in the header. Keep this false in viewer paths so a
         // killed direct writer cannot be mistaken for a complete waveform.
         bool allowUnfinalized = false;
@@ -60,6 +62,39 @@ public:
 
 class WaveParser4Reader {
 public:
+    using LoadProgressCallback = std::function<void(quint64 completedBlocks,
+                                                    quint64 totalBlocks)>;
+
+    struct SignalValueMatchRequest {
+        int signalId = -1;
+        quint64 targetBits = 0;
+    };
+
+    struct SignalValueMatchSegment {
+        int signalId = -1;
+        qint64 start = 0;
+        qint64 end = 0;
+    };
+
+    struct DataBlockDescriptor {
+        enum class Kind {
+            Raw,
+            Lod
+        };
+
+        Kind kind = Kind::Raw;
+        int index = -1;
+        quint64 blockId = 0;
+        qint64 bucketCycles = 1;
+        quint64 signalChunkId = 0;
+        int firstStorageId = 1;
+        int storageCount = 0;
+        qint64 start = 0;
+        qint64 end = 0;
+        quint64 fileBytes = 0;
+        quint64 estimatedDecodedBytes = 0;
+    };
+
     enum class RawBlockCompareResult {
         Equal,
         Different,
@@ -77,16 +112,66 @@ public:
 
     bool open(const QString& filePath, QString& error, bool allowUnfinalized = false);
     const WaveFile& directoryWave() const;
+    WaveFile takeDirectoryWave();
     bool loadSignals(const QVector<int>& signalIds,
                      WaveFile& outWave,
                      QString& error,
                      quint64 maxDecodedSamples = 0,
                      qint64 timeStart = 0,
-                     qint64 timeEnd = std::numeric_limits<qint64>::max()) const;
+                     qint64 timeEnd = std::numeric_limits<qint64>::max(),
+                     const LoadProgressCallback& progress = LoadProgressCallback()) const;
+    bool loadSignalLod(const QVector<int>& signalIds,
+                       WaveFile& outWave,
+                       QString& error,
+                       qint64 timeStart,
+                       qint64 timeEnd,
+                       qint64 targetBucketCycles) const;
+    bool findRawSignalEvent(const QVector<int>& signalIds,
+                            qint64 timeStart,
+                            qint64 timeEnd,
+                            bool firstEvent,
+                            int& resultSignalId,
+                            qint64& resultTime,
+                            QString& error,
+                            quint64 maxDecodedSamples = 0) const;
+    bool findSignalValueMatches(
+        const QVector<SignalValueMatchRequest>& requests,
+        qint64 timeStart,
+        qint64 timeEnd,
+        QVector<SignalValueMatchSegment>& matches,
+        QString& error,
+        quint64 maxDecodedSamples = 0) const;
+    QVector<DataBlockDescriptor> dataBlocks() const;
+    bool loadDataBlock(const DataBlockDescriptor& block,
+                       WaveFile& outWave,
+                       QString& error,
+                       quint64 maxDecodedSamples = 0) const;
     RawBlockCompareResult compareRawBlocksWith(const WaveParser4Reader& other,
                                                QString& error) const;
 
 private:
+    bool loadSignalLodImpl(const QVector<int>& signalIds,
+                           WaveFile& outWave,
+                           QString& error,
+                           qint64 timeStart,
+                           qint64 timeEnd,
+                           qint64 targetBucketCycles,
+                           bool exactBucketOnly,
+                           int onlyChunkIndex) const;
     struct Impl;
     std::unique_ptr<Impl> d;
 };
+
+// Build is read-only and may run on a worker thread. Apply must run on the
+// thread that owns consumers of the destination WaveTreeInfo (the Viewer UI
+// thread in normal use).
+bool buildWaveSubtreeReferencePatch(
+    const WaveTreeInfo& sourceTree,
+    int mountNodeId,
+    WaveSubtreeReferencePatch& patch,
+    QString& error,
+    const std::atomic_bool* cancel = nullptr);
+bool applyWaveSubtreeReferencePatch(
+    WaveTreeInfo& destinationTree,
+    const WaveSubtreeReferencePatch& patch,
+    QString& error);

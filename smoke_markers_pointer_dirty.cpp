@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -90,9 +91,10 @@ struct Top {
     std::unique_ptr<DirectLeaf> direct_unique;
     std::shared_ptr<DirectLeaf> direct_shared;
     PlainLeaf* plain_ptr;
-    wave::WavePtr<DirectLeaf*> wave_raw;
-    wave::WavePtr<DirectLeaf*> wave_raw_array;
-    wave::WavePtr<std::shared_ptr<DirectLeaf> > wave_shared;
+    WAVE_PTR DirectLeaf* wave_raw;
+    std::size_t wave_raw_array_count;
+    WAVE_PTR_ARRAY(wave_raw_array_count) DirectLeaf* wave_raw_array;
+    WAVE_PTR std::shared_ptr<DirectLeaf> wave_shared;
     MetricChannel peek;
     MetricChannel port_channel;
     vsipIN<MetricValue> port;
@@ -113,11 +115,11 @@ struct Top {
           direct_shared(new DirectLeaf(shared_target_seed)),
           plain_ptr(&plain_target),
           wave_raw(&wave_raw_target),
+          wave_raw_array_count(2),
           wave_raw_array(wave_raw_array_targets),
           wave_shared(std::shared_ptr<DirectLeaf>(new DirectLeaf(wave_shared_target_seed))),
           dirty_counter(0),
           flag_bool(0) {
-        wave_raw_array.declareSize(2);
         friend_box.set_secret(7);
         peek.value.count = 11;
         port_channel.value.count = 12;
@@ -195,9 +197,12 @@ template<> struct reflected_visitor<Top> {
         on_ptr("direct_unique", std::addressof(obj->direct_unique));
         on_ptr("direct_shared", std::addressof(obj->direct_shared));
         on_ptr("plain_ptr", std::addressof(obj->plain_ptr));
-        on_ptr("wave_raw", std::addressof(obj->wave_raw));
-        on_ptr("wave_raw_array", std::addressof(obj->wave_raw_array));
-        on_ptr("wave_shared", std::addressof(obj->wave_shared));
+        ::wave::detail::invoke_annotated_ptr_visitor(
+            on_ptr, "wave_raw", obj->wave_raw, 1u);
+        ::wave::detail::invoke_annotated_ptr_visitor(
+            on_ptr, "wave_raw_array", obj->wave_raw_array, obj->wave_raw_array_count);
+        ::wave::detail::invoke_annotated_ptr_visitor(
+            on_ptr, "wave_shared", obj->wave_shared, 1u);
         on_ptr("peek", std::addressof(obj->peek));
         on_ptr("port", std::addressof(obj->port));
         on_ptr("dirty_counter", std::addressof(obj->dirty_counter));
@@ -270,6 +275,31 @@ static bool has_bool_event(const wave::InMemoryWaveSink& sink,
     return false;
 }
 
+static bool patch_u32_at(const wave::InMemoryWaveSink& sink,
+                         wave::NodeId node_id,
+                         wave::Cycle cycle,
+                         std::uint64_t byte_offset,
+                         std::uint32_t expected) {
+    unsigned char bytes[sizeof(expected)] = {};
+    for (std::size_t byte = 0; byte < sizeof(expected); ++byte) {
+        const std::uint64_t target = byte_offset + byte;
+        bool found = false;
+        for (std::size_t i = sink.array_patches.size(); i != 0; --i) {
+            const wave::InMemoryWaveSink::OwnedArrayPatch& patch = sink.array_patches[i - 1u];
+            if (patch.node_id != node_id || patch.cycle > cycle || target < patch.byte_offset) continue;
+            const std::uint64_t local = target - patch.byte_offset;
+            if (local >= patch.data.size()) continue;
+            bytes[byte] = patch.data[static_cast<std::size_t>(local)];
+            found = true;
+            break;
+        }
+        if (!found) return false;
+    }
+    std::uint32_t actual = 0;
+    std::memcpy(&actual, bytes, sizeof(actual));
+    return actual == expected;
+}
+
 static int fail(const char* msg) {
     std::cerr << msg << "\n";
     return 1;
@@ -305,8 +335,6 @@ int main() {
         "top.peek.count",
         "top.port.count",
         "top.dirty_counter",
-        "top.slots.[0].count",
-        "top.slots.[1].tag",
         "top.flag_bool"
     };
     for (std::size_t i = 0; i < sizeof(required_paths) / sizeof(required_paths[0]); ++i) {
@@ -321,15 +349,22 @@ int main() {
     if (has_decl(index, "top.plain_ptr.value")) {
         return fail("unmarked plain pointer was expanded");
     }
+    if (sink.array_block_declarations.size() != 1u ||
+        sink.array_block_declarations[0].element_count != top.slots.size() ||
+        sink.array_block_declarations[0].element_stride != sizeof(ArraySlot) ||
+        sink.array_block_declarations[0].schema.size() != 3u) {
+        return fail("wave::array compact declaration mismatch");
+    }
+    const wave::NodeId slots_node_id = sink.array_block_declarations[0].node_id;
 
     if (!has_u64_event(sink, index, "top.friend_box.secret", 0, 7)) return fail("private friend value missing");
     if (!has_u64_event(sink, index, "top.direct_raw.value", 0, 10)) return fail("direct raw pointer value missing");
     if (!has_u64_event(sink, index, "top.direct_unique.value", 0, 20)) return fail("direct unique_ptr value missing");
     if (!has_u64_event(sink, index, "top.direct_shared.value", 0, 30)) return fail("direct shared_ptr value missing");
-    if (!has_u64_event(sink, index, "top.wave_raw.value", 0, 40)) return fail("WavePtr raw value missing");
-    if (!has_u64_event(sink, index, "top.wave_raw_array.[0].value", 0, 70)) return fail("WavePtr raw array element 0 missing");
-    if (!has_u64_event(sink, index, "top.wave_raw_array.[1].value", 0, 80)) return fail("WavePtr raw array element 1 missing");
-    if (!has_u64_event(sink, index, "top.wave_shared.value", 0, 50)) return fail("WavePtr shared value missing");
+    if (!has_u64_event(sink, index, "top.wave_raw.value", 0, 40)) return fail("annotated raw pointer value missing");
+    if (!has_u64_event(sink, index, "top.wave_raw_array.[0].value", 0, 70)) return fail("annotated raw pointer array element 0 missing");
+    if (!has_u64_event(sink, index, "top.wave_raw_array.[1].value", 0, 80)) return fail("annotated raw pointer array element 1 missing");
+    if (!has_u64_event(sink, index, "top.wave_shared.value", 0, 50)) return fail("annotated shared pointer value missing");
     if (!has_u64_event(sink, index, "top.peek.count", 0, 11)) return fail("peek initial value missing");
     if (!has_u64_event(sink, index, "top.port.count", 0, 12)) return fail("port-derived peek initial value missing");
 
@@ -363,10 +398,13 @@ int main() {
     if (!has_u64_event(sink, index, "top.peek.count", 3, 111)) return fail("dirty peek update missing");
     if (!has_u64_event(sink, index, "top.port.count", 3, 112)) return fail("dirty port update missing");
     if (!has_u64_event(sink, index, "top.dirty_counter", 3, 77)) return fail("WaveValue dirty update missing");
-    if (!has_u64_event(sink, index, "top.slots.[2].count", 3, 55)) return fail("wave::array dirty update missing");
+    if (!patch_u32_at(sink, slots_node_id, 3,
+                      2u * sizeof(ArraySlot) + offsetof(ArraySlot, count), 55u)) {
+        return fail("wave::array dirty patch missing");
+    }
     if (!has_bool_event(sink, index, "top.flag_bool", 3, true)) return fail("bool storage update missing");
     if (!has_u64_event(sink, index, "top.direct_raw.value", 3, 99)) return fail("direct pointer update missing");
-    if (!has_u64_event(sink, index, "top.wave_raw_array.[1].value", 3, 88)) return fail("WavePtr raw array update missing");
+    if (!has_u64_event(sink, index, "top.wave_raw_array.[1].value", 3, 88)) return fail("annotated raw pointer array update missing");
 
     std::cout << "markers/pointer/dirty coverage passed: tracks="
               << sink.declarations.size()

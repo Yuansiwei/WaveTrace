@@ -5,6 +5,7 @@
 #include <QHash>
 #include <QFileInfo>
 #include <QString>
+#include <QStringList>
 #include <QTextStream>
 
 #include <algorithm>
@@ -12,8 +13,27 @@
 
 namespace {
 
-QString signal_key(const WaveSignal& signal) {
-    return signal.name;
+QString signal_key(const WaveFile& wave, int signalIndex) {
+    if (signalIndex < 0 || signalIndex >= wave.signalList.size()) return QString();
+    if (!wave.tree.valid ||
+        signalIndex >= wave.tree.signalIndexToNodeId.size() ||
+        wave.tree.signalIndexToNodeId.at(signalIndex) <= 0) {
+        return wave.signalList.at(signalIndex).name;
+    }
+
+    QStringList parts;
+    int nodeId = wave.tree.signalIndexToNodeId.at(signalIndex);
+    int guard = 0;
+    while (nodeId > 0 &&
+           nodeId < wave.tree.nodesById.size() &&
+           wave.tree.nodesById.at(nodeId).valid &&
+           guard < wave.tree.nodesById.size()) {
+        const WaveTreeNode& node = wave.tree.nodesById.at(nodeId);
+        parts.prepend(waveTreeNodeSegmentName(wave.tree, nodeId));
+        nodeId = node.parentId;
+        ++guard;
+    }
+    return parts.join(QStringLiteral("."));
 }
 
 bool samples_equal(const WaveSample& left, const WaveSample& right) {
@@ -289,7 +309,12 @@ int main(int argc, char** argv) {
 
     QHash<QString, int> rightByName;
     for (int i = 0; i < right.signalList.size(); ++i) {
-        rightByName.insert(signal_key(right.signalList.at(i)), i);
+        const QString key = signal_key(right, i);
+        if (rightByName.contains(key)) {
+            std::cerr << "duplicate right signal key: " << key.toLocal8Bit().constData() << "\n";
+            return 5;
+        }
+        rightByName.insert(key, i);
     }
 
     if (left.signalList.size() != right.signalList.size()) {
@@ -299,8 +324,9 @@ int main(int argc, char** argv) {
     }
 
     quint64 checkedSamples = 0;
-    for (const WaveSignal& leftSignal : left.signalList) {
-        const QString key = signal_key(leftSignal);
+    for (int leftIndex = 0; leftIndex < left.signalList.size(); ++leftIndex) {
+        const WaveSignal& leftSignal = left.signalList.at(leftIndex);
+        const QString key = signal_key(left, leftIndex);
         const auto it = rightByName.constFind(key);
         if (it == rightByName.constEnd()) {
             std::cerr << "missing right signal: " << key.toLocal8Bit().constData() << "\n";

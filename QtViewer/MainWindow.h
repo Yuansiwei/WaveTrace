@@ -7,7 +7,14 @@
 #include <QString>
 #include <QSet>
 #include <QVector>
+#include <QJsonObject>
+#include <QJsonValue>
+#include <atomic>
+#include <functional>
+#include <limits>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 class QLabel;
 class QDialog;
@@ -16,6 +23,9 @@ class QDragMoveEvent;
 class QDropEvent;
 class QEvent;
 class QLineEdit;
+class QComboBox;
+class QCheckBox;
+class QCloseEvent;
 class QPushButton;
 class QIcon;
 class QSplitter;
@@ -25,9 +35,15 @@ class QModelIndex;
 class QTreeView;
 class QTreeWidget;
 class QTreeWidgetItem;
+class QVBoxLayout;
+class QWidget;
 class WaveCanvas;
+class WaveParser4Reader;
+class WaveBlockCacheLoader;
 class ActiveSignalListWidget;
+class AgentRpcServer;
 struct SignalLogicTree;
+struct TreeWarmupControl;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -35,15 +51,44 @@ public:
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override;
     bool openWaveFilePath(const QString& path, bool showError = true);
+    void activateFirstSignalsForBenchmark(int count);
+    void jumpSelectedTreeSignalToViewportEventForBenchmark(bool firstEvent);
+    bool runValueFindForBenchmark(const QString& targetText,
+                                  int activeSignalCount,
+                                  int* hitCount,
+                                  quint64* resultChecksum,
+                                  qint64* elapsedMs,
+                                  qint64 rangeStart = 0,
+                                  qint64 rangeEnd = 0);
+    void selectViewportRangeForBenchmark(qint64 start, qint64 end);
+    void resetViewForBenchmark();
+    void openSignalConditionSearchDialogForBenchmark();
+    bool benchmarkActiveViewportCoverage(int* covered, int* total) const;
+    bool benchmarkValidateRawCaches(QString* error);
+    bool runViewerSessionStateRegressionForBenchmark(QString* error);
+    bool runTreeSearchStateRegressionForBenchmark(QString* error);
+    bool runCompareActivationOrderRegressionForBenchmark(QString* error);
+    bool runDerivedExpressionForBenchmark(const QString& expression,
+                                          int widthOverride,
+                                          qint64* elapsedMs,
+                                          qint64* outputSampleCount,
+                                          quint64* outputChecksum);
     bool compareWaveFilePaths(const QString& leftPath,
                               const QString& rightPath,
                               bool showProgress = true,
                               bool showMessages = true,
                               QString* errorMessage = nullptr,
                               qint64* elapsedMs = nullptr,
-                              int* resultSignalCount = nullptr);
+                              int* resultSignalCount = nullptr,
+                              bool eventTimesOnly = false,
+                              const QString& expectedSamePeerPath = QString());
+    QJsonValue handleAgentRpc(const QString& method,
+                              const QJsonObject& params,
+                              int* errorCode,
+                              QString* errorMessage);
 
 protected:
+    void closeEvent(QCloseEvent* event) override;
     bool eventFilter(QObject* watched, QEvent* event) override;
     void dragEnterEvent(QDragEnterEvent* event) override;
     void dragMoveEvent(QDragMoveEvent* event) override;
@@ -51,6 +96,7 @@ protected:
 
 private:
     void openWaveFile();
+    void importSignalPathsFromTextFile();
     void compareWaveFiles();
     void zoomIn();
     void zoomOut();
@@ -59,8 +105,12 @@ private:
     void jumpToPrevChange();
     void jumpToNextChange();
     void jumpToTime();
+    void applyWindowRangeInput();
     void openDerivedSignalDialog();
     void openValueFindDialog();
+    void openSignalConditionSearchDialog();
+    void startSignalConditionSearch();
+    void cancelSignalConditionSearch();
     void runValueFind();
     void jumpToPreviousValueFindHit();
     void jumpToNextValueFindHit();
@@ -78,6 +128,7 @@ private:
     void onCursorMoved(qint64 t);
     void onHoverMoved(qint64 t);
     void onViewportChanged(qint64 start, qint64 end);
+    void onViewportRangeSelected(qint64 start, qint64 end);
 
 private:
     enum ActiveItemRoles {
@@ -93,19 +144,39 @@ private:
         qint64 duration = 0;
     };
 
+    struct SignalConditionValueRow {
+        QWidget* widget = nullptr;
+        QLineEdit* valueEdit = nullptr;
+        QLineEdit* ratioEdit = nullptr;
+        QPushButton* removeButton = nullptr;
+    };
+
+    struct ViewerSessionSignal {
+        QString path;
+        QString format;
+        bool selected = false;
+        bool current = false;
+    };
+
     WaveFile m_wave;
     QString m_currentWaveFilePath;
     bool m_currentWaveSupportsOnDemand = false;
+    std::shared_ptr<WaveParser4Reader> m_waveReader;
+    std::shared_ptr<std::mutex> m_waveReaderMutex = std::make_shared<std::mutex>();
+    std::unique_ptr<WaveBlockCacheLoader> m_blockCacheLoader;
     QVector<int> m_signalIndexBySignalId;
 
     QWidget* m_central = nullptr;
-    QLabel* m_metaLabel = nullptr;
     QLabel* m_cursorLabel = nullptr;
     QLabel* m_hoverLabel = nullptr;
-    QLabel* m_windowLabel = nullptr;
+    QLineEdit* m_windowRangeStartEdit = nullptr;
+    QLineEdit* m_windowRangeEndEdit = nullptr;
     QLineEdit* m_treeSearchEdit = nullptr;
     QPushButton* m_treeSearchCaseButton = nullptr;
     QPushButton* m_treeSearchRegexButton = nullptr;
+    QPushButton* m_treeSearchPrevButton = nullptr;
+    QPushButton* m_treeSearchNextButton = nullptr;
+    QPushButton* m_treeSearchRestoreButton = nullptr;
     QLineEdit* m_activeSearchEdit = nullptr;
     QLineEdit* m_jumpTimeEdit = nullptr;
     QTreeView* m_tree = nullptr;
@@ -116,8 +187,10 @@ private:
     QPushButton* m_clearActiveButton = nullptr;
     QSplitter* m_splitter = nullptr;
     QTimer* m_activeValueRefreshTimer = nullptr;
+    QTimer* m_viewportLoadTimer = nullptr;
     QDialog* m_valueFindDialog = nullptr;
     QLineEdit* m_valueFindEdit = nullptr;
+    QComboBox* m_valueFindRangeCombo = nullptr;
     QLabel* m_valueFindSummaryLabel = nullptr;
     QTreeWidget* m_valueFindResults = nullptr;
     QPushButton* m_valueFindPrevButton = nullptr;
@@ -125,8 +198,68 @@ private:
     QVector<ValueFindHit> m_valueFindHits;
     QList<int> m_valueFindSignalIndexes;
     QString m_valueFindSummaryBase;
+    qint64 m_valueFindRangeStart = 0;
+    qint64 m_valueFindRangeEnd = 0;
     int m_valueFindCurrentHit = -1;
+    QDialog* m_signalConditionSearchDialog = nullptr;
+    QCheckBox* m_signalConditionScopeCheck = nullptr;
+    QCheckBox* m_signalConditionCropTreeCheck = nullptr;
+    QLineEdit* m_signalConditionNameEdit = nullptr;
+    QCheckBox* m_signalConditionRegexCheck = nullptr;
+    QCheckBox* m_signalConditionCaseCheck = nullptr;
+    QLineEdit* m_signalConditionChangeMinEdit = nullptr;
+    QLineEdit* m_signalConditionChangeMaxEdit = nullptr;
+    QVBoxLayout* m_signalConditionValueRowsLayout = nullptr;
+    QLabel* m_signalConditionStatusLabel = nullptr;
+    QPushButton* m_signalConditionSearchButton = nullptr;
+    QPushButton* m_signalConditionCancelButton = nullptr;
+    QPushButton* m_signalConditionPrevButton = nullptr;
+    QPushButton* m_signalConditionNextButton = nullptr;
+    QVector<SignalConditionValueRow> m_signalConditionValueRows;
+    std::thread m_signalConditionSearchThread;
+    std::shared_ptr<std::atomic_bool> m_signalConditionSearchCancel;
+    quint64 m_signalConditionSearchGeneration = 0;
     std::unique_ptr<SignalLogicTree> m_signalTreeModel;
+    std::unique_ptr<AgentRpcServer> m_agentRpcServer;
+    std::thread m_treeWarmupThread;
+    std::thread m_viewportLoadThread;
+    std::shared_ptr<std::atomic_bool> m_treeWarmupCancel;
+    std::shared_ptr<TreeWarmupControl> m_treeWarmupControl;
+    quint64 m_treeWarmupGeneration = 0;
+    quint64 m_waveFileGeneration = 0;
+    quint64 m_viewportLoadSerial = 0;
+    qint64 m_pendingViewportStart = 0;
+    qint64 m_pendingViewportEnd = 0;
+    qint64 m_animationTargetStart = 0;
+    qint64 m_animationTargetEnd = 0;
+    bool m_viewportLoadPending = false;
+    bool m_viewportLoadInFlight = false;
+    bool m_animationTargetLoadScheduled = false;
+    bool m_guardedViewportCommitPending = false;
+    qint64 m_guardedViewportCommitStart = 0;
+    qint64 m_guardedViewportCommitEnd = 0;
+    quint64 m_guardedViewportCommitSerial = 0;
+    quint64 m_deferredViewportApplySerial = 0;
+    qint64 m_deferredViewportBucketCycles = 1;
+    std::function<void()> m_deferredViewportApply;
+    QSet<QString> m_userExpandedNodePaths;
+    QVector<int> m_treeSearchMatchedNodeIds;
+    QVector<int> m_treeSearchAutoExpandedNodeIds;
+    int m_treeSearchCurrentMatch = -1;
+    bool m_treeSearchCropMode = false;
+    bool m_treeSearchSnapshotValid = false;
+    QSet<QString> m_treeSearchSavedExpandedNodePaths;
+    QVector<int> m_treeSearchSavedSelectedNodeIds;
+    int m_treeSearchSavedCurrentNodeId = -1;
+    int m_treeSearchSavedVerticalScroll = 0;
+    int m_treeSearchSavedHorizontalScroll = 0;
+    int m_treeSearchSavedTopNodeId = -1;
+    int m_treeSearchSavedTopNodeOffset = 0;
+    quint64 m_treeSearchRestoreGeneration = 0;
+    QVector<ViewerSessionSignal> m_pendingSessionSignals;
+    bool m_treeSearchActive = false;
+    bool m_applyingTreeExpansionState = false;
+    bool m_pendingSessionSignalRestore = false;
 
     void buildUi();
     void applyTheme();
@@ -136,7 +269,18 @@ private:
     void updateMetaLabel();
 
     void rebuildTree();
+    void scheduleTreeWarmup();
+    void stopTreeWarmup();
+    void prioritizeTreeReference(int nodeId);
     void resetTreeViewModel();
+    void saveViewerSessionState() const;
+    bool loadViewerSessionState();
+    void retryPendingViewerSessionRestore();
+    void restoreUserTreeExpansionState();
+    void captureTreeSearchState();
+    void restoreTreeSearchState();
+    void applyTreeSearchExpansion();
+    void navigateTreeSearchMatch(int delta);
     void collectSignalIndexesFromLogicNode(int nodeId, QSet<int>& seen, QList<int>& output) const;
     QList<int> selectedActiveSignalIndexesForJump() const;
     QList<int> selectedActiveSignalIndexesForFind() const;
@@ -145,28 +289,61 @@ private:
     void jumpToValueFindHit(int hitIndex);
     void jumpToAdjacentValueFindHit(bool forward);
     void jumpSelectedTreeSignalToViewportEvent(bool firstEvent);
-    void showTreeSearchResults(const QString& query);
+    void addSignalConditionValueRow(const QString& valueText = QString(),
+                                    const QString& ratioText = QString());
+    void removeSignalConditionValueRow(QWidget* rowWidget);
+    void loadSignalConditionSearchSettings();
+    void saveSignalConditionSearchSettings() const;
+    void stopSignalConditionSearch();
+    void supersedeSignalConditionSearch();
+    void applySignalConditionSearchResults(const QVector<int>& matchedNodeIds,
+                                           qint64 examinedSignals,
+                                           qint64 nameCandidates,
+                                           qint64 elapsedMs,
+                                           bool truncated,
+                                           const QString& error);
+    void showTreeSearchResults(const QString& query,
+                               bool preserveSnapshot = false);
     void rebuildActiveListRows();
     void rebuildVisibleSignals();
     void syncActiveScrollToCanvas();
     void clampWindowToAvailableScreen();
     void refreshActiveValueLabels();
     void scheduleRefreshActiveValueLabels(int delayMs = 35);
+    void scheduleViewportDataLoad(qint64 start, qint64 end);
+    void scheduleAnimationTargetDataLoad(qint64 start, qint64 end);
+    bool applyDeferredViewportResultIfReady(bool force);
+    void completeGuardedViewportCommit(bool success);
+    void startPendingViewportDataLoad();
     bool handleWaveFileDropEvent(QEvent* event);
 
     void insertSignalIntoTree(const QString& fullName, int signalIndex);
+    void materializeBitsetNode(int nodeId);
+    void materializeArrayNode(int nodeId);
     QList<int> selectedTreeSignalIndexesForViewportJump() const;
     bool selectActiveSignalByIndex(int signalIndex);
     bool canDeferSamplesWithLod(const WaveSignal& sig) const;
     bool ensureSignalLodLoaded(const QList<int>& signalIndexes);
-    bool ensureSignalSamplesLoaded(const QList<int>& signalIndexes, bool allowLodDefer = true, bool viewportRaw = false, bool quiet = false);
+    bool ensureSignalSamplesLoaded(const QList<int>& signalIndexes,
+                                   bool allowLodDefer = true,
+                                   bool viewportRaw = false,
+                                   bool quiet = false,
+                                   qint64 requestedRawStart = std::numeric_limits<qint64>::min(),
+                                   qint64 requestedRawEnd = std::numeric_limits<qint64>::min());
+    bool ensureAgentSignalRangeLoaded(int signalIndex, qint64 start, qint64 end, QString* error);
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-    bool ensureSignalSamplesLoaded(const QVector<int>& signalIndexes, bool allowLodDefer = true, bool viewportRaw = false, bool quiet = false);
+    bool ensureSignalSamplesLoaded(const QVector<int>& signalIndexes,
+                                   bool allowLodDefer = true,
+                                   bool viewportRaw = false,
+                                   bool quiet = false,
+                                   qint64 requestedRawStart = std::numeric_limits<qint64>::min(),
+                                   qint64 requestedRawEnd = std::numeric_limits<qint64>::min());
 #endif
     bool createDerivedSignal(const QString& name, const QString& expression, int widthOverride);
 
     void addSignalToActive(int signalIndex);
     void addSignalIndexesToActive(const QList<int>& signalIndexes);
+    void sortActiveSignalsByFirstDifference();
     void removeActiveItem(QTreeWidgetItem* item);
     void removeActiveRows(const QList<int>& rows);
     int signalIndexFromActiveItem(QTreeWidgetItem* item) const;

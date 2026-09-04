@@ -1,12 +1,14 @@
 #pragma once
 
-// Manual-cycle WaveTap wrapper for the clean external-recorder workflow.
+// Business-cycle WaveTap wrapper for the clean external-recorder workflow.
 //
 // This wrapper intentionally does not own Tracer or PathStableWvz4Recorder.
 // Your business program owns and opens/closes the recorder, owns the tracer,
-// registers roots, and calls sample_one_cycle() once after each stable business
-// cycle. WaveTap owns only the monotonically increasing business-cycle counter
-// used by the recorder/tracer sampling sequence:
+// and registers roots.  In a SystemC build WaveTap is an sc_module: its
+// constructor registers a supplied sc_clock and automatically samples on every
+// falling edge.  Without SystemC the manual sample_one_cycle() API remains
+// available.  WaveTap owns only the monotonically increasing business-cycle
+// counter used by the recorder/tracer sampling sequence:
 //
 //   recorder.begin_cycle(cycle);
 //   tracer.sample(cycle);
@@ -14,13 +16,9 @@
 //   ++cycle;
 //
 // Business code does NOT pass a cycle number and does NOT call
-// prepare_topology(). The first sample_one_cycle() lazily freezes the topology,
-// builds dirty lookup tables, opens the WVZ4 writer layout, and then records
-// cycle 0.
-//
-// WaveTap has no SystemC dependency and does not derive from sc_module.
-// If <systemc.h> is available, this header also provides SystemCStartSampler,
-// a tiny sc_module callback wrapper that samples once in start_of_simulation().
+// prepare_topology(). The first falling-edge/manual sample lazily freezes the
+// topology, builds dirty lookup tables, opens the WVZ4 writer layout, and then
+// records cycle 0. There is no start_of_simulation sample.
 
 #if defined(min)
 #pragma push_macro("min")
@@ -45,19 +43,53 @@
 #if defined(WAVE_TAP_HAS_SYSTEMC_)
 #include <iostream>
 #endif
+#include <cstdint>
+#include <exception>
+#include <limits>
 #include <sstream>
 #include <string>
 
 namespace wave {
 
+#if defined(WAVE_TAP_HAS_SYSTEMC_)
+class WaveTap : public sc_core::sc_module {
+#else
 class WaveTap {
+#endif
 public:
+#if defined(WAVE_TAP_HAS_SYSTEMC_)
+    SC_HAS_PROCESS(WaveTap);
+#endif
+
     WaveTap() = delete;
     WaveTap(const WaveTap&) = delete;
     WaveTap& operator=(const WaveTap&) = delete;
 
+#if defined(WAVE_TAP_HAS_SYSTEMC_)
+    WaveTap(sc_core::sc_module_name name,
+            Tracer& tracer,
+            ::PathStableWvz4Recorder& recorder,
+            sc_core::sc_clock& clock)
+        : sc_core::sc_module(name),
+          tracer_(&tracer),
+          recorder_(&recorder) {
+        if (tracer_->trace_cycle_zero_only()) {
+            recorder_->disable_lod_tables_for_cycle_zero_snapshot();
+        }
+        if (automatic_sampling_required_()) {
+            SC_METHOD(sample_on_clock_falling_edge_);
+            sensitive << clock.negedge_event();
+            dont_initialize();
+        }
+    }
+#else
     WaveTap(Tracer& tracer, ::PathStableWvz4Recorder& recorder)
-        : tracer_(&tracer), recorder_(&recorder) {}
+        : tracer_(&tracer), recorder_(&recorder) {
+        if (tracer_->trace_cycle_zero_only()) {
+            recorder_->disable_lod_tables_for_cycle_zero_snapshot();
+        }
+    }
+#endif
 
     ~WaveTap() = default;
 
@@ -84,23 +116,36 @@ public:
     }
 
     // Samples exactly one stable business cycle and then advances the internal
-    // cycle counter. Worker threads must already be at a barrier/join point
-    // before this call; this method is not a concurrent snapshot mechanism.
+    // cycle counter. SystemC builds call this automatically on each registered
+    // clock falling edge. Worker threads must already
+    // be at a barrier/join point before a sample; this method is not a
+    // concurrent snapshot mechanism.
     //
-    // This is the only public sampling API by design: business code should call
-    // tap.sample_one_cycle() once per completed cycle and should not pass cycle
-    // numbers by hand. On failure, the internal cycle counter is not advanced
-    // so the caller can inspect last_error() and decide whether to retry/abort.
-    bool sample_one_cycle() {
-        std::string error;
-        const bool ok = sample_one_cycle_impl_(error);
-        if (!ok) last_error_ = error;
-        return ok;
+    // The public method remains available for non-SystemC/manual integrations
+    // and tests. Callers do not pass cycle numbers. On failure, the internal
+    // cycle counter is not advanced so last_error() identifies the failed
+    // automatic or manual sample.
+    bool sample_one_cycle() noexcept {
+        if (fatal_error_) return false;
+        try {
+            std::string error;
+            const bool ok = sample_one_cycle_impl_(error);
+            if (!ok) last_error_ = error;
+            return ok;
+        } catch (const std::exception& ex) {
+            latch_fatal_exception_(ex.what());
+            return false;
+        } catch (...) {
+            latch_fatal_exception_("non-standard exception");
+            return false;
+        }
     }
 
     Cycle next_cycle() const noexcept { return next_cycle_; }
 
     bool is_topology_prepared() const noexcept { return topology_prepared_; }
+
+    bool has_fatal_error() const noexcept { return fatal_error_; }
 
     const std::string& last_error() const noexcept { return last_error_; }
 
@@ -111,6 +156,62 @@ public:
     const ::PathStableWvz4Recorder& recorder() const noexcept { return *recorder_; }
 
 private:
+#if defined(WAVE_TAP_HAS_SYSTEMC_)
+    static bool automatic_sampling_required_() {
+        const ::wave::config::RuntimeConfig& config =
+            ::wave::config::runtime_config();
+        // Malformed configuration must still reach sample_one_cycle() so its
+        // existing diagnostic is reported. Only an explicit, valid disabled
+        // state suppresses automatic SystemC sampling entirely.
+        return !config.valid || config.wave_trace;
+    }
+
+    void sample_on_clock_falling_edge_() noexcept {
+        run_automatic_sample_("falling-edge");
+    }
+
+    void run_automatic_sample_(const char* source) noexcept {
+        if (sample_one_cycle()) {
+            automatic_error_reported_ = false;
+            return;
+        }
+        report_automatic_failure_once_(source);
+    }
+
+    void report_automatic_failure_once_(const char* source) noexcept {
+        if (automatic_error_reported_) return;
+        automatic_error_reported_ = true;
+        try {
+            std::cerr << "[wave] " << (source ? source : "automatic")
+                      << " sample failed: "
+                      << (last_error_.empty() ? "unknown WaveTrace failure" : last_error_)
+                      << "\n";
+        } catch (...) {
+            // The SystemC callback is an absolute exception boundary. Even a
+            // diagnostic stream configured to throw must not escape into the
+            // simulation kernel.
+        }
+    }
+#endif
+
+    void latch_fatal_exception_(const char* message) noexcept {
+        fatal_error_ = true;
+        try {
+            std::ostringstream os;
+            os << "WaveTap fatal sampling exception at cycle "
+               << static_cast<unsigned long long>(next_cycle_)
+               << ": " << (message ? message : "unknown exception");
+            last_error_ = os.str();
+        } catch (...) {
+            // Preserve the fatal latch even if diagnostics cannot allocate.
+            try {
+                last_error_ = "WaveTap fatal sampling exception";
+            } catch (...) {
+                last_error_.clear();
+            }
+        }
+    }
+
     bool sample_one_cycle_impl_(std::string& error) {
         error.clear();
         if (!tracer_ || !recorder_) {
@@ -119,6 +220,25 @@ private:
         }
 
         const Cycle cycle = next_cycle_;
+        const ::wave::config::RuntimeConfig& config = ::wave::config::runtime_config();
+        if (!config.valid) {
+            error = "WaveTap::sample_one_cycle failed: invalid WaveTrace config '";
+            error += config.path;
+            error += "': ";
+            error += config.error;
+            return false;
+        }
+        // Manual callers may still invoke sample_one_cycle() while tracing is
+        // disabled. Treat that as a quiet successful no-op.
+        if (!config.wave_trace) return finish_skipped_cycle_(cycle, false);
+
+        const std::uint64_t cycle_value = static_cast<std::uint64_t>(cycle);
+        const bool outside_capture_window =
+            cycle_value < config.wave_trace_start ||
+            cycle_value > config.wave_trace_end ||
+            (tracer_->trace_cycle_zero_only() && cycle != 0);
+        if (outside_capture_window) return finish_skipped_cycle_(cycle, true);
+
         // Lazy topology freeze. User code does not call prepare_topology().
         // This is intentionally done before begin_cycle() so topology/layout
         // declaration failures cannot leave a partially-open cycle frame.
@@ -137,6 +257,13 @@ private:
         }
 
         ++next_cycle_;
+        last_error_.clear();
+        return true;
+    }
+
+    bool finish_skipped_cycle_(Cycle cycle, bool show_progress) {
+        if (show_progress) tracer_->maybe_print_cycle_progress(cycle, false);
+        if (next_cycle_ != (std::numeric_limits<Cycle>::max)()) ++next_cycle_;
         last_error_.clear();
         return true;
     }
@@ -160,7 +287,8 @@ private:
         // almost always a bug: either reflection did not instantiate, the root
         // pointer/type is wrong, or the first lazy expansion was empty. Fail here
         // before the recorder opens an irreversible layout.
-        if (tracer_->root_watch_count() != 0u && tracer_->tracks().size() <= 1u) {
+        if (tracer_->root_watch_count() != 0u && tracer_->tracks().size() <= 1u &&
+            tracer_->compact_array_block_count() == 0u) {
             error = "WaveTap lazy topology produced no reflected tracks after add_root; ";
             error += state_summary_();
             return false;
@@ -265,29 +393,12 @@ private:
     bool topology_prepared_ = false;
     bool writer_preopened_ = false;
     bool attach_sample_thread_ = true;
+    bool fatal_error_ = false;
+#if defined(WAVE_TAP_HAS_SYSTEMC_)
+    bool automatic_error_reported_ = false;
+#endif
     std::string last_error_;
 };
-
-#if defined(WAVE_TAP_HAS_SYSTEMC_)
-class SystemCStartSampler : public sc_core::sc_module {
-public:
-    SC_HAS_PROCESS(SystemCStartSampler);
-
-    SystemCStartSampler(sc_core::sc_module_name name, WaveTap& tap)
-        : sc_core::sc_module(name), tap_(&tap) {}
-
-    void start_of_simulation() override {
-        if (!tap_) return;
-        if (!tap_->sample_one_cycle()) {
-            std::cerr << "[wave] start_of_simulation sample failed: "
-                      << tap_->last_error() << "\n";
-        }
-    }
-
-private:
-    WaveTap* tap_;
-};
-#endif
 
 } // namespace wave
 

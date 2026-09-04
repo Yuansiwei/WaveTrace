@@ -236,10 +236,15 @@ struct ShaderWaveSampler : sc_core::sc_module {
 
     void run() {
         for (int i = 0; i < cycles_to_sample; ++i) {
-            wait(clk.posedge_event());
+            wait(clk.negedge_event());
             wait(sc_core::SC_ZERO_TIME);
-            if (!tap.sample_one_cycle()) {
+            if (!tap.last_error().empty()) {
                 if (error) *error = tap.last_error();
+                sc_core::sc_stop();
+                return;
+            }
+            if (tap.next_cycle() != static_cast<wave::Cycle>(i + 1)) {
+                if (error) *error = "WaveTap automatic sample count mismatch";
                 sc_core::sc_stop();
                 return;
             }
@@ -313,7 +318,7 @@ int sc_main(int argc, char* argv[]) {
     wave::Tracer tracer(recorder, opt);
     tracer.add_root("shader", &shader);
 
-    wave::WaveTap tap(tracer, recorder);
+    wave::WaveTap tap("wave_tap", tracer, recorder, clk);
     ShaderWaveSampler sampler("shader_wave_sampler", tap, cycles, &error);
     sampler.clk(clk);
 
@@ -333,6 +338,7 @@ int sc_main(int argc, char* argv[]) {
               << " dirty_peek=" << (enable_dirty_peek ? 1 : 0)
               << " writer_mode=helper"
               << " shader_cycles=" << shader.cycle
+              << " sampled_cycles=" << tap.next_cycle()
               << " sim_time=" << sc_core::sc_time_stamp() << "\n";
     return 0;
 }

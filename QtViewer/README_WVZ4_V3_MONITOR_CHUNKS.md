@@ -179,7 +179,13 @@ Repeated `peek()` pointers are grouped by:
 peek address + reflected/type tag + byte width -> dirty group id
 ```
 
-Different waveform paths that point to the same `peek()` address still generate their own leaves/signals. They only share the same dirty group id. When any alias writes the underlying object, the dirty hook marks the whole group dirty; sampling then updates all leaves belonging to that group.
+WVZ4 v16 stores repeated runtime-erased `DynamicTraceTarget` or
+`PeekTraceSource` objects as one canonical subtree plus reference nodes.
+Those reference paths reuse the canonical signals and dirty group. Every alias
+hook is bound to that group so a write through any exposed interface schedules
+the shared physical storage. Other value-source forms that are not runtime
+subtree references can still own separate logical leaves while sharing a dirty
+group.
 
 ### Runtime structure
 
@@ -239,6 +245,13 @@ private:
 ```
 
 The tracer automatically binds the hook to the dirty group when the `peek()` source is expanded. If no hook is visible, or `enable_dirty_peek_groups` is false, the node remains on the normal poll path.
+
+`DynamicTraceTarget` uses the same dirty queue and sampling engine, but its
+`enable_dynamic_dirty_groups` switch defaults to `true` independently of the
+peek switch. Every Dynamic write path must call
+`wave_dirty_hook()->mark_dirty()` after modifying reflected storage. Set
+`enable_dynamic_dirty_groups=false` only for legacy Dynamic targets that still
+need flat polling.
 
 ### Dynamic dirty group task split
 

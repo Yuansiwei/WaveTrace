@@ -116,28 +116,6 @@ template<> struct reflected_visitor<SystemCTreeNode> {
 };
 }
 
-struct SystemCTreeSampler : sc_core::sc_module {
-    sc_core::sc_in<bool> clk;
-    wave::WaveTap* tap;
-    std::string* error;
-
-    SC_HAS_PROCESS(SystemCTreeSampler);
-
-    SystemCTreeSampler(sc_core::sc_module_name name, wave::WaveTap* wave_tap, std::string* error_out)
-        : sc_core::sc_module(name), clk("clk"), tap(wave_tap), error(error_out) {
-        SC_THREAD(run);
-    }
-
-    void run() {
-        wait(clk.posedge_event());
-        wait(sc_core::SC_ZERO_TIME);
-        if (!tap || !tap->sample_one_cycle()) {
-            if (error) *error = tap ? tap->last_error() : "missing WaveTap";
-        }
-        sc_core::sc_stop();
-    }
-};
-
 int sc_main(int argc, char* argv[]) {
     std::string out_path = "build_vs\\systemc_tree_12m.wvz4";
     std::uint64_t requested_leaves = 12000000ull;
@@ -246,10 +224,12 @@ int sc_main(int argc, char* argv[]) {
     const auto topology_begin = std::chrono::steady_clock::now();
     if (sample_one) {
         sc_core::sc_clock clk("clk", sc_core::sc_time(1, sc_core::SC_NS));
-        wave::WaveTap tap(tracer, recorder);
-        SystemCTreeSampler sampler("tree_sampler", &tap, &error);
-        sampler.clk(clk);
-        sc_core::sc_start();
+        wave::WaveTap tap("wave_tap", tracer, recorder, clk);
+        tap.sample_one_cycle();
+        if (!tap.last_error().empty()) error = tap.last_error();
+        if (error.empty() && tap.next_cycle() != static_cast<wave::Cycle>(1)) {
+            error = "WaveTap manual sample count mismatch";
+        }
     } else {
         tracer.prepare_topology(0);
         if (!recorder.open_writer_if_needed(error)) {

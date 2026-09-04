@@ -181,7 +181,7 @@ Viewer 远景可以用 LOD；但光标精确值、导出、最终搜索确认、
 | 反射生成 | `ReflectGen.cpp` |
 | 业务接入宏和尺寸保持封装 | `reflect_macro.h` |
 | 追踪运行时 | `wave_runtime.h` |
-| WaveTap 手动周期采样 | `wave_tap.h` |
+| WaveTap SystemC 启动/下降沿自动采样 | `wave_tap.h` |
 | WVZ4 记录器桥接 | `wave_path_wvz4_recorder.h` |
 | WVZ4 writer / 压缩 / LOD / helper IPC | `wvz4_writer_typed.h` |
 | helper 进程入口 | `wvz4_writer_monitor_main.cpp` |

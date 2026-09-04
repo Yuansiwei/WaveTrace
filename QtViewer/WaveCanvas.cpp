@@ -222,6 +222,7 @@ namespace {
     }
 
     void logLodUse(const char* phase,
+                   const WaveFile* wave,
                    const WaveSignal& sig,
                    int signalIndex,
                    int row,
@@ -240,7 +241,7 @@ namespace {
             .arg(QString::fromLatin1(phase ? phase : "lod"))
             .arg(signalIndex)
             .arg(row)
-            .arg(csvEscape(sig.name))
+            .arg(csvEscape(wave ? waveSignalFullPath(*wave, signalIndex) : sig.name))
             .arg(sig.kind == SignalKind::Bit ? QStringLiteral("bit") : QStringLiteral("bus"))
             .arg(sig.width)
             .arg(viewportStart)
@@ -256,7 +257,8 @@ namespace {
         appendLodRenderLogLine(line);
     }
 
-    void logLodRawFallback(const WaveSignal& sig,
+    void logLodRawFallback(const WaveFile* wave,
+                           const WaveSignal& sig,
                            int signalIndex,
                            int row,
                            qint64 viewportStart,
@@ -267,7 +269,7 @@ namespace {
         const QString line = QStringLiteral("raw-fallback,signal=%1,row=%2,name=%3,kind=%4,width=%5,viewport=%6..%7,draw=%8..%9")
             .arg(signalIndex)
             .arg(row)
-            .arg(csvEscape(sig.name))
+            .arg(csvEscape(wave ? waveSignalFullPath(*wave, signalIndex) : sig.name))
             .arg(sig.kind == SignalKind::Bit ? QStringLiteral("bit") : QStringLiteral("bus"))
             .arg(sig.width)
             .arg(viewportStart)
@@ -335,8 +337,8 @@ namespace {
         bool drawRightEdge = true;
     };
 
-    void drawBusFrame(QPainter& p, const BusFrame& busFrame, const QColor& color,
-                      qreal penWidth, const QBrush& brush = Qt::NoBrush) {
+    void drawBusFrame(QPainter& p, const BusFrame& busFrame,
+                      const QBrush& brush = Qt::NoBrush) {
         if (busFrame.rect.isEmpty()) return;
 
         const QRectF frame = busRoundedFrameRect(busFrame.rect);
@@ -344,9 +346,7 @@ namespace {
         const bool drawLeft = busFrame.drawLeftEdge;
         const bool drawRight = busFrame.drawRightEdge;
 
-        p.setPen(waveStrokePen(color, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
         if (drawLeft && drawRight) {
-            p.setBrush(brush);
             p.drawRoundedRect(frame, radius, radius);
             return;
         }
@@ -388,6 +388,7 @@ namespace {
             path.quadTo(left, top, left + radius, top);
         }
         p.drawPath(path);
+        p.setBrush(brush);
     }
 
     void drawBusRoundedFrames(QPainter& p, const QVector<BusFrame>& frames, const QColor& color,
@@ -398,8 +399,10 @@ namespace {
         const QPen oldPen = p.pen();
         const QBrush oldBrush = p.brush();
         p.setRenderHint(QPainter::Antialiasing, true);
+        p.setPen(waveStrokePen(color, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        p.setBrush(brush);
         for (const BusFrame& frame : frames) {
-            drawBusFrame(p, frame, color, penWidth, brush);
+            drawBusFrame(p, frame, brush);
         }
         p.setPen(oldPen);
         p.setBrush(oldBrush);
@@ -415,7 +418,9 @@ namespace {
         const QPen oldPen = p.pen();
         const QBrush oldBrush = p.brush();
         p.setRenderHint(QPainter::Antialiasing, true);
-        drawBusFrame(p, BusFrame{ rect, drawLeftEdge, drawRightEdge }, color, penWidth, brush);
+        p.setPen(waveStrokePen(color, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        p.setBrush(brush);
+        drawBusFrame(p, BusFrame{ rect, drawLeftEdge, drawRightEdge }, brush);
         p.setPen(oldPen);
         p.setBrush(oldBrush);
         p.setRenderHint(QPainter::Antialiasing, oldAntialiasing);
@@ -516,81 +521,69 @@ namespace {
         p.setRenderHint(QPainter::Antialiasing, oldAntialiasing);
     }
 
-    enum class DenseWaveBlockKind { Known, Z, Absent };
-
-    struct DenseWaveBlockSets {
-        QVector<QRect> knownMiniRects;
-        QVector<QRect> zMiniRects;
-        QVector<QRect> absentMiniRects;
-        QVector<int> knownBoundaryXs;
-        QVector<int> zBoundaryXs;
-        QVector<int> absentBoundaryXs;
-
-        void reserve(int expectedRects) {
-            const int capped = qMax(0, expectedRects);
-            knownMiniRects.reserve(capped);
-            zMiniRects.reserve(capped / 2 + 4);
-            absentMiniRects.reserve(capped / 2 + 4);
-            knownBoundaryXs.reserve(capped * 2);
-            zBoundaryXs.reserve(capped + 4);
-            absentBoundaryXs.reserve(capped + 4);
-        }
-
-        void addRect(const QRect& rect, DenseWaveBlockKind kind) {
-            QVector<QRect>& rects = (kind == DenseWaveBlockKind::Absent) ? absentMiniRects :
-                ((kind == DenseWaveBlockKind::Z) ? zMiniRects : knownMiniRects);
-            QVector<int>& boundaryXs = (kind == DenseWaveBlockKind::Absent) ? absentBoundaryXs :
-                ((kind == DenseWaveBlockKind::Z) ? zBoundaryXs : knownBoundaryXs);
-            rects.push_back(rect);
-            boundaryXs.push_back(rect.left());
-            boundaryXs.push_back(rect.right());
-        }
+    struct ExactBitSegment {
+        int x1 = 0;
+        int x2 = 0;
+        QChar state;
     };
 
-    DenseWaveBlockKind denseBlockKindForBitState(QChar state) {
-        if (state == QLatin1Char('a')) return DenseWaveBlockKind::Absent;
-        if (state == QLatin1Char('z')) return DenseWaveBlockKind::Z;
-        return DenseWaveBlockKind::Known;
-    }
+    void drawExactBitSegments(QPainter& p,
+                              const QVector<ExactBitSegment>& segments,
+                              int yHigh,
+                              int yLow,
+                              int yMid,
+                              const QColor& knownColor,
+                              const QColor& zColor,
+                              const QColor& absentColor,
+                              const char* context,
+                              int signalIndex,
+                              int row) {
+        QChar previousState;
+        bool havePrevious = false;
+        for (const ExactBitSegment& segment : segments) {
+            if (segment.x2 <= segment.x1) continue;
+            const int right = segment.x2 - 1;
+            const bool isOne = segment.state == QLatin1Char('1');
+            const bool isZero = segment.state == QLatin1Char('0');
+            const bool isZ = segment.state == QLatin1Char('z');
+            const int y = isOne ? yHigh : (isZero ? yLow : yMid);
+            const QColor color = isZ ? zColor :
+                (segment.state == QLatin1Char('a') ? absentColor : knownColor);
 
-    QColor denseBlockLineColor(DenseWaveBlockKind kind,
-                               const QColor& knownColor,
-                               const QColor& zColor,
-                               const QColor& absentColor) {
-        if (kind == DenseWaveBlockKind::Z) return zColor;
-        if (kind == DenseWaveBlockKind::Absent) return absentColor;
-        return knownColor;
-    }
+            validateBitHorizontalPrimitive(context, signalIndex, row,
+                                           segment.x1, right, y,
+                                           yHigh, yLow, yMid);
+            if (isZ) {
+                p.setPen(waveStrokePen(color, Qt::DashLine));
+                p.drawLine(segment.x1, y, right, y);
+            } else {
+                drawHorizontalPixelBlock(p, segment.x1, right, y, color);
+            }
 
-    QColor denseBitBlockFillColor(DenseWaveBlockKind kind,
-                                  const QColor& knownColor,
-                                  const QColor& zColor,
-                                  const QColor& absentColor) {
-        QColor fill = denseBlockLineColor(kind, knownColor, zColor, absentColor);
-        if (kind == DenseWaveBlockKind::Known) return fill;
-        fill.setAlpha(kind == DenseWaveBlockKind::Absent ? 80 : 95);
-        return fill;
-    }
-
-    void drawDenseWaveBlockSets(QPainter& p,
-                                const DenseWaveBlockSets& blocks,
-                                int yTop,
-                                int yBottom,
-                                const QColor& knownColor,
-                                const QColor& zColor,
-                                const QColor& absentColor) {
-        drawMergedDenseBusMiniRects(p, blocks.knownMiniRects, knownColor,
-                                    denseBitBlockFillColor(DenseWaveBlockKind::Known, knownColor, zColor, absentColor),
-                                    kWaveStrokeWidth);
-        drawMergedDenseBusMiniRects(p, blocks.zMiniRects, zColor,
-                                    denseBitBlockFillColor(DenseWaveBlockKind::Z, knownColor, zColor, absentColor),
-                                    kWaveStrokeWidth);
-        drawMergedDenseBusMiniRects(p, blocks.absentMiniRects, absentColor,
-                                    denseBitBlockFillColor(DenseWaveBlockKind::Absent, knownColor, zColor, absentColor),
-                                    kWaveStrokeWidth);
-        drawMergedBoundaryBlocks(p, blocks.knownBoundaryXs, yTop, yBottom, knownColor);
-        drawMergedBoundaryBlocks(p, blocks.zBoundaryXs, yTop, yBottom, zColor);
-        drawMergedBoundaryBlocks(p, blocks.absentBoundaryXs, yTop, yBottom, absentColor);
+            if (havePrevious && previousState != segment.state) {
+                const int previousY = previousState == QLatin1Char('1') ? yHigh :
+                    (previousState == QLatin1Char('0') ? yLow : yMid);
+                const int top = qMin(previousY, y);
+                const int bottom = qMax(previousY, y);
+                const bool specialTransition = isZ || previousState == QLatin1Char('z') ||
+                    segment.state == QLatin1Char('a') || previousState == QLatin1Char('a');
+                const QColor transitionColor =
+                    (segment.state == QLatin1Char('a') || previousState == QLatin1Char('a')) ? absentColor :
+                    ((isZ || previousState == QLatin1Char('z')) ? zColor : knownColor);
+                validateBitVerticalPrimitive(context, signalIndex, row,
+                                             segment.x1, segment.x1,
+                                             top, bottom, yHigh, yLow);
+                if (specialTransition) {
+                    p.setPen(waveStrokePen(transitionColor, Qt::DashLine, Qt::FlatCap));
+                    p.drawLine(segment.x1, top, segment.x1, bottom);
+                } else {
+                    drawVerticalPixelBlock(p, segment.x1, segment.x1,
+                                           top, bottom, transitionColor);
+                }
+            }
+            previousState = segment.state;
+            havePrevious = true;
+        }
     }
 
     QString normalizedTextValue(const QString& raw) {
@@ -765,86 +758,20 @@ namespace {
         return windowStart + bucketCycles;
     }
 
-    QVector<WaveLodValidRange> intersectLodRanges(const QVector<WaveLodValidRange>& a,
-                                                  const QVector<WaveLodValidRange>& b) {
-        QVector<WaveLodValidRange> out;
-        int ai = 0;
-        int bi = 0;
-        while (ai < a.size() && bi < b.size()) {
-            const qint64 start = qMax(a.at(ai).start, b.at(bi).start);
-            const qint64 end = qMin(a.at(ai).end, b.at(bi).end);
-            if (end > start) {
-                WaveLodValidRange range;
-                range.start = start;
-                range.end = end;
-                out.push_back(range);
-            }
-            if (a.at(ai).end < b.at(bi).end) ++ai;
-            else ++bi;
-        }
-        return out;
-    }
-
-    QVector<WaveLodValidRange> inferredLodDataRanges(const WaveLodLevel& level) {
-        QVector<WaveLodValidRange> ranges;
-        const qint64 bucketCycles = qMax<qint64>(1, level.bucketCycles);
-
-        if (!level.buckets.isEmpty()) {
-            WaveLodValidRange range;
-            range.start = level.buckets.constFirst().start;
-            range.end = level.buckets.constLast().end;
-            if (range.end > range.start) ranges.push_back(range);
-            return ranges;
-        }
-
-        if (level.samples.size() < 2) return ranges;
-        const qint64 maxContinuousGap = qMax<qint64>(bucketCycles * 8, bucketCycles + 1);
-        qint64 prevWindowStart = lodSampleWindowStart(level.samples.constFirst().time, bucketCycles);
-        bool open = false;
-        qint64 openStart = 0;
-        qint64 openEnd = 0;
-
-        for (int i = 1; i < level.samples.size(); ++i) {
-            const qint64 windowStart = lodSampleWindowStart(level.samples.at(i).time, bucketCycles);
-            const qint64 gap = windowStart - prevWindowStart;
-            if (gap >= 0 && gap <= maxContinuousGap) {
-                if (!open) {
-                    open = true;
-                    openStart = prevWindowStart;
-                }
-                openEnd = lodSampleWindowEnd(windowStart, bucketCycles);
-            } else if (open) {
-                WaveLodValidRange range;
-                range.start = openStart;
-                range.end = openEnd;
-                if (range.end > range.start) ranges.push_back(range);
-                open = false;
-            }
-            prevWindowStart = windowStart;
-        }
-
-        if (open) {
-            WaveLodValidRange range;
-            range.start = openStart;
-            range.end = std::numeric_limits<qint64>::max();
-            ranges.push_back(range);
-        }
-        return ranges;
-    }
-
-    QVector<WaveLodValidRange> effectiveLodValidRanges(const WaveLodLevel& level) {
-        if (level.validRanges.isEmpty() && level.loadedRanges.isEmpty()) {
-            return inferredLodDataRanges(level);
-        }
-        if (level.validRanges.isEmpty()) return level.loadedRanges;
-        if (level.loadedRanges.isEmpty()) return level.validRanges;
-        return intersectLodRanges(level.validRanges, level.loadedRanges);
+    const QVector<WaveLodValidRange>& effectiveLodLoadedRanges(const WaveLodLevel& level) {
+        // LOD samples are step-function anchors: a value remains valid until the
+        // next sample.  Historical writers stored transition-window fragments in
+        // validRanges, so using those fragments as waveform coverage creates
+        // holes in otherwise stable values.  Only loadedRanges is a physical
+        // availability boundary.  An empty loadedRanges means a legacy/eager
+        // level that is fully resident in memory.
+        return level.loadedRanges;
     }
 
     bool lodLevelIntersectsRange(const WaveLodLevel& level, qint64 start, qint64 end) {
-        if (end <= start) return false;
-        const QVector<WaveLodValidRange> ranges = effectiveLodValidRanges(level);
-        if (ranges.isEmpty()) return false;
+        if (end <= start || (level.samples.isEmpty() && level.buckets.isEmpty())) return false;
+        const QVector<WaveLodValidRange>& ranges = effectiveLodLoadedRanges(level);
+        if (ranges.isEmpty()) return true;
         for (const WaveLodValidRange& range : ranges) {
             if (range.end > start && range.start < end) return true;
         }
@@ -854,8 +781,9 @@ namespace {
     const WaveLodLevel* chooseLodLevelForViewport(const WaveSignal& sig, qint64 start, qint64 end,
                                                   qint64 spanValue, int plotWidth) {
         const double cyclesPerPixel = double(spanValue) / double(qMax(1, plotWidth));
-        if (cyclesPerPixel < 128.0 || sig.lodLevels.isEmpty()) return nullptr;
+        if (sig.lodLevels.isEmpty()) return nullptr;
         const WaveLodLevel* best = nullptr;
+        const WaveLodLevel* transitionalFallback = nullptr;
 
         const qint64 maxBucketCycles = qMax<qint64>(1, qint64(std::floor(cyclesPerPixel)));
         for (int i = 0; i < sig.lodLevels.size(); ++i) {
@@ -863,9 +791,13 @@ namespace {
             if (level.bucketCycles <= 0 || (level.buckets.isEmpty() && level.samples.isEmpty())) continue;
             if (!lodLevelIntersectsRange(level, start, end)) continue;
             if (level.bucketCycles <= maxBucketCycles) best = &level;
-            else break;
+            else if (!transitionalFallback) transitionalFallback = &level;
         }
-        return best;
+        // While a finer LOD/RAW range is being fetched, keep drawing the
+        // smallest already-loaded coarser level.  Rejecting it outright makes
+        // an otherwise valid waveform disappear for the animation + debounce
+        // + I/O interval at every LOD boundary.
+        return best ? best : transitionalFallback;
     }
 
     int lowerSampleIndexForTime(const QVector<WaveSample>& samples, qint64 t) {
@@ -917,6 +849,11 @@ WaveCanvas::WaveCanvas(QWidget* parent)
         Q_EMIT viewportChanged(m_viewStart, m_viewEnd);
         update();
         });
+    connect(m_viewAnim, &QVariantAnimation::finished, this, [this]() {
+        // Animation frames repaint from the cache. Emit one settled notification
+        // so MainWindow performs at most one range load per zoom gesture.
+        Q_EMIT viewportChanged(m_viewStart, m_viewEnd);
+        });
 }
 
 QSize WaveCanvas::minimumSizeHint() const {
@@ -933,6 +870,10 @@ qint64 WaveCanvas::span() const { return qMax<qint64>(1, m_viewEnd - m_viewStart
 
 qint64 WaveCanvas::fullStartTime() const { return fullStart(); }
 qint64 WaveCanvas::fullEndTime() const { return fullEnd(); }
+
+bool WaveCanvas::viewportAnimationActive() const {
+    return m_viewAnim && m_viewAnim->state() == QAbstractAnimation::Running;
+}
 
 QRect WaveCanvas::overviewRect() const {
     return QRect(m_padX, height() - m_overviewHeight - 8, plotSpanPxForWidth(width(), m_padX), m_overviewHeight);
@@ -972,6 +913,14 @@ void WaveCanvas::setVisibleEntries(const QVector<ActiveSignalRef>& entries) {
     update();
 }
 
+void WaveCanvas::invalidateSignalSampleCaches(const QVector<int>& signalIndexes) {
+    for (int signalIndex : signalIndexes) {
+        m_lastSampleIndexBySignal.remove(signalIndex);
+        m_strideLevelsBySignal.remove(signalIndex);
+        m_bitParityStrideLevelsBySignal.remove(signalIndex);
+    }
+}
+
 void WaveCanvas::setFirstVisibleEntryIndex(int index) {
     setVisibleEntryWindow(index, m_visibleEntryCountLimit);
 }
@@ -989,7 +938,13 @@ void WaveCanvas::setVisibleEntryWindow(int firstEntryIndex, int visibleEntryCoun
 
 void WaveCanvas::setSelectedEntryIndex(int index) {
     const int clamped = (index < 0 || index >= m_visibleEntries.size()) ? -1 : index;
-    if (m_selectedEntryIndex == clamped && m_selectedEntryIndexes.size() == (clamped >= 0 ? 1 : 0) && (clamped < 0 || m_selectedEntryIndexes.contains(clamped))) return;
+    if (!m_allEntriesSelected &&
+        m_selectedEntryIndex == clamped &&
+        m_selectedEntryIndexes.size() == (clamped >= 0 ? 1 : 0) &&
+        (clamped < 0 || m_selectedEntryIndexes.contains(clamped))) {
+        return;
+    }
+    m_allEntriesSelected = false;
     m_selectedEntryIndex = clamped;
     m_selectedEntryIndexes.clear();
     if (clamped >= 0) m_selectedEntryIndexes.insert(clamped);
@@ -997,6 +952,7 @@ void WaveCanvas::setSelectedEntryIndex(int index) {
 }
 
 void WaveCanvas::setSelectedEntryIndexes(const QSet<int>& indexes) {
+    m_allEntriesSelected = false;
     QSet<int> filtered;
     for (int idx : indexes) {
         if (idx >= 0 && idx < m_visibleEntries.size()) filtered.insert(idx);
@@ -1019,6 +975,31 @@ void WaveCanvas::setViewportInstant(qint64 start, qint64 end) {
     update();
 }
 
+void WaveCanvas::setAllEntriesSelected() {
+    const bool selectAll = !m_visibleEntries.isEmpty();
+    if (m_allEntriesSelected == selectAll && m_selectedEntryIndexes.isEmpty()) return;
+    m_allEntriesSelected = selectAll;
+    m_selectedEntryIndexes.clear();
+    if (!selectAll) {
+        m_selectedEntryIndex = -1;
+    } else if (m_selectedEntryIndex < 0 ||
+               m_selectedEntryIndex >= m_visibleEntries.size()) {
+        m_selectedEntryIndex = 0;
+    }
+    update();
+}
+
+void WaveCanvas::commitViewportRange(qint64 start, qint64 end) {
+    setViewportInstant(start, end);
+}
+
+void WaveCanvas::clearCursor() {
+    m_cursorTime = -1;
+    m_hoverTime = -1;
+    Q_EMIT cursorMoved(m_cursorTime);
+    update();
+}
+
 void WaveCanvas::animateViewportTo(qint64 start, qint64 end, int durationMs) {
     m_viewAnim->stop();
     m_animFromStart = m_viewStart;
@@ -1029,6 +1010,7 @@ void WaveCanvas::animateViewportTo(qint64 start, qint64 end, int durationMs) {
     m_viewAnim->setStartValue(0.0);
     m_viewAnim->setEndValue(1.0);
     m_viewAnim->start();
+    Q_EMIT viewportTargetRequested(start, end);
 }
 
 void WaveCanvas::resetView() {
@@ -1281,7 +1263,11 @@ QVector<int> WaveCanvas::collectSampleIndicesForWindow(const WaveSignal& sig, in
 
 
 void WaveCanvas::zoomByFactor(double factor) {
-    const qint64 center = (m_cursorTime >= 0) ? m_cursorTime : ((m_viewStart + m_viewEnd) / 2);
+    const bool cursorVisible =
+        m_cursorTime >= m_viewStart && m_cursorTime <= m_viewEnd;
+    const qint64 center = cursorVisible
+        ? m_cursorTime
+        : ((m_viewStart + m_viewEnd) / 2);
     zoomAt(center, factor, true);
 }
 
@@ -1309,6 +1295,11 @@ QString WaveCanvas::formattedValueAtCursor(const ActiveSignalRef& entry) const {
 
 namespace {
     qint64 nearestOrdinaryChangeInSignal(const WaveSignal& sig, qint64 ref, bool forward) {
+        if (sig.proceduralClock) {
+            return forward
+                ? waveProceduralClockNextTransition(sig, ref)
+                : waveProceduralClockPreviousTransition(sig, ref);
+        }
         if (sig.changeTimesReady) {
             if (sig.changeTimes.isEmpty()) return -1;
             if (forward) {
@@ -1480,6 +1471,30 @@ double WaveCanvas::timeToX(qint64 t) const {
     return m_padX + (double(t - m_viewStart) / double(span())) * usable;
 }
 
+qint64 WaveCanvas::snapCursorClickTime(qint64 t) const {
+    const qint64 step = kWaveViewerDisplayTicksPerCycle;
+    if (step <= 1) return t;
+
+    const qint64 remainder = t % step;
+    const qint64 towardZero = t - remainder;
+    qint64 nearest = towardZero;
+    if (remainder >= 0 &&
+        remainder * 2 >= step &&
+        towardZero <= (std::numeric_limits<qint64>::max)() - step) {
+        nearest = towardZero + step;
+    } else if (remainder < 0 &&
+               (-remainder) * 2 >= step &&
+               towardZero >= (std::numeric_limits<qint64>::min)() + step) {
+        nearest = towardZero - step;
+    }
+    if (nearest < fullStart() || nearest > fullEnd()) return t;
+
+    constexpr double kCursorCycleSnapPixels = 6.0;
+    return std::abs(timeToX(nearest) - timeToX(t)) <= kCursorCycleSnapPixels
+        ? nearest
+        : t;
+}
+
 qint64 WaveCanvas::overviewXToTime(double x) const {
     const QRect r = overviewRect();
     const qint64 total = qMax<qint64>(1, fullEnd() - fullStart());
@@ -1563,6 +1578,7 @@ WaveSample WaveCanvas::rawValueAtTime(int signalIndex, qint64 t) const {
     if (!m_wave || signalIndex < 0 || signalIndex >= m_wave->signalList.size()) { WaveSample s; s.isAbsent = true; s.value = waveAbsentValue(); return s; }
     const WaveSignal& sig = m_wave->signalList.at(signalIndex);
     if (sig.hasVisibleRange && (t < sig.visibleStart || t >= sig.visibleEnd)) { WaveSample s; s.isAbsent = true; s.value = waveAbsentValue(); return s; }
+    if (sig.proceduralClock) return waveProceduralClockSampleAtTime(sig, t);
     if (sig.samples.isEmpty()) { WaveSample s; s.isAbsent = true; s.value = waveAbsentValue(); return s; }
     if (t < sig.samples.first().time) { WaveSample s; s.isAbsent = true; s.value = waveAbsentValue(); return s; }
     const int idx = lastSampleIndexAtOrBefore(sig, signalIndex, t);
@@ -1585,9 +1601,9 @@ QString WaveCanvas::formatValue(const WaveSignal& sig, const WaveSample& sample,
         const quint64 bits = rawBits;
         switch (format) {
         case ValueRadix::Bin:
-            return QString::number(bits, 2).rightJustified(qMax(1, sig.width), QLatin1Char('0'));
+            return waveFormatBinaryValue(bits, sig.width);
         case ValueRadix::Hex:
-            return QString::number(bits, 16).toUpper().rightJustified(qMax(1, (sig.width + 3) / 4), QLatin1Char('0'));
+            return waveFormatHexValue(bits, sig.width);
         case ValueRadix::Int:
             if (sig.width == 32) return QString::number(static_cast<qint32>(bits & 0xFFFFFFFFu));
             return QString::number(static_cast<qint64>(bits));
@@ -1629,25 +1645,28 @@ QString WaveCanvas::formatValue(const WaveSignal& sig, const WaveSample& sample,
     switch (format) {
     case ValueRadix::Bin:
         if (numericText && canUseRawBitsForDisplay) {
-            return QString::number(bits, 2).rightJustified(qMax(1, sig.width), QLatin1Char('0'));
+            return waveFormatBinaryValue(bits, sig.width);
         }
         if (explicitBinary) {
-            return normalized.toLower().rightJustified(qMax(1, sig.width), QLatin1Char('0'));
+            return QStringLiteral("0b") +
+                waveTrimLeadingZeroDigits(normalized.toLower());
         }
         if (hexText) {
-            return hexToBinaryText(trimmed, sig.width);
+            return QStringLiteral("0b") +
+                waveTrimLeadingZeroDigits(hexToBinaryText(trimmed, sig.width));
         }
         return normalized;
     case ValueRadix::Hex:
         if (numericText && canUseRawBitsForDisplay) {
-            return QString::number(bits, 16).toUpper().rightJustified(qMax(1, (sig.width + 3) / 4), QLatin1Char('0'));
+            return waveFormatHexValue(bits, sig.width);
         }
         if (explicitBinary) {
-            return explicitBinaryToHexText(trimmed, sig.width);
+            return QStringLiteral("0x") +
+                waveTrimLeadingZeroDigits(explicitBinaryToHexText(trimmed, sig.width));
         }
         if (hexText) {
             const QString hexDigits = normalized.toUpper();
-            return hexDigits.rightJustified(qMax(1, (sig.width + 3) / 4), QLatin1Char('0'));
+            return QStringLiteral("0x") + waveTrimLeadingZeroDigits(hexDigits);
         }
         return normalized.toUpper();
     case ValueRadix::Int: {
@@ -1806,7 +1825,9 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
         const bool rowHasVisibleTime = rowViewEnd > rowViewStart;
 
         p.fillRect(QRect(0, yTop, width(), m_rowHeight), (absoluteRow % 2 == 0) ? QColor("#000000") : QColor("#080808"));
-        const bool isSelectedRow = m_selectedEntryIndexes.contains(absoluteRow) || (absoluteRow == m_selectedEntryIndex);
+        const bool isSelectedRow = m_allEntriesSelected ||
+                                   m_selectedEntryIndexes.contains(absoluteRow) ||
+                                   (absoluteRow == m_selectedEntryIndex);
         if (isSelectedRow) {
             QLinearGradient selGrad(0, yTop, 0, yTop + m_rowHeight);
             selGrad.setColorAt(0.0, QColor(115, 160, 220, 88));
@@ -1840,8 +1861,124 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
 
         const int plotRight = plotRightPixel;
         const int plotWidth = plotSpanPx;
+        if (sig.proceduralClock) {
+            const QColor color = isSelectedRow ? selectedKnownColor : waveGreen;
+            const qint64 firstTransition =
+                waveProceduralClockNextTransition(sig, rowViewStart);
+            const qint64 lastTransition =
+                waveProceduralClockPreviousTransition(sig, rowViewEnd);
+            quint64 transitionCount = 0;
+            if (firstTransition >= rowViewStart && firstTransition < rowViewEnd &&
+                lastTransition >= firstTransition &&
+                sig.clockTogglePeriodTicks != 0) {
+                transitionCount =
+                    quint64(lastTransition - firstTransition) /
+                        sig.clockTogglePeriodTicks +
+                    1u;
+            }
+
+            // Preserve exact square-wave geometry while individual edges remain
+            // resolvable. Once several edges land in one pixel, render directly
+            // per pixel from the clock formula; work then stays O(view width).
+            const quint64 exactEdgeLimit = quint64(qMax(64, plotWidth * 4));
+            if (transitionCount <= exactEdgeLimit) {
+                bool value =
+                    waveProceduralClockValueAtTime(sig, rowViewStart);
+                qint64 segmentStart = rowViewStart;
+                // valueAtTime(rowViewStart) already reflects a transition that
+                // lands exactly on the left viewport boundary. Start with the
+                // first strictly later edge so that boundary is not toggled twice.
+                qint64 transition = firstTransition;
+                while (transition >= rowViewStart && transition < rowViewEnd) {
+                    const int x1 = qBound(plotLeft, fastX(segmentStart), plotRightBoundary);
+                    const int x2 = qBound(plotLeft, fastX(transition), plotRightBoundary);
+                    if (x2 > x1) {
+                        drawHorizontalPixelBlock(
+                            p, x1, x2 - 1, value ? yHigh : yLow, color);
+                    }
+                    const int edgeX = qBound(plotLeft, fastX(transition), plotRight);
+                    drawVerticalPixelBlock(p, edgeX, edgeX, yHigh, yLow, color);
+                    value = !value;
+                    segmentStart = transition;
+                    transition = waveProceduralClockNextTransition(sig, transition);
+                }
+                const int x1 = qBound(plotLeft, fastX(segmentStart), plotRightBoundary);
+                const int x2 = qBound(plotLeft, fastX(rowViewEnd), plotRightBoundary);
+                if (x2 > x1) {
+                    drawHorizontalPixelBlock(
+                        p, x1, x2 - 1, value ? yHigh : yLow, color);
+                }
+            } else {
+                const int firstX = qBound(plotLeft, fastX(rowViewStart), plotRight);
+                const int lastXExclusive =
+                    qBound(firstX + 1, fastX(rowViewEnd), plotRightBoundary);
+                int edgeRunStart = -1;
+                int horizontalRunStart = -1;
+                int horizontalRunY = yLow;
+                auto flushEdgeRun = [&](int endExclusive) {
+                    if (edgeRunStart < 0 || endExclusive <= edgeRunStart) return;
+                    drawVerticalPixelBlock(
+                        p, edgeRunStart, endExclusive - 1, yHigh, yLow, color);
+                    edgeRunStart = -1;
+                };
+                auto flushHorizontalRun = [&](int endExclusive) {
+                    if (horizontalRunStart < 0 ||
+                        endExclusive <= horizontalRunStart) return;
+                    drawHorizontalPixelBlock(
+                        p, horizontalRunStart, endExclusive - 1,
+                        horizontalRunY, color);
+                    horizontalRunStart = -1;
+                };
+                for (int x = firstX; x < lastXExclusive; ++x) {
+                    const qint64 pixelStart =
+                        qMax(rowViewStart, xToTime(double(x) - 0.5));
+                    const qint64 pixelEnd =
+                        qMin(rowViewEnd, xToTime(double(x) + 0.5));
+                    if (pixelEnd <= pixelStart) continue;
+
+                    const bool value =
+                        waveProceduralClockValueAtTime(sig, pixelStart);
+                    const qint64 edge =
+                        waveProceduralClockTransitionAtOrAfter(sig, pixelStart);
+                    const bool hasEdge = edge >= pixelStart && edge < pixelEnd;
+                    if (hasEdge) {
+                        flushHorizontalRun(x);
+                        if (edgeRunStart < 0) edgeRunStart = x;
+                    } else {
+                        flushEdgeRun(x);
+                        const int y = value ? yHigh : yLow;
+                        if (horizontalRunStart < 0) {
+                            horizontalRunStart = x;
+                            horizontalRunY = y;
+                        } else if (horizontalRunY != y) {
+                            flushHorizontalRun(x);
+                            horizontalRunStart = x;
+                            horizontalRunY = y;
+                        }
+                    }
+                }
+                flushEdgeRun(lastXExclusive);
+                flushHorizontalRun(lastXExclusive);
+            }
+            continue;
+        }
+
         const bool rawSamplesCoverRow = waveSignalRawSamplesCoverRange(sig, rowViewStart, rowViewEnd);
+        const qint64 maxUsefulLodBucket = qMax<qint64>(
+            1, qint64(std::floor(double(spanValue) / double(qMax(1, plotWidth)))));
+        bool haveResolutionAppropriateLod = false;
+        for (const WaveLodLevel& level : sig.lodLevels) {
+            if (level.bucketCycles <= 0 || level.bucketCycles > maxUsefulLodBucket ||
+                (level.buckets.isEmpty() && level.samples.isEmpty())) continue;
+            if (lodLevelIntersectsRange(level, rowViewStart, rowViewEnd)) {
+                haveResolutionAppropriateLod = true;
+                break;
+            }
+        }
+        const bool rawRequiredForResolution = rawSamplesCoverRow &&
+            !sig.samples.isEmpty() && !haveResolutionAppropriateLod;
         const bool preferRawSamples = viewerDisableLodEnabled() ||
+            rawRequiredForResolution ||
             (rawSamplesCoverRow && !sig.samples.isEmpty() &&
              sig.samples.size() <= qMax(2000, plotWidth * 8));
         if (!preferRawSamples) if (const WaveLodLevel* lodLevel = chooseLodLevelForViewport(sig, rowViewStart, rowViewEnd, spanValue, plotWidth)) {
@@ -1853,7 +1990,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                 }
             }
             if (selectedLodIndex < 0) selectedLodIndex = 0;
-            logLodUse("select", sig, entry.signalIndex, absoluteRow,
+            logLodUse("select", m_wave, sig, entry.signalIndex, absoluteRow,
                       m_viewStart, m_viewEnd, rowViewStart, rowViewEnd,
                       selectedLodIndex, *lodLevel);
 
@@ -1867,7 +2004,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
 
                 auto drawRawLastResortRange = [&](qint64 start, qint64 end) {
                     if (!waveSignalRawSamplesCoverRange(sig, start, end) || sig.samples.isEmpty() || end <= start) return;
-                    logLodRawFallback(sig, entry.signalIndex, absoluteRow,
+                    logLodRawFallback(m_wave, sig, entry.signalIndex, absoluteRow,
                                       m_viewStart, m_viewEnd, start, end);
                     const int x1 = fastX(start);
                     const int x2 = fastX(end);
@@ -1924,7 +2061,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                 auto drawLodSampleRange = [&](const WaveLodLevel& level, qint64 visibleStart, qint64 visibleEnd) {
                     if (level.samples.isEmpty() || visibleEnd <= visibleStart) return;
                     const int drawLevelIndex = lodLevelIndexFor(level);
-                    logLodUse("draw-samples", sig, entry.signalIndex, absoluteRow,
+                    logLodUse("draw-samples", m_wave, sig, entry.signalIndex, absoluteRow,
                               m_viewStart, m_viewEnd, visibleStart, visibleEnd,
                               drawLevelIndex, level);
 
@@ -1943,33 +2080,77 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     if (lastExclusive <= firstIdx) lastExclusive = qMin(lodSamples.size(), firstIdx + 1);
 
                     if (sig.kind == SignalKind::Bit) {
-                        const int yBitTop = yHigh;
-                        const int yBitBottom = yLow + 1;
-                        DenseWaveBlockSets denseBlocks;
-                        denseBlocks.reserve(lastExclusive - firstIdx);
+                        QVector<ExactBitSegment> segments;
+                        segments.reserve(lastExclusive - firstIdx + 1);
 
-                        for (int i = firstIdx; i < lastExclusive; ++i) {
-                            const WaveSample& sample = lodSamples.at(i);
-                            const qint64 t0 = sample.time;
-                            const qint64 t1 = (i + 1 < lodSamples.size()) ? lodSamples.at(i + 1).time : visibleEnd;
-                            const qint64 segStart = qMax(t0, visibleStart);
-                            const qint64 segEnd = qMin(t1, visibleEnd);
-                            if (segEnd <= segStart) continue;
-
-                            const QChar state = classifyBitStateChar(sample);
-                            const DenseWaveBlockKind kind = denseBlockKindForBitState(state);
-                            const int x1 = fastX(segStart);
-                            const int x2 = qMax(x1 + 1, fastX(segEnd));
-                            denseBlocks.addRect(QRect(x1, yBitTop, x2 - x1, qMax(1, yBitBottom - yBitTop)), kind);
+                        const int firstAtOrAfter = lowerSampleIndexForTime(lodSamples, visibleStart);
+                        int sampleIndex = firstAtOrAfter;
+                        WaveSample current;
+                        current.rawFieldsReady = true;
+                        current.rawBits = 0;
+                        if (firstAtOrAfter > 0) {
+                            current = lodSamples.at(firstAtOrAfter - 1);
+                        } else if (waveSignalRawSamplesCoverRange(sig, visibleStart, visibleStart + 1) &&
+                                   !sig.samples.isEmpty()) {
+                            const WaveSample rawAnchor = rawValueAtTime(entry.signalIndex, visibleStart);
+                            if (!sampleIsAbsentState(rawAnchor)) current = rawAnchor;
+                        }
+                        while (sampleIndex < lodSamples.size() &&
+                               lodSamples.at(sampleIndex).time <= visibleStart) {
+                            current = lodSamples.at(sampleIndex);
+                            ++sampleIndex;
                         }
 
-                        drawDenseWaveBlockSets(p, denseBlocks, yBitTop, yBitBottom,
-                                               isSelectedRow ? selectedKnownColor : waveGreen,
-                                               zColor, absentColor);
+                        qint64 cursor = visibleStart;
+                        for (; sampleIndex < lodSamples.size(); ++sampleIndex) {
+                            const WaveSample& next = lodSamples.at(sampleIndex);
+                            if (next.time >= visibleEnd) break;
+                            if (next.time > cursor) {
+                                const int x1 = fastX(cursor);
+                                const int x2 = qMax(x1 + 1, fastX(next.time));
+                                segments.push_back(ExactBitSegment{
+                                    x1, x2, classifyBitStateChar(current) });
+                            }
+                            current = next;
+                            cursor = qMax(cursor, next.time);
+                        }
+                        if (cursor < visibleEnd) {
+                            const int x1 = fastX(cursor);
+                            const int x2 = qMax(x1 + 1, fastX(visibleEnd));
+                            segments.push_back(ExactBitSegment{
+                                x1, x2, classifyBitStateChar(current) });
+                        }
+
+                        drawExactBitSegments(p, segments, yHigh, yLow, yMid,
+                                             isSelectedRow ? selectedKnownColor : waveGreen,
+                                             zColor, absentColor,
+                                             "lod-sample-bit", entry.signalIndex, absoluteRow);
+
+                        // A sample-based LOD record means its sampling window
+                        // contained at least one real transition.  The writer
+                        // stores only the last transition/value in that window,
+                        // so adjacent records may legitimately have the same
+                        // final value (for example, an even number of toggles).
+                        // Always draw an activity edge for every resident LOD
+                        // record instead of mistaking equal final values for a
+                        // stable interval.
+                        QVector<int> activityBoundaryXs;
+                        int activityIndex = lowerSampleIndexForTime(lodSamples, visibleStart);
+                        for (; activityIndex < lodSamples.size(); ++activityIndex) {
+                            const WaveSample& activity = lodSamples.at(activityIndex);
+                            if (activity.time >= visibleEnd) break;
+                            activityBoundaryXs.push_back(fastX(activity.time));
+                        }
+                        drawMergedBoundaryBlocks(
+                            p, activityBoundaryXs, yHigh, yLow,
+                            isSelectedRow ? selectedKnownColor : waveGreen);
                     } else {
                         const int yBusTop = yTop + 8;
                         const int yBusBottom = yTop + m_rowHeight - 8;
                         const qreal penWidth = kWaveStrokeWidth;
+                        WaveSample implicitZeroSample;
+                        implicitZeroSample.rawBits = 0;
+                        implicitZeroSample.rawFieldsReady = true;
                         enum class DenseMiniFrameKind { Known, Z, Absent };
                         QVector<QRect> knownMiniRects;
                         QVector<QRect> zMiniRects;
@@ -2040,22 +2221,52 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                         };
 
                         const int lodVisibleCount = lastExclusive - firstIdx;
-                        const bool lodDenseByPixel = lodVisibleCount > qMax(1, plotWidth);
+                        // At roughly one LOD sample per pixel, outlined bus
+                        // frames degenerate into sparse one-pixel edges. RAW's
+                        // dense renderer fills activity columns, so switching
+                        // at the finest LOD boundary visibly flashes. Enter the
+                        // dense activity renderer before that boundary so both
+                        // representations have the same pixel semantics.
+                        const bool lodDenseByPixel =
+                            lodVisibleCount > qMax(40, plotWidth / 3);
                         if (!lodDenseByPixel) {
-                            for (int i = firstIdx; i < lastExclusive; ++i) {
+                            WaveSample rawAnchorSample;
+                            const WaveSample* currentSample = &implicitZeroSample;
+                            int sampleIndex = lowerSampleIndexForTime(lodSamples, visibleStart);
+                            if (sampleIndex > 0) {
+                                currentSample = &lodSamples.at(sampleIndex - 1);
+                            } else if (waveSignalRawSamplesCoverRange(sig, visibleStart, visibleEnd) &&
+                                       !sig.samples.isEmpty()) {
+                                rawAnchorSample = rawValueAtTime(entry.signalIndex, visibleStart);
+                                currentSample = sampleIsAbsentState(rawAnchorSample)
+                                    ? nullptr : &rawAnchorSample;
+                            }
+                            while (sampleIndex < lodSamples.size() &&
+                                   lodSamples.at(sampleIndex).time <= visibleStart) {
+                                currentSample = &lodSamples.at(sampleIndex);
+                                ++sampleIndex;
+                            }
+
+                            qint64 cursor = visibleStart;
+                            for (int i = sampleIndex; i < lodSamples.size(); ++i) {
                                 const WaveSample& sample = lodSamples.at(i);
-                                const qint64 t0 = sample.time;
-                                const qint64 t1 = (i + 1 < lodSamples.size()) ? lodSamples.at(i + 1).time : visibleEnd;
-                                const qint64 segStart = qMax(t0, visibleStart);
-                                const qint64 segEnd = qMin(qMax(t1, t0 + 1), visibleEnd);
-                                drawBusStableSampleRange(&sample, segStart, segEnd);
+                                if (sample.time >= visibleEnd) break;
+                                if (sample.time > cursor) {
+                                    drawBusStableSampleRange(currentSample, cursor, sample.time);
+                                }
+                                currentSample = &sample;
+                                cursor = qMax(cursor, sample.time);
+                            }
+                            if (cursor < visibleEnd) {
+                                drawBusStableSampleRange(currentSample, cursor, visibleEnd);
                             }
                         } else {
                             WaveSample rawAnchorSample;
-                            const WaveSample* currentSample = nullptr;
+                            const WaveSample* currentSample = &implicitZeroSample;
                             if (waveSignalRawSamplesCoverRange(sig, visibleStart, visibleEnd) && !sig.samples.isEmpty()) {
                                 rawAnchorSample = rawValueAtTime(entry.signalIndex, visibleStart);
-                                if (!sampleIsAbsentState(rawAnchorSample)) currentSample = &rawAnchorSample;
+                                currentSample = sampleIsAbsentState(rawAnchorSample)
+                                    ? nullptr : &rawAnchorSample;
                             }
                             qint64 cursor = visibleStart;
                             for (int i = firstIdx; i < lastExclusive && cursor < visibleEnd; ++i) {
@@ -2099,7 +2310,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                         const WaveLodLevel& fallbackLevel = sig.lodLevels.at(levelIndex);
                         if (fallbackLevel.bucketCycles <= 0 || fallbackLevel.samples.isEmpty()) continue;
 
-                        const QVector<WaveLodValidRange> fallbackRanges = effectiveLodValidRanges(fallbackLevel);
+                        const QVector<WaveLodValidRange>& fallbackRanges = effectiveLodLoadedRanges(fallbackLevel);
                         if (fallbackRanges.isEmpty()) {
                             drawLodSampleRange(fallbackLevel, start, end);
                             return;
@@ -2122,15 +2333,15 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     drawRawLastResortRange(start, end);
                 };
 
-                const QVector<WaveLodValidRange> validRanges = effectiveLodValidRanges(*lodLevel);
-                if (validRanges.isEmpty()) {
+                const QVector<WaveLodValidRange>& loadedRanges = effectiveLodLoadedRanges(*lodLevel);
+                if (loadedRanges.isEmpty()) {
                     drawLodSampleRange(*lodLevel, rowViewStart, rowViewEnd);
                     continue;
                 }
 
                 bool drewLodRange = false;
                 qint64 cursor = rowViewStart;
-                for (const WaveLodValidRange& range : validRanges) {
+                for (const WaveLodValidRange& range : loadedRanges) {
                     const qint64 clippedStart = qMax(range.start, rowViewStart);
                     const qint64 clippedEnd = qMin(range.end, rowViewEnd);
                     if (clippedEnd <= clippedStart) continue;
@@ -2151,7 +2362,7 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
             }
 
             const QVector<WaveLodBucket>& buckets = lodLevel->buckets;
-            logLodUse("draw-buckets", sig, entry.signalIndex, absoluteRow,
+            logLodUse("draw-buckets", m_wave, sig, entry.signalIndex, absoluteRow,
                       m_viewStart, m_viewEnd, rowViewStart, rowViewEnd,
                       selectedLodIndex, *lodLevel);
             int lodIndex = lowerLodBucketByEnd(buckets, rowViewStart);
@@ -2292,14 +2503,12 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
             const int visibleCount = lastExclusive - firstIdx;
             const bool highDensity = visibleCount > qMax(4000, plotWidth * 8);
             if (highDensity) {
-                const int yBitTop = yHigh;
-                const int yBitBottom = yLow + 1;
-                DenseWaveBlockSets denseBlocks;
+                QVector<ExactBitSegment> segments;
                 QVector<int> sampled = collectBitAlternatingSampleIndicesForWindow(
                     sig, entry.signalIndex, rowViewStart, rowViewEnd, qMax(64, plotWidth * 3));
                 std::sort(sampled.begin(), sampled.end());
                 sampled.erase(std::unique(sampled.begin(), sampled.end()), sampled.end());
-                denseBlocks.reserve(sampled.size());
+                segments.reserve(sampled.size());
 
                 for (int s = 0; s < sampled.size(); ++s) {
                     const int i = sampled.at(s);
@@ -2316,16 +2525,15 @@ void WaveCanvas::paintEvent(QPaintEvent*) {
                     if (segEnd <= segStart) continue;
 
                     const QChar state = classifyBitStateChar(sample);
-                    const DenseWaveBlockKind kind = denseBlockKindForBitState(state);
                     const int x1 = fastX(segStart);
                     const int x2 = qMax(x1 + 1, fastX(segEnd));
-                    const QRect rect(x1, yBitTop, x2 - x1, qMax(1, yBitBottom - yBitTop));
-                    denseBlocks.addRect(rect, kind);
+                    segments.push_back(ExactBitSegment{ x1, x2, state });
                 }
 
-                drawDenseWaveBlockSets(p, denseBlocks, yBitTop, yBitBottom,
-                                       isSelectedRow ? selectedKnownColor : waveGreen,
-                                       zColor, absentColor);
+                drawExactBitSegments(p, segments, yHigh, yLow, yMid,
+                                     isSelectedRow ? selectedKnownColor : waveGreen,
+                                     zColor, absentColor,
+                                     "raw-dense-bit", entry.signalIndex, absoluteRow);
             } else {
                 std::vector<int> lowDiff(plotWidth + 1, 0);
                 std::vector<int> highDiff(plotWidth + 1, 0);
@@ -2824,19 +3032,18 @@ void WaveCanvas::mouseReleaseEvent(QMouseEvent* event) {
             if (ns < fullStart()) ns = fullStart();
             if (ne > fullEnd()) ne = fullEnd();
             if (ne - ns < m_minWindow) ns = qMax(fullStart(), ne - m_minWindow);
-            setViewportInstant(ns, ne);
-            m_cursorTime = ns + (ne - ns) / 2;
+            Q_EMIT viewportRangeSelected(ns, ne);
         }
         else {
-            m_cursorTime = t1;
+            m_cursorTime = snapCursorClickTime(t1);
             if (m_pendingClickRow >= 0) {
                 m_selectedEntryIndex = m_pendingClickRow;
                 Q_EMIT entryClicked(m_pendingClickRow, m_pendingClickCtrlHeld);
             }
+            Q_EMIT cursorMoved(m_cursorTime);
         }
         m_pendingClickRow = -1;
         m_pendingClickCtrlHeld = false;
-        Q_EMIT cursorMoved(m_cursorTime);
         update();
         event->accept();
         return;
@@ -2869,8 +3076,11 @@ void WaveCanvas::leaveEvent(QEvent* event) {
 }
 
 void WaveCanvas::wheelEvent(QWheelEvent* event) {
-    m_cursorTime = xToTime(wheelEventXCompat(event));
-    Q_EMIT cursorMoved(m_cursorTime);
-    zoomAt(m_cursorTime, event->angleDelta().y() > 0 ? 0.85 : 1.15, true);
+    const bool cursorVisible =
+        m_cursorTime >= m_viewStart && m_cursorTime <= m_viewEnd;
+    const qint64 zoomCenter = cursorVisible
+        ? m_cursorTime
+        : xToTime(wheelEventXCompat(event));
+    zoomAt(zoomCenter, event->angleDelta().y() > 0 ? 0.85 : 1.15, true);
     event->accept();
 }
